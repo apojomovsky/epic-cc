@@ -29,6 +29,21 @@ const PIC18_SFR_ACCESS_LO: u16 = 0xF60;
 /// per byte. (epic-cc#486)
 const COPY_LOOP_MIN_PAIRS: usize = 6;
 
+/// Codegen options. `copy_loop` keeps the POSTINC drain (epic-cc#486):
+/// long staged runs lower to the 9-word seeded loop, which runs about
+/// 3x slower per byte than straight `MOVFF`s. The speed profile turns it
+/// off, trading flash for cycles on those runs (epic-cc#883).
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    pub copy_loop: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { copy_loop: true }
+    }
+}
+
 /// The result of resolving a pointer to a concrete access. `Direct`: the
 /// address is statically known, so a plain `MOVFF`/`MOVF`/`MOVWF` reaches
 /// it. `Indirect`: `FSR0` has been set up and the access goes through
@@ -192,6 +207,9 @@ struct Gen<'m> {
     /// the source location active when it was staged so the parallel
     /// `locs` vector stays index-aligned whichever way the drain goes.
     pending_copies: Vec<(u16, u16, Option<SrcLoc>)>,
+    /// Whether long staged runs drain as the POSTINC loop. Off under the
+    /// speed profile, where straight `MOVFF`s trade flash for cycles.
+    copy_loop: bool,
     /// Every RAM address a global occupies. The W cache never records or
     /// reuses one: an interrupt can write a global between the store and
     /// the reload, while the ISR epilogue restores W to its pre-interrupt
@@ -429,12 +447,13 @@ impl<'m> Gen<'m> {
     /// Drains `pending_copies`. A run that reached `COPY_LOOP_MIN_PAIRS`
     /// (the buffer only extends while each pair is consecutive with the
     /// first, src and dst each advancing by one) lowers to the seeded
-    /// loop; anything shorter replays as the straight MOVFFs it would
-    /// have been. The loop label is a pure straight-line cycle (reached
-    /// only by the MOVLW above and the BRA below, body free of banked
-    /// operands), so the tracked `bsr` survives it; the POSTINC walk does
-    /// move FSR0 n bytes past its seed, so the tracked FSR0 position does
-    /// not. Raw pushes, not `emit`: flush runs from inside `emit`.
+    /// loop; anything shorter, or any run with `copy_loop` off, replays
+    /// as the straight MOVFFs it would have been. The loop label is a pure
+    /// straight-line cycle (reached only by the MOVLW above and the BRA
+    /// below, body free of banked operands), so the tracked `bsr` survives
+    /// it; the POSTINC walk does move FSR0 n bytes past its seed, so the
+    /// tracked FSR0 position does not. Raw pushes, not `emit`: flush runs
+    /// from inside `emit`.
     fn flush_copies(&mut self) {
         if self.pending_copies.is_empty() {
             return;
@@ -445,7 +464,7 @@ impl<'m> Gen<'m> {
         // adjacent copies can stage a longer run; a byte-counted loop
         // cannot hold that count in the MOVLW literal, so long runs
         // replay straight, the pre-loop form.
-        if n >= COPY_LOOP_MIN_PAIRS && n <= 255 {
+        if self.copy_loop && n >= COPY_LOOP_MIN_PAIRS && n <= 255 {
             // The count rides in WREG, so the drained form clobbers W
             // (epic-cc#502).
             self.w_holds = None;
@@ -8383,6 +8402,29 @@ pub fn select_with_locs(
     isr_save: Option<u16>,
     isr_hi_save: Option<u16>,
 ) -> (String, Vec<Option<SrcLoc>>) {
+    select_with_opts(
+        device,
+        m,
+        addrs,
+        isr_low_save,
+        isr_save,
+        isr_hi_save,
+        Options::default(),
+    )
+}
+
+/// `select_with_locs` with codegen options. The driver passes
+/// `copy_loop: false` under the speed profile, so long staged runs stay
+/// straight `MOVFF`s instead of trading cycles for flash (epic-cc#883).
+pub fn select_with_opts(
+    device: &Device,
+    m: &Module,
+    addrs: &HashMap<String, u16>,
+    isr_low_save: Option<u16>,
+    isr_save: Option<u16>,
+    isr_hi_save: Option<u16>,
+    opts: Options,
+) -> (String, Vec<Option<SrcLoc>>) {
     let (common_lo, _) = device
         .fixed_retval
         .expect("isel-pic18's fixed retval region needs a fixed_retval reservation");
@@ -8579,6 +8621,7 @@ pub fn select_with_locs(
             fsr0_holds: None,
             tblptr_holds: None,
             pending_copies: Vec::new(),
+            copy_loop: opts.copy_loop,
             cur_func: &f.name,
             global_addrs: &global_addrs,
             w_holds: None,
@@ -9227,6 +9270,7 @@ pub fn select_with_locs(
                 fsr0_holds: None,
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
+                copy_loop: opts.copy_loop,
                 cur_func: &f.name,
                 global_addrs: &global_addrs,
                 w_holds: None,
@@ -9561,6 +9605,7 @@ mod tests {
                 fsr0_holds: None,
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
+                copy_loop: true,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
                 w_holds: None,
@@ -9591,6 +9636,7 @@ mod tests {
                 fsr0_holds: None,
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
+                copy_loop: true,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
                 w_holds: None,
@@ -9636,6 +9682,7 @@ mod p3_gen_tests {
             fsr0_holds: None,
             tblptr_holds: None,
             pending_copies: Vec::new(),
+            copy_loop: true,
             cur_func: "main",
             global_addrs: empty_global_addrs(),
             w_holds: None,
