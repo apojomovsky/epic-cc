@@ -540,6 +540,9 @@ fn main() {
     let mut addrs: HashMap<String, u16> = HashMap::new();
     addrs.extend(layout.globals.iter().map(|(k, &v)| (k.clone(), v)));
     addrs.extend(layout.locals.iter().map(|(k, &v)| (k.clone(), v)));
+    // Cross-page chunk entries (epic-cc#841): filled by the PIC14 arm
+    // below, empty for every other core; the page-fit check reads it.
+    let mut chunks: HashMap<String, Vec<String>> = HashMap::new();
     let (asm, mut locs) = match device.core {
         device::Core::Pic14 => {
             // Pooled string table (epic-cc#815): additive and default
@@ -551,7 +554,10 @@ fn main() {
             } else {
                 isel::ConstPool::empty()
             };
-            isel::select_with_locs(device, &m, &addrs, &layout.staged_consts, &pool)
+            let (asm, locs, c) =
+                isel::select_with_locs(device, &m, &addrs, &layout.staged_consts, &pool);
+            chunks = c;
+            (asm, locs)
         }
         device::Core::Pic18 => isel_pic18::select_with_locs(
             device,
@@ -593,7 +599,7 @@ fn main() {
             // Panics here instead, before assembling (epic-cc#17). PIC14/PIC14E
             // page GOTOs via PCLATH; PIC18's 20-bit GOTO/CALL reach all flash.
             if device.core == device::Core::Pic14 {
-                isel::verify_page_fit(&m, &asm);
+                isel::verify_page_fit_split(&m, &asm, &chunks);
             } else {
                 isel_pic14e::verify_page_fit(&m, &asm);
             }

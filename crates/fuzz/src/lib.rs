@@ -2512,7 +2512,7 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
                 asm::assemble_file_to_hex(device, &asm)
             }
             device::Core::Pic14 => {
-                let (asm, _) = isel::select_with_locs(
+                let (asm, _, _) = isel::select_with_locs(
                     device,
                     &m,
                     &addrs,

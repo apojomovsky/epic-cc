@@ -4817,6 +4817,120 @@ fn panics_on_function_larger_than_a_page() {
 }
 
 #[test]
+fn split_function_spans_pages_and_runs_in_sim() {
+    // epic-cc#841: a function past one 2048-word page is placed across
+    // pages in chunks linked by PCLATH-setting GOTOs instead of erroring.
+    // main is ~3400 words over six blocks (pads plus a counted loop with
+    // a helper CALL), so it splits; the latch branches back, the body
+    // calls across pages, and every intra-function GOTO carries its
+    // target's page (sets precede skip-op pairs). Hand-traced outputs:
+    // in=0 -> 29, in=1 -> 16, in=2 -> 17.
+    let mut entry_pad = String::new();
+    for _ in 0..300 {
+        entry_pad.push_str("    %d1 = add i8 %d1, 1\n");
+    }
+    let (mut pad2, mut pad3, mut pad4) = (String::new(), String::new(), String::new());
+    for _ in 0..250 {
+        pad2.push_str("    %d2 = add i8 %d2, 1\n");
+        pad3.push_str("    %d3 = add i8 %d3, 1\n");
+        pad4.push_str("    %d4 = add i8 %d4, 1\n");
+    }
+    let m = parse(&format!(
+        "global in i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %a = load i8 @in\n    %n = add i8 %a, 0\n\
+         \x20   %d1 = add i8 %a, 0\n{entry_pad}    br h1\n\
+         block h1:\n    %i = phi i8 %n entry %m latch\n    %q = phi i8 %n entry %u latch\n\
+         \x20   %i2 = add i8 %i, 1\n    %q2 = add i8 %q, 7\n    %d2 = add i8 %i2, 0\n{pad2}    br h2\n\
+         block h2:\n    %j = phi i8 %i2 h1\n    %r = phi i8 %q2 h1\n    %t = call i8 @helper(i8 %r)\n\
+         \x20   %r2 = add i8 %t, 5\n    %d3 = add i8 %r2, 0\n{pad3}    br h3\n\
+         block h3:\n    %k = phi i8 %j h2\n    %s = phi i8 %r2 h2\n    %s2 = add i8 %s, 1\n\
+         \x20   %d4 = add i8 %s2, 0\n{pad4}    br latch\n\
+         block latch:\n    %m = phi i8 %k h3\n    %u = phi i8 %s2 h3\n    %c = icmp ult i8 %m, 2\n\
+         \x20   br i1 %c h1 exit_h\n\
+         block exit_h:\n    %v = add i8 %u, 1\n    store i8 %v @out\n    ret void\n\
+         fn helper(i8) (x)\n  block entry:\n    %r = add i8 %x, 1\n    ret i8 %r\n"
+    ));
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::a", 0x25),
+        ("main::n", 0x26),
+        ("main::d1", 0x27),
+        ("main::i", 0x28),
+        ("main::q", 0x29),
+        ("main::i2", 0x2A),
+        ("main::q2", 0x2B),
+        ("main::d2", 0x2C),
+        ("main::j", 0x2D),
+        ("main::r", 0x2E),
+        ("main::t", 0x2F),
+        ("main::r2", 0x30),
+        ("main::d3", 0x31),
+        ("main::k", 0x32),
+        ("main::s", 0x33),
+        ("main::s2", 0x34),
+        ("main::d4", 0x35),
+        ("main::m", 0x36),
+        ("main::u", 0x37),
+        ("main::c", 0x38),
+        ("main::v", 0x39),
+        ("helper::x", 0x40),
+        ("helper::r", 0x41),
+    ]);
+    let (asm, _, chunks) = isel::select_with_locs(
+        &PIC16F877A,
+        &m,
+        &addrs,
+        &std::collections::HashSet::new(),
+        &isel::ConstPool::empty(),
+    );
+    let entries = chunks.get("main").expect("main must split:\n{asm}");
+    assert!(
+        entries.len() >= 2,
+        "main must place in at least two chunks:\n{asm}"
+    );
+    let pages: Vec<usize> = entries
+        .iter()
+        .map(|e| label_addr(&asm, e) / 0x800)
+        .collect();
+    assert!(
+        pages.iter().collect::<std::collections::HashSet<_>>().len() >= 2,
+        "chunks must land on distinct pages:\n{asm}"
+    );
+    // Every non-final chunk ends with a PCLATH-setting link to the next
+    // chunk's entry label.
+    for next in entries.iter().skip(1) {
+        assert!(
+            asm.contains(&format!(
+                "MOVLW PAGE({next})\n    MOVWF PCLATH\n    GOTO {next}"
+            )),
+            "link to {next} must set PCLATH first:\n{asm}"
+        );
+    }
+    let banked = banking::assign_banks(&PIC16F877A, &asm);
+    let peeped = peephole::optimize(&banked);
+    // No panic: each chunk fits its page in the final layout.
+    isel::verify_page_fit_split(&m, &peeped, &chunks);
+    // The split program really runs, across pages and back: the loop
+    // latch returns to the header and the helper CALL restores PCLATH.
+    assert_eq!(
+        sim_run_asm(&peeped, &[(0x20, 0)], 0x21),
+        29,
+        "in=0 loops twice:\n{peeped}"
+    );
+    assert_eq!(
+        sim_run_asm(&peeped, &[(0x20, 1)], 0x21),
+        16,
+        "in=1 loops once:\n{peeped}"
+    );
+    assert_eq!(
+        sim_run_asm(&peeped, &[(0x20, 2)], 0x21),
+        17,
+        "in=2 takes no back edge:\n{peeped}"
+    );
+}
+
+#[test]
 fn org_pads_function_across_page_boundary() {
     // main padded to fill page 0's remainder; the greedy assignment emits
     // `.org 0x800` before helper so it lands in page 1.
