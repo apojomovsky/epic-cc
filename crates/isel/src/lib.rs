@@ -8022,15 +8022,12 @@ pub fn select_with_locs(
         split_set.insert(name.clone());
     }
     // Pass A2: split members are re-emitted raw with the split discipline
-    // (restores forced, since `page_of` is None) plus goto sets, measured
-    // through a second whole-text banking, and planned there. Pass B emits
-    // the raw final text, so the driver's whole-text banking is the single
-    // pass that banks it: banking the same lines twice in different
-    // label-proof contexts re-inserts BANKSELs around already-selected SFR
-    // accesses (notably each PCLATH set), growing chunks past placement.
-    // Single banking keeps placement exact; the only downstream deltas are
-    // elided restores (shrink-only: removing a bank-forcing write cannot
-    // add a mismatch) and links plus entry proofs, both reserved below.
+    // plus goto sets, measured through a second whole-text banking, and
+    // planned there. Pass B emits the raw text, so the driver's banking is
+    // the single pass that banks it: banking twice in different contexts
+    // re-inserts BANKSELs around already-selected PCLATH sets, growing
+    // chunks past placement. Downstream deltas are elided restores
+    // (shrink-only) and links plus entry proofs, both reserved below.
     let mut plans: HashMap<String, SplitPlan> = HashMap::new();
     let mut raw_final: HashMap<String, (Vec<String>, Vec<Option<SrcLoc>>)> = HashMap::new();
     if !split_set.is_empty() {
@@ -8177,12 +8174,10 @@ pub fn select_with_locs(
         } else if let Some(plan) = plans.get(name) {
             // Each chunk packs like a function, plus two bounded reserves.
             // The emitted link is 3 raw words; the driver's banking may add
-            // up to a FULL BANKSEL (2 words) selecting PCLATH's bank around
-            // its MOVWF, so 5 is the provable bound. A non-first chunk entry
-            // gains the linking GOTO as a predecessor the measure lacked:
-            // where the measure proved the entry's bank and removed its
-            // reset, the link can unprove it, restoring at most one FULL
-            // BANKSEL (2 words). First entries keep no slack: their CALL
+            // up to a FULL BANKSEL (2 words) around its MOVWF, so 5 bounds
+            // it. A non-first entry gains the linking GOTO as a predecessor
+            // the measure lacked, unproving at most one FULL BANKSEL (2
+            // words) there. First entries keep no slack: their CALL
             // predecessors match in both bankings.
             let parts = plan_parts(plan);
             for (k, (entry, lines, _)) in parts.iter().enumerate() {

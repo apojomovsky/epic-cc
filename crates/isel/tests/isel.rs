@@ -4820,13 +4820,11 @@ fn panics_on_function_larger_than_a_page() {
 fn split_function_spans_pages_and_runs_in_sim() {
     // epic-cc#841: a function past one 2048-word page is placed across
     // pages in chunks linked by PCLATH-setting GOTOs instead of erroring.
-    // main is ~3400 words over six blocks (bulk pads plus a counted loop
-    // with a helper CALL), so it splits; the loop latch branches back to
-    // the header and the body calls across pages, and every intra-function
-    // GOTO carries its target's page (including the BTFSS+GOTO pairs the
-    // conditional branches lower to, where the set precedes the skip).
-    // Hand-traced outputs (i8 wraps mod 256): in=0 -> 29, in=1 -> 16,
-    // in=2 -> 17. See the IR below for the trace.
+    // main is ~3400 words over six blocks (pads plus a counted loop with
+    // a helper CALL), so it splits; the latch branches back, the body
+    // calls across pages, and every intra-function GOTO carries its
+    // target's page (sets precede skip-op pairs). Hand-traced outputs:
+    // in=0 -> 29, in=1 -> 16, in=2 -> 17.
     let mut entry_pad = String::new();
     for _ in 0..300 {
         entry_pad.push_str("    %d1 = add i8 %d1, 1\n");
