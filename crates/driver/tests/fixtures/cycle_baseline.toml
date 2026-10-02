@@ -1,0 +1,529 @@
+# epic-cc#840 cycle-count baseline. Do not hand-edit the
+# numbers; regenerate with:
+#   UPDATE_CYCLE_BASELINE=1 cargo test -p driver --test cycle_ladder_e2e
+# then diff and commit deliberately.
+
+[[entry]]
+name = "speed-mul-u8-18f4550"
+device = "18F4550"
+cycles = 18
+flash_words = 36
+ram_bytes = 16
+
+[[entry]]
+name = "speed-mul-u8-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 18
+flash_words = 36
+ram_bytes = 16
+
+[[entry]]
+name = "speed-mul-u8-16f877a"
+device = "16F877A"
+cycles = 128
+flash_words = 51
+ram_bytes = 17
+
+[[entry]]
+name = "speed-mul-u8-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 128
+flash_words = 51
+ram_bytes = 17
+
+[[entry]]
+name = "speed-mul-u16-18f4550"
+device = "18F4550"
+cycles = 40
+flash_words = 62
+ram_bytes = 33
+
+[[entry]]
+name = "speed-mul-u16-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 40
+flash_words = 62
+ram_bytes = 33
+
+[[entry]]
+name = "speed-mul-u16-16f877a"
+device = "16F877A"
+cycles = 332
+flash_words = 84
+ram_bytes = 34
+
+[[entry]]
+name = "speed-mul-u16-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 332
+flash_words = 84
+ram_bytes = 34
+
+[[entry]]
+name = "speed-mul-u32-18f4550"
+device = "18F4550"
+cycles = 110
+flash_words = 140
+ram_bytes = 49
+
+[[entry]]
+name = "speed-mul-u32-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 110
+flash_words = 140
+ram_bytes = 49
+
+[[entry]]
+name = "speed-mul-u32-16f877a"
+device = "16F877A"
+cycles = 689
+flash_words = 148
+ram_bytes = 49
+
+[[entry]]
+name = "speed-mul-u32-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 689
+flash_words = 148
+ram_bytes = 49
+
+[[entry]]
+name = "speed-divmod-u8-18f4550"
+device = "18F4550"
+cycles = 308
+flash_words = 88
+ram_bytes = 15
+
+[[entry]]
+name = "speed-divmod-u8-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 300
+flash_words = 89
+ram_bytes = 15
+
+[[entry]]
+name = "speed-divmod-u8-16f877a"
+device = "16F877A"
+cycles = 356
+flash_words = 90
+ram_bytes = 16
+
+[[entry]]
+name = "speed-divmod-u8-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 356
+flash_words = 90
+ram_bytes = 16
+
+[[entry]]
+name = "speed-divmod-u16-18f4550"
+device = "18F4550"
+cycles = 650
+flash_words = 109
+ram_bytes = 29
+
+[[entry]]
+name = "speed-divmod-u16-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 634
+flash_words = 115
+ram_bytes = 29
+
+[[entry]]
+name = "speed-divmod-u16-16f877a"
+device = "16F877A"
+cycles = 752
+flash_words = 116
+ram_bytes = 29
+
+[[entry]]
+name = "speed-divmod-u16-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 752
+flash_words = 116
+ram_bytes = 29
+
+[[entry]]
+name = "speed-divmod-u32-18f4550"
+device = "18F4550"
+cycles = 2044
+flash_words = 170
+ram_bytes = 51
+
+[[entry]]
+name = "speed-divmod-u32-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 2028
+flash_words = 177
+ram_bytes = 51
+
+[[entry]]
+name = "speed-divmod-u32-16f877a"
+device = "16F877A"
+cycles = 2676
+flash_words = 224
+ram_bytes = 52
+
+[[entry]]
+name = "speed-divmod-u32-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 2676
+flash_words = 224
+ram_bytes = 52
+
+[[entry]]
+name = "speed-shift-18f4550"
+device = "18F4550"
+cycles = 590
+flash_words = 231
+ram_bytes = 43
+
+[[entry]]
+name = "speed-shift-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 566
+flash_words = 234
+ram_bytes = 43
+
+[[entry]]
+name = "speed-shift-16f877a"
+device = "16F877A"
+cycles = 540
+flash_words = 220
+ram_bytes = 44
+
+[[entry]]
+name = "speed-shift-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 540
+flash_words = 220
+ram_bytes = 44
+
+[[entry]]
+name = "speed-memcpy-32-18f4550"
+device = "18F4550"
+cycles = 2587
+flash_words = 151
+ram_bytes = 83
+
+[[entry]]
+name = "speed-memcpy-32-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 2587
+flash_words = 151
+ram_bytes = 83
+
+[[entry]]
+name = "speed-memcpy-32-16f877a"
+device = "16F877A"
+cycles = 3739
+flash_words = 182
+ram_bytes = 84
+
+[[entry]]
+name = "speed-memcpy-32-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 3739
+flash_words = 182
+ram_bytes = 84
+
+[[entry]]
+name = "speed-memset-32-18f4550"
+device = "18F4550"
+cycles = 1534
+flash_words = 123
+ram_bytes = 53
+
+[[entry]]
+name = "speed-memset-32-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 1534
+flash_words = 123
+ram_bytes = 53
+
+[[entry]]
+name = "speed-memset-32-16f877a"
+device = "16F877A"
+cycles = 2239
+flash_words = 131
+ram_bytes = 53
+
+[[entry]]
+name = "speed-memset-32-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 2239
+flash_words = 131
+ram_bytes = 53
+
+[[entry]]
+name = "speed-strlen-strcmp-18f4550"
+device = "18F4550"
+cycles = 2289
+flash_words = 238
+ram_bytes = 57
+
+[[entry]]
+name = "speed-strlen-strcmp-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 2081
+flash_words = 242
+ram_bytes = 57
+
+[[entry]]
+name = "speed-strlen-strcmp-16f877a"
+device = "16F877A"
+cycles = 2730
+flash_words = 282
+ram_bytes = 58
+
+[[entry]]
+name = "speed-strlen-strcmp-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 2730
+flash_words = 282
+ram_bytes = 58
+
+[[entry]]
+name = "speed-crc16-18f4550"
+device = "18F4550"
+cycles = 13704
+flash_words = 173
+ram_bytes = 54
+
+[[entry]]
+name = "speed-crc16-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 13704
+flash_words = 173
+ram_bytes = 54
+
+[[entry]]
+name = "speed-crc16-16f877a"
+device = "16F877A"
+cycles = 17594
+flash_words = 212
+ram_bytes = 55
+
+[[entry]]
+name = "speed-crc16-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 17594
+flash_words = 212
+ram_bytes = 55
+
+[[entry]]
+name = "speed-switch16-18f4550"
+device = "18F4550"
+cycles = 98
+flash_words = 91
+ram_bytes = 10
+
+[[entry]]
+name = "speed-switch16-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 74
+flash_words = 107
+ram_bytes = 10
+
+[[entry]]
+name = "speed-switch16-16f877a"
+device = "16F877A"
+cycles = 73
+flash_words = 102
+ram_bytes = 11
+
+[[entry]]
+name = "speed-switch16-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 73
+flash_words = 102
+ram_bytes = 11
+
+[[entry]]
+name = "speed-struct-scan-18f4550"
+device = "18F4550"
+cycles = 406
+flash_words = 81
+ram_bytes = 46
+
+[[entry]]
+name = "speed-struct-scan-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 406
+flash_words = 81
+ram_bytes = 46
+
+[[entry]]
+name = "speed-struct-scan-16f877a"
+device = "16F877A"
+cycles = 534
+flash_words = 89
+ram_bytes = 47
+
+[[entry]]
+name = "speed-struct-scan-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 534
+flash_words = 89
+ram_bytes = 47
+
+[[entry]]
+name = "speed-u16-dec-18f4550"
+device = "18F4550"
+cycles = 1838
+flash_words = 123
+ram_bytes = 33
+
+[[entry]]
+name = "speed-u16-dec-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 1818
+flash_words = 124
+ram_bytes = 33
+
+[[entry]]
+name = "speed-u16-dec-16f877a"
+device = "16F877A"
+cycles = 2808
+flash_words = 149
+ram_bytes = 33
+
+[[entry]]
+name = "speed-u16-dec-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 2808
+flash_words = 149
+ram_bytes = 33
+
+[[entry]]
+name = "speed-pid-step-18f4550"
+device = "18F4550"
+cycles = 313
+flash_words = 254
+ram_bytes = 53
+
+[[entry]]
+name = "speed-pid-step-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 305
+flash_words = 267
+ram_bytes = 53
+
+[[entry]]
+name = "speed-pid-step-16f877a"
+device = "16F877A"
+cycles = 1289
+flash_words = 386
+ram_bytes = 53
+
+[[entry]]
+name = "speed-pid-step-16f877a"
+device = "16F877A"
+profile = "O2"
+cycles = 1289
+flash_words = 386
+ram_bytes = 53
+
+[[entry]]
+name = "scen-pid-update-18f4550"
+device = "18F4550"
+cycles = 776
+flash_words = 827
+ram_bytes = 131
+
+[[entry]]
+name = "scen-pid-update-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 736
+flash_words = 833
+ram_bytes = 131
+
+[[entry]]
+name = "speed-isr-18f4550-latency"
+device = "18F4550"
+cycles = 39
+flash_words = 112
+ram_bytes = 31
+
+[[entry]]
+name = "speed-isr-18f4550-roundtrip"
+device = "18F4550"
+cycles = 83
+flash_words = 112
+ram_bytes = 31
+
+[[entry]]
+name = "speed-isr-18f4550-latency"
+device = "18F4550"
+profile = "O2"
+cycles = 39
+flash_words = 112
+ram_bytes = 31
+
+[[entry]]
+name = "speed-isr-18f4550-roundtrip"
+device = "18F4550"
+profile = "O2"
+cycles = 83
+flash_words = 112
+ram_bytes = 31
+
+[[entry]]
+name = "speed-isr-16f877a-latency"
+device = "16F877A"
+cycles = 24
+flash_words = 82
+ram_bytes = 22
+
+[[entry]]
+name = "speed-isr-16f877a-roundtrip"
+device = "16F877A"
+cycles = 49
+flash_words = 82
+ram_bytes = 22
+
+[[entry]]
+name = "speed-isr-16f877a-latency"
+device = "16F877A"
+profile = "O2"
+cycles = 24
+flash_words = 82
+ram_bytes = 22
+
+[[entry]]
+name = "speed-isr-16f877a-roundtrip"
+device = "16F877A"
+profile = "O2"
+cycles = 49
+flash_words = 82
+ram_bytes = 22
