@@ -965,7 +965,9 @@ fn frame_layout(
     // A folded or forwarded producer (epic-cc#863) needs no slot: isel
     // reads the source or computes into the store destination, so no
     // interval enters coloring and no address leaves placement.
-    let mut vals: Vec<(&String, (usize, u16), (usize, u16), u8, usize)> = Vec::new();
+    // The sort key keeps a bounded object at its old full-interval start:
+    // coloring order is unchanged, so only real sharing moves addresses.
+    let mut vals: Vec<(&String, (usize, u16), (usize, u16), u8, usize, (usize, u16))> = Vec::new();
     for (v, &(d, p_d, w, o, mem)) in &defs {
         if unplaced.contains(v) {
             continue;
@@ -1017,9 +1019,14 @@ fn frame_layout(
             }
             (lo, hi)
         };
-        vals.push((v, lo, hi, w, o));
+        let srt = if mem && !fixed.contains(v) {
+            (0usize, 0u16)
+        } else {
+            lo
+        };
+        vals.push((v, lo, hi, w, o, srt));
     }
-    vals.sort_by(|a, b| a.1.cmp(&b.1).then(a.4.cmp(&b.4)));
+    vals.sort_by(|a, b| a.5.cmp(&b.5).then(a.4.cmp(&b.4)));
     // A block reachable from itself runs more than once, so linear
     // dead-after cannot see dynamic-after uses across the back edge.
     let on_cycle = |mi: usize| -> bool {
@@ -1465,7 +1472,7 @@ fn frame_layout(
     // occupant.
     let interval_of: HashMap<&str, ((usize, u16), (usize, u16))> = vals
         .iter()
-        .map(|(v, lo, hi, _, _)| (v.as_str(), (*lo, *hi)))
+        .map(|(v, lo, hi, _, _, _)| (v.as_str(), (*lo, *hi)))
         .collect();
     // Diamond pins color behind a per-frame width-sum gate: the pinned
     // layout wins only on a strictly smaller slot-width sum, ties keep the
@@ -1478,7 +1485,7 @@ fn frame_layout(
         // opens at the earliest pred end), so arms with no slot yet wait
         // for a second sweep. Base pins keep the single sweep bit for bit.
         let mut deferred: Vec<(String, Vec<String>, (usize, u16), (usize, u16), u8)> = Vec::new();
-        for (v, lo, hi, w, _) in &vals {
+        for (v, lo, hi, w, _, _) in &vals {
             let mut stuck = false;
             if let Some(s) = pins.get(v.as_str()) {
                 if let Some(&si) = slot_of.get(s.as_str()) {
@@ -1584,7 +1591,7 @@ fn frame_layout(
     }
     let size: u16 = widths.iter().map(|&w| u16::from(w)).sum();
     let mut live: HashMap<String, (usize, (usize, u16), (usize, u16))> = HashMap::new();
-    for (v, lo, hi, _, _) in &vals {
+    for (v, lo, hi, _, _, _) in &vals {
         if let Some(&s) = slot_of.get(*v) {
             live.insert((*v).clone(), (s, *lo, *hi));
         }
