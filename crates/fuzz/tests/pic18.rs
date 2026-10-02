@@ -7,7 +7,7 @@
 use device::PIC18F4550;
 use fuzz::{
     generate, generate_float, generate_ir, generate_signed, run_differential,
-    run_differential_with_profile, run_ir_differential,
+    run_differential_with_profile, run_ir_differential, run_ir_twin_differential_with_profile,
 };
 
 #[test]
@@ -52,6 +52,20 @@ fn pic18_float_fast_corpus_differential_clean() {
 }
 
 #[test]
+fn pic18_float_fast_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the PIC18 float gate (epic-cc#860).
+    let mut clean = 0usize;
+    for seed in 0..8 {
+        let prog = generate_float(seed);
+        match run_differential_with_profile(&prog, &PIC18F4550, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(e) => panic!("pic18 float seed {seed} not differential-clean under -O2: {e}"),
+        }
+    }
+    assert_eq!(clean, 8, "all 8 float seeds clean under -O2");
+}
+
+#[test]
 fn pic18_signed_fast_corpus_differential_clean() {
     let mut clean = 0usize;
     for seed in 0..8 {
@@ -62,6 +76,20 @@ fn pic18_signed_fast_corpus_differential_clean() {
         }
     }
     assert_eq!(clean, 8, "all 8 signed seeds clean");
+}
+
+#[test]
+fn pic18_signed_fast_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the PIC18 signed gate (epic-cc#860).
+    let mut clean = 0usize;
+    for seed in 0..8 {
+        let prog = generate_signed(seed);
+        match run_differential_with_profile(&prog, &PIC18F4550, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(e) => panic!("pic18 signed seed {seed} not differential-clean under -O2: {e}"),
+        }
+    }
+    assert_eq!(clean, 8, "all 8 signed seeds clean under -O2");
 }
 
 #[test]
@@ -78,6 +106,22 @@ fn pic18_ir_fast_corpus_differential_clean() {
 }
 
 #[test]
+fn pic18_ir_fast_corpus_differential_clean_under_o2() {
+    // The `-O2` slice for the PIC18 IR fast seeds (epic-cc#860): the C
+    // twins through the speed profile (the canonical path is
+    // profile-free; see `run_ir_twin_differential_with_profile`).
+    let mut clean = 0usize;
+    for seed in 0..8 {
+        let prog = generate_ir(seed);
+        match run_ir_twin_differential_with_profile(&prog, &PIC18F4550, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(e) => panic!("pic18 IR seed {seed} not differential-clean under -O2: {e}"),
+        }
+    }
+    assert_eq!(clean, 8, "all 8 IR seeds clean under -O2");
+}
+
+#[test]
 #[ignore = "full 200-seed pic18 integer corpus (slow)"]
 fn pic18_full_corpus_differential_clean() {
     let mut clean = 0usize;
@@ -86,6 +130,24 @@ fn pic18_full_corpus_differential_clean() {
         match run_differential(&prog, &PIC18F4550) {
             Ok(_) => clean += 1,
             Err(f) => panic!("pic18 full corpus seed {seed} failed ({:?}): {f}", f.kind),
+        }
+    }
+    assert_eq!(clean, 200);
+}
+
+#[test]
+#[ignore = "full 200-seed pic18 integer corpus under -O2 (slow)"]
+fn pic18_full_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the full PIC18 integer corpus (epic-cc#860).
+    let mut clean = 0usize;
+    for seed in 0..200 {
+        let prog = generate(seed);
+        match run_differential_with_profile(&prog, &PIC18F4550, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(f) => panic!(
+                "pic18 full corpus seed {seed} failed under -O2 ({:?}): {f}",
+                f.kind
+            ),
         }
     }
     assert_eq!(clean, 200);
@@ -106,6 +168,24 @@ fn pic18_float_corpus_differential_clean() {
 }
 
 #[test]
+#[ignore = "full 50-seed pic18 float corpus under -O2 (slow)"]
+fn pic18_float_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the full PIC18 float corpus (epic-cc#860).
+    let mut clean = 0usize;
+    for seed in 0..50 {
+        let prog = generate_float(seed);
+        match run_differential_with_profile(&prog, &PIC18F4550, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(f) => panic!(
+                "pic18 float corpus seed {seed} failed under -O2 ({:?}): {f}",
+                f.kind
+            ),
+        }
+    }
+    assert_eq!(clean, 50);
+}
+
+#[test]
 #[ignore = "full 50-seed pic18 signed corpus (slow)"]
 fn pic18_signed_corpus_differential_clean() {
     let mut clean = 0usize;
@@ -114,6 +194,24 @@ fn pic18_signed_corpus_differential_clean() {
         match run_differential(&prog, &PIC18F4550) {
             Ok(_) => clean += 1,
             Err(f) => panic!("pic18 signed corpus seed {seed} failed ({:?}): {f}", f.kind),
+        }
+    }
+    assert_eq!(clean, 50);
+}
+
+#[test]
+#[ignore = "full 50-seed pic18 signed corpus under -O2 (slow)"]
+fn pic18_signed_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the full PIC18 signed corpus (epic-cc#860).
+    let mut clean = 0usize;
+    for seed in 0..50 {
+        let prog = generate_signed(seed);
+        match run_differential_with_profile(&prog, &PIC18F4550, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(f) => panic!(
+                "pic18 signed corpus seed {seed} failed under -O2 ({:?}): {f}",
+                f.kind
+            ),
         }
     }
     assert_eq!(clean, 50);
