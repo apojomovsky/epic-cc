@@ -660,6 +660,25 @@ impl ValueFolds {
         out.extend(self.loads.keys().cloned());
         out
     }
+    /// Regs needing no slot on classic PIC14 (epic-cc#875): folded loads
+    /// plus forwarded regs produced by a `Load`, whose store reads the
+    /// source global. Forwarded `Bin` results keep their slot: `isel`
+    /// computes those into the temp as before, it has no store-folded
+    /// destination there.
+    pub fn unplaced_pic14(&self, f: &ir::Func) -> HashSet<String> {
+        let mut out: HashSet<String> = self.loads.keys().cloned().collect();
+        for r in self.forwarded.keys() {
+            let produced_by_load = f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::Load(l) if l.dst == *r));
+            if produced_by_load {
+                out.insert(r.clone());
+            }
+        }
+        out
+    }
 }
 
 /// A gap instruction the fold may move a global read past: a pure lane

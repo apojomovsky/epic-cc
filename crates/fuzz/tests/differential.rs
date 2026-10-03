@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use device;
 use fuzz::{
     generate, generate_float, generate_ir, generate_signed, run_differential,
-    run_differential_with_profile, run_ir_differential, FailureKind, Input, IrProgram, Program,
-    TYPEDEF_PROLOGUE,
+    run_differential_with_profile, run_ir_differential, run_ir_twin_differential_with_profile,
+    FailureKind, Input, IrProgram, Program, TYPEDEF_PROLOGUE,
 };
 
 /// The brief's tiny program: one u8 volatile input, one scalar expression.
@@ -273,6 +273,18 @@ fn full_corpus_differential_clean() {
 }
 
 #[test]
+#[ignore = "full 200-seed corpus under -O2 (slow)"]
+fn full_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the full integer corpus (epic-cc#860).
+    for seed in 0..200u64 {
+        let prog = generate(seed);
+        run_differential_with_profile(&prog, &device::PIC16F877A, Some("O2")).unwrap_or_else(|e| {
+            panic!("generated seed {seed} not differential-clean under -O2: {e}")
+        });
+    }
+}
+
+#[test]
 #[ignore = "full 200-seed corpus coverage sanity (slow)"]
 fn full_corpus_spans_the_generation_surface() {
     // The committed 200-seed corpus must genuinely span the surface: every
@@ -342,8 +354,8 @@ fn generator_corpus_differential_clean_under_o2() {
     // The `-O2` slice of the differential gate (epic-cc#839): the same
     // fast integer seeds, compiled with the speed profile (no factoring,
     // aggressive inline tier). Profiles change shaping, never semantics,
-    // so every seed stays clean. Float/signed/IR corpora under `-O2`
-    // ride in a follow-up; the fast integer slice pays the CI budget here.
+    // so every seed stays clean. Sibling tests below cover the float,
+    // signed and IR fast seeds and the full corpora under `-O2`.
     for seed in 0..8 {
         let prog = generate(seed);
         run_differential_with_profile(&prog, &device::PIC16F877A, Some("O2")).unwrap_or_else(|e| {
@@ -627,6 +639,28 @@ fn generate_float_is_deterministic_and_spanning() {
 }
 
 #[test]
+fn float_fast_corpus_differential_clean() {
+    // The float generator's fast seeds must all be differential-clean
+    // under the default profile (the PIC14 gate never had this fast
+    // slice; PIC14E and PIC18 do).
+    for seed in 0..8u64 {
+        let prog = generate_float(seed);
+        run_differential(&prog, &device::PIC16F877A)
+            .unwrap_or_else(|e| panic!("float seed {seed} not differential-clean: {e}"));
+    }
+}
+
+#[test]
+fn float_fast_corpus_differential_clean_under_o2() {
+    // The `-O2` slice for the float fast seeds (epic-cc#860).
+    for seed in 0..8u64 {
+        let prog = generate_float(seed);
+        run_differential_with_profile(&prog, &device::PIC16F877A, Some("O2"))
+            .unwrap_or_else(|e| panic!("float seed {seed} not differential-clean under -O2: {e}"));
+    }
+}
+
+#[test]
 #[ignore = "full 50-seed float corpus (slow)"]
 fn float_corpus_differential_clean() {
     // The acceptance gate: all 50 committed float seeds must run
@@ -666,6 +700,18 @@ fn float_corpus_differential_clean() {
         "float corpus (50 seeds): clean {clean}, mismatch {mismatch}, panic {panic_kind}, \
          nohalt {nohalt}, compile {compile}, harness {harness}"
     );
+}
+
+#[test]
+#[ignore = "full 50-seed float corpus under -O2 (slow)"]
+fn float_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the full float corpus (epic-cc#860).
+    for seed in 0..50u64 {
+        let prog = generate_float(seed);
+        run_differential_with_profile(&prog, &device::PIC16F877A, Some("O2")).unwrap_or_else(|e| {
+            panic!("generated float seed {seed} not differential-clean under -O2: {e}")
+        });
+    }
 }
 
 #[test]
@@ -812,6 +858,16 @@ fn generate_signed_fast_corpus_differential_clean() {
 }
 
 #[test]
+fn generate_signed_fast_corpus_differential_clean_under_o2() {
+    // The `-O2` slice for the signed fast seeds (epic-cc#860).
+    for seed in 0..8u64 {
+        let prog = generate_signed(seed);
+        run_differential_with_profile(&prog, &device::PIC16F877A, Some("O2"))
+            .unwrap_or_else(|e| panic!("signed seed {seed} not differential-clean under -O2: {e}"));
+    }
+}
+
+#[test]
 #[ignore = "full 50-seed signed corpus (slow)"]
 fn signed_corpus_differential_clean() {
     // The acceptance gate: all 50 signed seeds must run differential-clean.
@@ -846,6 +902,18 @@ fn signed_corpus_differential_clean() {
         "signed corpus (50 seeds): clean {clean}, mismatch {mismatch}, panic {panic_kind}, \
          nohalt {nohalt}, compile {compile}, harness {harness}"
     );
+}
+
+#[test]
+#[ignore = "full 50-seed signed corpus under -O2 (slow)"]
+fn signed_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the full signed corpus (epic-cc#860).
+    for seed in 0..50u64 {
+        let prog = generate_signed(seed);
+        run_differential_with_profile(&prog, &device::PIC16F877A, Some("O2")).unwrap_or_else(|e| {
+            panic!("generated signed seed {seed} not differential-clean under -O2: {e}")
+        });
+    }
 }
 
 // ---- IR-level mode ----
@@ -933,5 +1001,19 @@ fn generate_ir_fast_corpus_differential_clean() {
         let prog = generate_ir(seed);
         run_ir_differential(&prog, &device::PIC16F877A)
             .unwrap_or_else(|e| panic!("IR seed {seed} not differential-clean: {e}"));
+    }
+}
+
+#[test]
+fn generate_ir_fast_corpus_differential_clean_under_o2() {
+    // The `-O2` slice for the IR fast seeds (epic-cc#860): each seed's
+    // C twin through the speed profile. The twins carry the same
+    // sdiv/srem/ashr/compare shapes as the canonical IR, and clang
+    // emits helper calls for them, so this exercises the `-O2` inline
+    // tier on IR-shaped programs.
+    for seed in 0..8u64 {
+        let prog = generate_ir(seed);
+        run_ir_twin_differential_with_profile(&prog, &device::PIC16F877A, Some("O2"))
+            .unwrap_or_else(|e| panic!("IR seed {seed} not differential-clean under -O2: {e}"));
     }
 }

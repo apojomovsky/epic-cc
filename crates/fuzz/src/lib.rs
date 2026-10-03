@@ -2457,14 +2457,7 @@ pub fn run_ir_differential(prog: &IrProgram, device: &device::Device) -> Result<
     let twin_path = dir.path.join("twin.c");
     std::fs::write(&twin_path, &prog.c_twin)
         .map_err(|e| Failure::new(FailureKind::Harness, format!("write twin.c: {e}")))?;
-    let host_prog = Program {
-        c_source: prog.c_twin.clone(),
-        inputs: prog.inputs.clone(),
-        checksum_name: prog.checksum_name.clone(),
-        seed: prog.seed,
-        statements: Vec::new(),
-        prologue: prog.c_twin.clone(),
-    };
+    let host_prog = ir_twin_program(prog)?;
     let host = run_host(&host_prog, &twin_path, &dir)?;
 
     if pic == host {
@@ -2475,6 +2468,56 @@ pub fn run_ir_differential(prog: &IrProgram, device: &device::Device) -> Result<
             format!("mismatch: pic checksum {pic}, host checksum {host}"),
         ))
     }
+}
+
+/// Run an IR-level program's C twin on both sides under `-O<profile>`.
+/// The twin goes through the full driver pipeline (clang plus the
+/// profile's inline and factoring choices), which is the `-O2` slice
+/// for IR-shaped programs. Routing the canonical text under a profile
+/// flag would prove nothing: that path is profile-free by construction
+/// (single-function programs, no LLVM opt, no outlining in-process).
+pub fn run_ir_twin_differential_with_profile(
+    prog: &IrProgram,
+    device: &device::Device,
+    profile: Option<&str>,
+) -> Result<u32, Failure> {
+    run_differential_with_profile(&ir_twin_program(prog)?, device, profile)
+}
+
+/// The C twin as a runnable program (shared by the host side of
+/// `run_ir_differential` and the profiled twin runs above). The twin
+/// source declares its inputs bare, so the initializers ride here: the
+/// PIC side has no pre-main seeding hook (epic-cc#561), while the host
+/// side re-seeds the same values through `host_main`.
+fn ir_twin_program(prog: &IrProgram) -> Result<Program, Failure> {
+    let mut twin = prog.c_twin.clone();
+    for input in &prog.inputs {
+        let bare = format!("volatile {} {};", ctype(input.width), input.name);
+        if !twin.contains(&bare) {
+            return Err(Failure::new(
+                FailureKind::Harness,
+                format!("twin has no decl for input {}", input.name),
+            ));
+        }
+        twin = twin.replacen(
+            &bare,
+            &format!(
+                "volatile {} {} = 0x{:X}u;",
+                ctype(input.width),
+                input.name,
+                input.value & width_mask(input.width)
+            ),
+            1,
+        );
+    }
+    Ok(Program {
+        c_source: twin.clone(),
+        inputs: prog.inputs.clone(),
+        checksum_name: prog.checksum_name.clone(),
+        seed: prog.seed,
+        statements: Vec::new(),
+        prologue: twin,
+    })
 }
 
 /// PIC side of the IR mode: the canonical IR through the in-process pipeline

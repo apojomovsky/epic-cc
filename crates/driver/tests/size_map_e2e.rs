@@ -108,17 +108,17 @@ fn map_file_matches_the_allocator_map() {
     let written = std::fs::read_to_string(&map_path).unwrap();
     // The map is the allocator's own addresses, in the driver's HashMap
     // key form ({func}::{name} locals), sorted deterministically, then
-    // the alloc scalars (epic-cc#814). add.c has two globals and two i8
-    // locals and no ISR, so the exact lines are pinned.
+    // the alloc scalars (epic-cc#814). add.c has two globals and one i8
+    // local (`%1` folds, epic-cc#875) and no ISR, so the exact lines
+    // are pinned.
     assert_eq!(
         written,
         "; epic-cc map for p16f877a\n\
          global in 0x20\n\
          global out 0x21\n\
-         local main::1 0x22\n\
-         local main::2 0x23\n\
-         total-bank0 0x02\n\
-         bank-used 0 0x04\n\
+         local main::2 0x22\n\
+         total-bank0 0x01\n\
+         bank-used 0 0x03\n\
          bank-used 1 0x00\n\
          bank-used 2 0x00\n\
          bank-used 3 0x00\n"

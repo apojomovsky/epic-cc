@@ -9,7 +9,8 @@ use callgraph;
 use device::{PIC12F509, PIC16F505};
 use fuzz::{
     generate_baseline, generate_ir_baseline, generate_signed_baseline, run_differential,
-    run_ir_differential, IrProgram,
+    run_differential_with_profile, run_ir_differential, run_ir_twin_differential_with_profile,
+    IrProgram,
 };
 use ir;
 use legalize;
@@ -26,6 +27,22 @@ fn pic_baseline_integer_fast_corpus_differential_clean() {
         }
     }
     assert_eq!(clean, 8, "all 8 integer seeds clean");
+}
+
+#[test]
+fn pic_baseline_integer_fast_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the baseline integer gate (epic-cc#860).
+    let mut clean = 0usize;
+    for seed in 0..8 {
+        let prog = generate_baseline(seed);
+        match run_differential_with_profile(&prog, &PIC12F509, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(e) => {
+                panic!("pic-baseline integer seed {seed} not differential-clean under -O2: {e}")
+            }
+        }
+    }
+    assert_eq!(clean, 8, "all 8 integer seeds clean under -O2");
 }
 
 /// epic-cc#429: the same integer fast corpus on the second-shipped
@@ -45,6 +62,24 @@ fn pic_baseline_505_integer_fast_corpus_differential_clean() {
     assert_eq!(clean, 8, "all 8 integer seeds clean on p16f505");
 }
 
+/// The `-O2` slice of the 505 integer fast corpus (epic-cc#860): same
+/// `max(1)` pin as the default-profile test above, under the speed
+/// profile.
+#[test]
+fn pic_baseline_505_integer_fast_corpus_differential_clean_under_o2() {
+    let mut clean = 0usize;
+    for seed in 0..8 {
+        let prog = generate_baseline(seed);
+        match run_differential_with_profile(&prog, &PIC16F505, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(e) => {
+                panic!("pic-baseline/505 integer seed {seed} not differential-clean under -O2: {e}")
+            }
+        }
+    }
+    assert_eq!(clean, 8, "all 8 integer seeds clean on p16f505 under -O2");
+}
+
 #[test]
 fn pic_baseline_signed_fast_corpus_differential_clean() {
     let mut clean = 0usize;
@@ -59,6 +94,22 @@ fn pic_baseline_signed_fast_corpus_differential_clean() {
 }
 
 #[test]
+fn pic_baseline_signed_fast_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the baseline signed gate (epic-cc#860).
+    let mut clean = 0usize;
+    for seed in 0..8 {
+        let prog = generate_signed_baseline(seed);
+        match run_differential_with_profile(&prog, &PIC12F509, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(e) => {
+                panic!("pic-baseline signed seed {seed} not differential-clean under -O2: {e}")
+            }
+        }
+    }
+    assert_eq!(clean, 8, "all 8 signed seeds clean under -O2");
+}
+
+#[test]
 fn pic_baseline_ir_fast_corpus_differential_clean() {
     let mut clean = 0usize;
     for seed in 0..8 {
@@ -69,6 +120,22 @@ fn pic_baseline_ir_fast_corpus_differential_clean() {
         }
     }
     assert_eq!(clean, 8, "all 8 IR seeds clean");
+}
+
+#[test]
+fn pic_baseline_ir_fast_corpus_differential_clean_under_o2() {
+    // The `-O2` slice for the baseline IR fast seeds (epic-cc#860): the
+    // C twins through the speed profile (the canonical path is
+    // profile-free; see `run_ir_twin_differential_with_profile`).
+    let mut clean = 0usize;
+    for seed in 0..8 {
+        let prog = generate_ir_baseline(seed);
+        match run_ir_twin_differential_with_profile(&prog, &PIC12F509, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(e) => panic!("pic-baseline IR seed {seed} not differential-clean under -O2: {e}"),
+        }
+    }
+    assert_eq!(clean, 8, "all 8 IR seeds clean under -O2");
 }
 
 #[test]
@@ -86,6 +153,23 @@ fn pic_baseline_full_corpus_differential_clean() {
 }
 
 #[test]
+#[ignore = "full 200-seed pic-baseline integer corpus under -O2 (slow)"]
+fn pic_baseline_full_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the full baseline integer corpus (epic-cc#860).
+    let mut clean = 0usize;
+    for seed in 0..200 {
+        let prog = generate_baseline(seed);
+        match run_differential_with_profile(&prog, &PIC12F509, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(e) => {
+                panic!("pic-baseline integer seed {seed} not differential-clean under -O2: {e}")
+            }
+        }
+    }
+    assert_eq!(clean, 200, "all 200 integer seeds clean under -O2");
+}
+
+#[test]
 #[ignore = "full 50-seed pic-baseline signed corpus (slow)"]
 fn pic_baseline_signed_corpus_differential_clean() {
     let mut clean = 0usize;
@@ -97,6 +181,23 @@ fn pic_baseline_signed_corpus_differential_clean() {
         }
     }
     assert_eq!(clean, 50, "all 50 signed seeds clean");
+}
+
+#[test]
+#[ignore = "full 50-seed pic-baseline signed corpus under -O2 (slow)"]
+fn pic_baseline_signed_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the full baseline signed corpus (epic-cc#860).
+    let mut clean = 0usize;
+    for seed in 0..50 {
+        let prog = generate_signed_baseline(seed);
+        match run_differential_with_profile(&prog, &PIC12F509, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(e) => {
+                panic!("pic-baseline signed seed {seed} not differential-clean under -O2: {e}")
+            }
+        }
+    }
+    assert_eq!(clean, 50, "all 50 signed seeds clean under -O2");
 }
 
 /// docs/37 D-2's ordering hazard end to end: INDF accesses through a
