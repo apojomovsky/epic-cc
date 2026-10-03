@@ -684,3 +684,80 @@ fn no_gate_folds_nothing() {
     assert!(folds.loads.is_empty(), "bounding pass folds nothing");
     assert!(folds.forwarded.is_empty(), "bounding pass forwards nothing");
 }
+
+#[test]
+fn pic14_drops_direct_load_but_keeps_forwarded_bin() {
+    // The add shape on classic PIC14 (epic-cc#875): `%1` reads `@in`
+    // directly, while `%2` still stages: `isel` has no store-folded
+    // destination for `Bin` results there.
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %2 = add i8 %1 1\n\
+             store i8 %2 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert_eq!(
+        folds.unplaced_pic14(&m.funcs[0]),
+        std::collections::HashSet::from(["1".to_string()]),
+    );
+}
+
+#[test]
+fn pic14_drops_load_forwarded_into_store() {
+    // `%1 = load @in; store %1 @slot`: the store reads `@in`, so the
+    // copy never stages on PIC14 either.
+    let m = parse(
+        "global in i8\n\
+         global slot i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             store i8 %1 @slot\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        folds.forwarded.contains_key("1"),
+        "single-use load forwards to the store"
+    );
+    assert!(
+        folds.unplaced_pic14(&m.funcs[0]).contains("1"),
+        "forwarded load needs no slot"
+    );
+}
+
+#[test]
+fn pic14_drops_threaded_load() {
+    // A load fanned out to stores rides W on PIC14 just like PIC18:
+    // the slot drops either way.
+    let m = parse(
+        "global in i8\n\
+         global slot i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             store i8 %1 @slot\n\
+             store i8 %1 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        folds.unplaced_pic14(&m.funcs[0]).contains("1"),
+        "threaded load needs no slot"
+    );
+}
