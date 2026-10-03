@@ -273,7 +273,7 @@ fn main() {
         }
     }
 
-    // 1. clang: one invocation per translation unit. `.cpp` units compile
+    // 1. clang: one invocation per translation unit. C++ units compile
     // as C++ through the same `clang` binary (the bundle ships no
     // `clang++`; `-x c++` selects the language explicitly, epic-cc#457).
     let clang_opts = clang::Options {

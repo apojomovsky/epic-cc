@@ -54,7 +54,7 @@ pub struct Options {
     /// `<{ ... }>` types clang prints, so nothing past the front end needs
     /// the flag (epic-cc#166).
     pub packed_structs: bool,
-    /// `.cpp` input (epic-cc#457, EC++ subset): compile as C++ with the
+    /// C++ input (epic-cc#457, EC++ subset): compile as C++ with the
     /// subset enforced. The driver invokes the already-resolved `clang`
     /// binary (the release bundle ships no `clang++`); `-x c++` selects
     /// the language explicitly and `-fno-exceptions -fno-rtti` enforce
@@ -103,10 +103,20 @@ pub fn apply_options(cmd: &mut Command, opts: &Options) {
     }
 }
 
-/// True for EC++ inputs: a case-insensitive `.cpp` extension (epic-cc#457).
-/// Every other path (including the shipped C runtime helpers) compiles as C.
+/// True for EC++ inputs: every extension clang itself compiles as C++
+/// (epic-cc#842). The single-letter `C` stays case-sensitive (`c` is C);
+/// the rest match case-insensitively so no mixed-case spelling bypasses
+/// the subset flags. Every other path (including the shipped C runtime
+/// helpers) compiles as C.
 pub fn is_cpp_input(path: &str) -> bool {
-    path.to_ascii_lowercase().ends_with(".cpp")
+    match Path::new(path).extension().and_then(|ext| ext.to_str()) {
+        Some("C") => true,
+        Some(ext) => matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "cc" | "cp" | "cpp" | "cxx" | "c++"
+        ),
+        None => false,
+    }
 }
 
 /// Read the dev-container env pair (`PIC8_CLANG_UNWRAPPED` +
@@ -278,11 +288,15 @@ mod tests {
     }
 
     #[test]
-    fn cpp_input_matches_extension_only() {
-        assert!(is_cpp_input("prog.cpp"));
-        assert!(is_cpp_input("prog.CPP"));
-        assert!(!is_cpp_input("prog.c"));
-        assert!(!is_cpp_input("prog.cc"));
-        assert!(!is_cpp_input("prog.cpp.bak"));
+    fn cpp_input_matches_every_clang_cxx_extension() {
+        for name in [
+            "prog.cpp", "prog.CPP", "prog.Cpp", "prog.cc", "prog.CC", "prog.cp", "prog.cxx",
+            "prog.CXX", "prog.c++", "prog.C++", "prog.C",
+        ] {
+            assert!(is_cpp_input(name), "{name} is C++");
+        }
+        for name in ["prog.c", "prog.h", "prog.cpp.bak", "prog.o"] {
+            assert!(!is_cpp_input(name), "{name} is not C++");
+        }
     }
 }
