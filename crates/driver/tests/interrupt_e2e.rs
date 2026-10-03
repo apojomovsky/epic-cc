@@ -9,21 +9,21 @@
 //! `in` and `out` are volatile globals (addresses read off `--map`
 //! below); PORTB is the F877A SFR at RAM[0x06].
 //!
-//! The injection point is main's **word 72** (`%2 = load out`, the argument
+//! The injection point is main's **word 71** (`%2 = load out`, the argument
 //! load of `out = bump(out)`, immediately after the `PORTB = 0x11` store at
-//! word 71), verified against the exact emitted asm (crates/asm/tests/
+//! word 70), verified against the exact emitted asm (crates/asm/tests/
 //! fixtures/interrupt.asm, which was captured from this same driver
 //! pipeline): the ISR preempts main before the shared helper's argument is
 //! read, so the ISR's bump lands in `out` before main's bump reads it.
 //!
 //! Hand computation from the emitted IR + the injection point (in = 0x10):
-//!   main: out = in                          -> 0x10   (word 69 store)
-//!   main: PORTB = 0x11                      (word 71 store)
-//!   <- fire_interrupt at pc == 72: push 72, jump to the vector (word 4)
+//!   main: out = in                          -> 0x10   (word 68 store)
+//!   main: PORTB = 0x11                      (word 70 store)
+//!   <- fire_interrupt at pc == 71: push 71, jump to the vector (word 4)
 //!   isr:  save W/STATUS/PCLATH/FSR/retval/scratch -> 0x75-0x7D
 //!         PORTB = 0x55                      (SFR write from the ISR)
 //!         out = bump_isr(out = 0x10)        -> 0x11   (the _isr duplicate)
-//!         restore; RETFIE -> pc == 72
+//!         restore; RETFIE -> pc == 71
 //!   main: %2 = load out (0x11, the ISR's bump) -> bump(0x11) = 0x12 -> out
 //!   main: %4 = load out (0x12); %5 = %4 + 1 = 0x13 -> out
 //!   main: %6 = load out (0x13); %7 = bump(2) = 3; %8 = %6 + %7 = 0x16 -> out
@@ -33,10 +33,10 @@
 //! gives out == 0x15, so the ISR's bump is observable in the final value.
 use std::process::Command;
 
-/// The interrupt vector (word 4) and the injection point (word 72) as
+/// The interrupt vector (word 4) and the injection point (word 71) as
 /// documented above.
 const VECTOR: u16 = 4;
-const INJECT_PC: u16 = 72;
+const INJECT_PC: u16 = 71;
 
 /// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
 /// output. Rebuilding the pipeline here instead would be a second copy of
@@ -84,7 +84,7 @@ fn interrupt_runs_correctly_with_mid_run_fire() {
     let mut p = pic14_sim::Pic14::new(prog);
     p.ram_mut()[in_addr] = 0x10; // in = 0x10
 
-    // Run main to the injection point (word 72): the `%2 = load out` for
+    // Run main to the injection point (word 71): the `%2 = load out` for
     // `out = bump(out)`, right after the `PORTB = 0x11` store.
     let mut steps = 0usize;
     while p.pc() != INJECT_PC {
@@ -103,12 +103,12 @@ fn interrupt_runs_correctly_with_mid_run_fire() {
         0x11,
         "PORTB == 0x11 (main's SFR write) before the ISR"
     );
-    // Fire the interrupt: push pc (72), jump to the vector at word 4.
+    // Fire the interrupt: push pc (71), jump to the vector at word 4.
     p.fire_interrupt();
     assert_eq!(p.pc(), VECTOR, "the ISR starts at the vector (word 4)");
 
     // The ISR runs (PORTB = 0x55, out = bump_isr(out)), RETFIE returns to
-    // word 72, and main completes: out == 0x16, PORTB == 0x22, then the
+    // word 71, and main completes: out == 0x16, PORTB == 0x22, then the
     // __start SLEEP halts the machine.
     p.run(500_000);
     assert_eq!(
