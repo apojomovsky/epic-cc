@@ -885,10 +885,7 @@ fn offset_pointer_into_ram_global_is_ram() {
              %2 = load ptr %1\n\
              ret void\n",
     );
-    m.globals[1].refs = vec![
-        (0usize, "arr".to_string(), 2u16),
-        (1, "arr".to_string(), 2),
-    ];
+    m.globals[1].refs = vec![(0usize, "arr".to_string(), 2u16), (1, "arr".to_string(), 2)];
     let prov = iselcore::flash_provenance(&m);
     assert!(prov.flash.is_empty(), "got {:?}", prov.flash);
     assert!(prov.mixed.is_empty(), "got {:?}", prov.mixed);

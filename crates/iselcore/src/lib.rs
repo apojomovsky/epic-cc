@@ -1002,10 +1002,8 @@ enum ProvBase {
 /// (`&arr[2]` in C) folds to the same nonzero-addend shape but names a
 /// RAM address, and must never seed flash provenance.
 fn vptr_covered(m: &Module, g: &str, off: u16, n: u8) -> bool {
-    let is_vtable = |t: &str| {
-        t.starts_with("_ZTV")
-            && m.globals.iter().any(|x| x.name == t && x.is_const)
-    };
+    let is_vtable =
+        |t: &str| t.starts_with("_ZTV") && m.globals.iter().any(|x| x.name == t && x.is_const);
     let Some(gl) = m.globals.iter().find(|x| x.name == g) else {
         return false;
     };
