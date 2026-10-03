@@ -17,9 +17,10 @@ pub const USER_PREFIX: &str = "epic-cc: error:";
 /// invariant violation: recursion and depth (callgraph emits only those),
 /// missing or dangling entry points (wholeprog), programs that do not fit
 /// RAM, pages, or flash (alloc, isel, asm), and unsupported constructs
-/// (`not supported`, the marker the fuzz classifier also keys on). A new
-/// user-error panic earns an entry here plus a unit test below; anything
-/// unlisted stays an internal error.
+/// (`not supported`, the marker the fuzz classifier also keys on), and the
+/// EC++ subset bans (`EC++ subset`, irparse names the rule it enforces).
+/// A new user-error panic earns an entry here plus a unit test below;
+/// anything unlisted stays an internal error.
 const USER_PATTERNS: &[&str] = &[
     "epic-cc: error:",
     "callgraph:",
@@ -37,6 +38,7 @@ const USER_PATTERNS: &[&str] = &[
     "not supported",
     "unsupported",
     "init-once guard",
+    "EC++ subset",
 ];
 
 /// Whether a panic payload is a deliberate user error, not a bug.
@@ -240,6 +242,17 @@ mod tests {
         assert!(is_user_error(
             "legalize: function-local static in `touch` is reachable from ISR context; the init-once guard cannot be trusted there"
         ));
+    }
+
+    #[test]
+    fn ecpp_subset_rejections_are_user_errors() {
+        for payload in [
+            "irparse: heap new/delete are not in the EC++ subset (call to @_Znwm)",
+            "irparse: multiple inheritance is not in the EC++ subset (thunk call @_ZThn8BaseD0Ev)",
+            "irparse: multiple inheritance is not in the EC++ subset (thunk _ZThn8BaseD0Ev)",
+        ] {
+            assert!(is_user_error(payload), "{payload} is a user error");
+        }
     }
 
     #[test]

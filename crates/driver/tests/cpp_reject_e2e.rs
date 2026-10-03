@@ -30,3 +30,26 @@ fn cpp_heap_new_still_rejected() {
         "heap new/delete are not in the EC++ subset",
     );
 }
+
+#[test]
+fn cc_try_catch_still_rejected() {
+    // epic-cc#842: clang infers C++ from `.cc` by itself, so the subset
+    // flags must ride on every C++ extension, not just `.cpp`.
+    let output = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            "tests/fixtures/cpp_exceptions_reject.cc",
+            "-o",
+            "tests/fixtures/cpp_exceptions_reject_cc.hex",
+            "--device",
+            "p18f4550",
+        ])
+        .output()
+        .expect("run driver");
+    let _ = std::fs::remove_file("tests/fixtures/cpp_exceptions_reject_cc.hex");
+    assert!(!output.status.success(), ".cc try/catch must not compile");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("exceptions disabled"),
+        "frontend error names the rule: {stderr}"
+    );
+}
