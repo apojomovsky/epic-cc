@@ -38,7 +38,8 @@ Overlay is `main path + ISR base gap + ISR region` on all four: the
 disjoint ISR region sits above the main context, so globals stack
 above the ISR top. The gap holds the 7-byte carved ISR save
 (`isr-save` in the map, epic-cc#477); bridge measures 10, with 3
-unattributed bytes between its path top and the save. Holes are
+ISR-context bytes between its main-context top and the save (see
+Residuals). Holes are
 intra-span alignment gaps; menu carries one more leading byte (globals
 open at `0x0F6`, the first even address). Fixed is 4 bytes of
 retval/flag plus the 12-byte ISR save on every demo. No demo has
