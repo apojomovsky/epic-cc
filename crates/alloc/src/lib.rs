@@ -1717,10 +1717,26 @@ fn home_args(
 /// driver, the `alloc` binary, and tests). On PIC18 with fitting frames
 /// it pairs two passes (epic-cc#863): a bounding pass with every slot
 /// placed, whose globals name the access-safe fold set, then the gated
-/// pass that drops those slots. Other cores, and layouts that fall back
-/// to globals-first, take the bounding pass as the result.
+/// pass that drops those slots. Classic PIC14 pairs the same two passes
+/// (epic-cc#875), gated on every mapped RAM global: without an access
+/// bank the fold only deletes file-register accesses, so no placement
+/// can make one cost flash. Other cores, and PIC18 layouts that fall
+/// back to globals-first, take the bounding pass as the result.
 pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let (nofold, fit) = allocate_inner(device, m, edges_text, None);
+    if device.core == Core::Pic14 {
+        // Globals-first is exact, not monotone: global placement reads
+        // only the module's globals, never the frame widths the gated
+        // pass shrinks, so the bounding map's globals are the final
+        // map's globals and the two passes fold the same set.
+        let safe: HashSet<String> = m
+            .globals
+            .iter()
+            .filter(|g| !g.is_const && nofold.globals.contains_key(&g.name))
+            .map(|g| g.name.clone())
+            .collect();
+        return allocate_inner(device, m, edges_text, Some(&safe)).0;
+    }
     if device.core != Core::Pic18 || !fit {
         return nofold;
     }
@@ -1764,12 +1780,14 @@ fn allocate_inner(
     // slot materializes its two address bytes into the dst slot, so the
     // dst needs a RAM slot; a folded select is virtual and defines none.
     let resolved = resolve_pointers(m);
-    // Value folds (epic-cc#863): producers needing no slot, computed by
-    // the predicate `isel-pic18` shares, so a dropped slot is never
-    // read. Other cores keep every slot: their backends still address
-    // staged copies. The gate names access-safe globals; `None` folds
-    // nothing, for the bounding pass.
-    let folds: HashMap<String, ValueFolds> = if device.core == Core::Pic18 {
+    // Value folds (epic-cc#863, epic-cc#875): producers needing no slot,
+    // computed by the predicate both PIC18 and PIC14 backends share, so
+    // a dropped slot is never read. Other cores keep every slot: their
+    // backends still address staged copies. The gate names foldable
+    // globals (access-safe on PIC18, every mapped RAM global on PIC14);
+    // `None` folds nothing, for the bounding pass.
+    let fold_core = device.core == Core::Pic18 || device.core == Core::Pic14;
+    let folds: HashMap<String, ValueFolds> = if fold_core {
         m.funcs
             .iter()
             .map(|f| (f.name.clone(), find_value_folds(f, m, &resolved, gate)))
@@ -1777,9 +1795,23 @@ fn allocate_inner(
     } else {
         HashMap::new()
     };
-    let unplaced: HashMap<String, HashSet<String>> = folds
+    // PIC14 drops only what its backend skips: folded loads plus
+    // load-forwarded stores. Forwarded `Bin` results keep their slot
+    // there, so they stay out of this set even though the shared
+    // predicate names them.
+    let unplaced: HashMap<String, HashSet<String>> = m
+        .funcs
         .iter()
-        .map(|(f, folds)| (f.clone(), folds.unplaced()))
+        .map(|f| {
+            let empty = ValueFolds::default();
+            let folds = folds.get(&f.name).unwrap_or(&empty);
+            let dropped = if device.core == Core::Pic14 {
+                folds.unplaced_pic14(f)
+            } else {
+                folds.unplaced()
+            };
+            (f.name.clone(), dropped)
+        })
         .collect();
     let no_fold: HashSet<String> = HashSet::new();
     let unplaced_in = |name: &str| unplaced.get(name).unwrap_or(&no_fold);
@@ -2858,11 +2890,11 @@ fn allocate_inner(
         device.gpr_start()
     };
     globals.extend(floating_map);
-    // Value-fold placement check (epic-cc#863): every dropped slot's
-    // globals must be bank-select free in the final map, or `isel-pic18`
-    // declines the fold and reads a slot that is not there. The gated
-    // pass only shrinks the overlay, so globals never move up out of
-    // the access bank; a violation panics rather than miscompiling.
+    // Value-fold placement check (epic-cc#863, epic-cc#875): every
+    // dropped slot's globals must be addressable in the final map, or
+    // the backend declines the fold and reads a slot that is not there.
+    // The gated pass only shrinks the overlay, so globals never move up
+    // out of reach; a violation panics rather than miscompiling.
     if gate.is_some() {
         let hi = device.access_bank.map(|(_, hi)| hi).unwrap_or(u16::MAX);
         let placed = |g: &str| globals.get(g).is_some_and(|a| *a <= hi);
@@ -2870,15 +2902,21 @@ fn allocate_inner(
             for fold in folds.loads.values() {
                 match fold {
                     iselcore::LoadFold::Direct(g) => {
-                        assert!(placed(g), "alloc: folded source @{g} left the access bank");
+                        assert!(
+                            placed(g),
+                            "alloc: folded source @{g} left addressable range"
+                        );
                     }
                     iselcore::LoadFold::ThreadW(g, dsts) => {
                         assert!(
                             placed(g),
-                            "alloc: threaded source @{g} left the access bank"
+                            "alloc: threaded source @{g} left addressable range"
                         );
                         for d in dsts {
-                            assert!(placed(d), "alloc: threaded store @{d} left the access bank");
+                            assert!(
+                                placed(d),
+                                "alloc: threaded store @{d} left addressable range"
+                            );
                         }
                     }
                 }
