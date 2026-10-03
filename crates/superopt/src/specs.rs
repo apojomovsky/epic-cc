@@ -257,6 +257,13 @@ pub fn all_specs() -> Vec<Spec> {
             nightly_cases: xorwf_n_flag_nightly,
             chunk_cases: 500,
         },
+        Spec {
+            name: "tblrd-flash-ptr",
+            candidate: tblrd_flash_ptr_candidate,
+            pr_cases: tblrd_flash_ptr_pr,
+            nightly_cases: tblrd_flash_ptr_nightly,
+            chunk_cases: 100,
+        },
     ]
 }
 
@@ -999,4 +1006,78 @@ pub fn bitmask_base_nightly() -> Vec<Case> {
         bitmask_base_expect,
     ));
     cases
+}
+
+/// Runtime-`TBLRD` vtable slot load (epic-cc#832): the two-byte sequence
+/// `isel-pic18` emits for a load through a vptr-derived reg. The `LOW`
+/// setup lines stand in for `__start`'s vptr init; the seed plus the two
+/// reads are the sequence under test. The table rides behind a
+/// branch-over so every replay carries its own bytes.
+const VT_SLOT_LO: usize = 0x040;
+const VT_SLOT_HI: usize = 0x041;
+const VT_DST_LO: usize = 0x042;
+const VT_DST_HI: usize = 0x043;
+const VT_TAB0: u8 = 0x34;
+const VT_TAB1: u8 = 0x12;
+
+pub fn tblrd_flash_ptr_candidate() -> Candidate {
+    vec![
+        "BRA vt_tab_end",
+        "vt_tab:",
+        "db 0x34, 0x12, 0x78, 0x56",
+        "vt_tab_end:",
+        "MOVLW LOW(vt_tab)",
+        "MOVWF 0x040,A",
+        "MOVLW HIGH(vt_tab)",
+        "MOVWF 0x041,A",
+        "MOVF 0x040,W,A",
+        "MOVWF 0xF6,A",
+        "MOVF 0x041,W,A",
+        "MOVWF 0xF7,A",
+        "CLRF 0xF8,A",
+        "TBLRD*",
+        "MOVFF 0xFF5,0x042",
+        "MOVLW 0x01",
+        "ADDWF 0xF6,F,A",
+        "MOVLW 0x00",
+        "ADDWFC 0xF7,F,A",
+        "ADDWFC 0xF8,F,A",
+        "TBLRD*",
+        "MOVFF 0xFF5,0x043",
+    ]
+}
+
+/// Entry `W` crossed with entry `STATUS`: neither may leak into the
+/// read bytes. `STATUS` is poked (not just recorded) because the batch
+/// poisons RAM while unimplemented `STATUS` bits read 0 on silicon, so
+/// an unpoked `STATUS` can never byte-match; `0x00` and `0x1F` cover
+/// clear and set flag states with those bits clear.
+fn tblrd_flash_ptr_cases_over(ws: &[u8]) -> Vec<Case> {
+    let mut cases = Vec::new();
+    for &w in ws {
+        for st in [0x00u8, 0x1F] {
+            cases.push(Case {
+                entry_w: w,
+                pokes: vec![(STATUS_ADDR, st)],
+                allowed_changes: vec![
+                    VT_SLOT_LO, VT_SLOT_HI, VT_DST_LO, VT_DST_HI,
+                    // `TBLPTR`/`TABLAT` by full SFR address: the `,A`
+                    // access bit maps the `0xF6` file byte to `0xFF6`.
+                    0xFF5, 0xFF6, 0xFF7, 0xFF8,
+                ],
+                check: Box::new(|sim: &Pic18| {
+                    sim.ram()[VT_DST_LO] == VT_TAB0 && sim.ram()[VT_DST_HI] == VT_TAB1
+                }),
+            });
+        }
+    }
+    cases
+}
+
+pub fn tblrd_flash_ptr_pr() -> Vec<Case> {
+    tblrd_flash_ptr_cases_over(&[0x00, 0xFF, 0x2A])
+}
+
+pub fn tblrd_flash_ptr_nightly() -> Vec<Case> {
+    tblrd_flash_ptr_cases_over(&[0x00, 0x01, 0x7F, 0x80, 0xFF, 0x2A])
 }

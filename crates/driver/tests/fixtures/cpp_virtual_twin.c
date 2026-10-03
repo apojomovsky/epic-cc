@@ -1,5 +1,5 @@
-// Dispatch sequences stay sim-only until the `mdb` replay lands with
-// #832 (docs/40 §5).
+// Dispatch replays on hardware through the `tblrd-flash-ptr` superopt
+// spec (#832); per-fixture runs stay sim-only (docs/40 §5).
 
 #ifndef SEL
 #define SEL 0
