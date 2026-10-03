@@ -40,7 +40,7 @@
 
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
-use iselcore::{resolve_pointers, ssa_key, Base, PtrResolution, Slot};
+use iselcore::{find_value_folds, resolve_pointers, ssa_key, Base, PtrResolution, Slot};
 use std::collections::{HashMap, HashSet};
 
 /// The recipe a routine function emits, or `None` if the name is not a
@@ -184,6 +184,16 @@ struct Gen<'m> {
     /// chunk, so restores involving a member are never elided. Empty in
     /// pass A (membership is decided from pass-A sizes).
     split: &'m HashSet<String>,
+    /// Every RAM byte a global occupies. The W cache never records or
+    /// reuses one: an interrupt can rewrite a global between the store
+    /// and the reload while its epilogue restores W, so a cached global
+    /// byte is never trustworthy. Only a function-private frame slot is
+    /// safe to track, the same rule `isel-pic18` states (epic-cc#875).
+    global_addrs: &'m HashSet<u16>,
+    /// Value folds from the shared per-function pre-scan (epic-cc#875):
+    /// loads whose byte never stages to a slot. `alloc` drops those
+    /// slots; the load arm skips them and consumers read the source.
+    w_folds: iselcore::ValueFolds,
     /// The slot address whose value `emit_w_store`/`emit_w_load` last left
     /// in W, or `None` when unknown. The cache skips a reload when the value
     /// never left W, and every cached slot is the SSA value's own private
@@ -261,6 +271,19 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// Record that W holds the byte at `addr`, unless the address belongs
+    /// to a global: an interrupt can rewrite a global at any time while
+    /// its epilogue restores the interrupted W, so a global's cached byte
+    /// is never trustworthy across the next instruction boundary. Loads
+    /// of folded sources therefore always re-read (epic-cc#875).
+    fn mark_w(&mut self, addr: u16) {
+        self.w_holds = if self.global_addrs.contains(&addr) {
+            None
+        } else {
+            Some(addr)
+        };
+    }
+
     /// `MOVWF addr`, unless `addr` is already known to hold W's value from
     /// an immediately preceding `emit_w_store`/`emit_w_load` of the same
     /// address (a genuine no-op then: the byte there already equals W).
@@ -271,7 +294,7 @@ impl<'m> Gen<'m> {
             // gets W's value exactly once, as if it had never deferred.
             self.deferred_store = None;
             self.emit(format!("    MOVWF 0x{addr:02X}"));
-            self.w_holds = Some(addr);
+            self.mark_w(addr);
             self.z_rel = None;
             return;
         }
@@ -279,7 +302,7 @@ impl<'m> Gen<'m> {
         if self.w_holds != Some(addr) {
             self.emit(format!("    MOVWF 0x{addr:02X}"));
         }
-        self.w_holds = Some(addr);
+        self.mark_w(addr);
         // The skipped-MOVWF path never hits `emit`, so the flag relation
         // from an earlier materialize would survive into a later branch on
         // a different slot; W is this store's value now, not the compare's.
@@ -306,7 +329,7 @@ impl<'m> Gen<'m> {
         if self.w_holds != Some(addr) {
             self.emit(format!("    MOVF 0x{addr:02X}, W"));
         }
-        self.w_holds = Some(addr);
+        self.mark_w(addr);
         // Same reason as emit_w_store: a skipped MOVF skips its `emit`, so
         // a stale flag relation must not outlive the reload; a MOVF also
         // resets Z to (addr == 0), which is not the compare's Z.
@@ -482,10 +505,41 @@ impl<'m> Gen<'m> {
         out
     }
 
+    /// The source global a skipped load read, when `r` is one (epic-cc#875):
+    /// a `Direct` fold names it, and a load forwarded into its store
+    /// re-reads it from the load. Forwarded `Bin` results return `None`:
+    /// those still stage, so every reader resolves to the temp as before.
+    fn folded_load_source(&self, r: &str) -> Option<u16> {
+        if let Some(iselcore::LoadFold::Direct(g)) = self.w_folds.loads.get(r) {
+            return Some(self.global_addr(g));
+        }
+        if !self.w_folds.forwarded.contains_key(r) {
+            return None;
+        }
+        let f = self.m.funcs.iter().find(|f| f.name == self.cur_func)?;
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Load(l) = inst {
+                    if l.dst == r {
+                        return Some(self.global_addr(l.ptr.strip_prefix('@').unwrap_or(&l.ptr)));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Resolve an operand value to its base byte address (lo for multi-byte).
     fn val_addr(&self, v: &Val) -> Slot {
         match v {
-            Val::Reg(r) => self.slot_addr(self.cur_func, r),
+            // A folded load reads its source global: the slot is gone, so
+            // every reader resolves here (epic-cc#875). A threaded load
+            // never arrives: its only readers are the stores below, which
+            // write back the byte still in W instead.
+            Val::Reg(r) => match self.folded_load_source(r) {
+                Some(a) => Slot::Direct(a),
+                None => self.slot_addr(self.cur_func, r),
+            },
             Val::Global(g) => Slot::Direct(
                 *self
                     .addrs
@@ -3036,6 +3090,26 @@ impl<'m> Gen<'m> {
                 // i1` (epic-cc#462). i1 is one byte in the byte model, so
                 // every arm below (`bytes()` is 1) is the whole story; the
                 // same premise the PIC18 sibling states (epic-cc#464).
+                // A folded load never stages (epic-cc#875): the consumer
+                // reads the source global directly, or the byte rides W
+                // to its stores. `alloc` dropped the slot, so nothing
+                // below may look it up.
+                if let Some(fold) = self.w_folds.loads.get(&l.dst).cloned() {
+                    match fold {
+                        iselcore::LoadFold::Direct(_) => return,
+                        iselcore::LoadFold::ThreadW(g, _) => {
+                            let src = self.global_addr(&g);
+                            self.emit(format!("    MOVF 0x{src:02X}, W"));
+                            return;
+                        }
+                    }
+                }
+                // A load forwarded into its store never stages either: this
+                // load is the forwarded producer, so the store below reads
+                // the source global through `folded_load_source`.
+                if self.w_folds.forwarded.contains_key(&l.dst) {
+                    return;
+                }
                 let dst = self.slot_addr(self.cur_func, &l.dst).direct();
                 if let Some(g) = l.ptr.strip_prefix('@') {
                     let src = self.global_addr(g);
@@ -3076,6 +3150,20 @@ impl<'m> Gen<'m> {
                 // convention every i1 consumer tests for nonzero.
                 if let Some(g) = s.ptr.strip_prefix('@') {
                     let dst = self.global_addr(g);
+                    // A W-threaded store (epic-cc#875): the folded load left
+                    // the byte in W, so the store writes it back out with no
+                    // slot read. The predicate allows only direct-global
+                    // single-byte stores with a stores-only gap, which W
+                    // survives (`MOVWF` preserves it; the ISR restores it).
+                    if let Val::Reg(r) = &s.val {
+                        if matches!(
+                            self.w_folds.loads.get(r),
+                            Some(iselcore::LoadFold::ThreadW(_, _))
+                        ) {
+                            self.emit(format!("    MOVWF 0x{dst:02X}"));
+                            return;
+                        }
+                    }
                     self.emit_move_val_to_slot(&s.val, s.ty, dst);
                 } else if s.ptr.starts_with("0x") {
                     // A literal (SFR) pointer from `inttoptr`: a direct MOVWF
@@ -7809,6 +7897,38 @@ pub fn select_with_locs(
     // slots, alloca buffers); `gep` itself emits nothing. The fold is shared
     // with isel-pic18 in `iselcore::resolve_pointers`.
     let resolved = resolve_pointers(m);
+    // Value folds for every function (epic-cc#875): loads whose byte never
+    // stages, over the same mapped-global set `alloc` places by, so a
+    // skipped load reads an address both stages agree on. Pass-independent
+    // (module, map, and pointer resolution only), so all three Gen sites
+    // below share the one map.
+    let fold_safe: HashSet<String> = m
+        .globals
+        .iter()
+        .filter(|x| !x.is_const && addrs.contains_key(&x.name))
+        .map(|x| x.name.clone())
+        .collect();
+    let folds: HashMap<String, iselcore::ValueFolds> = m
+        .funcs
+        .iter()
+        .map(|f| {
+            (
+                f.name.clone(),
+                find_value_folds(f, m, &resolved, Some(&fold_safe)),
+            )
+        })
+        .collect();
+    // Every byte a RAM global occupies, so no W-cache entry can be
+    // grounded in storage an interrupt may rewrite behind the
+    // compiler's back (the same rule `isel-pic18` states).
+    let mut global_addrs: HashSet<u16> = HashSet::new();
+    for g in &m.globals {
+        if let Some(&a) = addrs.get(&g.name) {
+            for i in 0..g.size as u16 {
+                global_addrs.insert(a + i);
+            }
+        }
+    }
     // Fresh-label counter at module scope: labels are file-scoped in the
     // single `.asm` output, so it must not reset per function.
     // ---- PASS A: emit every function body with every PCLATH restore
@@ -7840,6 +7960,8 @@ pub fn select_with_locs(
                 tmp: &mut tmp,
                 page_of: None,
                 split: &no_split,
+                global_addrs: &global_addrs,
+                w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
                 w_holds: None,
                 use_count: HashMap::new(),
                 deferred_store: None,
@@ -8051,6 +8173,8 @@ pub fn select_with_locs(
                 tmp: &mut tmp2,
                 page_of: None,
                 split: &split_set,
+                global_addrs: &global_addrs,
+                w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
                 w_holds: None,
                 use_count: HashMap::new(),
                 deferred_store: None,
@@ -8322,6 +8446,8 @@ pub fn select_with_locs(
                             tmp: &mut tmp,
                             page_of: Some(&pages),
                             split: &split_set,
+                            global_addrs: &global_addrs,
+                            w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
                             w_holds: None,
                             use_count: HashMap::new(),
                             deferred_store: None,
