@@ -996,15 +996,24 @@ enum ProvBase {
 }
 
 /// Whether global `g`'s bytes `[off, off + n)` are all vptr fields: every
-/// byte carries a nonzero-addend ref (the folded constant GEP of a vptr
-/// initializer, `(pos, vtable, slot offset)`).
+/// byte carries a nonzero-addend ref into a `const` vtable (`_ZTV*`,
+/// Itanium ABI prefix), the folded constant GEP of a vptr initializer.
+/// The target check is load-bearing: a plain constant GEP initializer
+/// (`&arr[2]` in C) folds to the same nonzero-addend shape but names a
+/// RAM address, and must never seed flash provenance.
 fn vptr_covered(m: &Module, g: &str, off: u16, n: u8) -> bool {
+    let is_vtable = |t: &str| {
+        t.starts_with("_ZTV")
+            && m.globals.iter().any(|x| x.name == t && x.is_const)
+    };
     let Some(gl) = m.globals.iter().find(|x| x.name == g) else {
         return false;
     };
     (0..n).all(|i| {
         let pos = off.wrapping_add(u16::from(i)) as usize;
-        gl.refs.iter().any(|(p, _, add)| *p == pos && *add != 0)
+        gl.refs
+            .iter()
+            .any(|(p, t, add)| *p == pos && *add != 0 && is_vtable(t))
     })
 }
 

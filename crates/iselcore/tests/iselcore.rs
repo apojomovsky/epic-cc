@@ -772,6 +772,9 @@ fn vptr_load_through_object_phi_is_flash() {
         "global g_b i8\n\
          global g_d i8\n\
          global g_m i8\n\
+         const _ZTVb i8\n\
+         const _ZTVd i8\n\
+         const _ZTVm i8\n\
          fn main() ()\n\
            block entry:\n\
              %6 = select i1 %c, ptr @g_d, ptr @g_m\n\
@@ -780,7 +783,7 @@ fn vptr_load_through_object_phi_is_flash() {
              %10 = load ptr %9\n\
              ret void\n",
     );
-    for g in m.globals.iter_mut() {
+    for g in m.globals.iter_mut().filter(|g| !g.is_const) {
         g.refs = vec![
             (0usize, format!("_ZTV{}", g.name[2..].to_string()), 4u16),
             (1, format!("_ZTV{}", g.name[2..].to_string()), 4),
@@ -806,6 +809,7 @@ fn vptr_load_through_object_phi_is_flash() {
 fn vptr_load_direct_from_object_global_is_flash() {
     let mut m = parse(
         "global g_b i8\n\
+         const _ZTV4Base i8\n\
          fn main() ()\n\
            block entry:\n\
              %1 = load ptr @g_b\n\
@@ -846,6 +850,7 @@ fn plain_global_load_ptr_is_ram() {
 fn phi_of_flash_and_runtime_is_mixed() {
     let mut m = parse(
         "global g_b i8\n\
+         const _ZTV4Base i8\n\
          fn main() ()\n\
            block entry:\n\
              %9 = load ptr @g_b\n\
@@ -864,4 +869,27 @@ fn phi_of_flash_and_runtime_is_mixed() {
         "partial-flash phi must be mixed, got {:?}",
         prov.mixed
     );
+}
+
+// A plain constant-GEP initializer (`&arr[2]` in C) folds to the same
+// nonzero-addend ref shape as a vptr, but names a RAM address: loads out
+// of it and dereferences through the result stay RAM (epic-cc#832 review).
+#[test]
+fn offset_pointer_into_ram_global_is_ram() {
+    let mut m = parse(
+        "global arr i8\n\
+         global p i8\n\
+         fn main() ()\n\
+           block entry:\n\
+             %1 = load ptr @p\n\
+             %2 = load ptr %1\n\
+             ret void\n",
+    );
+    m.globals[1].refs = vec![
+        (0usize, "arr".to_string(), 2u16),
+        (1, "arr".to_string(), 2),
+    ];
+    let prov = iselcore::flash_provenance(&m);
+    assert!(prov.flash.is_empty(), "got {:?}", prov.flash);
+    assert!(prov.mixed.is_empty(), "got {:?}", prov.mixed);
 }
