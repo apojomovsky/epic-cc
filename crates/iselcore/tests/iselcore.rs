@@ -761,3 +761,97 @@ fn pic14_drops_threaded_load() {
         "threaded load needs no slot"
     );
 }
+
+// epic-cc#832: a `load ptr` out of an object's vptr field (a global whose
+// loaded bytes all carry nonzero-addend refs) holds a flash address, so
+// the slot load through it must read program memory. The dispatch shape
+// is a phi/select of object globals feeding the vptr load.
+#[test]
+fn vptr_load_through_object_phi_is_flash() {
+    let mut m = parse(
+        "global g_b i8\n\
+         global g_d i8\n\
+         global g_m i8\n\
+         fn main() ()\n\
+           block entry:\n\
+             %6 = select i1 %c, ptr @g_d, ptr @g_m\n\
+             %8 = phi ptr %6 entry @g_b entry\n\
+             %9 = load ptr %8\n\
+             %10 = load ptr %9\n\
+             ret void\n",
+    );
+    for g in m.globals.iter_mut() {
+        g.refs = vec![
+            (0usize, format!("_ZTV{}", g.name[2..].to_string()), 4u16),
+            (1, format!("_ZTV{}", g.name[2..].to_string()), 4),
+        ];
+    }
+    let prov = iselcore::flash_provenance(&m);
+    assert!(
+        prov.flash.contains("main::9"),
+        "vptr load holds a flash address, got {:?}",
+        prov.flash
+    );
+    assert!(!prov.flash.contains("main::10"));
+    assert!(prov.mixed.is_empty(), "no partial arm, got {:?}", prov.mixed);
+}
+
+// A `load ptr` straight out of one object global is the same fact with
+// no address folding in between.
+#[test]
+fn vptr_load_direct_from_object_global_is_flash() {
+    let mut m = parse(
+        "global g_b i8\n\
+         fn main() ()\n\
+           block entry:\n\
+             %1 = load ptr @g_b\n\
+             %2 = load ptr %1\n\
+             ret void\n",
+    );
+    m.globals[0].refs = vec![(0usize, "_ZTV4Base".to_string(), 4u16), (1, "_ZTV4Base".to_string(), 4)];
+    let prov = iselcore::flash_provenance(&m);
+    assert!(prov.flash.contains("main::1"));
+    assert!(!prov.flash.contains("main::2"));
+    assert!(prov.mixed.is_empty());
+}
+
+// A `load ptr` out of a plain global (no vptr refs) is the C shape: RAM
+// both sides, both provenance sets stay empty.
+#[test]
+fn plain_global_load_ptr_is_ram() {
+    let m = parse(
+        "global tbl i8\n\
+         fn main() ()\n\
+           block entry:\n\
+             %1 = load ptr @tbl\n\
+             %2 = load ptr %1\n\
+             ret void\n",
+    );
+    let prov = iselcore::flash_provenance(&m);
+    assert!(prov.flash.is_empty());
+    assert!(prov.mixed.is_empty());
+}
+
+// A phi joining a flash (vptr) value with a runtime address may carry
+// either: the runtime sequence cannot serve it, so it lands in `mixed`
+// and every backend panics rather than emitting a wrong read.
+#[test]
+fn phi_of_flash_and_runtime_is_mixed() {
+    let mut m = parse(
+        "global g_b i8\n\
+         fn main() ()\n\
+           block entry:\n\
+             %9 = load ptr @g_b\n\
+             %10 = phi ptr %9 entry %p entry\n\
+             %11 = load ptr %10\n\
+             ret void\n",
+    );
+    m.globals[0].refs = vec![(0usize, "_ZTV4Base".to_string(), 4u16), (1, "_ZTV4Base".to_string(), 4)];
+    let prov = iselcore::flash_provenance(&m);
+    assert!(prov.flash.contains("main::9"));
+    assert!(
+        prov.mixed.contains("main::10"),
+        "partial-flash phi must be mixed, got {:?}",
+        prov.mixed
+    );
+}

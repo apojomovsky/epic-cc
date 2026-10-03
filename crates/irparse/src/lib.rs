@@ -2696,15 +2696,13 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
             let (is_const, rest) = if let Some(i) = after.find("global ") {
                 (false, &after[i + "global ".len()..])
             } else if let Some(i) = after.find("constant ") {
-                // A C++ vtable (`_ZTV*`, Itanium ABI prefix) decodes
-                // RAM-resident: the slot load dereferences its address
-                // through a runtime pointer, which the data-memory
-                // indirect lowering serves but a flash table cannot
-                // (runtime TBLRD is future work, filed separately).
-                // Nothing writes it after `__start`, so the 6 bytes
-                // per vtable are init-only RAM (epic-cc#460).
-                let vtable = name.starts_with("_ZTV");
-                (!vtable, &after[i + "constant ".len()..])
+                // A C++ vtable (`_ZTV*`, Itanium ABI prefix) rides the
+                // ADR-010 flash path like any const table: the slot load
+                // dereferences its address through a runtime pointer,
+                // which isel-pic18 serves with a TBLPTR seeded from the
+                // vptr value (flash-pointer provenance, epic-cc#832).
+                // Other backends reject C++ dispatch loudly (PIC18-only).
+                (true, &after[i + "constant ".len()..])
             } else {
                 continue;
             };

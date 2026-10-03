@@ -39,7 +39,7 @@
 
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
-use iselcore::{resolve_pointers, ssa_key, Base, PtrResolution, Slot};
+use iselcore::{flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot};
 use std::collections::{HashMap, HashSet};
 
 /// The byte address of a literal-pointer operand (`"0x<K>"`, the
@@ -84,6 +84,10 @@ struct Gen<'m> {
     /// themselves emit nothing; each `load`/`store`/`memcpy` through a
     /// pointer reg lowers the pointer at its use.
     resolved: &'m PtrResolution,
+    /// Flash-pointer provenance (`iselcore::flash_provenance`): a load or
+    /// store through a flash-derived reg is C++ virtual dispatch over a
+    /// flash vtable, PIC18-only, so this backend panics on it (epic-cc#832).
+    prov: FlashProvenance,
     scratch: u16,
     /// A second fixed common-RAM temp, dedicated to the ADDLW-replacement
     /// idioms (baseline has no literal-add op, D-6): `W = W + k` and the
@@ -1735,6 +1739,16 @@ impl<'m> Gen<'m> {
                         )
                     });
                     let ptr = Val::Reg(r.to_string());
+                    // C++ virtual dispatch reads its vtable from flash via
+                    // runtime `TBLRD`, which only PIC18 lowers: panic here
+                    // rather than misreading a flash address as RAM
+                    // (epic-cc#832).
+                    let key = ssa_key(self.cur_func, r);
+                    if self.prov.flash.contains(&key) || self.prov.mixed.contains(&key) {
+                        panic!(
+                            "isel: load through flash-derived address %{r} is C++ virtual dispatch (PIC18-only, epic-cc#832)"
+                        );
+                    }
                     for k in 0..l.ty.bytes() {
                         self.emit_ptr_load_byte(&ptr, k);
                         self.emit_w_store(dst + u16::from(k));
@@ -1774,6 +1788,15 @@ impl<'m> Gen<'m> {
                         );
                     }
                     let ptr = Val::Reg(r.to_string());
+                    // A store through a flash-derived address would write
+                    // ROM through a runtime pointer: panic like the const
+                    // case above (epic-cc#832).
+                    let key = ssa_key(self.cur_func, r);
+                    if self.prov.flash.contains(&key) || self.prov.mixed.contains(&key) {
+                        panic!(
+                            "isel: store through flash-derived address %{r} is C++ virtual dispatch (PIC18-only, epic-cc#832)"
+                        );
+                    }
                     for k in 0..s.ty.bytes() {
                         self.emit_ptr_store_byte(&ptr, k, &s.val);
                     }
@@ -3668,6 +3691,9 @@ pub fn select_with_locs(
     locs.extend(std::iter::repeat(None).take(start_len));
     // Pointers resolve eagerly: every GEP chain folds to `(base, k, terms)`.
     let resolved = resolve_pointers(m);
+    // Flash-pointer provenance for the C++ dispatch panic below: computed
+    // once beside the pointer resolution (epic-cc#832).
+    let prov = flash_provenance(m);
     // Emit each function into its own buffer (PA0 fixups recorded per
     // buffer); layout assigns pages after measuring, then patches the
     // bits in place. Call sequences are uniform size, so one pass
@@ -3686,6 +3712,7 @@ pub fn select_with_locs(
             addrs,
             device,
             resolved: &resolved,
+            prov: prov.clone(),
             scratch,
             scratch2,
             store_tmp,
