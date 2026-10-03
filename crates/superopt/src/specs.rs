@@ -1008,14 +1008,11 @@ pub fn bitmask_base_nightly() -> Vec<Case> {
     cases
 }
 
-/// Runtime-`TBLRD` vtable slot load (epic-cc#832): the exact two-byte
-/// sequence `isel-pic18` emits for a load through a vptr-derived reg.
-/// `TBLPTR` seeds from the slot's two RAM bytes (a 16-bit flash byte
-/// address), each byte reads with `TBLRD*`. The `MOVLW LOW/HIGH(vt)`
-/// setup lines are test scaffolding (they stand in for `__start`'s vptr
-/// init); the seed plus the two reads are the sequence under test.
-/// Slot and destination sit at fixed GPR; the table rides along behind
-/// a branch-over so every replay carries its own bytes.
+/// Runtime-`TBLRD` vtable slot load (epic-cc#832): the two-byte sequence
+/// `isel-pic18` emits for a load through a vptr-derived reg. The `LOW`
+/// setup lines stand in for `__start`'s vptr init; the seed plus the two
+/// reads are the sequence under test. The table rides behind a
+/// branch-over so every replay carries its own bytes.
 const VT_SLOT_LO: usize = 0x040;
 const VT_SLOT_HI: usize = 0x041;
 const VT_DST_LO: usize = 0x042;

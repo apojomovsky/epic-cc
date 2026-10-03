@@ -975,18 +975,11 @@ pub fn find_value_folds(
 }
 
 /// Flash-pointer provenance for C++ vtable dispatch (epic-cc#832).
-///
-/// A vtable lives in flash while the objects pointing into it live in
-/// RAM. The vptr value a `load ptr` pulls out of an object is therefore
-/// a flash address, and a later load through it must read program memory
-/// (`TBLRD`), not data memory. `flash` holds exactly the regs proven to
-/// carry such an address: `load ptr` results whose source bytes are all
-/// vptr fields, closed under phi/select arms that are all flash. `mixed`
-/// holds regs that may carry one through a partially flash arm set or a
-/// `gep` over a flash reg: shapes the runtime sequence does not serve,
-/// so every backend panics on them rather than emitting a wrong read.
-/// Anything else keeps the existing RAM lowering. C programs have no
-/// nonzero-addend refs, so both sets stay empty there by construction.
+/// `flash` holds regs proven to carry a vtable (flash) address: `load
+/// ptr` results read wholly from vptr fields, closed under all-flash
+/// phi/select arms. `mixed` holds partially flash derivations and `gep`
+/// over flash regs: unserved shapes every backend panics on. C programs
+/// have no nonzero-addend refs, so both sets stay empty there.
 #[derive(Clone, Debug, Default)]
 pub struct FlashProvenance {
     pub flash: HashSet<String>,
