@@ -3468,6 +3468,36 @@ fn a_six_byte_copy_run_becomes_a_postinc_loop() {
     );
 }
 
+#[test]
+fn speed_profile_drains_long_copy_runs_straight() {
+    // With `copy_loop` off (the `-O2` drain, epic-cc#883) a 12-byte run
+    // stays twelve MOVFFs: the loop wins flash at roughly 3x the cycles
+    // per byte, a trade the speed profile refuses.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 12\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
+    let opts = isel_pic18::Options { copy_loop: false };
+    let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+    for i in 0..12u16 {
+        let expect = format!("MOVFF 0x{:03X}, 0x{:03X}", 0x100 + i, 0x110 + i);
+        let expect_nospace = format!("MOVFF 0x{:03X},0x{:03X}", 0x100 + i, 0x110 + i);
+        assert!(
+            asm.contains(&expect) || asm.contains(&expect_nospace),
+            "byte {i} missing:\n{asm}"
+        );
+    }
+    assert!(
+        !asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "no POSTINC loop with copy_loop off:\n{asm}"
+    );
+}
+
 /// A coalesced lane shortens the pending run before the drain decides:
 /// five staged lanes plus one self lane replay straight. The 6-lane loop
 /// never forms (epic-cc#739). The skip returns before the consecutivity
