@@ -45,7 +45,9 @@
 
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
-use iselcore::{flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot};
+use iselcore::{
+    flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot,
+};
 use std::collections::{HashMap, HashSet};
 
 /// Returns the recipe for a runtime routine name, or `None` for other names.

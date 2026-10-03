@@ -14,7 +14,10 @@ fn decodes_vtable_const_with_fn_refs() {
     assert_eq!(m.globals.len(), 1);
     let vt = &m.globals[0];
     assert_eq!(vt.name, "_ZTV7Derived");
-    assert!(vt.is_const, "vtable rides the flash table path (epic-cc#832)");
+    assert!(
+        vt.is_const,
+        "vtable rides the flash table path (epic-cc#832)"
+    );
     assert_eq!(vt.size, 6);
     assert_eq!(vt.bytes, vec![0u8; 6]);
     assert_eq!(

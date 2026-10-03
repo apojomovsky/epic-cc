@@ -40,7 +40,10 @@
 
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
-use iselcore::{find_value_folds, flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot};
+use iselcore::{
+    find_value_folds, flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance,
+    PtrResolution, Slot,
+};
 use std::collections::{HashMap, HashSet};
 
 /// The recipe a routine function emits, or `None` if the name is not a

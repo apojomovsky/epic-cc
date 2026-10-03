@@ -1011,9 +1011,7 @@ fn vptr_covered(m: &Module, g: &str, off: u16, n: u8) -> bool {
     };
     (0..n).all(|i| {
         let pos = off.wrapping_add(u16::from(i)) as usize;
-        gl.refs
-            .iter()
-            .any(|(p, _, add)| *p == pos && *add != 0)
+        gl.refs.iter().any(|(p, _, add)| *p == pos && *add != 0)
     })
 }
 
@@ -1156,9 +1154,7 @@ pub fn flash_provenance(m: &Module) -> FlashProvenance {
                                     ir::Val::Reg(r) if out.flash.contains(&ssa_key(&f.name, r)) => {
                                         fc += 1;
                                     }
-                                    ir::Val::Reg(r)
-                                        if out.mixed.contains(&ssa_key(&f.name, r)) =>
-                                    {
+                                    ir::Val::Reg(r) if out.mixed.contains(&ssa_key(&f.name, r)) => {
                                         mc += 1;
                                     }
                                     _ => uc += 1,
@@ -1183,9 +1179,7 @@ pub fn flash_provenance(m: &Module) -> FlashProvenance {
                                     ir::Val::Reg(r) if out.flash.contains(&ssa_key(&f.name, r)) => {
                                         fc += 1;
                                     }
-                                    ir::Val::Reg(r)
-                                        if out.mixed.contains(&ssa_key(&f.name, r)) =>
-                                    {
+                                    ir::Val::Reg(r) if out.mixed.contains(&ssa_key(&f.name, r)) => {
                                         mc += 1;
                                     }
                                     _ => uc += 1,

@@ -11,7 +11,9 @@ use std::collections::{HashMap, HashSet};
 
 use device::Device;
 use ir::{Block, Func, Icmp, Inst, Module, SrcLoc, Ty, Val};
-use iselcore::{flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot};
+use iselcore::{
+    flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot,
+};
 
 /// The high Access Bank segment's start: every classic-mode PIC18's SFRs
 /// live at `0xF60-0xFFF` (160 bytes) by the core's own linear-addressing
@@ -3249,10 +3251,10 @@ impl<'m> Gen<'m> {
             if ha == 0 { "A" } else { "B" }
         ));
         self.emit("    MOVWF 0xF7,A".to_string()); // TBLPTRH
-        // `TBLPTRU` stays zero: a vptr value is only two bytes wide (its
-        // initializer writes `LOW`/`HIGH`), so a table above 64 KB is
-        // unrepresentable long before this seed runs, and every PIC18 part
-        // here is smaller still.
+                                                   // `TBLPTRU` stays zero: a vptr value is only two bytes wide (its
+                                                   // initializer writes `LOW`/`HIGH`), so a table above 64 KB is
+                                                   // unrepresentable long before this seed runs, and every PIC18 part
+                                                   // here is smaller still.
         self.emit("    CLRF 0xF8,A".to_string()); // TBLPTRU
         if byte_off != 0 {
             self.emit(format!("    MOVLW 0x{byte_off:02X}"));

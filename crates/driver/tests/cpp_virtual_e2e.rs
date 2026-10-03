@@ -1,11 +1,11 @@
 //! #460 acceptance: single-inheritance virtual dispatch through a
-//! vtable: the vptr slot address folds at parse and the indirect call
-//! dispatches the selected override. Tables are RAM-resident (flash
-//! placement waits on runtime TBLRD, #832). The input class selects the
-//! dynamic type at runtime (`-D SEL=`); all three overrides return from
+//! flash-resident vtable (ADR-010): the vptr slot address folds at parse,
+//! the slot load seeds `TBLPTR` from the vptr value (#832), and the
+//! indirect call dispatches the selected override. The input class selects
+//! the dynamic type at runtime (`-D SEL=`); all three overrides return from
 //! the same vtable layout. PIC18 only.
-//! Dispatch sequences stay sim-only until the `mdb` replay lands with
-//! #832 (docs/40 §5).
+//! The dispatch sequence replays on hardware through the `tblrd-flash-ptr`
+//! superopt spec; per-fixture runs stay sim-only (docs/40 §5).
 
 use std::process::Command;
 

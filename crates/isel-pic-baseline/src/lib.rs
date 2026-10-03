@@ -39,7 +39,9 @@
 
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
-use iselcore::{flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot};
+use iselcore::{
+    flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot,
+};
 use std::collections::{HashMap, HashSet};
 
 /// The byte address of a literal-pointer operand (`"0x<K>"`, the

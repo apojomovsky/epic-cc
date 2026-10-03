@@ -793,7 +793,11 @@ fn vptr_load_through_object_phi_is_flash() {
         prov.flash
     );
     assert!(!prov.flash.contains("main::10"));
-    assert!(prov.mixed.is_empty(), "no partial arm, got {:?}", prov.mixed);
+    assert!(
+        prov.mixed.is_empty(),
+        "no partial arm, got {:?}",
+        prov.mixed
+    );
 }
 
 // A `load ptr` straight out of one object global is the same fact with
@@ -808,7 +812,10 @@ fn vptr_load_direct_from_object_global_is_flash() {
              %2 = load ptr %1\n\
              ret void\n",
     );
-    m.globals[0].refs = vec![(0usize, "_ZTV4Base".to_string(), 4u16), (1, "_ZTV4Base".to_string(), 4)];
+    m.globals[0].refs = vec![
+        (0usize, "_ZTV4Base".to_string(), 4u16),
+        (1, "_ZTV4Base".to_string(), 4),
+    ];
     let prov = iselcore::flash_provenance(&m);
     assert!(prov.flash.contains("main::1"));
     assert!(!prov.flash.contains("main::2"));
@@ -846,7 +853,10 @@ fn phi_of_flash_and_runtime_is_mixed() {
              %11 = load ptr %10\n\
              ret void\n",
     );
-    m.globals[0].refs = vec![(0usize, "_ZTV4Base".to_string(), 4u16), (1, "_ZTV4Base".to_string(), 4)];
+    m.globals[0].refs = vec![
+        (0usize, "_ZTV4Base".to_string(), 4u16),
+        (1, "_ZTV4Base".to_string(), 4),
+    ];
     let prov = iselcore::flash_provenance(&m);
     assert!(prov.flash.contains("main::9"));
     assert!(
