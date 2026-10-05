@@ -2088,8 +2088,10 @@ pub struct Pic18 {
     /// (prescaler x (PR2+1) x postscaler per TMR2IF). Reset while
     /// TMR2ON is clear so enabling never fires a stale burst.
     timer2_acc: u64,
+    /// Harness opt-in for the Timer2 model. Off unless enabled, so
+    /// gates written before the model run exactly as before.
+    timer2_enabled: bool,
 }
-
 impl Pic18 {
     pub fn new(prog: Vec<u16>) -> Self {
         let mut ram = [0; 4096];
@@ -2110,7 +2112,13 @@ impl Pic18 {
             isr_stack: Vec::new(),
             jump_target: None,
             timer2_acc: 0,
+            timer2_enabled: false,
         }
+    }
+    /// Enable the Timer2 match model for this run. Off by default, so
+    /// existing gates observe no timer unless they opt in.
+    pub fn set_timer2_enabled(&mut self, enabled: bool) {
+        self.timer2_enabled = enabled;
     }
     pub fn ram(&self) -> &[u8; 4096] {
         &self.ram
@@ -3088,13 +3096,14 @@ impl Pic18 {
         self.pc = PIC18_LO_VECTOR;
         self.isr_stack.push(false);
     }
-    /// Bank `delta` instruction cycles into Timer2. A match sets PIR1
-    /// TMR2IF and latches the high request; the dispatch clears the flag
-    /// and the vector entry consumes the latch. Period is prescaler x
-    /// (PR2+1) x postscaler from live T2CON/PR2, so firmware that
-    /// reprograms the timer mid-run retunes the model with it.
+    /// Bank `delta` instruction cycles into Timer2 while the harness has
+    /// enabled the model. A match sets PIR1 TMR2IF and latches the high
+    /// request; the firmware handler clears the flag and the vector entry
+    /// consumes the latch. Period is prescaler x (PR2+1) x postscaler from
+    /// live T2CON/PR2, so firmware that reprograms the timer mid-run
+    /// retunes the model with it.
     fn tick_timer2(&mut self, delta: u64) {
-        if self.ram[PIC18_T2CON] & PIC18_T2CON_TMR2ON == 0 {
+        if !self.timer2_enabled || self.ram[PIC18_T2CON] & PIC18_T2CON_TMR2ON == 0 {
             self.timer2_acc = 0;
             return;
         }
@@ -3375,6 +3384,7 @@ mod pic18_timer2 {
 
     fn pic_armed(t2con: u8, pr2: u8) -> Pic18 {
         let mut pic = Pic18::new(vec![0u16; 64]);
+        pic.set_timer2_enabled(true);
         pic.ram[PIC18_T2CON] = t2con;
         pic.ram[PIC18_PR2] = pr2;
         pic.ram[PIC18_PIE1] = PIC18_TMR2IE;
@@ -3444,6 +3454,7 @@ mod pic18_timer2 {
     #[test]
     fn match_without_enable_sets_flag_but_stays_linear() {
         let mut pic = Pic18::new(vec![0u16; 64]);
+        pic.set_timer2_enabled(true);
         pic.ram[PIC18_T2CON] = PIC18_T2CON_TMR2ON;
         pic.ram[PIC18_PR2] = 1;
         pic.ram[PIC18_INTCON] = PIC18_GIEH;
@@ -3459,6 +3470,7 @@ mod pic18_timer2 {
     #[test]
     fn match_stays_pending_while_gie_is_clear() {
         let mut pic = Pic18::new(vec![0u16; 64]);
+        pic.set_timer2_enabled(true);
         pic.ram[PIC18_T2CON] = PIC18_T2CON_TMR2ON;
         pic.ram[PIC18_PR2] = 1;
         pic.ram[PIC18_PIE1] = PIC18_TMR2IE;
@@ -3468,6 +3480,36 @@ mod pic18_timer2 {
         pic.ram[PIC18_INTCON] = PIC18_GIEH;
         pic.run(1);
         assert_eq!(pic.pc(), PIC18_HI_VECTOR, "must vector once GIE goes up");
+    }
+
+    #[test]
+    fn prescaler_16_encodings_match_every_sixteen_cycles() {
+        // T2CKPS 10 and 11 both mean 1:16; with PR2 0 the period is 16.
+        for bits in [0x02, 0x03] {
+            let mut pic = pic_armed(PIC18_T2CON_TMR2ON | bits, 0);
+            pic.run(15);
+            assert_eq!(pic.ram()[PIC18_PIR1] & PIC18_TMR2IF, 0, "fifteen is short");
+            pic.run(1);
+            assert_eq!(
+                pic.ram()[PIC18_PIR1] & PIC18_TMR2IF,
+                PIC18_TMR2IF,
+                "sixteen must match"
+            );
+        }
+    }
+
+    #[test]
+    fn model_off_ignores_a_programmed_timer() {
+        // The harness never opted in: T2CON programmed, TMR2ON set, yet
+        // no flag, no latch, no vector. Pre-model gates stay inert.
+        let mut pic = Pic18::new(vec![0u16; 64]);
+        pic.ram[PIC18_T2CON] = PIC18_T2CON_TMR2ON;
+        pic.ram[PIC18_PR2] = 0;
+        pic.ram[PIC18_PIE1] = PIC18_TMR2IE;
+        pic.ram[PIC18_INTCON] = PIC18_GIEH;
+        pic.run(8);
+        assert_eq!(pic.ram()[PIC18_PIR1] & PIC18_TMR2IF, 0, "model off: idle");
+        assert!(!pic.interrupt_pending(), "no latch while off");
     }
 }
 
