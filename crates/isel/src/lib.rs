@@ -158,6 +158,11 @@ struct Gen<'m> {
     /// no RAM address stages at its use sites; everything else keeps
     /// today's paths.
     staged: &'m HashSet<String>,
+    /// Pooled flash string table (epic-cc#816), threaded from the
+    /// driver. A member with no RAM address (alloc gated its copy)
+    /// materializes as chunk label plus offset; everything else keeps
+    /// today's paths. Empty unless asked, so unflagged output matches.
+    pool: &'m ConstPool,
     /// Every pointer reg in the module, keyed `{func}::{reg}`, resolved to
     /// its folded `(base, k, terms)`: GEP chains fully collapsed (base
     /// `Reg` replaced by the base's own entry), plus the seeded pointer
@@ -583,6 +588,29 @@ impl<'m> Gen<'m> {
             .find(|g| g.name == name)
             .unwrap_or_else(|| panic!("isel: unknown global @{name}"))
             .is_const
+    }
+    /// Pooled address of a const with no RAM copy (epic-cc#816): its
+    /// chunk label plus byte offset. `Some` only when the const pooled
+    /// and alloc gated its copy (absent from the map and unstaged); a
+    /// kept copy, a staged const, or an unflagged build falls back to
+    /// today's paths. Callers add any GEP offset, mirroring the RAM
+    /// path's wrapping add.
+    fn pool_lit(&self, name: &str) -> Option<(String, u16)> {
+        if self.addrs.contains_key(name) || self.staged.contains(name) {
+            return None;
+        }
+        self.pool.resolve(name).map(|(c, o)| (c.to_string(), o))
+    }
+    /// Link-time literal for one pooled address byte (epic-cc#816):
+    /// `LOW/HIGH(chunk)` at offset 0, else the `+off` form the
+    /// assembler already accepts for ref bytes.
+    fn pool_lit_op(chunk: &str, off: u16, idx: u8) -> String {
+        let lit = if idx == 0 { "LOW" } else { "HIGH" };
+        if off == 0 {
+            format!("{lit}({chunk})")
+        } else {
+            format!("{lit}({chunk}+{off})")
+        }
     }
     /// Whether `name` is a function (a valid indirect-call target) rather
     /// than a RAM/const global. A function's address is a link-time label
@@ -1332,6 +1360,16 @@ impl<'m> Gen<'m> {
                         // (epic-cc#645). A dynamic term cannot ride a
                         // literal and still takes the address path below.
                         if self.global_is_const(name) && terms.is_empty() {
+                            if let Some((chunk, off)) = self.pool_lit(name) {
+                                // Gated copy (epic-cc#816): k folds into
+                                // the pooled offset once, no carry dance.
+                                let at = off.wrapping_add(k as u16);
+                                self.emit(format!(
+                                    "    MOVLW {}",
+                                    Self::pool_lit_op(&chunk, at, idx)
+                                ));
+                                return;
+                            }
                             // `LOW`/`HIGH` are 8-bit link-time literals, so
                             // the low byte's carry into the high byte is not
                             // knowable at compile time. `MOVLW` leaves
@@ -1532,8 +1570,17 @@ impl<'m> Gen<'m> {
                     // A function's address is a link-time label literal:
                     // byte 0 = LOW(g), byte 1 = HIGH(g) (epic-cc#73). A
                     // flash const table is the same shape (epic-cc#645).
-                    let lit = if idx == 0 { "LOW" } else { "HIGH" };
-                    self.emit(format!("    MOVLW {lit}({g})"));
+                    // Functions never pool; a gated const (epic-cc#816)
+                    // materializes as its chunk label plus offset.
+                    match self.pool_lit(g) {
+                        Some((chunk, off)) => {
+                            self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, off, idx)));
+                        }
+                        None => {
+                            let lit = if idx == 0 { "LOW" } else { "HIGH" };
+                            self.emit(format!("    MOVLW {lit}({g})"));
+                        }
+                    }
                 } else {
                     // A data global in value position is a pointer ADDRESS
                     // (a `store ptr @g, ...` or a pointer phi incoming;
@@ -2080,6 +2127,14 @@ impl<'m> Gen<'m> {
                     self.emit_stage_const_to_slot(g, dst);
                     return;
                 }
+                if let Some((chunk, off)) = self.pool_lit(g) {
+                    // Gated copy (epic-cc#816): the pooled flash address.
+                    self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, off, 0)));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst));
+                    self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, off, 1)));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
+                    return;
+                }
                 if self.is_function(g) || self.global_is_const(g) {
                     // A function's address and a flash const table's address
                     // are both link-time label literals (epic-cc#645: a
@@ -2106,6 +2161,15 @@ impl<'m> Gen<'m> {
                 let sa = match &base {
                     Base::Slot(sname, true) => self.slot_addr(self.cur_func, sname).direct(),
                     Base::Global(name) => {
+                        if let Some((chunk, off)) = self.pool_lit(name) {
+                            // Gated copy (epic-cc#816): the pooled flash
+                            // address (k is 0 by the assert above).
+                            self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, off, 0)));
+                            self.emit(format!("    MOVWF 0x{:02X}", dst));
+                            self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, off, 1)));
+                            self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
+                            return;
+                        }
                         let addr = self.global_addr(name);
                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                         self.emit(format!("    MOVWF 0x{:02X}", dst));
@@ -2640,6 +2704,13 @@ impl<'m> Gen<'m> {
                             // No RAM address on small cores: copy the table
                             // through the shared buffer into the param slot.
                             self.emit_stage_const_to_slot(g, pa);
+                        } else if let Some((chunk, off)) = self.pool_lit(g) {
+                            // Gated copy (epic-cc#816): the pooled flash
+                            // address, for the flash-side reader.
+                            self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, off, 0)));
+                            self.emit(format!("    MOVWF 0x{:02X}", pa));
+                            self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, off, 1)));
+                            self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
                         } else {
                             if self.global_is_const(g) {
                                 let size = self.global_size(g);
@@ -2680,6 +2751,16 @@ impl<'m> Gen<'m> {
                         let Base::Global(name) = &base else {
                             unreachable!()
                         };
+                        if let Some((chunk, off)) = self.pool_lit(name) {
+                            // Gated copy (epic-cc#816): pool base plus the
+                            // GEP offset, like the RAM path's add below.
+                            let at = off.wrapping_add(k);
+                            self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, at, 0)));
+                            self.emit(format!("    MOVWF 0x{:02X}", pa));
+                            self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, at, 1)));
+                            self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                            continue;
+                        }
                         let addr = self.global_addr(name).wrapping_add(k);
                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                         self.emit(format!("    MOVWF 0x{:02X}", pa));
@@ -7652,14 +7733,27 @@ pub struct PoolChunk {
 
 /// Pooled flash string table: address-taken const bytes under one base,
 /// emitted alongside the per-const tables. Empty unless the driver was
-/// asked (`--const-pool`), so unflagged output is bit-identical.
+/// asked (`--const-pool`), so unflagged output is bit-identical. `loc`
+/// maps every member (duplicates alias the first occurrence) to its
+/// chunk label plus byte offset, for the epic-cc#816 rewrite.
 pub struct ConstPool {
     pub chunks: Vec<PoolChunk>,
+    loc: HashMap<String, (String, u16)>,
 }
 
 impl ConstPool {
     pub fn empty() -> Self {
-        ConstPool { chunks: Vec::new() }
+        ConstPool {
+            chunks: Vec::new(),
+            loc: HashMap::new(),
+        }
+    }
+
+    /// Pooled address of a member const (epic-cc#816): its chunk label
+    /// plus byte offset, for rewriting LOW/HIGH materializations.
+    /// `None` when the const never pooled (flag off or ineligible).
+    pub fn resolve(&self, name: &str) -> Option<(&str, u16)> {
+        self.loc.get(name).map(|(c, o)| (c.as_str(), *o))
     }
 
     /// Synthesized table globals, one per chunk, for the per-const
@@ -7685,26 +7779,30 @@ impl ConstPool {
 /// members (bytes plus member-local refs) pooled once, whole members
 /// greedy-packed into ≤255-byte chunks. Refs rebase to chunk-local
 /// offsets; targets and addends ride along, since LOW/HIGH literals
-/// resolve independently of where the bytes sit. Deterministic by
-/// construction: epic-cc#816 reuses this to resolve const to
-/// (chunk, offset). Non-flash candidates (mapped, pinned, empty, or
-/// over 255 bytes) never pool.
+/// resolve independently of where the bytes sit. `loc` records every
+/// member (duplicates alias the first occurrence) for the epic-cc#816
+/// rewrite. Eligibility is `iselcore::pool_member`, shared with alloc's
+/// copy gating so both stages agree on membership.
 pub fn build_pool(m: &Module, candidates: &HashSet<String>) -> ConstPool {
     let mut names: Vec<&String> = candidates.iter().collect();
     names.sort();
     let mut chunks: Vec<PoolChunk> = Vec::new();
-    let mut seen: Vec<(Vec<u8>, Vec<(usize, String, u16)>)> = Vec::new();
+    let mut loc: HashMap<String, (String, u16)> = HashMap::new();
+    let mut seen: Vec<(Vec<u8>, Vec<(usize, String, u16)>, String, u16)> = Vec::new();
     for name in names {
         let Some(g) = m.globals.iter().find(|g| &g.name == name) else {
             continue;
         };
-        if !g.is_const || g.addr.is_some() || g.bytes.is_empty() || g.bytes.len() > 255 {
+        if !iselcore::pool_member(g) {
             continue;
         }
-        if seen.iter().any(|(b, r)| *b == g.bytes && *r == g.refs) {
+        if let Some((_, _, chunk, off)) = seen
+            .iter()
+            .find(|(b, r, _, _)| *b == g.bytes && *r == g.refs)
+        {
+            loc.insert(name.clone(), (chunk.clone(), *off));
             continue;
         }
-        seen.push((g.bytes.clone(), g.refs.clone()));
         let start_new = chunks
             .last()
             .map_or(true, |c: &PoolChunk| c.bytes.len() + g.bytes.len() > 255);
@@ -7726,8 +7824,11 @@ pub fn build_pool(m: &Module, candidates: &HashSet<String>) -> ConstPool {
         chunk
             .refs
             .extend(g.refs.iter().map(|(o, t, a)| (base + o, t.clone(), *a)));
+        let at = (chunk.name.clone(), base as u16);
+        seen.push((g.bytes.clone(), g.refs.clone(), at.0.clone(), at.1));
+        loc.insert(name.clone(), at);
     }
-    ConstPool { chunks }
+    ConstPool { chunks, loc }
 }
 
 /// Select instructions for the whole module, producing PIC14 assembly text.
@@ -7981,6 +8082,7 @@ pub fn select_with_locs(
                 addrs,
                 device,
                 staged: &staged,
+                pool: &pool,
                 resolved: &resolved,
                 prov: prov.clone(),
                 scratch,
@@ -8195,6 +8297,7 @@ pub fn select_with_locs(
                 addrs,
                 device,
                 staged: &staged,
+                pool: &pool,
                 resolved: &resolved,
                 prov: prov.clone(),
                 scratch,
@@ -8469,6 +8572,7 @@ pub fn select_with_locs(
                             addrs,
                             device,
                             staged: &staged,
+                            pool: &pool,
                             resolved: &resolved,
                             prov: prov.clone(),
                             scratch,

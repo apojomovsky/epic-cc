@@ -68,9 +68,10 @@ pub struct Cli {
     pub opt_level: OptLevel,
     /// PIC18 code factoring (docs/44); `--no-outline` turns it off.
     pub outline: bool,
-    /// PIC14 pooled flash string table (epic-cc#815); `--const-pool`
-    /// turns it on. Off by default: the pool is additive, so unflagged
-    /// output stays bit-identical.
+    /// PIC14 pooled flash string table (epic-cc#815, addresses and
+    /// gating per epic-cc#816); `--const-pool` turns it on. Off by
+    /// default: the pool is additive, so unflagged output stays
+    /// bit-identical.
     pub const_pool: bool,
 }
 
@@ -98,9 +99,9 @@ usage: epic-cc [options] <input.c|input.cpp>...
                        (smaller flash by default; opt out for timing-critical
                        code or stepping through inline copies)
   --const-pool         PIC14: also emit address-taken const bytes as one
-                       pooled flash table alongside the per-const tables
-                       (epic-cc#815; addresses still resolve per-const
-                       until epic-cc#816)
+                       pooled flash table alongside the per-const tables,
+                       rewrite their addresses to it, and drop their RAM
+                       copies (epic-cc#815, epic-cc#816)
   --report <file>      write the build report as JSON into <file>: flash and
                        RAM use, the clock, and every config field's value
   --f-cpu <hz>         board clock in Hz, the last-resort D-4 source: it must
