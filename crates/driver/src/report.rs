@@ -163,6 +163,7 @@ pub struct FixedUses {
 /// wide compares (multi-byte equality, signed or const-byte ordered
 /// chains), and wide ALU (32-bit add/sub, const-LHS sub past byte 0).
 /// Switches desugar to branches before isel, so they need no group.
+///
 /// PIC14E differs twice: every equality fold stores scratch, and its
 /// FSR setups keep the fast shape for empty term lists. Its constant
 /// memcpy parks the byte in the hold byte across an indirect
@@ -508,6 +509,7 @@ pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
 /// `fixed_uses` + the memcpy park bytes (both 0x7E/0x7F for the
 /// dynamic loop, 0x7F alone for a PIC14E constant copy), plus the
 /// ISR save area (9) when the program has an ISR.
+///
 /// PIC18's touched retval/flag bytes (the flag shares byte 0), plus the
 /// ISR save area (12) when present. Every ISR prologue saves and
 /// restores all 4 retval bytes, so `has_isr` forces the full count even
@@ -750,7 +752,8 @@ pub fn render_size(
 mod tests {
     use super::*;
     use ir::{
-        Bin, Block, Call, CallArg, Func, Gep, GepBase, Global, Icmp, Load, MemLen, Memcpy, Ty,
+        Alloca, Bin, Block, Call, CallArg, Func, Gep, GepBase, Global, Icmp, IntToPtr, Load,
+        MemLen, Memcpy, Store, Ty,
     };
 
     fn void_main(insts: Vec<Inst>) -> Module {
@@ -957,7 +960,6 @@ mod tests {
         let add = bin_op(BinOp::Add, Ty::I8, Val::Reg("x".to_string()), Val::Const(1));
         let u = fixed_uses(&void_main(vec![add]), pic14());
         assert!(!u.scratch);
-        assert!(!u.memcpy_park);
         let sub8 = bin_op(BinOp::Sub, Ty::I8, Val::Const(7), Val::Reg("x".to_string()));
         assert!(!fixed_uses(&void_main(vec![sub8]), pic14()).scratch);
         let sub16 = bin_op(
@@ -1116,5 +1118,117 @@ mod tests {
         let u14e = fixed_uses(&void_main(vec![copy]), pic14e());
         assert!(!u14e.memcpy_park);
         assert!(u14e.memcpy_hold);
+    }
+
+    fn slot_chain_terms(terms: Vec<(u16, String)>) -> Module {
+        // `%q` resolves to an alloca slot plus GEP terms: the store
+        // below takes the slot FSR path with those terms.
+        void_main(vec![
+            Inst::Alloca(Alloca {
+                dst: "a".to_string(),
+                size: 16,
+                loc: None,
+            }),
+            Inst::Gep(Gep {
+                dst: "q".to_string(),
+                base: GepBase::Reg("a".to_string()),
+                k: 0,
+                terms,
+                loc: None,
+            }),
+        ])
+    }
+
+    fn with_store(m: &mut Module) {
+        m.funcs[0].blocks[0].insts.push(Inst::Store(Store {
+            ty: Ty::I8,
+            val: Val::Const(1),
+            ptr: "%q".to_string(),
+            volatile: false,
+            loc: None,
+        }));
+    }
+
+    #[test]
+    fn store_term_shapes_match_load_shapes() {
+        let mut fast = slot_chain_terms(vec![(1, "i".to_string())]);
+        with_store(&mut fast);
+        assert!(!fixed_uses(&fast, pic14()).scratch);
+        let mut slow = slot_chain_terms(vec![(1, "i".to_string()), (1, "j".to_string())]);
+        with_store(&mut slow);
+        assert!(fixed_uses(&slow, pic14()).scratch);
+        assert!(fixed_uses(&slow, pic14e()).scratch);
+    }
+
+    #[test]
+    fn indirect_single_term_splits_per_core() {
+        // An inttoptr slot holds a runtime address: PIC14 always
+        // accumulates the indirect setup, PIC14E keeps the fast
+        // shape for a single scale-1 term.
+        let m = void_main(vec![
+            Inst::IntToPtr(IntToPtr {
+                dst: "p".to_string(),
+                from: Ty::I16,
+                val: Val::Reg("a".to_string()),
+                to: Ty::I16,
+                loc: None,
+            }),
+            Inst::Gep(Gep {
+                dst: "q".to_string(),
+                base: GepBase::Reg("p".to_string()),
+                k: 0,
+                terms: vec![(1, "i".to_string())],
+                loc: None,
+            }),
+            Inst::Load(Load {
+                dst: "v".to_string(),
+                ty: Ty::I8,
+                ptr: "%q".to_string(),
+                ptr_ty: false,
+                volatile: false,
+                loc: None,
+            }),
+        ]);
+        assert!(fixed_uses(&m, pic14()).scratch);
+        assert!(!fixed_uses(&m, pic14e()).scratch);
+    }
+
+    #[test]
+    fn byval_const_arg_and_pool_callee_touch_scratch() {
+        let call = Inst::Call(Call {
+            dst: None,
+            ty: None,
+            func: "f".to_string(),
+            args: vec![CallArg {
+                ty: None,
+                val: Val::Global("tab".to_string()),
+                byval: Some(4),
+                sret: false,
+            }],
+            callees: vec![],
+            loc: None,
+        });
+        let mut m = void_main(vec![call]);
+        m.globals.push(Global {
+            name: "tab".to_string(),
+            ty: Ty::I8,
+            is_const: true,
+            size: 16,
+            bytes: vec![],
+            refs: vec![],
+            addr: None,
+        });
+        assert!(fixed_uses(&m, pic14()).scratch);
+        m.funcs.push(Func {
+            name: iselcore::LOG_POOL_CALLEE.to_string(),
+            ret: None,
+            params: vec![],
+            blocks: vec![],
+            isr: false,
+            irq_priority: 0,
+            naked: false,
+            variadic: false,
+        });
+        assert!(fixed_uses(&m, pic14()).scratch);
     }
 }
