@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 
 use ir::{
     Alloca, Bin, BinOp, Block, Br, Call, CallArg, FBinOp, FloatConvOp, Func, Gep, GepBase, Global,
-    Icmp, Inst, IntToPtr, MemLen, Module, Param, Phi, Select, Sext, Trunc, Ty, Val, Zext,
+    Icmp, Inst, IntToPtr, MemLen, Module, Param, Phi, Select, Sext, SrcLoc, Trunc, Ty, Val, Zext,
 };
 /// Whole-module lowering: scalar ops that need runtime support become calls
 /// to injected routine functions (see module docs).
@@ -344,242 +344,52 @@ fn sink_ptr_select_funcs(m: Module) -> Module {
 /// plain global, the store non-volatile. Anything else keeps the expanded
 /// loop, which is always correct.
 fn share_decimal_loops(m: Module) -> (Module, bool) {
-    let mut fired = false;
+    // Detection first, over borrowed functions: the rewrite only pays when
+    // at least two sites share the helper. One site would grow (a call
+    // plus the helper body cost more than the inline loop), so a lone loop
+    // stays expanded. Multi-caller repetition only, per the ticket scope.
+    let mut detected: Vec<Vec<(usize, DecimalSite)>> = Vec::new();
+    let mut total = 0;
+    for f in &m.funcs {
+        let sites = find_decimal_sites(f);
+        total += sites.len();
+        detected.push(sites);
+    }
+    if total < 2 {
+        return (m, false);
+    }
     let mut funcs = Vec::with_capacity(m.funcs.len());
-    for f in m.funcs {
-        // Successor sets, for the single-preheader check (owned labels: the
-        // blocks move below).
-        let idx: HashMap<String, usize> = f
-            .blocks
-            .iter()
-            .enumerate()
-            .map(|(i, b)| (b.label.clone(), i))
-            .collect();
-        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); f.blocks.len()];
-        for (i, b) in f.blocks.iter().enumerate() {
-            let succs: Vec<&str> = match b.insts.last() {
-                Some(Inst::Br(br)) => vec![br.target.as_str()],
-                Some(Inst::BrCond(br)) => vec![br.t.as_str(), br.f.as_str()],
-                Some(Inst::Switch(sw)) => {
-                    let mut v: Vec<&str> = sw.cases.iter().map(|(_, t)| t.as_str()).collect();
-                    v.push(sw.default.as_str());
-                    v
-                }
-                _ => Vec::new(),
-            };
-            for s in succs {
-                if let Some(&j) = idx.get(s) {
-                    preds[j].push(i);
-                }
-            }
-        }
-        // Uses per block, so loop-locality is checkable: every intermediate
-        // must be consumed inside the header (the count `n1` keeps its name
-        // as the call dst, so its outside uses keep working).
-        let mut uses: HashMap<String, Vec<usize>> = HashMap::new();
-        for (i, b) in f.blocks.iter().enumerate() {
-            for inst in &b.insts {
-                for r in inst_reads(inst) {
-                    uses.entry(r).or_default().push(i);
-                }
-            }
-        }
-        let only_in =
-            |r: &str, h: usize| -> bool { uses.get(r).is_some_and(|v| v.iter().all(|&i| i == h)) };
+    for (f, sites) in m.funcs.into_iter().zip(detected) {
         let mut blocks = f.blocks;
-        for h in 0..blocks.len() {
-            let pre = preds[h].iter().filter(|&&p| p != h).count();
-            if !preds[h].contains(&h) || pre != 1 {
-                continue;
-            }
-            let hlabel = blocks[h].label.clone();
-            let insts = &blocks[h].insts;
-            if insts.len() != 13 {
-                continue;
-            }
-            // The two phis, either order: i32 value from the preheader, i8
-            // count from zero.
-            let mut vphi: Option<&Phi> = None;
-            let mut nphi: Option<&Phi> = None;
-            for inst in &insts[0..2] {
-                let Inst::Phi(ph) = inst else { continue };
-                if ph.ty == Ty::I32 && vphi.is_none() {
-                    vphi = Some(ph);
-                } else if ph.ty == Ty::I8 && nphi.is_none() {
-                    nphi = Some(ph);
-                }
-            }
-            let (Some(vphi), Some(nphi)) = (vphi, nphi) else {
-                continue;
-            };
-            let Some((vq, vv0)) = phi_arms(vphi, &hlabel) else {
-                continue;
-            };
-            let Some((nn1, nzero)) = phi_arms(nphi, &hlabel) else {
-                continue;
-            };
-            if nzero != Val::Const(0) {
-                continue;
-            }
-            let Val::Reg(v0) = vv0 else { continue };
-            let Val::Reg(n1) = nn1 else { continue };
-            let [v, n] = [vphi.dst.clone(), nphi.dst.clone()];
-            // udiv, mul, add, trunc, or-48, zext, gep, store, bump, ult-10.
-            let Inst::Bin(udiv) = &insts[2] else { continue };
-            if udiv.op != BinOp::UDiv
-                || udiv.ty != Ty::I32
-                || udiv.a != Val::Reg(v.clone())
-                || udiv.b != Val::Const(10)
-            {
-                continue;
-            }
-            let q = udiv.dst.clone();
-            // The loop carries the quotient: the value phi's self arm is
-            // the udiv dst, anything else is a different loop.
-            if vq != Val::Reg(q.clone()) {
-                continue;
-            }
-            let Inst::Bin(mul) = &insts[3] else { continue };
-            if mul.op != BinOp::Mul || mul.ty != Ty::I32 || bin_reg_const(mul, &q, 246).is_none() {
-                continue;
-            }
-            let m = mul.dst.clone();
-            let Inst::Bin(add) = &insts[4] else { continue };
-            if add.op != BinOp::Add || add.ty != Ty::I32 {
-                continue;
-            }
-            let arms = [&add.a, &add.b].map(|a| match a {
-                Val::Reg(r) => Some(r.as_str()),
-                _ => None,
-            });
-            if !arms.contains(&Some(m.as_str())) || !arms.contains(&Some(v.as_str())) {
-                continue;
-            }
-            let s = add.dst.clone();
-            let Inst::Trunc(tr) = &insts[5] else { continue };
-            if tr.from != Ty::I32 || tr.to != Ty::I8 || tr.val != Val::Reg(s.clone()) {
-                continue;
-            }
-            let r = tr.dst.clone();
-            let Inst::Bin(or) = &insts[6] else { continue };
-            if or.op != BinOp::Or || or.ty != Ty::I8 {
-                continue;
-            }
-            let oarms = [&or.a, &or.b].map(|a| match a {
-                Val::Reg(x) => Some(x.as_str()),
-                _ => None,
-            });
-            if !oarms.contains(&Some(r.as_str())) {
-                continue;
-            }
-            let is48 = [&or.a, &or.b].iter().any(|a| **a == Val::Const(48));
-            if !is48 {
-                continue;
-            }
-            let d = or.dst.clone();
-            let Inst::Zext(zx) = &insts[7] else { continue };
-            if zx.from != Ty::I8 || zx.to != Ty::I16 || zx.val != Val::Reg(n.clone()) {
-                continue;
-            }
-            let ix = zx.dst.clone();
-            let Inst::Gep(gp) = &insts[8] else { continue };
-            let GepBase::Global(buf) = &gp.base else {
-                continue;
-            };
-            if gp.k != 0 || gp.terms != vec![(1u16, ix.clone())] {
-                continue;
-            }
-            let pp = gp.dst.clone();
-            let Inst::Store(st) = &insts[9] else { continue };
-            if st.ty != Ty::I8
-                || st.val != Val::Reg(d.clone())
-                || st.ptr.strip_prefix('%').unwrap_or(&st.ptr) != pp
-                || st.volatile
-            {
-                continue;
-            }
-            let Inst::Bin(bump) = &insts[10] else {
-                continue;
-            };
-            if bump.op != BinOp::Add || bump.ty != Ty::I8 {
-                continue;
-            }
-            let barms = [&bump.a, &bump.b].map(|a| match a {
-                Val::Reg(x) => Some(x.as_str()),
-                _ => None,
-            });
-            if !barms.contains(&Some(n.as_str())) {
-                continue;
-            }
-            let is1 = [&bump.a, &bump.b].iter().any(|a| **a == Val::Const(1));
-            if !is1 || bump.dst != n1 {
-                continue;
-            }
-            let Inst::Icmp(ic) = &insts[11] else { continue };
-            if ic.pred != "ult" || ic.ty != Ty::I32 {
-                continue;
-            }
-            let carms = [&ic.a, &ic.b].map(|a| match a {
-                Val::Reg(x) => Some(x.as_str()),
-                _ => None,
-            });
-            if !carms.contains(&Some(v.as_str())) {
-                continue;
-            }
-            let is10 = [&ic.a, &ic.b].iter().any(|a| **a == Val::Const(10));
-            if !is10 {
-                continue;
-            }
-            let cc = ic.dst.clone();
-            let Inst::BrCond(br) = &insts[12] else {
-                continue;
-            };
-            if br.cond != Val::Reg(cc.clone()) || br.f != hlabel {
-                continue;
-            }
-            let exit = br.t.clone();
-            if exit == hlabel {
-                continue;
-            }
-            // Loop-locality: every intermediate dies in the header. The
-            // count keeps its name on the call, so its outside uses keep
-            // working; the entry value only gains a use in the header, so
-            // neither is constrained.
-            if ![v, n, q, m, s, r, d, ix, pp, cc]
-                .iter()
-                .all(|x| only_in(x, h))
-            {
-                continue;
-            }
+        for (h, site) in sites {
             let call = Inst::Call(Call {
-                dst: Some(n1.clone()),
+                dst: Some(site.n1.clone()),
                 ty: Some(Ty::I8),
                 func: "__udec_u32".to_string(),
                 args: vec![
                     CallArg {
                         ty: Some(Ty::I32),
-                        val: Val::Reg(v0.clone()),
+                        val: Val::Reg(site.v0.clone()),
                         byval: None,
                         sret: false,
                     },
                     CallArg {
                         ty: None,
-                        val: Val::Global(buf.clone()),
+                        val: Val::Global(site.buf.clone()),
                         byval: None,
                         sret: false,
                     },
                 ],
                 callees: Vec::new(),
-                loc: udiv.loc.clone(),
+                loc: site.udiv_loc.clone(),
             });
             blocks[h].insts = vec![
                 call,
                 Inst::Br(Br {
-                    target: exit,
-                    loc: br.loc.clone(),
+                    target: site.exit.clone(),
+                    loc: site.br_loc.clone(),
                 }),
             ];
-            fired = true;
         }
         funcs.push(Func {
             name: f.name,
@@ -598,8 +408,241 @@ fn share_decimal_loops(m: Module) -> (Module, bool) {
             funcs,
             module_asm: m.module_asm,
         },
-        fired,
+        true,
     )
+}
+
+/// One decimal-loop header matched for sharing: the call arguments plus
+/// the exit edge and source locations the rewritten block keeps.
+struct DecimalSite {
+    v0: String,
+    n1: String,
+    buf: String,
+    exit: String,
+    udiv_loc: Option<SrcLoc>,
+    br_loc: Option<SrcLoc>,
+}
+
+/// Every decimal-digit-loop header in one function, without rewriting.
+fn find_decimal_sites(f: &Func) -> Vec<(usize, DecimalSite)> {
+    // Successor sets, for the single-preheader check (owned labels: the
+    // blocks move below).
+    let idx: HashMap<String, usize> = f
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label.clone(), i))
+        .collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); f.blocks.len()];
+    for (i, b) in f.blocks.iter().enumerate() {
+        let succs: Vec<&str> = match b.insts.last() {
+            Some(Inst::Br(br)) => vec![br.target.as_str()],
+            Some(Inst::BrCond(br)) => vec![br.t.as_str(), br.f.as_str()],
+            Some(Inst::Switch(sw)) => {
+                let mut v: Vec<&str> = sw.cases.iter().map(|(_, t)| t.as_str()).collect();
+                v.push(sw.default.as_str());
+                v
+            }
+            _ => Vec::new(),
+        };
+        for s in succs {
+            if let Some(&j) = idx.get(s) {
+                preds[j].push(i);
+            }
+        }
+    }
+    // Uses per block, so loop-locality is checkable: every intermediate
+    // must be consumed inside the header (the count `n1` keeps its name
+    // as the call dst, so its outside uses keep working).
+    let mut uses: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, b) in f.blocks.iter().enumerate() {
+        for inst in &b.insts {
+            for r in inst_reads(inst) {
+                uses.entry(r).or_default().push(i);
+            }
+        }
+    }
+    let only_in =
+        |r: &str, h: usize| -> bool { uses.get(r).is_some_and(|v| v.iter().all(|&i| i == h)) };
+    let blocks = &f.blocks;
+    let mut sites = Vec::new();
+    for h in 0..blocks.len() {
+        let pre = preds[h].iter().filter(|&&p| p != h).count();
+        if !preds[h].contains(&h) || pre != 1 {
+            continue;
+        }
+        let hlabel = blocks[h].label.clone();
+        let insts = &blocks[h].insts;
+        if insts.len() != 13 {
+            continue;
+        }
+        // The two phis, either order: i32 value from the preheader, i8
+        // count from zero.
+        let mut vphi: Option<&Phi> = None;
+        let mut nphi: Option<&Phi> = None;
+        for inst in &insts[0..2] {
+            let Inst::Phi(ph) = inst else { continue };
+            if ph.ty == Ty::I32 && vphi.is_none() {
+                vphi = Some(ph);
+            } else if ph.ty == Ty::I8 && nphi.is_none() {
+                nphi = Some(ph);
+            }
+        }
+        let (Some(vphi), Some(nphi)) = (vphi, nphi) else {
+            continue;
+        };
+        let Some((vq, vv0)) = phi_arms(vphi, &hlabel) else {
+            continue;
+        };
+        let Some((nn1, nzero)) = phi_arms(nphi, &hlabel) else {
+            continue;
+        };
+        if nzero != Val::Const(0) {
+            continue;
+        }
+        let Val::Reg(v0) = vv0 else { continue };
+        let Val::Reg(n1) = nn1 else { continue };
+        let [v, n] = [vphi.dst.clone(), nphi.dst.clone()];
+        // udiv, mul, add, trunc, or-48, zext, gep, store, bump, ult-10.
+        let Inst::Bin(udiv) = &insts[2] else { continue };
+        if udiv.op != BinOp::UDiv
+            || udiv.ty != Ty::I32
+            || udiv.a != Val::Reg(v.clone())
+            || udiv.b != Val::Const(10)
+        {
+            continue;
+        }
+        let q = udiv.dst.clone();
+        // The loop carries the quotient: the value phi's self arm is
+        // the udiv dst, anything else is a different loop.
+        if vq != Val::Reg(q.clone()) {
+            continue;
+        }
+        let Inst::Bin(mul) = &insts[3] else { continue };
+        if mul.op != BinOp::Mul || mul.ty != Ty::I32 || bin_reg_const(mul, &q, 246).is_none() {
+            continue;
+        }
+        let m = mul.dst.clone();
+        let Inst::Bin(add) = &insts[4] else { continue };
+        if add.op != BinOp::Add || add.ty != Ty::I32 {
+            continue;
+        }
+        let arms = [&add.a, &add.b].map(|a| match a {
+            Val::Reg(r) => Some(r.as_str()),
+            _ => None,
+        });
+        if !arms.contains(&Some(m.as_str())) || !arms.contains(&Some(v.as_str())) {
+            continue;
+        }
+        let s = add.dst.clone();
+        let Inst::Trunc(tr) = &insts[5] else { continue };
+        if tr.from != Ty::I32 || tr.to != Ty::I8 || tr.val != Val::Reg(s.clone()) {
+            continue;
+        }
+        let r = tr.dst.clone();
+        let Inst::Bin(or) = &insts[6] else { continue };
+        if or.op != BinOp::Or || or.ty != Ty::I8 {
+            continue;
+        }
+        let oarms = [&or.a, &or.b].map(|a| match a {
+            Val::Reg(x) => Some(x.as_str()),
+            _ => None,
+        });
+        if !oarms.contains(&Some(r.as_str())) {
+            continue;
+        }
+        let is48 = [&or.a, &or.b].iter().any(|a| **a == Val::Const(48));
+        if !is48 {
+            continue;
+        }
+        let d = or.dst.clone();
+        let Inst::Zext(zx) = &insts[7] else { continue };
+        if zx.from != Ty::I8 || zx.to != Ty::I16 || zx.val != Val::Reg(n.clone()) {
+            continue;
+        }
+        let ix = zx.dst.clone();
+        let Inst::Gep(gp) = &insts[8] else { continue };
+        let GepBase::Global(buf) = &gp.base else {
+            continue;
+        };
+        if gp.k != 0 || gp.terms != vec![(1u16, ix.clone())] {
+            continue;
+        }
+        let pp = gp.dst.clone();
+        let Inst::Store(st) = &insts[9] else { continue };
+        if st.ty != Ty::I8
+            || st.val != Val::Reg(d.clone())
+            || st.ptr.strip_prefix('%').unwrap_or(&st.ptr) != pp
+            || st.volatile
+        {
+            continue;
+        }
+        let Inst::Bin(bump) = &insts[10] else {
+            continue;
+        };
+        if bump.op != BinOp::Add || bump.ty != Ty::I8 {
+            continue;
+        }
+        let barms = [&bump.a, &bump.b].map(|a| match a {
+            Val::Reg(x) => Some(x.as_str()),
+            _ => None,
+        });
+        if !barms.contains(&Some(n.as_str())) {
+            continue;
+        }
+        let is1 = [&bump.a, &bump.b].iter().any(|a| **a == Val::Const(1));
+        if !is1 || bump.dst != n1 {
+            continue;
+        }
+        let Inst::Icmp(ic) = &insts[11] else { continue };
+        if ic.pred != "ult" || ic.ty != Ty::I32 {
+            continue;
+        }
+        let carms = [&ic.a, &ic.b].map(|a| match a {
+            Val::Reg(x) => Some(x.as_str()),
+            _ => None,
+        });
+        if !carms.contains(&Some(v.as_str())) {
+            continue;
+        }
+        let is10 = [&ic.a, &ic.b].iter().any(|a| **a == Val::Const(10));
+        if !is10 {
+            continue;
+        }
+        let cc = ic.dst.clone();
+        let Inst::BrCond(br) = &insts[12] else {
+            continue;
+        };
+        if br.cond != Val::Reg(cc.clone()) || br.f != hlabel {
+            continue;
+        }
+        let exit = br.t.clone();
+        if exit == hlabel {
+            continue;
+        }
+        // Loop-locality: every intermediate dies in the header. The
+        // count keeps its name on the call, so its outside uses keep
+        // working; the entry value only gains a use in the header, so
+        // neither is constrained.
+        if ![v, n, q, m, s, r, d, ix, pp, cc]
+            .iter()
+            .all(|x| only_in(x, h))
+        {
+            continue;
+        }
+        sites.push((
+            h,
+            DecimalSite {
+                v0,
+                n1,
+                buf: buf.clone(),
+                exit,
+                udiv_loc: udiv.loc.clone(),
+                br_loc: br.loc.clone(),
+            },
+        ));
+    }
+    sites
 }
 
 /// The `(self-reg, outside-val)` arms of a loop phi against header `h`:
