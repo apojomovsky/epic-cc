@@ -9507,6 +9507,10 @@ pub fn select_with_opts(
             }
         }
         let mut init: Vec<String> = Vec::new();
+        // The init writes run straight-line with no labels or calls between
+        // them, so one select per bank run suffices; the reset BSR is
+        // unknown here, hence `None` for the first banked byte.
+        let mut init_bsr: Option<u8> = None;
         for g in &m.globals {
             // Const globals living in RAM copy their bytes down; a mutable
             // global with an initializer also needs its bytes written, or it
@@ -9555,7 +9559,10 @@ pub fn select_with_opts(
                         init.push(format!("    MOVWF 0x{addr:03X},A"));
                     } else {
                         let bsr = (addr >> 8) as u8;
-                        init.push(format!("    MOVLB 0x{bsr:02X}"));
+                        if init_bsr != Some(bsr) {
+                            init.push(format!("    MOVLB 0x{bsr:02X}"));
+                            init_bsr = Some(bsr);
+                        }
                         init.push(format!("    MOVWF 0x{addr:03X},B"));
                     }
                 }

@@ -5172,6 +5172,54 @@ fn const_to_ram_init_ram_ref_materializes_the_alloc_address() {
         "a RAM global has no label to resolve:\n{asm}"
     );
 }
+
+#[test]
+fn ram_init_selects_once_per_bank_run() {
+    // Adjacent banked initializer bytes share one MOVLB, and an
+    // access-bank write between them must not cost a re-select: only a
+    // bank change needs a fresh one. A dropped select would write the
+    // byte 0x100 off, silently.
+    let m = with_bytes(
+        with_bytes(
+            with_bytes(
+                parse(
+                    "global a i8\nglobal b i8\nglobal c i8\n\
+                     fn main(void) ()\n  block entry:\n    ret void\n",
+                ),
+                "a",
+                &[0x11],
+            ),
+            "b",
+            &[0x22],
+        ),
+        "c",
+        &[0x33],
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("a", 0x1F0), ("b", 0x030), ("c", 0x1F1)]),
+        None,
+    );
+    let window = asm
+        .split("__start:")
+        .nth(1)
+        .expect("__start label")
+        .split("    call main")
+        .next()
+        .expect("__start must call main");
+    assert_eq!(
+        window.matches("MOVLB").count(),
+        1,
+        "one select for the bank-1 run, none for the access byte:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    assert_eq!(p.ram()[0x1F0], 0x11, "banked byte a");
+    assert_eq!(p.ram()[0x030], 0x22, "access byte b");
+    assert_eq!(p.ram()[0x1F1], 0x33, "banked byte c after the access write");
+}
 // P7 float tests: bit-exact sim per recipe (add, mul, div, cmp, conversions, RNE)
 fn f32_le(x: f32) -> [u8; 4] {
     x.to_bits().to_le_bytes()
