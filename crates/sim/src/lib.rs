@@ -3438,6 +3438,7 @@ mod pic18_timer2 {
     #[test]
     fn timer_off_sets_no_flag() {
         let mut pic = Pic18::new(vec![0u16; 64]);
+        pic.set_timer2_enabled(true);
         pic.ram[PIC18_PR2] = 0;
         pic.ram[PIC18_PIE1] = PIC18_TMR2IE;
         pic.ram[PIC18_INTCON] = PIC18_GIEH;
