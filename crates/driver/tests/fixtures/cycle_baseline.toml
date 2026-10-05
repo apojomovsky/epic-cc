@@ -469,6 +469,21 @@ flash_words = 830
 ram_bytes = 131
 
 [[entry]]
+name = "scen-control-pass-18f4550"
+device = "18F4550"
+cycles = 824
+flash_words = 4092
+ram_bytes = 653
+
+[[entry]]
+name = "scen-control-pass-18f4550"
+device = "18F4550"
+profile = "O2"
+cycles = 766
+flash_words = 4307
+ram_bytes = 749
+
+[[entry]]
 name = "speed-isr-18f4550-latency"
 device = "18F4550"
 cycles = 39

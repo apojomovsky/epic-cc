@@ -47,9 +47,17 @@ of an interrupted run against a clean baseline run.
   so no shift of a negative value is needed).
 - `scen-pid-update`: one `epic_pid_update` through the vendored epic-pid
   sources (PIC18 only, like the demo it comes from).
+- `scen-control-pass`: one `control_demo_task_control` pass through the
+  vendored control demo sources (PIC18 only, like the demo it comes
+  from). Init only programs Timer2 and never enables GIE, and the pass
+  injects its ADC reading through the demo's sim override, so it runs
+  ISR-free with no timer model. Note the vendor's `__EPIC_CC__`
+  `epic_adcfilter_oversample` stub returns 0 under our compiler, so the
+  pass pins average, PID and PWM with a zero sample; the injected value
+  only takes effect under the reference compiler.
 - `speed-isr-*`: interrupt latency plus round trip per core.
 
-Menu-tick and control-pass scenarios are deliberately absent: both run
-through `epic_tick_delay_ms`, which spins on a timer flag the sim does
-not model yet (epic-cc#859). They become follow-up rows once the timer
-model lands.
+Menu-tick is still absent: `menu_demo_init` needs the Timer2 tick for
+its LCD startup delays, and the first tick ISR traps in a miscompiled
+callback dispatch (epic-cc#873 notes). It becomes a row once that
+dispatch is fixed.
