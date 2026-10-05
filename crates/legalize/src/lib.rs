@@ -44,11 +44,24 @@
 use std::collections::{HashMap, HashSet};
 
 use ir::{
-    Alloca, Bin, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Gep, GepBase, Global,
-    Icmp, Inst, IntToPtr, MemLen, Module, Param, Select, Sext, Trunc, Ty, Val, Zext,
+    Alloca, Bin, BinOp, Block, Br, Call, CallArg, FBinOp, FloatConvOp, Func, Gep, GepBase, Global,
+    Icmp, Inst, IntToPtr, MemLen, Module, Param, Phi, Select, Sext, SrcLoc, Trunc, Ty, Val, Zext,
 };
-
+/// Whole-module lowering: scalar ops that need runtime support become calls
+/// to injected routine functions (see module docs).
 pub fn legalize(m: Module) -> Module {
+    legalize_inner(m, false)
+}
+
+/// PIC18 entry: shares each u32 decimal-digit loop as one call to the
+/// `__udec_u32` helper before the generic lowering (epic-cc#722). The
+/// helper body exists only in the PIC18 backend, so every other core uses
+/// the plain entry and its IR stays byte-identical.
+pub fn legalize_pic18(m: Module) -> Module {
+    legalize_inner(m, true)
+}
+
+fn legalize_inner(m: Module, pic18: bool) -> Module {
     // Interrupt duplication happens in two layers. User functions split
     // here, before the lowering loop, because their calls already exist.
     // The runtime routines split after it (`split_isr_routines`), because
@@ -58,9 +71,29 @@ pub fn legalize(m: Module) -> Module {
     // (they all read the same shared storage, epic-cc#568).
     let (m, stored_lo, stored_hi, spellings) = duplicate_isr_shared(m);
     let m = sink_ptr_select_funcs(m);
+    // The decimal loops become one shared routine call on the PIC18 entry
+    // only. Runs before `narrow_div_rem_tails`, which would otherwise
+    // narrow each loop's multiply in place and hide the whole-loop shape.
+    let (m, udec) = if pic18 {
+        share_decimal_loops(m)
+    } else {
+        (m, false)
+    };
+    // The counted bench loop shares on a single site (see `BenchSite`).
+    let (m, bench) = if pic18 {
+        share_bench_loops(m)
+    } else {
+        (m, false)
+    };
     let m = narrow_div_rem_tails(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
+    if udec {
+        used.push("__udec_u32".to_string());
+    }
+    if bench {
+        used.push("__udec_u16_5".to_string());
+    }
     // Fresh SSA names for the fcmp materialization intermediates (the call
     // dst and the icmp temps), seeded with every name the module defines so
     // each tree avoids collision with a user reg.
@@ -297,6 +330,637 @@ fn sink_ptr_select_funcs(m: Module) -> Module {
         globals: m.globals,
         funcs,
         module_asm: m.module_asm,
+    }
+}
+
+/// Shares each u32 decimal-digit loop as one `__udec_u32` call (epic-cc#722).
+///
+/// clang emits a `put_udec`-style digit loop as a single-block do-while:
+/// an i32 value phi and an i8 count phi, `udiv i32 v, 10`, `mul i32 q,
+/// 246`, the truncating add, `or 48`, a `zext` index into a byte-buffer
+/// global, a non-volatile digit store, the count bump, and an `ult v, 10`
+/// back-edge. The TU-static emitter inlines into every decimal function,
+/// so the loop repeats per emitter with only slot addresses changed, and
+/// no text-level factorer can share the copies. Rewrites each matching
+/// header into `%n = call i8 @__udec_u32(i32 %v0, ptr @buf)` plus a direct
+/// branch to the exit block; the exit's `n == 0` check stays (always
+/// false, one dead compare) so the rewrite touches one block only. Returns
+/// whether sharing fired, so the caller records the routine. Firing needs
+/// at least two sites module-wide: one lone loop stays expanded, since a
+/// call plus the helper body cost more than the inline loop.
+///
+/// Fires only when the shape is exact and loop-local: a self-edge plus one
+/// preheader, the value phi fed from that preheader, the count phi from
+/// zero, every intermediate single-use inside the header, the buffer a
+/// plain global, the store non-volatile. Anything else keeps the expanded
+/// loop, which is always correct.
+fn share_decimal_loops(m: Module) -> (Module, bool) {
+    // Detection first, over borrowed functions: the rewrite only pays when
+    // at least two sites share the helper. One site would grow (a call
+    // plus the helper body cost more than the inline loop), so a lone loop
+    // stays expanded. Multi-caller repetition only, per the ticket scope.
+    let mut detected: Vec<Vec<(usize, DecimalSite)>> = Vec::new();
+    let mut total = 0;
+    for f in &m.funcs {
+        let sites = find_decimal_sites(f);
+        total += sites.len();
+        detected.push(sites);
+    }
+    if total < 2 {
+        return (m, false);
+    }
+    let mut funcs = Vec::with_capacity(m.funcs.len());
+    for (f, sites) in m.funcs.into_iter().zip(detected) {
+        let mut blocks = f.blocks;
+        for (h, site) in sites {
+            let call = Inst::Call(Call {
+                dst: Some(site.n1.clone()),
+                ty: Some(Ty::I8),
+                func: "__udec_u32".to_string(),
+                args: vec![
+                    CallArg {
+                        ty: Some(Ty::I32),
+                        val: Val::Reg(site.v0.clone()),
+                        byval: None,
+                        sret: false,
+                    },
+                    CallArg {
+                        ty: None,
+                        val: Val::Global(site.buf.clone()),
+                        byval: None,
+                        sret: false,
+                    },
+                ],
+                callees: Vec::new(),
+                loc: site.udiv_loc.clone(),
+            });
+            blocks[h].insts = vec![
+                call,
+                Inst::Br(Br {
+                    target: site.exit.clone(),
+                    loc: site.br_loc.clone(),
+                }),
+            ];
+        }
+        funcs.push(Func {
+            name: f.name,
+            ret: f.ret,
+            params: f.params,
+            blocks,
+            isr: f.isr,
+            irq_priority: f.irq_priority,
+            naked: f.naked,
+            variadic: f.variadic,
+        });
+    }
+    (
+        Module {
+            globals: m.globals,
+            funcs,
+            module_asm: m.module_asm,
+        },
+        true,
+    )
+}
+
+/// Rewrites every counted bench loop into a void `__udec_u16_5` call
+/// (epic-cc#722). Fires on a single site: see `BenchSite` for why the bench
+/// row shrinks anyway.
+fn share_bench_loops(m: Module) -> (Module, bool) {
+    let mut detected: Vec<Vec<(usize, BenchSite)>> = Vec::new();
+    let mut total = 0;
+    for f in &m.funcs {
+        let sites = find_bench_sites(f);
+        total += sites.len();
+        detected.push(sites);
+    }
+    if total < 1 {
+        return (m, false);
+    }
+    let mut funcs = Vec::with_capacity(m.funcs.len());
+    for (f, sites) in m.funcs.into_iter().zip(detected) {
+        let mut blocks = f.blocks;
+        for (h, site) in sites {
+            let call = Inst::Call(Call {
+                dst: None,
+                ty: None,
+                func: "__udec_u16_5".to_string(),
+                args: vec![
+                    CallArg {
+                        ty: Some(Ty::I16),
+                        val: Val::Reg(site.v0.clone()),
+                        byval: None,
+                        sret: false,
+                    },
+                    CallArg {
+                        ty: None,
+                        val: Val::Global(site.buf.clone()),
+                        byval: None,
+                        sret: false,
+                    },
+                ],
+                callees: Vec::new(),
+                loc: site.udiv_loc.clone(),
+            });
+            blocks[h].insts = vec![
+                call,
+                Inst::Br(Br {
+                    target: site.exit.clone(),
+                    loc: site.br_loc.clone(),
+                }),
+            ];
+        }
+        funcs.push(Func {
+            name: f.name,
+            ret: f.ret,
+            params: f.params,
+            blocks,
+            isr: f.isr,
+            irq_priority: f.irq_priority,
+            naked: f.naked,
+            variadic: f.variadic,
+        });
+    }
+    (
+        Module {
+            globals: m.globals,
+            funcs,
+            module_asm: m.module_asm,
+        },
+        true,
+    )
+}
+
+/// One decimal-loop header matched for sharing: the call arguments plus
+/// the exit edge and source locations the rewritten block keeps.
+struct DecimalSite {
+    v0: String,
+    n1: String,
+    buf: String,
+    exit: String,
+    udiv_loc: Option<SrcLoc>,
+    br_loc: Option<SrcLoc>,
+}
+
+/// Predecessor indices per block, by label. Unknown targets (calls to
+/// labels the listing cannot see) contribute no edge.
+fn block_preds(f: &Func) -> Vec<Vec<usize>> {
+    // Successor sets, for the single-preheader check (owned labels: the
+    // blocks move below).
+    let idx: HashMap<String, usize> = f
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label.clone(), i))
+        .collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); f.blocks.len()];
+    for (i, b) in f.blocks.iter().enumerate() {
+        let succs: Vec<&str> = match b.insts.last() {
+            Some(Inst::Br(br)) => vec![br.target.as_str()],
+            Some(Inst::BrCond(br)) => vec![br.t.as_str(), br.f.as_str()],
+            Some(Inst::Switch(sw)) => {
+                let mut v: Vec<&str> = sw.cases.iter().map(|(_, t)| t.as_str()).collect();
+                v.push(sw.default.as_str());
+                v
+            }
+            _ => Vec::new(),
+        };
+        for s in succs {
+            if let Some(&j) = idx.get(s) {
+                preds[j].push(i);
+            }
+        }
+    }
+    preds
+}
+
+/// Registers read per block index, for loop-locality checks.
+fn block_uses(f: &Func) -> HashMap<String, Vec<usize>> {
+    let mut uses: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, b) in f.blocks.iter().enumerate() {
+        for inst in &b.insts {
+            for r in inst_reads(inst) {
+                uses.entry(r).or_default().push(i);
+            }
+        }
+    }
+    uses
+}
+
+/// Every decimal-digit-loop header in one function, without rewriting.
+fn find_decimal_sites(f: &Func) -> Vec<(usize, DecimalSite)> {
+    let preds = block_preds(f);
+    // Uses per block, so loop-locality is checkable: every intermediate
+    // must be consumed inside the header (the count `n1` keeps its name
+    // as the call dst, so its outside uses keep working).
+    let uses = block_uses(f);
+    let only_in =
+        |r: &str, h: usize| -> bool { uses.get(r).is_some_and(|v| v.iter().all(|&i| i == h)) };
+    let blocks = &f.blocks;
+    let mut sites = Vec::new();
+    for h in 0..blocks.len() {
+        let pre = preds[h].iter().filter(|&&p| p != h).count();
+        if !preds[h].contains(&h) || pre != 1 {
+            continue;
+        }
+        let hlabel = blocks[h].label.clone();
+        let insts = &blocks[h].insts;
+        if insts.len() != 13 {
+            continue;
+        }
+        // The two phis, either order: i32 value from the preheader, i8
+        // count from zero.
+        let mut vphi: Option<&Phi> = None;
+        let mut nphi: Option<&Phi> = None;
+        for inst in &insts[0..2] {
+            let Inst::Phi(ph) = inst else { continue };
+            if ph.ty == Ty::I32 && vphi.is_none() {
+                vphi = Some(ph);
+            } else if ph.ty == Ty::I8 && nphi.is_none() {
+                nphi = Some(ph);
+            }
+        }
+        let (Some(vphi), Some(nphi)) = (vphi, nphi) else {
+            continue;
+        };
+        let Some((vq, vv0)) = phi_arms(vphi, &hlabel) else {
+            continue;
+        };
+        let Some((nn1, nzero)) = phi_arms(nphi, &hlabel) else {
+            continue;
+        };
+        if nzero != Val::Const(0) {
+            continue;
+        }
+        let Val::Reg(v0) = vv0 else { continue };
+        let Val::Reg(n1) = nn1 else { continue };
+        let [v, n] = [vphi.dst.clone(), nphi.dst.clone()];
+        // udiv, mul, add, trunc, or-48, zext, gep, store, bump, ult-10.
+        let Inst::Bin(udiv) = &insts[2] else { continue };
+        if udiv.op != BinOp::UDiv
+            || udiv.ty != Ty::I32
+            || udiv.a != Val::Reg(v.clone())
+            || udiv.b != Val::Const(10)
+        {
+            continue;
+        }
+        let q = udiv.dst.clone();
+        // The loop carries the quotient: the value phi's self arm is
+        // the udiv dst, anything else is a different loop.
+        if vq != Val::Reg(q.clone()) {
+            continue;
+        }
+        let Inst::Bin(mul) = &insts[3] else { continue };
+        if mul.op != BinOp::Mul || mul.ty != Ty::I32 || bin_reg_const(mul, &q, 246).is_none() {
+            continue;
+        }
+        let m = mul.dst.clone();
+        let Inst::Bin(add) = &insts[4] else { continue };
+        if add.op != BinOp::Add || add.ty != Ty::I32 {
+            continue;
+        }
+        let arms = [&add.a, &add.b].map(|a| match a {
+            Val::Reg(r) => Some(r.as_str()),
+            _ => None,
+        });
+        if !arms.contains(&Some(m.as_str())) || !arms.contains(&Some(v.as_str())) {
+            continue;
+        }
+        let s = add.dst.clone();
+        let Inst::Trunc(tr) = &insts[5] else { continue };
+        if tr.from != Ty::I32 || tr.to != Ty::I8 || tr.val != Val::Reg(s.clone()) {
+            continue;
+        }
+        let r = tr.dst.clone();
+        let Inst::Bin(or) = &insts[6] else { continue };
+        if or.op != BinOp::Or || or.ty != Ty::I8 {
+            continue;
+        }
+        let oarms = [&or.a, &or.b].map(|a| match a {
+            Val::Reg(x) => Some(x.as_str()),
+            _ => None,
+        });
+        if !oarms.contains(&Some(r.as_str())) {
+            continue;
+        }
+        let is48 = [&or.a, &or.b].iter().any(|a| **a == Val::Const(48));
+        if !is48 {
+            continue;
+        }
+        let d = or.dst.clone();
+        let Inst::Zext(zx) = &insts[7] else { continue };
+        if zx.from != Ty::I8 || zx.to != Ty::I16 || zx.val != Val::Reg(n.clone()) {
+            continue;
+        }
+        let ix = zx.dst.clone();
+        let Inst::Gep(gp) = &insts[8] else { continue };
+        let GepBase::Global(buf) = &gp.base else {
+            continue;
+        };
+        if gp.k != 0 || gp.terms != vec![(1u16, ix.clone())] {
+            continue;
+        }
+        let pp = gp.dst.clone();
+        let Inst::Store(st) = &insts[9] else { continue };
+        if st.ty != Ty::I8
+            || st.val != Val::Reg(d.clone())
+            || st.ptr.strip_prefix('%').unwrap_or(&st.ptr) != pp
+            || st.volatile
+        {
+            continue;
+        }
+        let Inst::Bin(bump) = &insts[10] else {
+            continue;
+        };
+        if bump.op != BinOp::Add || bump.ty != Ty::I8 {
+            continue;
+        }
+        let barms = [&bump.a, &bump.b].map(|a| match a {
+            Val::Reg(x) => Some(x.as_str()),
+            _ => None,
+        });
+        if !barms.contains(&Some(n.as_str())) {
+            continue;
+        }
+        let is1 = [&bump.a, &bump.b].iter().any(|a| **a == Val::Const(1));
+        if !is1 || bump.dst != n1 {
+            continue;
+        }
+        let Inst::Icmp(ic) = &insts[11] else { continue };
+        // `ult` is not commutative: the value must be the first arm and 10
+        // the second, so the loop exits exactly when v < 10 (review #722).
+        if ic.pred != "ult"
+            || ic.ty != Ty::I32
+            || ic.a != Val::Reg(v.clone())
+            || ic.b != Val::Const(10)
+        {
+            continue;
+        }
+        let cc = ic.dst.clone();
+        let Inst::BrCond(br) = &insts[12] else {
+            continue;
+        };
+        if br.cond != Val::Reg(cc.clone()) || br.f != hlabel {
+            continue;
+        }
+        let exit = br.t.clone();
+        if exit == hlabel {
+            continue;
+        }
+        // Loop-locality: every intermediate dies in the header. The
+        // count keeps its name on the call, so its outside uses keep
+        // working; the entry value only gains a use in the header, so
+        // neither is constrained.
+        if ![v, n, q, m, s, r, d, ix, pp, cc]
+            .iter()
+            .all(|x| only_in(x, h))
+        {
+            continue;
+        }
+        sites.push((
+            h,
+            DecimalSite {
+                v0,
+                n1,
+                buf: buf.clone(),
+                exit,
+                udiv_loc: udiv.loc.clone(),
+                br_loc: br.loc.clone(),
+            },
+        ));
+    }
+    sites
+}
+
+/// The bench-u16-dec counted loop as one `__udec_u16_5` call (epic-cc#722).
+/// Same div-rem core as the do-while shape but counted: an i16 counter
+/// phi, no ASCII step, a volatile-allowed store, and an `eq`-on-count exit
+/// after exactly 5 digits. Unlike the do-while sharing this fires on a
+/// single site: the bench row shrinks (109 to 67 flash) because the helper
+/// displaces the `__udiv_u16`/`__mul_u8` routines, which lose their last
+/// caller and vanish. A lone loop beside live div routines could grow;
+/// the size ladder guards that direction.
+struct BenchSite {
+    v0: String,
+    buf: String,
+    exit: String,
+    udiv_loc: Option<SrcLoc>,
+    br_loc: Option<SrcLoc>,
+}
+
+/// Every bench-shaped counted digit loop in one function, without rewriting.
+fn find_bench_sites(f: &Func) -> Vec<(usize, BenchSite)> {
+    let preds = block_preds(f);
+    let uses = block_uses(f);
+    let only_in =
+        |r: &str, h: usize| -> bool { uses.get(r).is_some_and(|v| v.iter().all(|&i| i == h)) };
+    let blocks = &f.blocks;
+    let mut sites = Vec::new();
+    for h in 0..blocks.len() {
+        let pre = preds[h].iter().filter(|&&p| p != h).count();
+        if !preds[h].contains(&h) || pre != 1 {
+            continue;
+        }
+        let hlabel = blocks[h].label.clone();
+        let insts = &blocks[h].insts;
+        if insts.len() != 11 {
+            continue;
+        }
+        let mut vphi: Option<&Phi> = None;
+        let mut nphi: Option<&Phi> = None;
+        for inst in &insts[0..2] {
+            let Inst::Phi(ph) = inst else { continue };
+            if ph.ty == Ty::I16 && vphi.is_none() {
+                vphi = Some(ph);
+            } else if ph.ty == Ty::I16 && nphi.is_none() {
+                // Both phis are i16; told apart below by their incoming.
+                nphi = Some(ph);
+            }
+        }
+        // The counter phi counts from zero, the value phi carries the
+        // quotient; disambiguate by the zero incoming.
+        let (Some(p0), Some(p1)) = (vphi, nphi) else {
+            continue;
+        };
+        let (a0self, a0out) = match phi_arms(p0, &hlabel) {
+            Some(x) => x,
+            None => continue,
+        };
+        let (a1self, a1out) = match phi_arms(p1, &hlabel) {
+            Some(x) => x,
+            None => continue,
+        };
+        // Counter: self arm is the bump (checked below), outside is 0.
+        // Value: outside is a register, self is the quotient.
+        let (n, n1bump, v, v0, qself) = if a0out == Val::Const(0) {
+            let (Some(nn1), Some(vv0)) = (
+                match &a0self {
+                    Val::Reg(r) => Some(r.clone()),
+                    _ => None,
+                },
+                match &a1out {
+                    Val::Reg(r) => Some(r.clone()),
+                    _ => None,
+                },
+            ) else {
+                continue;
+            };
+            (p0.dst.clone(), nn1, p1.dst.clone(), vv0, a1self)
+        } else if a1out == Val::Const(0) {
+            let (Some(nn1), Some(vv0)) = (
+                match &a1self {
+                    Val::Reg(r) => Some(r.clone()),
+                    _ => None,
+                },
+                match &a0out {
+                    Val::Reg(r) => Some(r.clone()),
+                    _ => None,
+                },
+            ) else {
+                continue;
+            };
+            (p1.dst.clone(), nn1, p0.dst.clone(), vv0, a0self)
+        } else {
+            continue;
+        };
+        let Inst::Bin(udiv) = &insts[2] else { continue };
+        if udiv.op != BinOp::UDiv
+            || udiv.ty != Ty::I16
+            || udiv.a != Val::Reg(v.clone())
+            || udiv.b != Val::Const(10)
+        {
+            continue;
+        }
+        let q = udiv.dst.clone();
+        if qself != Val::Reg(q.clone()) {
+            continue;
+        }
+        let Inst::Bin(mul) = &insts[3] else { continue };
+        if mul.op != BinOp::Mul || mul.ty != Ty::I16 || bin_reg_const(mul, &q, 246).is_none() {
+            continue;
+        }
+        let m = mul.dst.clone();
+        let Inst::Bin(add) = &insts[4] else { continue };
+        if add.op != BinOp::Add || add.ty != Ty::I16 {
+            continue;
+        }
+        let arms = [&add.a, &add.b].map(|a| match a {
+            Val::Reg(r) => Some(r.as_str()),
+            _ => None,
+        });
+        if !arms.contains(&Some(m.as_str())) || !arms.contains(&Some(v.as_str())) {
+            continue;
+        }
+        let s = add.dst.clone();
+        let Inst::Trunc(tr) = &insts[5] else { continue };
+        if tr.from != Ty::I16 || tr.to != Ty::I8 || tr.val != Val::Reg(s.clone()) {
+            continue;
+        }
+        let r = tr.dst.clone();
+        let Inst::Gep(gp) = &insts[6] else { continue };
+        let GepBase::Global(buf) = &gp.base else {
+            continue;
+        };
+        if gp.k != 0 || gp.terms != vec![(1u16, n.clone())] {
+            continue;
+        }
+        let pp = gp.dst.clone();
+        let Inst::Store(st) = &insts[7] else { continue };
+        if st.ty != Ty::I8
+            || st.val != Val::Reg(r.clone())
+            || st.ptr.strip_prefix('%').unwrap_or(&st.ptr) != pp
+        {
+            continue;
+        }
+        let Inst::Bin(bump) = &insts[8] else { continue };
+        if bump.op != BinOp::Add || bump.ty != Ty::I16 || bump.dst != n1bump {
+            continue;
+        }
+        let barms = [&bump.a, &bump.b].map(|a| match a {
+            Val::Reg(x) => Some(x.as_str()),
+            _ => None,
+        });
+        if !barms.contains(&Some(n.as_str())) {
+            continue;
+        }
+        let is1 = [&bump.a, &bump.b].iter().any(|a| **a == Val::Const(1));
+        if !is1 {
+            continue;
+        }
+        let Inst::Icmp(ic) = &insts[9] else { continue };
+        if ic.pred != "eq" || ic.ty != Ty::I16 {
+            continue;
+        }
+        let carms = [&ic.a, &ic.b].map(|a| match a {
+            Val::Reg(x) => Some(x.as_str()),
+            _ => None,
+        });
+        if !carms.contains(&Some(n1bump.as_str())) {
+            continue;
+        }
+        let is5 = [&ic.a, &ic.b].iter().any(|a| **a == Val::Const(5));
+        if !is5 {
+            continue;
+        }
+        let cc = ic.dst.clone();
+        let Inst::BrCond(br) = &insts[10] else {
+            continue;
+        };
+        // Counted exit: true leaves (count reached), false loops back.
+        if br.cond != Val::Reg(cc.clone()) || br.f != hlabel {
+            continue;
+        }
+        let exit = br.t.clone();
+        if exit == hlabel {
+            continue;
+        }
+        if ![v, n, q, m, s, r, pp, n1bump, cc]
+            .iter()
+            .all(|x| only_in(x, h))
+        {
+            continue;
+        }
+        sites.push((
+            h,
+            BenchSite {
+                v0,
+                buf: buf.clone(),
+                exit,
+                udiv_loc: udiv.loc.clone(),
+                br_loc: br.loc.clone(),
+            },
+        ));
+    }
+    sites
+}
+
+/// The `(self-reg, outside-val)` arms of a loop phi against header `h`:
+/// one incoming from `h` itself, one from elsewhere. `None` on any other
+/// shape (multi-entry loops never share).
+fn phi_arms(ph: &Phi, h: &str) -> Option<(Val, Val)> {
+    if ph.incoming.len() != 2 {
+        return None;
+    }
+    let from_h = ph.incoming.iter().find(|(_, l)| l == h);
+    let from_out = ph.incoming.iter().find(|(_, l)| l != h);
+    match (from_h, from_out) {
+        (Some((a, _)), Some((b, _))) => Some((a.clone(), b.clone())),
+        _ => None,
+    }
+}
+
+/// Matches `bin` as `<reg> <op> <k>` in either arm order: the register
+/// must equal `r` and the other arm the constant `k`.
+fn bin_reg_const(bin: &Bin, r: &str, k: i64) -> Option<()> {
+    let reg = |a: &Val| match a {
+        Val::Reg(x) if x == r => true,
+        _ => false,
+    };
+    let con = |a: &Val| matches!(a, Val::Const(c) if *c == k);
+    if (reg(&bin.a) && con(&bin.b)) || (con(&bin.a) && reg(&bin.b)) {
+        Some(())
+    } else {
+        None
     }
 }
 
@@ -3576,6 +4240,8 @@ fn param(name: &str, width: u8) -> Param {
 /// | `__shl_u16`, `__lshr_u16`, `__ashr_i16` | 4 | `cnt`@0-1 (masked count / loop counter), `spare`@2-3 (recipe scratch) |
 /// | `__mul_u32` | 11 | `bk_lo`@0 / `bk_hi`@1 (multiplier backup: 2 bytes, the low 16 bits first, reloaded from `b`'s high half for the second 16 of the 32 iterations), `cnt`@2 (loop counter, 32), `r`@3-6 (32-bit running product: the low 32 bits of the full product), `t`@7-10 (shifted multiplicand: 4 bytes, shifting left with wraparound, so the shifted-out high bits drop and i32 `mul` wraps) |
 /// | `__udiv_u32`, `__urem_u32` | 10 | `rem`@0-3 (partial remainder: full 32 bits, with no carry out for a 32/32 divide), `den`@4-7 (denominator copy: the divmod subtracts/restores against this, so the param slot stays untouched), `cnt`@8 (loop counter, 32), `spare`@9 (recipe scratch) |
+/// | `__udec_u32` | 11 | `den`@0-3 (baked divisor 10, set once: the loop divides by a constant), `rem`@4-7 (divmod remainder, digit source), `cnt`@8 (bit counter, 32), `digit`@9 (ASCII digit staging), `n`@10 (digit count, the return value) |
+/// | `__udec_u16_5` | 7 | `den`@0-1 (baked divisor 10), `rem`@2-3 (divmod remainder, digit source), `dcnt`@4 (bit counter, 16), `iter`@5 (digit counter, 5), `digit`@6 (binary digit staging) |
 /// | `__sdiv_i32`, `__srem_i32` | 12 | the divmod part at the unsigned offsets: `rem`@0-3, `den`@4-7, `cnt`@8, `spare`@9, plus `flags`@10 (sign state: bit0 = negate quotient = num<0 XOR den<0, bit1 = negate remainder = num<0), `spare`@11 |
 /// | `__shl_u32`, `__lshr_u32`, `__ashr_i32` | 2 | `cnt`@0 (masked count / loop counter: the value shifts in the `val` param slot), `spare`@1 (recipe scratch) |
 /// | `__add_f32`, `__sub_f32` | 14 | `sa`@0 (sign of a), `ea`@1 (biased exponent of a), `ma`@2-4 (24-bit mantissa of a with the implicit bit), `sb`@5, `eb`@6, `mb`@7-9 (same for b), `stick`@10 (sticky collector for the right-alignment shift), `cnt`@11 (alignment/normalize shift counter), `ta1`@12 / `ta2`@13 (the 24-bit fraction window; `ta0` reuses the dead `eb` slot at offset 6) |
@@ -3602,6 +4268,24 @@ fn routine_func(name: &str) -> Func {
         "__udiv_u8" | "__urem_u8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 4),
         "__udiv_u16" | "__urem_u16" => (Ty::I16, vec![param("num", 2), param("den", 2)], 7),
         "__udiv_u32" | "__urem_u32" => (Ty::I32, vec![param("num", 4), param("den", 4)], 10),
+        // The decimal digit loop: value in, digit count out, digits to the
+        // caller buffer. `den`@0-3 holds the baked divisor 10, `rem`@4-7
+        // the divmod remainder, `cnt`@8 the bit counter, `digit`@9 the
+        // ASCII digit, `n`@10 the count (epic-cc#722).
+        "__udec_u32" => (
+            Ty::I8,
+            vec![
+                param("num", 4),
+                Param {
+                    name: "buf".into(),
+                    width: 2,
+                    byval: None,
+                    sret: false,
+                    ptr: true,
+                },
+            ],
+            11,
+        ),
         "__sdiv_i8" | "__srem_i8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 5),
         "__sdiv_i16" | "__srem_i16" => (Ty::I16, vec![param("num", 2), param("den", 2)], 7),
         "__sdiv_i32" | "__srem_i32" => (Ty::I32, vec![param("num", 4), param("den", 4)], 12),
@@ -3622,11 +4306,34 @@ fn routine_func(name: &str) -> Func {
         "__cmp_f32" => (Ty::I8, vec![param("a", 4), param("b", 4)], 6),
         "__uitofp_f32" | "__sitofp_f32" => (Ty::F32, vec![param("val", 4)], 8),
         "__fptoui_f32" | "__fptosi_f32" => (Ty::I32, vec![param("val", 4)], 8),
+        // The counted bench loop writes exactly 5 binary digits; nothing
+        // returns. `den`@0-1 (baked 10), `rem`@2-3, `dcnt`@4 (bit counter),
+        // `iter`@5 (digit counter, 5), `digit`@6.
+        "__udec_u16_5" => (
+            Ty::I8, // placeholder: the Func ret is forced to None below.
+            vec![
+                param("num", 2),
+                Param {
+                    name: "buf".into(),
+                    width: 2,
+                    byval: None,
+                    sret: false,
+                    ptr: true,
+                },
+            ],
+            7,
+        ),
         other => panic!("legalize: unknown runtime routine {other}"),
+    };
+    // The counted helper returns nothing: its Func carries no ret.
+    let ret = if name == "__udec_u16_5" {
+        None
+    } else {
+        Some(ret)
     };
     Func {
         name: name.into(),
-        ret: Some(ret),
+        ret,
         params,
         blocks: vec![Block {
             label: "entry".into(),
