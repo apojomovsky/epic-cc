@@ -2205,6 +2205,14 @@ fn allocate_inner(
     // resolve it through iselcore instead of the syntactic chain above.
     let mut const_byval: HashSet<String> = HashSet::new();
     let mut const_reg_uses: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    // A const feeding a pointer phi (the LSR chase shape) reads back
+    // through iselcore's indirect slot with RAM semantics, so it keeps
+    // its copy regardless of its other uses (epic-cc#816).
+    let mut const_phi: HashSet<String> = HashSet::new();
+    // Every arm of a non-folding pointer select (epic-cc#816): the
+    // select seeds an indirect slot isel derefs with RAM semantics,
+    // so each const arm keeps its copy even when directly named.
+    let mut const_sel: HashSet<String> = HashSet::new();
     // Staging site records (epic-cc#790): per-call direct consts and reg
     // args, per-select dst with direct const arms, operand users per
     // (func, reg) with block positions, direct call edges, and functions
@@ -2440,10 +2448,13 @@ fn allocate_inner(
                                 let Some(g) = base else { continue };
                                 // A GEP/reg-derived arm needs a real address
                                 // and keeps a RAM copy; a directly named arm
-                                // stages on small cores (below).
+                                // stages on small cores (below). Either way
+                                // the arm reads back through the select's
+                                // indirect slot, so gating never drops it.
                                 if let Some(gl) = m.globals.iter().find(|gl| gl.name == g) {
                                     if gl.size <= 255 {
                                         const_to_ram.insert(g.clone());
+                                        const_sel.insert(g.clone());
                                         if is_direct {
                                             const_direct.insert(g.clone());
                                             direct_arms.push(g.clone());
@@ -2467,6 +2478,31 @@ fn allocate_inner(
                                     dst: s.dst.clone(),
                                     arms: direct_arms,
                                 });
+                            }
+                        }
+                    }
+                    // A const reaching a pointer phi keeps its RAM copy:
+                    // iselcore seeds the phi as an indirect slot and every
+                    // read through it derefs RAM (the LSR chase shape whose
+                    // flash lowering is epic-cc#811). A gated address here
+                    // would deref flash as RAM.
+                    if let ir::Inst::Phi(p) = inst {
+                        if p.ptr {
+                            for (v, _) in &p.incoming {
+                                let base = match v {
+                                    ir::Val::Global(g) => {
+                                        if m.globals.iter().any(|gl| &gl.name == g && gl.is_const) {
+                                            Some(g.clone())
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    ir::Val::Reg(r) => find_const_base(r),
+                                    ir::Val::Const(_) => None,
+                                };
+                                if let Some(g) = base {
+                                    const_phi.insert(g);
+                                }
                             }
                         }
                     }
@@ -2744,16 +2780,15 @@ fn allocate_inner(
     }
     // Pool copy gating (epic-cc#816): a pooled const whose uses isel
     // rewrites to pool addresses needs no RAM copy. Rewritable uses
-    // are direct call args and select arms resolving to the const with
-    // no dynamic terms; a byval/sret arg, a dynamic term, or an opaque
-    // slot-mediated flow (phi, select dst, IntToPtr) keeps the copy, as
-    // does any mix of rewritable and RAM uses. Only the PIC14 backend
-    // rewrites, so other cores keep every copy. Chased reads resolve
-    // in iselcore per epic-cc#811; until then a chase flow reads as a
-    // slot and keeps its copy here.
+    // are direct call args and clean reg args resolving to the const
+    // with no dynamic terms; a byval/sret arg, a dynamic term, a
+    // select arm, a phi incoming, or any other opaque slot-mediated
+    // flow keeps the copy, as does any mix of rewritable and RAM
+    // uses. Only the PIC14 backend rewrites, so other cores keep
+    // every copy.
     if pool && device.core == Core::Pic14 {
         let ram_use = |g: &str| -> bool {
-            if const_byval.contains(g) {
+            if const_byval.contains(g) || const_phi.contains(g) || const_sel.contains(g) {
                 return true;
             }
             match const_reg_uses.get(g) {
@@ -2767,7 +2802,12 @@ fn allocate_inner(
             }
         };
         let mut gated: Vec<String> = Vec::new();
-        for g in &const_to_ram {
+        // Staged consts left `const_to_ram` in the block above, so the
+        // candidates are the union: a staged direct-only const gates out
+        // of staging too, not just out of its copy.
+        let mut cands: Vec<&String> = const_to_ram.iter().collect();
+        cands.extend(staged.iter());
+        for g in cands {
             let pooled = m
                 .globals
                 .iter()

@@ -1,4 +1,4 @@
-use alloc::{allocate, map_text, AllocLayout};
+use alloc::{allocate, allocate_with_pool, map_text, AllocLayout};
 use device::PIC16F1939;
 use device::PIC16F877A;
 use device::PIC18F4550;
@@ -2855,5 +2855,113 @@ fn pic14_multi_use_load_keeps_its_slot() {
         out.locals.contains_key("main::1"),
         "shared load keeps its slot: {:?}",
         out.locals
+    );
+}
+
+#[test]
+fn pooled_consts_drop_ram_copies_except_mixed_uses() {
+    // epic-cc#816: with pooling on, a const used only as a direct
+    // call arg keeps no RAM copy; one also reached through a dynamic
+    // index keeps its copy. Unflagged, both copy as before.
+    let mut m = parse(
+        "const solo i8\n\
+         const mixed i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(@solo)\n\
+             %i = add i8 1, 2\n\
+             %g = gep @mixed +0 +1*%i\n\
+             call void @f(%g)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].bytes = b"solo\0".to_vec();
+    m.globals[0].size = 5;
+    m.globals[1].bytes = b"mixed\0".to_vec();
+    m.globals[1].size = 6;
+    let unflagged = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        unflagged.globals.contains_key("solo") && unflagged.globals.contains_key("mixed"),
+        "unflagged const call args copy to RAM: {:?}",
+        unflagged.globals.keys().collect::<Vec<_>>()
+    );
+    let pooled = allocate_with_pool(&PIC16F877A, &m, "edge main f\n", true);
+    assert!(
+        !pooled.globals.contains_key("solo") && pooled.const_globals.contains("solo"),
+        "direct-only pooled const keeps no RAM copy: {:?}",
+        pooled.globals.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        pooled.globals.contains_key("mixed") && !pooled.const_globals.contains("mixed"),
+        "dynamically indexed pooled const keeps its copy: {:?}",
+        pooled.globals.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        pooled.address_taken_consts.contains("solo")
+            && pooled.address_taken_consts.contains("mixed"),
+        "both consts feed the pool either way: {:?}",
+        pooled.address_taken_consts
+    );
+}
+
+#[test]
+fn pooled_const_with_chase_phi_use_keeps_its_copy() {
+    // epic-cc#816: a const feeding a pointer phi (the LSR chase shape)
+    // keeps its RAM copy even though its direct call arg alone would
+    // gate: iselcore seeds the phi as an indirect slot read with RAM
+    // semantics, and a pooled flash address there would deref flash
+    // as RAM. The flash lowering of such reads is epic-cc#811.
+    let mut m = parse(
+        "const solo i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(@solo)\n\
+             %p = phi ptr @solo entry @solo entry\n\
+             %v = load i8 %p\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].bytes = b"solo\0".to_vec();
+    m.globals[0].size = 5;
+    let pooled = allocate_with_pool(&PIC16F877A, &m, "edge main f\n", true);
+    assert!(
+        pooled.globals.contains_key("solo") && !pooled.const_globals.contains("solo"),
+        "phi-fed pooled const keeps its copy: {:?}",
+        pooled.globals.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn pooled_const_select_arm_keeps_its_copy() {
+    // epic-cc#816: a const arm of a non-folding pointer select keeps
+    // its RAM copy: the select seeds an indirect slot isel derefs
+    // with RAM semantics, so a pooled flash address there would read
+    // flash as RAM.
+    let mut m = parse(
+        "const a i8\n\
+         global ramg i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %c = icmp eq i8 1, 1\n\
+             %s = select i1 %c, ptr @a, ptr @ramg\n\
+             %v = load i8 %s\n\
+             ret void\n",
+    );
+    m.globals[0].bytes = b"a\0".to_vec();
+    m.globals[0].size = 2;
+    let unflagged = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert!(
+        unflagged.globals.contains_key("a"),
+        "select-arm const copies without the flag"
+    );
+    let pooled = allocate_with_pool(&PIC16F877A, &m, "depth 1\n", true);
+    assert!(
+        pooled.globals.contains_key("a") && !pooled.const_globals.contains("a"),
+        "select-arm pooled const keeps its copy: {:?}",
+        pooled.globals.keys().collect::<Vec<_>>()
     );
 }

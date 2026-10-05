@@ -584,11 +584,12 @@ impl<'m> Gen<'m> {
     }
     /// Pooled address of a const with no RAM copy (epic-cc#816): its
     /// chunk label plus byte offset. `Some` only when the const pooled
-    /// and alloc gated its copy (absent from the map); a kept copy or
-    /// an unflagged build falls back to today's paths. Callers add any
-    /// GEP offset, mirroring the RAM path's wrapping add.
+    /// and alloc gated its copy (absent from the map and unstaged); a
+    /// kept copy, a staged const, or an unflagged build falls back to
+    /// today's paths. Callers add any GEP offset, mirroring the RAM
+    /// path's wrapping add.
     fn pool_lit(&self, name: &str) -> Option<(String, u16)> {
-        if self.addrs.contains_key(name) {
+        if self.addrs.contains_key(name) || self.staged.contains(name) {
             return None;
         }
         self.pool.resolve(name).map(|(c, o)| (c.to_string(), o))
