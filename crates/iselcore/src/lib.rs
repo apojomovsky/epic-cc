@@ -1019,7 +1019,8 @@ pub fn log_pool_site(
 /// Whether a pointer-select's arms all read through the pool
 /// (epic-cc#817): both arms pool-proven and every use of the dst is a
 /// routed log fmt arg, so the arms keep no RAM copy. Any other use
-/// (or none at all) keeps the status-quo copy.
+/// keeps the status-quo copy; a dead select (no uses) counts as fully
+/// routed, since nothing can read it.
 pub fn select_pool_routed(
     m: &Module,
     resolved: &PtrResolution,
@@ -1067,8 +1068,9 @@ pub fn select_pool_routed(
 /// Whether a value is a pool-resident address (epic-cc#817): a pooled
 /// member directly, a clean use of one (constant offsets stay inside
 /// the member's chunk, so the variant's index arithmetic serves them),
-/// or a select over two such arms. Dynamic terms stay RAM: no reader
-/// shape serves them.
+/// or a select over two such arms (dynamic terms over a select still
+/// route: the prologue resolves the runtime address). Only a direct
+/// pooled global with dynamic terms stays on the RAM loop.
 fn pool_proven_ptr(
     m: &Module,
     resolved: &PtrResolution,
