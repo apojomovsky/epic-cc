@@ -707,6 +707,8 @@ pub fn is_runtime_routine(name: &str) -> bool {
             | "__shl_u32"
             | "__lshr_u32"
             | "__ashr_i32"
+            | "__udec_u32"
+            | "__udec_u16_5"
             | "__add_f32"
             | "__sub_f32"
             | "__mul_f32"

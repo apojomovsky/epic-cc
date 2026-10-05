@@ -6000,6 +6000,88 @@ impl<'m> Gen<'m> {
         self.emit("    RETURN".to_string());
     }
 
+    /// The shared u32 decimal-digit loop (epic-cc#722): `n = 0; do { q =
+    /// v / 10; buf[n++] = (v - 10*q) | 48; v = q } while (v)`, returning
+    /// `n`. The value arrives in the `num` param slot, the quotient
+    /// accumulating there in place across digits; the caller buffer address
+    /// arrives in `buf`. Digits leave through FSR0/POSTINC0, loaded once
+    /// from `buf`: the buffer is fixed for the whole loop, and every CALL
+    /// already clears the caller's FSR0 tracking, so no belief survives
+    /// the call either way. Scratch: `den`@0-3 (baked 10), `rem`@4-7,
+    /// `cnt`@8, `digit`@9, `n`@10.
+    fn emit_udec_u32(&mut self, name: &str, scr: u16) {
+        let num = self.slot_addr(name, "num").direct();
+        let buf = self.slot_addr(name, "buf").direct();
+        let (den, rem, cnt, digit, n) = (scr, scr + 4, scr + 8, scr + 9, scr + 10);
+        // n = 0.
+        self.emit_banked("CLRF", n, "");
+        // FSR0 = buf, once: POSTINC0 walks the digits.
+        self.emit_copy_byte(buf, 0xFE9);
+        self.emit_copy_byte(buf + 1, 0xFEA);
+        // den = 10, once: the loop divides by a constant.
+        self.emit("    MOVLW 0x0A".to_string());
+        self.emit_banked("MOVWF", den, "");
+        self.emit_banked("CLRF", den + 1, "");
+        self.emit_banked("CLRF", den + 2, "");
+        self.emit_banked("CLRF", den + 3, "");
+        let l_digits = self.fresh_label();
+        let l_done = self.fresh_label();
+        self.emit_label(&l_digits);
+        // One restoring-division pass: quotient back into `num`, remainder
+        // (the digit value, 0-9) into `rem`.
+        self.emit_divmod_loop(num, den, rem, cnt, 4, 4);
+        // digit = rem0 | 48, then POSTINC0 (0xFEE) = digit: the FSR walks
+        // the buffer, one advance per digit. (0xFEB is PLUSW0, the indexed
+        // form, not this.)
+        self.emit_banked("MOVF", rem, ",W");
+        self.emit("    IORLW 0x30".to_string());
+        self.emit_banked("MOVWF", digit, "");
+        self.emit_copy_byte(digit, 0xFEE);
+        // n++, then loop while the quotient is nonzero.
+        self.emit_banked("INCF", n, ",F");
+        self.emit_banked("MOVF", num, ",W");
+        self.emit_banked("IORWF", num + 1, ",W");
+        self.emit_banked("IORWF", num + 2, ",W");
+        self.emit_banked("IORWF", num + 3, ",W");
+        self.emit(format!("    BNZ {l_digits}"));
+        self.emit_label(&l_done);
+        self.store_retval(n, 1);
+        self.emit("    RETURN".to_string());
+    }
+
+    /// The counted bench loop (epic-cc#722): exactly 5 binary digits,
+    /// nothing returned. Same divmod core as `emit_udec_u32` at half width
+    /// with a `DECFSZ` digit counter instead of the value exit test.
+    /// Scratch: `den`@0-1 (baked 10), `rem`@2-3, `dcnt`@4, `iter`@5,
+    /// `digit`@6.
+    fn emit_udec_u16_5(&mut self, name: &str, scr: u16) {
+        let num = self.slot_addr(name, "num").direct();
+        let buf = self.slot_addr(name, "buf").direct();
+        let (den, rem, dcnt, iter, digit) = (scr, scr + 2, scr + 4, scr + 5, scr + 6);
+        // FSR0 = buf, once: POSTINC0 walks the 5 digits.
+        self.emit_copy_byte(buf, 0xFE9);
+        self.emit_copy_byte(buf + 1, 0xFEA);
+        // den = 10, iter = 5, once.
+        self.emit("    MOVLW 0x0A".to_string());
+        self.emit_banked("MOVWF", den, "");
+        self.emit_banked("CLRF", den + 1, "");
+        self.emit("    MOVLW 0x05".to_string());
+        self.emit_banked("MOVWF", iter, "");
+        let l_digits = self.fresh_label();
+        self.emit_label(&l_digits);
+        // One restoring-division pass: quotient back into `num`, remainder
+        // (the binary digit, 0-9) into `rem`.
+        self.emit_divmod_loop(num, den, rem, dcnt, 2, 2);
+        // digit = rem0, then POSTINC0 (0xFEE) = digit.
+        self.emit_banked("MOVF", rem, ",W");
+        self.emit_banked("MOVWF", digit, "");
+        self.emit_copy_byte(digit, 0xFEE);
+        // Five digits exactly: DECFSZ skips the BRA on the last one.
+        self.emit_banked("DECFSZ", iter, ",F");
+        self.emit(format!("    BRA {l_digits}"));
+        self.emit("    RETURN".to_string());
+    }
+
     /// The signed div/mod wrapper: abs both operands in place in the param
     /// slots (unsigned abs, INT_MIN safe), run the unsigned divmod with
     /// `rem` at `__scr[1..]` and the counter after it (byte 0 holds the
@@ -8114,6 +8196,8 @@ impl<'m> Gen<'m> {
             "__urem_u16" => self.emit_divmod(name, 2, scr, false),
             "__udiv_u32" => self.emit_divmod(name, 4, scr, true),
             "__urem_u32" => self.emit_divmod(name, 4, scr, false),
+            "__udec_u32" => self.emit_udec_u32(name, scr),
+            "__udec_u16_5" => self.emit_udec_u16_5(name, scr),
             "__sdiv_i8" => self.emit_sdivmod(name, 1, scr, true),
             "__srem_i8" => self.emit_sdivmod(name, 1, scr, false),
             "__sdiv_i16" => self.emit_sdivmod(name, 2, scr, true),
