@@ -2787,9 +2787,53 @@ fn allocate_inner(
     // uses. Only the PIC14 backend rewrites, so other cores keep
     // every copy.
     if pool && device.core == Core::Pic14 {
+        // Pool membership as isel decides it (epic-cc#817): the
+        // address-taken snapshot the driver feeds `build_pool`,
+        // filtered by the shared eligibility predicate.
+        let pooled = |n: &str| -> bool {
+            address_taken_consts.contains(n)
+                && m.globals
+                    .iter()
+                    .find(|gl| gl.name == n)
+                    .is_some_and(iselcore::pool_member)
+        };
         let ram_use = |g: &str| -> bool {
-            if const_byval.contains(g) || const_phi.contains(g) || const_sel.contains(g) {
+            if const_byval.contains(g) || const_phi.contains(g) {
                 return true;
+            }
+            if const_sel.contains(g) {
+                // A select arm stays RAM unless every selecting use
+                // routes to the pool log variant (epic-cc#817); any
+                // non-routed select pins the copy.
+                for f in &m.funcs {
+                    for b in &f.blocks {
+                        for inst in &b.insts {
+                            if let ir::Inst::Select(s) = inst {
+                                if !s.ptr {
+                                    continue;
+                                }
+                                let hits = |v: &ir::Val| -> bool {
+                                    match v {
+                                        ir::Val::Global(n) => n.as_str() == g,
+                                        ir::Val::Reg(r) => {
+                                            matches!(resolved.get(&ssa_key(&f.name, r)),
+                                                Some((Base::Global(c), _, t)) if c.as_str() == g && t.is_empty())
+                                        }
+                                        _ => false,
+                                    }
+                                };
+                                if !hits(&s.a) && !hits(&s.b) {
+                                    continue;
+                                }
+                                if !iselcore::select_pool_routed(
+                                    m, &resolved, &pooled, &f.name, &s.dst,
+                                ) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             match const_reg_uses.get(g) {
                 None => false,

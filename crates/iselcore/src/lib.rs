@@ -982,6 +982,141 @@ pub fn pool_member(g: &ir::Global) -> bool {
     g.is_const && g.addr.is_none() && !g.bytes.is_empty() && g.bytes.len() <= 255
 }
 
+/// Callee whose byte loop isel specializes to pool reads (epic-cc#817).
+/// Direct calls with a pool-proven fmt arg route to the variant below;
+/// every other call keeps the original RAM loop.
+pub const LOG_POOL_CALLEE: &str = "epic_harness_log";
+/// Synthesized pool variant of the log loop, emitted inside the callee's
+/// own extent over its frame. Slots hold (in-chunk index, chunk id)
+/// pairs there, so only routed (pool-proven) call sites may target it.
+pub const LOG_POOL_VARIANT: &str = "__epic_log_pool";
+
+/// Whether a call routes to the pool log variant (epic-cc#817): a direct
+/// call to the log callee whose fmt arg is pool-proven. `pooled` tests
+/// pool membership; alloc passes its address-taken snapshot, isel its
+/// pool keys, so gating and routing agree by construction.
+pub fn log_pool_site(
+    m: &Module,
+    resolved: &PtrResolution,
+    pooled: &dyn Fn(&str) -> bool,
+    caller: &str,
+    func: &str,
+    args: &[ir::CallArg],
+    callees: &[String],
+) -> bool {
+    if func != LOG_POOL_CALLEE || !callees.is_empty() {
+        return false;
+    }
+    let Some(arg) = args.first() else {
+        return false;
+    };
+    if arg.ty.is_some() || arg.byval.is_some() || arg.sret {
+        return false;
+    }
+    pool_proven_ptr(m, resolved, pooled, caller, &arg.val, 0)
+}
+
+/// Whether a pointer-select's arms all read through the pool
+/// (epic-cc#817): both arms pool-proven and every use of the dst is a
+/// routed log fmt arg, so the arms keep no RAM copy. Any other use
+/// (or none at all) keeps the status-quo copy.
+pub fn select_pool_routed(
+    m: &Module,
+    resolved: &PtrResolution,
+    pooled: &dyn Fn(&str) -> bool,
+    func: &str,
+    dst: &str,
+) -> bool {
+    let Some(s) = select_of(m, func, dst) else {
+        return false;
+    };
+    if !s.ptr {
+        return false;
+    }
+    if !pool_proven_ptr(m, resolved, pooled, func, &s.a, 0)
+        || !pool_proven_ptr(m, resolved, pooled, func, &s.b, 0)
+    {
+        return false;
+    }
+    // Regs are function-scoped, so only the owning function can use the
+    // dst; scanning the whole module would match same-named regs in
+    // other functions and pin every select to RAM.
+    let Some(f) = m.funcs.iter().find(|f| f.name == func) else {
+        return false;
+    };
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if !reads_reg(inst, dst) {
+                continue;
+            }
+            let routed = match inst {
+                Inst::Call(c) => {
+                    matches!(c.args.first(), Some(a) if a.val == ir::Val::Reg(dst.to_string()))
+                        && log_pool_site(m, resolved, pooled, &f.name, &c.func, &c.args, &c.callees)
+                }
+                _ => false,
+            };
+            if !routed {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether a value is a pool-resident address (epic-cc#817): a pooled
+/// member directly, a clean use of one (constant offsets stay inside
+/// the member's chunk, so the variant's index arithmetic serves them),
+/// or a select over two such arms. Dynamic terms stay RAM: no reader
+/// shape serves them.
+fn pool_proven_ptr(
+    m: &Module,
+    resolved: &PtrResolution,
+    pooled: &dyn Fn(&str) -> bool,
+    func: &str,
+    val: &ir::Val,
+    depth: u8,
+) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    match val {
+        ir::Val::Global(g) => pooled(g),
+        ir::Val::Reg(r) => match resolved.get(&ssa_key(func, r)) {
+            Some((Base::Global(g), _, t)) => t.is_empty() && pooled(g),
+            Some((Base::Slot(dst, _), _, _)) => select_of(m, func, dst).is_some_and(|s| {
+                s.ptr
+                    && pool_proven_ptr(m, resolved, pooled, func, &s.a, depth + 1)
+                    && pool_proven_ptr(m, resolved, pooled, func, &s.b, depth + 1)
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The pointer-select defining `dst` in `func`, if any.
+fn select_of<'a>(m: &'a Module, func: &str, dst: &str) -> Option<&'a ir::Select> {
+    m.funcs
+        .iter()
+        .find(|f| f.name == func)?
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Select(s) if s.dst == dst => Some(s),
+            _ => None,
+        })
+}
+
+/// Whether `inst` reads `reg` in any operand position, phi incomings
+/// included. Defs never count: only uses can pin a select to RAM.
+fn reads_reg(inst: &Inst, reg: &str) -> bool {
+    ir::read_vals(inst)
+        .iter()
+        .any(|v| v.strip_prefix('%').unwrap_or(v) == reg)
+}
+
 /// Flash-pointer provenance for C++ vtable dispatch (epic-cc#832).
 /// `flash` holds regs proven to carry a vtable (flash) address: `load
 /// ptr` results read wholly from vptr fields, closed under all-flash
