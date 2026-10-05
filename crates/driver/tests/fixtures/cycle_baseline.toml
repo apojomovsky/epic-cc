@@ -457,7 +457,7 @@ ram_bytes = 53
 name = "scen-pid-update-18f4550"
 device = "18F4550"
 cycles = 776
-flash_words = 827
+flash_words = 824
 ram_bytes = 131
 
 [[entry]]
@@ -465,7 +465,7 @@ name = "scen-pid-update-18f4550"
 device = "18F4550"
 profile = "O2"
 cycles = 736
-flash_words = 833
+flash_words = 830
 ram_bytes = 131
 
 [[entry]]

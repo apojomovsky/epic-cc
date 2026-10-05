@@ -41,8 +41,8 @@
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    find_value_folds, flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance,
-    PtrResolution, Slot,
+    find_value_folds, flash_provenance, log_pool_site, resolve_pointers, ssa_key, Base,
+    FlashProvenance, PtrResolution, Slot, LOG_POOL_CALLEE, LOG_POOL_VARIANT,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -188,6 +188,16 @@ struct Gen<'m> {
     /// the page assignment); `Some` in pass B, where a same-page restore is
     /// skipped.
     page_of: Option<&'m HashMap<String, usize>>,
+    /// Pool log variant (epic-cc#817): emitting `__epic_log_pool`, whose
+    /// slots hold (in-chunk index, chunk id) pairs instead of addresses.
+    /// Loads through `pool_slots` read via the matching pool reader;
+    /// stores, address flows, or mixed phis through them panic rather
+    /// than misread.
+    pool_log: bool,
+    /// `{func}::{reg}` slots holding index pairs, closed over the fmt
+    /// param's phi/gep/select derivations. Only set in variant mode;
+    /// every other slot keeps address semantics.
+    pool_slots: HashSet<String>,
     /// Functions placed across pages (epic-cc#841): every member exceeds
     /// one 2048-word page even after inlining settled, so pass B emits
     /// it in page-sized chunks linked by PCLATH-setting GOTOs instead of
@@ -800,6 +810,16 @@ impl<'m> Gen<'m> {
     fn emit_ptr_load_byte(&mut self, ptr: &Val, byte_off: u8) {
         match ptr {
             Val::Reg(r) => {
+                // Pool log variant (epic-cc#817): index-pair slots read
+                // via the matching pool reader.
+                if self.pool_log
+                    && (self.pool_slots.contains(&ssa_key(self.cur_func, r))
+                        || matches!(self.resolved_for(r),
+                            (Base::Slot(s, _), _, _) if self.pool_slots.contains(&ssa_key(self.cur_func, &s))))
+                {
+                    self.emit_pool_read(r, byte_off);
+                    return;
+                }
                 if let (Base::Global(name), k, terms) = self.resolved_for(r) {
                     if self.global_is_const(&name) {
                         if self.global_size(&name) > 255 {
@@ -854,6 +874,124 @@ impl<'m> Gen<'m> {
         match self.emit_ptr_setup(ptr, byte_off) {
             Addr::Direct(a) => self.emit(format!("    MOVF 0x{a:02X}, W")),
             Addr::Indirect => self.emit("    MOVF INDF, W".to_string()),
+        }
+    }
+
+    /// `W = pool[idx + byte_off]`: one byte of the pool log variant
+    /// (epic-cc#817). The slot holds the call's (in-chunk index, chunk
+    /// id); the id picks the reader, the index plus the constant offset
+    /// feeds it. Members never cross chunks and the walk stays inside
+    /// one, so the 8-bit index never wraps and the id never changes.
+    fn emit_pool_read(&mut self, r: &str, byte_off: u8) {
+        let (base, k, terms) = self.resolved_for(r);
+        assert!(
+            terms.is_empty(),
+            "isel: pool log read through dynamic index %{r} is not supported"
+        );
+        let slot = match base {
+            Base::Slot(s, _) => {
+                assert!(
+                    self.pool_slots.contains(&ssa_key(self.cur_func, &s)),
+                    "isel: pool log read through non-index slot %{r}"
+                );
+                self.slot_addr(self.cur_func, &s).direct()
+            }
+            _ => panic!("isel: pool log read through non-slot base %{r}"),
+        };
+        // Mod-256 sum is the exact in-chunk index: the true offset stays
+        // below its chunk's 256-byte window (see above).
+        let kk = k.wrapping_add(u16::from(byte_off)) & 0xFF;
+        let chunks: Vec<String> = self.pool.chunks.iter().map(|c| c.name.clone()).collect();
+        let l_done = self.fresh_label();
+        let mut handlers: Vec<(String, String)> = Vec::new();
+        for (c, chunk) in chunks.iter().enumerate().skip(1) {
+            let l = self.fresh_label();
+            self.emit(format!("    MOVF 0x{:02X}, W", slot + 1));
+            self.emit(format!("    XORLW 0x{:02X}", c as u8));
+            self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+            self.emit(format!("    GOTO {l}"));
+            handlers.push((l, chunk.clone()));
+        }
+        self.emit_pool_chunk(&chunks[0], slot, kk as u8, &l_done, !handlers.is_empty());
+        for (l, chunk) in &handlers {
+            self.emit(format!("{l}:"));
+            self.emit_pool_chunk(chunk, slot, kk as u8, &l_done, true);
+        }
+        if !handlers.is_empty() {
+            self.emit(format!("{l_done}:"));
+        }
+    }
+
+    /// One pool chunk's reader CALL: W carries the slot's in-chunk index
+    /// plus the constant offset, the byte returns in W. Skips the trailing
+    /// jump for a lone chunk.
+    fn emit_pool_chunk(&mut self, chunk: &str, slot: u16, kk: u8, l_done: &str, close: bool) {
+        self.emit(format!("    MOVLW PAGE(__read_{chunk})"));
+        self.emit("    MOVWF PCLATH".to_string());
+        self.emit(format!("    MOVF 0x{slot:02X}, W"));
+        if kk != 0 {
+            self.emit(format!("    ADDLW 0x{kk:02X}"));
+        }
+        self.emit(format!("    CALL __read_{chunk}"));
+        self.emit_w_store(self.scratch);
+        self.emit_pclath_restore(&format!("__read_{chunk}"));
+        self.emit_w_load(self.scratch);
+        if close {
+            self.emit(format!("    GOTO {l_done}"));
+        }
+    }
+
+    /// Pool variant entry (epic-cc#817): resolve the fmt address to its
+    /// (in-chunk index, chunk id) once into the fmt slot. Each chunk
+    /// above the first is tested high-first with a link-time subtract;
+    /// chunk 0 is the fallthrough. No numeric layout premise: every
+    /// bound is the chunk's own base label.
+    fn emit_pool_prologue(&mut self, f: &ir::Func) {
+        let p = f
+            .params
+            .iter()
+            .find(|p| p.ptr)
+            .expect("isel: pool log variant needs a pointer param");
+        assert_eq!(p.width, 2, "isel: pool log fmt param must be 2 bytes");
+        let a = self.slot_addr(self.cur_func, &p.name).direct();
+        let chunks: Vec<String> = self.pool.chunks.iter().map(|c| c.name.clone()).collect();
+        let lo_t = self.retval_lo;
+        let hi_t = self.scratch;
+        let l_done = self.fresh_label();
+        let mut handlers: Vec<(String, usize)> = Vec::new();
+        for (c, base) in chunks.iter().enumerate().skip(1).rev() {
+            // D = ptr - base into temps; C set means ptr >= base.
+            let l = self.fresh_label();
+            self.emit(format!("    MOVLW LOW({base})"));
+            self.emit(format!("    SUBWF 0x{a:02X}, W"));
+            self.emit(format!("    MOVWF 0x{lo_t:02X}"));
+            self.emit(format!("    MOVLW HIGH({base})"));
+            self.emit("    BTFSS STATUS, 0".to_string());
+            self.emit("    ADDLW 0x01".to_string());
+            self.emit(format!("    SUBWF 0x{:02X}, W", a + 1));
+            self.emit(format!("    MOVWF 0x{hi_t:02X}"));
+            self.emit("    BTFSC STATUS, 0".to_string());
+            self.emit(format!("    GOTO {l}"));
+            handlers.push((l, c));
+        }
+        // Chunk 0: index = ptr - base_0, id 0.
+        let base0 = &chunks[0];
+        self.emit(format!("    MOVLW LOW({base0})"));
+        self.emit(format!("    SUBWF 0x{a:02X}, W"));
+        self.emit(format!("    MOVWF 0x{a:02X}"));
+        self.emit(format!("    CLRF 0x{:02X}", a + 1));
+        if !handlers.is_empty() {
+            self.emit(format!("    GOTO {l_done}"));
+        }
+        for (l, c) in &handlers {
+            self.emit(format!("{l}:"));
+            self.emit(format!("    MOVF 0x{lo_t:02X}, W"));
+            self.emit(format!("    MOVWF 0x{a:02X}"));
+            self.emit(format!("    MOVLW 0x{:02X}", *c as u8));
+            self.emit(format!("    MOVWF 0x{:02X}", a + 1));
+        }
+        if !handlers.is_empty() {
+            self.emit(format!("{l_done}:"));
         }
     }
 
@@ -2590,6 +2728,20 @@ impl<'m> Gen<'m> {
     /// by the direct call path and the per-candidate arms of an indirect
     /// call chain (epic-cc#73).
     fn emit_call_args(&mut self, func: &str, args: &[ir::CallArg]) {
+        // Pool log variant (epic-cc#817): derived slots hold indices,
+        // so passing one as an address reads the wrong bytes.
+        if self.pool_log {
+            for arg in args {
+                let ptr_arg = arg.ty.is_none() || arg.byval.is_some() || arg.sret;
+                if ptr_arg
+                    && matches!(&arg.val, Val::Reg(r) if self.pool_slots.contains(&ssa_key(self.cur_func, r)))
+                {
+                    panic!(
+                        "isel: pool log variant cannot pass a derived pointer as a call address"
+                    );
+                }
+            }
+        }
         let callee = self
             .m
             .funcs
@@ -3071,6 +3223,25 @@ impl<'m> Gen<'m> {
             self.emit(format!("    GOTO {l_trap}"));
             return;
         }
+        // Pool log variant (epic-cc#817): a proven pool address bypasses
+        // the RAM loop. Args still land in the callee's slots (the
+        // variant shares the frame); only the CALL target changes.
+        // RAM and unknown callers keep the original.
+        let pool = self.pool;
+        let target = if !pool.chunks.is_empty()
+            && log_pool_site(
+                self.m,
+                self.resolved,
+                &|n| pool.contains(n),
+                self.cur_func,
+                func,
+                args,
+                callees,
+            ) {
+            LOG_POOL_VARIANT
+        } else {
+            func
+        };
         self.emit_call_args(func, args);
         // PCLATH discipline: every CALL runs with PCLATH<4:3> = the
         // target's page. The set's MOVLW clobbers W, so it must come AFTER
@@ -3079,9 +3250,9 @@ impl<'m> Gen<'m> {
         // is in the caller's own page, where the restore is skipped (PCLATH
         // still holds the caller's page after the call, so its
         // intra-function GOTOs keep branching in its page).
-        self.emit(format!("    MOVLW PAGE({func})"));
+        self.emit(format!("    MOVLW PAGE({target})"));
         self.emit("    MOVWF PCLATH".to_string());
-        self.emit(format!("    CALL {func}"));
+        self.emit(format!("    CALL {target}"));
         if let Some(d) = dst {
             let t = ty.expect("isel: valued call must carry a type");
             // A valued callee leaves its last retval byte in W: valued
@@ -3243,6 +3414,15 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Store(s) => {
+                // Pool log variant (epic-cc#817): derived slots hold
+                // indices, so a store through one has no address.
+                if self.pool_log
+                    && s.ptr
+                        .strip_prefix('%')
+                        .is_some_and(|r| self.pool_slots.contains(&ssa_key(self.cur_func, r)))
+                {
+                    panic!("isel: pool log variant cannot store through a derived pointer");
+                }
                 // Same i1-in-memory story as the Load arm above
                 // (epic-cc#462): `trunc` normalizes an i1 byte to 0/1, the
                 // convention every i1 consumer tests for nonzero.
@@ -6736,12 +6916,146 @@ fn find_bit_test_collapse(
     })
 }
 
+/// `{func}::{reg}` slots holding (in-chunk index, chunk id) pairs in the
+/// log variant (epic-cc#817): the fmt param, closed over phi/gep/select
+/// derivations. Plain slots in the variant frame keep RAM semantics.
+fn pool_slot_closure(func: &str, f: &ir::Func) -> HashSet<String> {
+    let key = |n: &str| ssa_key(func, n);
+    let mut set = HashSet::new();
+    if let Some(p) = f.params.iter().find(|p| p.ptr) {
+        set.insert(key(&p.name));
+    }
+    let mut progressed = true;
+    while progressed {
+        progressed = false;
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let dst = match inst {
+                    Inst::Phi(p) if p.ptr => {
+                        let any = p
+                            .incoming
+                            .iter()
+                            .any(|(v, _)| matches!(v, Val::Reg(r) if set.contains(&key(r))));
+                        any.then(|| p.dst.clone())
+                    }
+                    Inst::Gep(g) => match &g.base {
+                        ir::GepBase::Reg(b) if set.contains(&key(b)) => Some(g.dst.clone()),
+                        _ => None,
+                    },
+                    Inst::Select(s) if s.ptr => {
+                        let arm = |v: &Val| matches!(v, Val::Reg(r) if set.contains(&key(r)));
+                        (arm(&s.a) || arm(&s.b)).then(|| s.dst.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(d) = dst {
+                    if set.insert(key(&d)) {
+                        progressed = true;
+                    }
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Alternate entry for the log callee reading through the pool
+/// (epic-cc#817): the same body over the same frame, with the fmt slot
+/// converted to a pool-relative index by the prologue. Routed call sites
+/// target this label; the RAM loop above keeps serving the rest.
+fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
+    if g.split.contains(LOG_POOL_CALLEE) {
+        panic!("isel: pool log callee exceeds a page; variant placement is not supported");
+    }
+    let slots = pool_slot_closure(g.cur_func, f);
+    // Variant contract: the fmt param is the only address source, so a
+    // store or an address flow through a derived slot, or a phi mixing
+    // derived and plain edges, has no index meaning. Panic rather than
+    // emit a loop that reads the wrong bytes.
+    for b in &f.blocks {
+        for inst in &b.insts {
+            match inst {
+                Inst::Store(s) => {
+                    if let Some(r) = s.ptr.strip_prefix('%') {
+                        if slots.contains(&ssa_key(g.cur_func, r)) {
+                            panic!(
+                                "isel: pool log variant cannot store through derived pointer %{r}"
+                            );
+                        }
+                    }
+                }
+                Inst::Call(c) => {
+                    for arg in &c.args {
+                        let ptr_arg = arg.ty.is_none() || arg.byval.is_some() || arg.sret;
+                        if ptr_arg
+                            && matches!(&arg.val, Val::Reg(r) if slots.contains(&ssa_key(g.cur_func, r)))
+                        {
+                            panic!(
+                                "isel: pool log variant cannot pass derived pointer as a call address"
+                            );
+                        }
+                    }
+                }
+                Inst::Phi(p) if p.ptr => {
+                    let n = p
+                        .incoming
+                        .iter()
+                        .filter(|(v, _)| {
+                            matches!(v, Val::Reg(r) if slots.contains(&ssa_key(g.cur_func, r)))
+                        })
+                        .count();
+                    if n != 0 && n != p.incoming.len() {
+                        panic!(
+                            "isel: pool log variant phi %{} mixes index and address edges",
+                            p.dst
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut vf = f.clone();
+    vf.name = LOG_POOL_VARIANT.to_string();
+    let mut vg = Gen {
+        m: g.m,
+        addrs: g.addrs,
+        device: g.device,
+        staged: g.staged,
+        pool: g.pool,
+        resolved: g.resolved,
+        prov: g.prov.clone(),
+        scratch: g.scratch,
+        retval_lo: g.retval_lo,
+        cur_func: g.cur_func,
+        bool_temps: HashSet::new(),
+        tmp: &mut *g.tmp,
+        page_of: g.page_of,
+        pool_log: true,
+        pool_slots: slots,
+        split: g.split,
+        global_addrs: g.global_addrs,
+        w_folds: g.w_folds.clone(),
+        w_holds: None,
+        use_count: HashMap::new(),
+        deferred_store: None,
+        deferred_uses: 0,
+        z_rel: None,
+        cur_loc: None,
+        out: Vec::new(),
+        locs: Vec::new(),
+    };
+    emit_func_body(&mut vg, &vf);
+    g.out.extend(vg.out);
+    g.locs.extend(vg.locs);
+}
+
 /// Emit one function's body into `g.out`: runtime routines get their recipe
 /// body; ordinary functions get the block labels, phi copies, and
 /// terminators. Shared by both emission passes: pass A measures the body
 /// (every PCLATH restore present) to drive the page assignment, pass
 /// B re-emits it with same-page restores skipped.
-fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
+fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
     // Labels, prologue, and phi-copy glue are compiler-generated: no source
     // instruction owns them, so they must not inherit a stale loc from the
     // previous function's last instruction.
@@ -6848,6 +7162,11 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     let doms = block_dominators(f);
     for (i, b) in f.blocks.iter().enumerate() {
         g.emit(format!("{}:", labels[&b.label]));
+        // Pool log variant (epic-cc#817): convert the fmt slot to a
+        // pool-relative index before the first load reads it.
+        if i == 0 && g.pool_log {
+            g.emit_pool_prologue(f);
+        }
         if i == 0 && f.isr {
             // The scratch/retval addresses are fixed, device-derived
             // constants (docs/39): bank-independent common RAM on every
@@ -7098,6 +7417,11 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     // terminator already flushed through `emit`, so this is normally empty.
     g.flush_deferred();
     g.emit("".to_string());
+    // Pool log variant (epic-cc#817): alternate entry over the same
+    // frame, emitted once per pass right after the RAM loop above.
+    if f.name == LOG_POOL_CALLEE && !g.pool_log && !g.pool.chunks.is_empty() {
+        emit_log_pool_variant(g, f);
+    }
 }
 
 /// Emit the dependency-ordered phi copies for one (pred -> merge) edge: a
@@ -7756,6 +8080,12 @@ impl ConstPool {
         self.loc.get(name).map(|(c, o)| (c.as_str(), *o))
     }
 
+    /// Whether `name` has a pooled address (epic-cc#817): the routing
+    /// predicate's membership test.
+    pub fn contains(&self, name: &str) -> bool {
+        self.loc.contains_key(name)
+    }
+
     /// Synthesized table globals, one per chunk, for the per-const
     /// emission path below: chunk labels, readers, page planning, and
     /// the collision guard all treat them as ordinary const tables.
@@ -8091,6 +8421,8 @@ pub fn select_with_locs(
                 bool_temps: HashSet::new(),
                 tmp: &mut tmp,
                 page_of: None,
+                pool_log: false,
+                pool_slots: HashSet::new(),
                 split: &no_split,
                 global_addrs: &global_addrs,
                 w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
@@ -8306,6 +8638,8 @@ pub fn select_with_locs(
                 bool_temps: HashSet::new(),
                 tmp: &mut tmp2,
                 page_of: None,
+                pool_log: false,
+                pool_slots: HashSet::new(),
                 split: &split_set,
                 global_addrs: &global_addrs,
                 w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
@@ -8494,6 +8828,14 @@ pub fn select_with_locs(
     for (entry, page) in reader_pages(&consts, table_start) {
         pages.insert(entry, page);
     }
+    // Pool log variant (epic-cc#817): emitted inside the callee's own
+    // extent, so it shares the callee's page and routed same-page calls
+    // elide the restore. Absent without the pool, like the variant.
+    if !pool.chunks.is_empty() {
+        if let Some(&p) = pages.get(LOG_POOL_CALLEE) {
+            pages.insert(LOG_POOL_VARIANT.to_string(), p);
+        }
+    }
     // ---- PASS B: emit the final text with every function's page known.
     // Same-page calls (and same-page const reads) skip the restore pair; the
     // pages are the assignment's, and the `.org` pads pin the page bases, so
@@ -8581,6 +8923,8 @@ pub fn select_with_locs(
                             bool_temps: HashSet::new(),
                             tmp: &mut tmp,
                             page_of: Some(&pages),
+                            pool_log: false,
+                            pool_slots: HashSet::new(),
                             split: &split_set,
                             global_addrs: &global_addrs,
                             w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
@@ -8786,6 +9130,20 @@ pub fn select_with_locs(
                         format!("__read_{}_hi{}", g.name, c)
                     },
                     format!("chunk-{c} reader entry of const {}", g.name),
+                );
+            }
+        }
+        // Pool log variant (epic-cc#817): its entry label shares the
+        // namespace, so a user const with the same name fails here,
+        // not as a silent assembler overwrite.
+        if !pool.chunks.is_empty() && m.funcs.iter().any(|f| f.name == LOG_POOL_CALLEE) {
+            if let Some(prev) = labels.insert(
+                LOG_POOL_VARIANT.to_string(),
+                "pool log variant entry".to_string(),
+            ) {
+                panic!(
+                    "isel: const-table label collision: `{}` is both {prev} and pool log variant entry",
+                    LOG_POOL_VARIANT
                 );
             }
         }

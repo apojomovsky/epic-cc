@@ -119,14 +119,17 @@ jobs:
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
 
+      # Exact-match content key only, no restore-keys prefix fallback.
+      # A prefix-hit restores artifacts built from a different tree and
+      # cargo can then link a stale rlib: new tests failing with old
+      # panic strings (false red seen in #828, a false green is the
+      # symmetric risk). See #831.
       - name: Cache cargo target dir
         if: steps.noncode.outputs.non_code != 'true'
         uses: actions/cache@v5
         with:
           path: target
-          key: cargo-${{ runner.os }}-${{ github.workflow }}-${{ github.sha }}-${{ matrix.device }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ github.workflow }}-
+          key: cargo-${{ runner.os }}-${{ github.workflow }}-${{ hashFiles('Cargo.lock', '**/*.rs', '**/*.toml') }}-${{ matrix.device }}
 
       - name: Cache cargo home
         if: steps.noncode.outputs.non_code != 'true'
@@ -292,15 +295,14 @@ jobs:
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
 
+      # Exact-match content key only, no restore-keys prefix fallback
+      # (stale-rlib contamination, see #831 and the canonical job above).
       - name: Cache cargo target dir
         if: steps.noncode.outputs.non_code != 'true'
         uses: actions/cache@v5
         with:
           path: target
-          key: cargo-${{ runner.os }}-devices-${{ github.sha }}
-          restore-keys: |
-            cargo-${{ runner.os }}-devices-
-            cargo-${{ runner.os }}-${{ github.workflow }}-
+          key: cargo-${{ runner.os }}-devices-${{ hashFiles('Cargo.lock', '**/*.rs', '**/*.toml') }}
 
       - name: Cache cargo home
         if: steps.noncode.outputs.non_code != 'true'
