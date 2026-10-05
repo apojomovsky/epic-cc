@@ -1723,7 +1723,20 @@ fn home_args(
 /// can make one cost flash. Other cores, and PIC18 layouts that fall
 /// back to globals-first, take the bounding pass as the result.
 pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
-    let (nofold, fit) = allocate_inner(device, m, edges_text, None);
+    allocate_with_pool(device, m, edges_text, false)
+}
+
+/// `allocate` with the pooled flash string table (epic-cc#816): when
+/// `pool` is set on PIC14, a pooled const whose uses isel rewrites to
+/// pool addresses keeps no RAM copy. The driver sets this from
+/// `--const-pool`; every other caller keeps the status quo.
+pub fn allocate_with_pool(
+    device: &Device,
+    m: &Module,
+    edges_text: &str,
+    pool: bool,
+) -> AllocLayout {
+    let (nofold, fit) = allocate_inner(device, m, edges_text, None, pool);
     if device.core == Core::Pic14 {
         // Globals-first is exact, not monotone: global placement reads
         // only the module's globals, never the frame widths the gated
@@ -1735,7 +1748,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             .filter(|g| !g.is_const && nofold.globals.contains_key(&g.name))
             .map(|g| g.name.clone())
             .collect();
-        return allocate_inner(device, m, edges_text, Some(&safe)).0;
+        return allocate_inner(device, m, edges_text, Some(&safe), pool).0;
     }
     if device.core != Core::Pic18 || !fit {
         return nofold;
@@ -1751,19 +1764,21 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         .filter(|g| !g.is_const && nofold.globals.get(&g.name).is_some_and(|a| *a <= hi))
         .map(|g| g.name.clone())
         .collect();
-    allocate_inner(device, m, edges_text, Some(&safe)).0
+    allocate_inner(device, m, edges_text, Some(&safe), pool).0
 }
 
 /// Address allocation with a value-fold gate (epic-cc#863). `None`
 /// places every slot; `Some` drops the access-safe folds it names. The
 /// public `allocate` pairs a bounding pass with the gated one. The
 /// `bool` reports whether the frames fit below the globals; when they
-/// do not, the globals-first fallback owns the layout instead.
+/// do not, the globals-first fallback owns the layout instead. `pool`
+/// gates pooled-const RAM copies on PIC14 (epic-cc#816).
 fn allocate_inner(
     device: &Device,
     m: &Module,
     edges_text: &str,
     gate: Option<&HashSet<String>>,
+    pool: bool,
 ) -> (AllocLayout, bool) {
     // The va region size frame_layout reserves: the widest call site, with
     // a one-byte floor so a variadic function whose call sites pass no
@@ -2185,6 +2200,19 @@ fn allocate_inner(
     // GEP/reg chain. The split feeds staging below.
     let mut const_direct: HashSet<String> = HashSet::new();
     let mut const_derived: HashSet<String> = HashSet::new();
+    // Pool gating records (epic-cc#816): byval/sret direct uses keep
+    // their copy, and every reg use's (func, reg) lets the gating pass
+    // resolve it through iselcore instead of the syntactic chain above.
+    let mut const_byval: HashSet<String> = HashSet::new();
+    let mut const_reg_uses: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    // A const feeding a pointer phi (the LSR chase shape) reads back
+    // through iselcore's indirect slot with RAM semantics, so it keeps
+    // its copy regardless of its other uses (epic-cc#816).
+    let mut const_phi: HashSet<String> = HashSet::new();
+    // Every arm of a non-folding pointer select (epic-cc#816): the
+    // select seeds an indirect slot isel derefs with RAM semantics,
+    // so each const arm keeps its copy even when directly named.
+    let mut const_sel: HashSet<String> = HashSet::new();
     // Staging site records (epic-cc#790): per-call direct consts and reg
     // args, per-select dst with direct const arms, operand users per
     // (func, reg) with block positions, direct call edges, and functions
@@ -2311,6 +2339,8 @@ fn allocate_inner(
                                                     // candidates (epic-cc#790).
                                                     if arg.byval.is_none() && !arg.sret {
                                                         const_direct.insert(g.clone());
+                                                    } else {
+                                                        const_byval.insert(g.clone());
                                                     }
                                                 }
                                             }
@@ -2323,7 +2353,11 @@ fn allocate_inner(
                                             {
                                                 if gl.size <= 255 {
                                                     const_to_ram.insert(base.clone());
-                                                    const_derived.insert(base);
+                                                    const_derived.insert(base.clone());
+                                                    const_reg_uses
+                                                        .entry(base)
+                                                        .or_default()
+                                                        .push((f.name.clone(), r.clone()));
                                                 }
                                             }
                                         }
@@ -2410,19 +2444,28 @@ fn allocate_inner(
                         ];
                         if arms[0].0 != arms[1].0 {
                             let mut direct_arms: Vec<String> = Vec::new();
-                            for (base, is_direct) in arms {
+                            for ((base, is_direct), v) in arms.into_iter().zip([&s.a, &s.b]) {
                                 let Some(g) = base else { continue };
                                 // A GEP/reg-derived arm needs a real address
                                 // and keeps a RAM copy; a directly named arm
-                                // stages on small cores (below).
+                                // stages on small cores (below). Either way
+                                // the arm reads back through the select's
+                                // indirect slot, so gating never drops it.
                                 if let Some(gl) = m.globals.iter().find(|gl| gl.name == g) {
                                     if gl.size <= 255 {
                                         const_to_ram.insert(g.clone());
+                                        const_sel.insert(g.clone());
                                         if is_direct {
                                             const_direct.insert(g.clone());
                                             direct_arms.push(g.clone());
                                         } else {
-                                            const_derived.insert(g);
+                                            const_derived.insert(g.clone());
+                                            if let ir::Val::Reg(r) = v {
+                                                const_reg_uses
+                                                    .entry(g)
+                                                    .or_default()
+                                                    .push((f.name.clone(), r.clone()));
+                                            }
                                         }
                                     }
                                 }
@@ -2435,6 +2478,31 @@ fn allocate_inner(
                                     dst: s.dst.clone(),
                                     arms: direct_arms,
                                 });
+                            }
+                        }
+                    }
+                    // A const reaching a pointer phi keeps its RAM copy:
+                    // iselcore seeds the phi as an indirect slot and every
+                    // read through it derefs RAM (the LSR chase shape whose
+                    // flash lowering is epic-cc#811). A gated address here
+                    // would deref flash as RAM.
+                    if let ir::Inst::Phi(p) = inst {
+                        if p.ptr {
+                            for (v, _) in &p.incoming {
+                                let base = match v {
+                                    ir::Val::Global(g) => {
+                                        if m.globals.iter().any(|gl| &gl.name == g && gl.is_const) {
+                                            Some(g.clone())
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    ir::Val::Reg(r) => find_const_base(r),
+                                    ir::Val::Const(_) => None,
+                                };
+                                if let Some(g) = base {
+                                    const_phi.insert(g);
+                                }
                             }
                         }
                     }
@@ -2708,6 +2776,62 @@ fn allocate_inner(
             for gname in &staged {
                 const_to_ram.remove(gname);
             }
+        }
+    }
+    // Pool copy gating (epic-cc#816): a pooled const whose uses isel
+    // rewrites to pool addresses needs no RAM copy. Rewritable uses
+    // are direct call args and clean reg args resolving to the const
+    // with no dynamic terms; a byval/sret arg, a dynamic term, a
+    // select arm, a phi incoming, or any other opaque slot-mediated
+    // flow keeps the copy, as does any mix of rewritable and RAM
+    // uses. Only the PIC14 backend rewrites, so other cores keep
+    // every copy.
+    if pool && device.core == Core::Pic14 {
+        let ram_use = |g: &str| -> bool {
+            if const_byval.contains(g) || const_phi.contains(g) || const_sel.contains(g) {
+                return true;
+            }
+            match const_reg_uses.get(g) {
+                None => false,
+                Some(uses) => uses
+                    .iter()
+                    .any(|(func, r)| match resolved.get(&ssa_key(func, r)) {
+                        Some((Base::Global(c), _, t)) => c != g || !t.is_empty(),
+                        _ => true,
+                    }),
+            }
+        };
+        let mut gated: Vec<String> = Vec::new();
+        // Staged consts left `const_to_ram` in the block above, so the
+        // candidates are the union: a staged direct-only const gates out
+        // of staging too, not just out of its copy.
+        let mut cands: Vec<&String> = const_to_ram.iter().collect();
+        cands.extend(staged.iter());
+        for g in cands {
+            let pooled = m
+                .globals
+                .iter()
+                .find(|gl| &gl.name == g)
+                .is_some_and(iselcore::pool_member);
+            if pooled && !ram_use(g) {
+                gated.push(g.clone());
+            }
+        }
+        for g in &gated {
+            const_to_ram.remove(g);
+            staged.remove(g);
+        }
+        if staged.len() < 2 {
+            const_to_ram.extend(staged.iter().cloned());
+            staged.clear();
+            stage_max = 0;
+        } else {
+            stage_max = staged
+                .iter()
+                .filter_map(|g| m.globals.iter().find(|gl| &gl.name == g))
+                .map(|gl| gl.size)
+                .max()
+                .unwrap_or(0);
         }
     }
     // RAM globals have no 255-byte ceiling: `Global.size` is `u16` and
