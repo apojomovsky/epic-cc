@@ -164,9 +164,10 @@ fn the_shared_u32_digit_loop_stores_the_right_digits() {
     let hex = std::fs::read_to_string(&hex_path).unwrap();
     let _ = std::fs::remove_file(&asm_path);
     let _ = std::fs::remove_file(&hex_path);
-    assert!(
-        asm.contains("CALL __udec_u32"),
-        "the digit loop is shared, not expanded:\n{asm}"
+    assert_eq!(
+        asm.matches("CALL __udec_u32").count(),
+        2,
+        "both digit loops are shared, not expanded:\n{asm}"
     );
     let start = start_steps(&asm);
     let equ = |name: &str| -> usize {
@@ -179,8 +180,8 @@ fn the_shared_u32_digit_loop_stores_the_right_digits() {
             .unwrap_or_else(|| panic!("no `{name} equ` in listing"))
     };
     let in_addr = equ("in");
-    let buf_addr = equ("buf");
-    let n_addr = equ("n_out");
+    let bufs = [equ("buf"), equ("buf2")];
+    let ns = [equ("n_out"), equ("n2_out")];
 
     // Digit-count and carry boundaries on both widths, up to u32 max.
     for v in [
@@ -204,8 +205,12 @@ fn the_shared_u32_digit_loop_stores_the_right_digits() {
                 break;
             }
         }
-        let got: Vec<u8> = (0..want.len()).map(|i| p.ram()[buf_addr + i]).collect();
-        assert_eq!(got, want, "digits of {v}");
-        assert_eq!(p.ram()[n_addr], want.len() as u8, "count of {v}");
+        let got: Vec<Vec<u8>> = bufs
+            .iter()
+            .map(|&b| (0..want.len()).map(|i| p.ram()[b + i]).collect())
+            .collect();
+        assert_eq!(got, [want.clone(), want.clone()], "digits of {v}");
+        let counts: Vec<u8> = ns.iter().map(|&a| p.ram()[a]).collect();
+        assert_eq!(counts, [want.len() as u8; 2], "counts of {v}");
     }
 }
