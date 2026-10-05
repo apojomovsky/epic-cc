@@ -90,14 +90,13 @@ jobs:
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
 
+      # Exact-match content key only, no restore-keys prefix fallback
+      # (stale-rlib contamination, see #831).
       - name: Cache cargo target dir
         uses: actions/cache@v5
         with:
           path: target
-          key: cargo-${{ runner.os }}-mdb-${{ matrix.spec }}-${{ github.sha }}
-          restore-keys: |
-            cargo-${{ runner.os }}-mdb-${{ matrix.spec }}-
-            cargo-${{ runner.os }}-
+          key: cargo-${{ runner.os }}-mdb-${{ matrix.spec }}-${{ hashFiles('Cargo.lock', '**/*.rs', '**/*.toml') }}
 
       - name: Cache cargo home
         uses: actions/cache@v5

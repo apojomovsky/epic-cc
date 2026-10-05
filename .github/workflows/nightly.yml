@@ -48,14 +48,13 @@ jobs:
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
 
+      # Exact-match content key only, no restore-keys prefix fallback
+      # (stale-rlib contamination, see #831).
       - name: Cache cargo target dir
         uses: actions/cache@v5
         with:
           path: target
-          key: cargo-${{ runner.os }}-nightly-${{ github.sha }}
-          restore-keys: |
-            cargo-${{ runner.os }}-nightly-
-            cargo-${{ runner.os }}-
+          key: cargo-${{ runner.os }}-nightly-${{ hashFiles('Cargo.lock', '**/*.rs', '**/*.toml') }}
 
       - name: Cache cargo home
         uses: actions/cache@v5
@@ -105,14 +104,13 @@ jobs:
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
 
+      # Exact-match content key only, no restore-keys prefix fallback
+      # (stale-rlib contamination, see #831).
       - name: Cache cargo target dir
         uses: actions/cache@v5
         with:
           path: target
-          key: cargo-${{ runner.os }}-sdcc-parity-${{ github.sha }}
-          restore-keys: |
-            cargo-${{ runner.os }}-sdcc-parity-
-            cargo-${{ runner.os }}-
+          key: cargo-${{ runner.os }}-sdcc-parity-${{ hashFiles('Cargo.lock', '**/*.rs', '**/*.toml') }}
 
       - name: Cache cargo home
         uses: actions/cache@v5
