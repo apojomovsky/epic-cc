@@ -51,13 +51,13 @@ of an interrupted run against a clean baseline run.
   vendored control demo sources (PIC18 only, like the demo it comes
   from). Init only programs Timer2 and never enables GIE, and the pass
   injects its ADC reading through the demo's sim override, so it runs
-  ISR-free with no timer model. Note the vendor's `__EPIC_CC__`
-  `epic_adcfilter_oversample` stub returns 0 under our compiler, so the
-  pass pins average, PID and PWM with a zero sample; the injected value
-  only takes effect under the reference compiler.
+  ISR-free with no timer model. Note the vendor oversample and average
+  helpers are `__EPIC_CC__` stubs returning 0, so the pass pins the PID
+  update and PWM duty with a zero sample; the injected value only takes
+  effect under the reference compiler.
 - `speed-isr-*`: interrupt latency plus round trip per core.
 
 Menu-tick is still absent: `menu_demo_init` needs the Timer2 tick for
-its LCD startup delays, and the first tick ISR traps in a miscompiled
-callback dispatch (epic-cc#873 notes). It becomes a row once that
-dispatch is fixed.
+its LCD startup delays, and the first tick ISR traps in the Timer2
+callback dispatch (epic-cc#918). It becomes a row once that trap is
+fixed.

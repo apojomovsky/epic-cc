@@ -2,9 +2,11 @@
  * (epic-cc#873 scenario). Inits the real demo, injects a scripted ADC
  * reading via the sim override (so the pass never polls unmodeled ADC
  * hardware), then times a single control_demo_task_control pass with
- * the marker protocol around it: oversample, average, PID update, PWM
- * duty. Init only programs Timer2, never waits on it, and never
- * enables GIE, so the pass runs ISR-free with no timer model. */
+ * the marker protocol around it. The vendor oversample and average
+ * helpers are __EPIC_CC__ stubs returning 0, so the pass pins the PID
+ * update and PWM duty with a zero sample. Init only programs Timer2,
+ * never waits on it, and never enables GIE, so the pass runs ISR-free
+ * with no timer model. */
 #include "control_demo_core.h"
 
 #include <stdint.h>
