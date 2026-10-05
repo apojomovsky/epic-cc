@@ -6049,6 +6049,39 @@ impl<'m> Gen<'m> {
         self.emit("    RETURN".to_string());
     }
 
+    /// The counted bench loop (epic-cc#722): exactly 5 binary digits,
+    /// nothing returned. Same divmod core as `emit_udec_u32` at half width
+    /// with a `DECFSZ` digit counter instead of the value exit test.
+    /// Scratch: `den`@0-1 (baked 10), `rem`@2-3, `dcnt`@4, `iter`@5,
+    /// `digit`@6.
+    fn emit_udec_u16_5(&mut self, name: &str, scr: u16) {
+        let num = self.slot_addr(name, "num").direct();
+        let buf = self.slot_addr(name, "buf").direct();
+        let (den, rem, dcnt, iter, digit) = (scr, scr + 2, scr + 4, scr + 5, scr + 6);
+        // FSR0 = buf, once: POSTINC0 walks the 5 digits.
+        self.emit_copy_byte(buf, 0xFE9);
+        self.emit_copy_byte(buf + 1, 0xFEA);
+        // den = 10, iter = 5, once.
+        self.emit("    MOVLW 0x0A".to_string());
+        self.emit_banked("MOVWF", den, "");
+        self.emit_banked("CLRF", den + 1, "");
+        self.emit("    MOVLW 0x05".to_string());
+        self.emit_banked("MOVWF", iter, "");
+        let l_digits = self.fresh_label();
+        self.emit_label(&l_digits);
+        // One restoring-division pass: quotient back into `num`, remainder
+        // (the binary digit, 0-9) into `rem`.
+        self.emit_divmod_loop(num, den, rem, dcnt, 2, 2);
+        // digit = rem0, then POSTINC0 (0xFEE) = digit.
+        self.emit_banked("MOVF", rem, ",W");
+        self.emit_banked("MOVWF", digit, "");
+        self.emit_copy_byte(digit, 0xFEE);
+        // Five digits exactly: DECFSZ skips the BRA on the last one.
+        self.emit_banked("DECFSZ", iter, ",F");
+        self.emit(format!("    BRA {l_digits}"));
+        self.emit("    RETURN".to_string());
+    }
+
     /// The signed div/mod wrapper: abs both operands in place in the param
     /// slots (unsigned abs, INT_MIN safe), run the unsigned divmod with
     /// `rem` at `__scr[1..]` and the counter after it (byte 0 holds the
@@ -8164,6 +8197,7 @@ impl<'m> Gen<'m> {
             "__udiv_u32" => self.emit_divmod(name, 4, scr, true),
             "__urem_u32" => self.emit_divmod(name, 4, scr, false),
             "__udec_u32" => self.emit_udec_u32(name, scr),
+            "__udec_u16_5" => self.emit_udec_u16_5(name, scr),
             "__sdiv_i8" => self.emit_sdivmod(name, 1, scr, true),
             "__srem_i8" => self.emit_sdivmod(name, 1, scr, false),
             "__sdiv_i16" => self.emit_sdivmod(name, 2, scr, true),
