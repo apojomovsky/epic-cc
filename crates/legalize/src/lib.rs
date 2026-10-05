@@ -3996,6 +3996,7 @@ fn routine_func(name: &str) -> Func {
             ],
             11,
         ),
+        "__sdiv_i8" | "__srem_i8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 5),
         "__sdiv_i16" | "__srem_i16" => (Ty::I16, vec![param("num", 2), param("den", 2)], 7),
         "__sdiv_i32" | "__srem_i32" => (Ty::I32, vec![param("num", 4), param("den", 4)], 12),
         "__shl_u8" | "__lshr_u8" | "__ashr_i8" => {
