@@ -2861,14 +2861,16 @@ fn pic14_multi_use_load_keeps_its_slot() {
 #[test]
 fn pooled_consts_drop_ram_copies_except_mixed_uses() {
     // epic-cc#816: with pooling on, a const used only as a direct
-    // call arg keeps no RAM copy; one also reached through a dynamic
-    // index keeps its copy. Unflagged, both copy as before.
+    // call arg keeps no RAM copy; one const used both directly and
+    // through a dynamic index keeps its copy. Unflagged, both copy
+    // as before.
     let mut m = parse(
         "const solo i8\n\
          const mixed i8\n\
          fn main(void) ()\n\
            block entry:\n\
              call void @f(@solo)\n\
+             call void @f(@mixed)\n\
              %i = add i8 1, 2\n\
              %g = gep @mixed +0 +1*%i\n\
              call void @f(%g)\n\
