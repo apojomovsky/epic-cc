@@ -140,35 +140,6 @@ pub struct FixedUses {
     pub memcpy_park: bool,
     pub memcpy_hold: bool,
 }
-/// the fixture corpus and fails any row the scan beats. Verbatim inline
-/// asm is outside the model: it can name any byte, fixed or otherwise.
-/// Each predicate fires on shapes that MIGHT touch, so misses default
-/// to counted.
-///
-/// PIC18 (isel-pic18): valued calls load `retval_lo..`, `Ret` stores the
-/// same width, the `k - a` chain parks C0 in the flag bit, `_delay`
-/// counts in `retval_lo..`. Mul/div/float bodies write their own result,
-/// covered by their return. i64 never reaches a backend (irparse rejects
-/// it), so widths above 4 cap in `fixed_bytes`.
-///
-/// PIC14/PIC14E (isel, isel-pic14e): same call/return widths, plus the
-/// dynamic-memcpy counters (2, constant lengths unroll), the `_delay`
-/// counters, the large-const-table index (1, tables over 255 bytes), the
-/// signed-wide-compare spill (1, unsigned chains fold in place), the
-/// scratch byte (below), the dynamic-memcpy park bytes (2), and the
-/// PIC14E constant-memcpy hold byte (1, below).
-///
-/// Scratch groups, each mirroring an emission site: const-table reads
-/// (any size, plus the pool-log variant), general dynamic address sums,
-/// wide compares (multi-byte equality, signed or const-byte ordered
-/// chains), and wide ALU (32-bit add/sub, const-LHS sub past byte 0).
-/// Switches desugar to branches before isel, so they need no group.
-///
-/// PIC14E differs twice: every equality fold stores scratch, and its
-/// FSR setups keep the fast shape for empty term lists. Its constant
-/// memcpy parks the byte in the hold byte across an indirect
-/// destination setup; indirectness needs alloc addresses, so any
-/// constant memcpy counts there.
 /// Whether `name` is a flash const table. A const with a RAM copy
 /// lowers through RAM instead, but the copy decision lives in alloc,
 /// invisible to this scan, so a const base always counts as a read.
@@ -319,6 +290,38 @@ fn bin_scratch(bin: &Bin) -> bool {
     }
 }
 
+/// The fixed bytes the module's lowering can touch, per core. Every arm
+/// mirrors an isel emission site, so a site missing here undercounts RAM:
+/// the `fixed_uses` e2e test scans emitted asm for fixed-range refs over
+/// the fixture corpus and fails any row the scan beats. Verbatim inline
+/// asm is outside the model: it can name any byte, fixed or otherwise.
+/// Each predicate fires on shapes that MIGHT touch, so misses default
+/// to counted.
+///
+/// PIC18 (isel-pic18): valued calls load `retval_lo..`, `Ret` stores the
+/// same width, the `k - a` chain parks C0 in the flag bit, `_delay`
+/// counts in `retval_lo..`. Mul/div/float bodies write their own result,
+/// covered by their return. i64 never reaches a backend (irparse rejects
+/// it), so widths above 4 cap in `fixed_bytes`.
+///
+/// PIC14/PIC14E (isel, isel-pic14e): same call/return widths, plus the
+/// dynamic-memcpy counters (2, constant lengths unroll), the `_delay`
+/// counters, the large-const-table index (1, tables over 255 bytes), the
+/// signed-wide-compare spill (1, unsigned chains fold in place), the
+/// scratch byte (below), the dynamic-memcpy park bytes (2), and the
+/// PIC14E constant-memcpy hold byte (1, below).
+///
+/// Scratch groups, each mirroring an emission site: const-table reads
+/// (any size, plus the pool-log variant), general dynamic address sums,
+/// wide compares (multi-byte equality, signed or const-byte ordered
+/// chains), and wide ALU (32-bit add/sub, const-LHS sub past byte 0).
+/// Switches desugar to branches before isel, so they need no group.
+///
+/// PIC14E differs twice: every equality fold stores scratch, and its
+/// FSR setups keep the fast shape for empty term lists. Its constant
+/// memcpy parks the byte in the hold byte across an indirect
+/// destination setup; indirectness needs alloc addresses, so any
+/// constant memcpy counts there.
 pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
     let mut retval: u8 = 0;
     let mut flag = false;
