@@ -2349,3 +2349,90 @@ fn fills_indirect_callees_from_vtable_refs() {
         .expect("indirect call");
     assert_eq!(call.callees, vec!["tick".to_string()]);
 }
+
+/// epic-cc#722: a u32 decimal-digit loop (udiv-10 / mul-246 / truncating add
+/// / or-48 / indexed byte-store / count bump / ult-10 single-block do-while)
+/// becomes one `__udec_u32` call on the PIC18 entry, with the routine Func
+/// injected; the plain entry keeps the expanded loop. Sharing needs at
+/// least two sites: one lone loop stays expanded, since a call plus the
+/// helper body cost more than the inline loop. Near-misses (volatile store,
+/// a different divisor, a `ule` exit, a second outside use of the quotient)
+/// never count as sites.
+#[test]
+fn shares_decimal_digit_loops_on_pic18_only() {
+    use legalize::legalize_pic18;
+    let loop_fn = |name: &str, tail: &str| {
+        format!(
+            "fn {name}(void) ()\n  block entry:\n    %v0 = load i32 @vin\n    br loop\n  block loop:\n    %cur = phi i32 %q loop %v0 entry\n    %n = phi i8 %n1 loop 0 entry\n    %q = udiv i32 %cur, 10\n    %m = mul i32 %q, 246\n    %s = add i32 %m, %cur\n    %r = trunc i32 %s to i8\n    %d = or i8 %r, 48\n    %ix = zext i8 %n to i16\n    %p = gep @buf +0 +1*%ix\n    {tail}\n    %n1 = add i8 %n, 1\n    %c = icmp ult i32 %cur, 10\n    br i1 %c exit loop\n  block exit:\n    ret void\n"
+        )
+    };
+    let good = |name: &str| loop_fn(name, "store i8 %d %p");
+    let header = "global buf i8\nglobal vin i32\n";
+    let pair = format!("{header}{}", good("emit1")) + &good("emit2");
+    let m = legalize_pic18(parse(&pair));
+    let text = ir::serialize(&m);
+    assert_eq!(
+        text.matches("call i8 @__udec_u32(i32 %v0, @buf)").count(),
+        2,
+        "both loops become helper calls:\n{text}"
+    );
+    assert!(
+        !text.contains("udiv i32"),
+        "no expanded divide remains:\n{text}"
+    );
+    let helper = m
+        .funcs
+        .iter()
+        .find(|f| f.name == "__udec_u32")
+        .expect("routine injected");
+    assert_eq!(helper.ret, Some(ir::Ty::I8));
+    assert_eq!(helper.params.len(), 2);
+    assert_eq!(helper.params[0].name, "num");
+    assert_eq!(helper.params[0].width, 4);
+    assert!(helper.params[1].ptr);
+    assert_eq!(helper.params[1].width, 2);
+    // One lone loop stays expanded: sharing would grow.
+    let lone = format!("{header}{}", good("emit1"));
+    let out = ir::serialize(&legalize_pic18(parse(&lone)));
+    assert!(
+        out.contains("__udiv_u32") && !out.contains("__udec_u32"),
+        "lone loop stays expanded:\n{out}"
+    );
+    // The plain entry keeps both expanded loops and injects nothing.
+    let plain = ir::serialize(&legalize(parse(&pair)));
+    assert!(
+        plain.matches("call i32 @__udiv_u32").count() == 2 && plain.contains("or i8"),
+        "plain entry keeps the loops:\n{plain}"
+    );
+    assert!(
+        !plain.contains("__udec_u32"),
+        "plain entry injects nothing:\n{plain}"
+    );
+    // Near-misses: two good loops plus one broken loop still share exactly
+    // the two good ones; the broken loop stays expanded.
+    let broken_tail = loop_fn("emit3", "store volatile i8 %d %p");
+    let broken_div = good("emit3").replace("udiv i32 %cur, 10", "udiv i32 %cur, 11");
+    let broken_exit = good("emit3").replace("icmp ult i32 %cur, 10", "icmp ule i32 %cur, 10");
+    let broken_leak = good("emit3").replace(
+        "block exit:\n    ret void",
+        "block exit:\n    %leak = add i32 %q, %v0\n    store i32 %leak @vin\n    ret void",
+    );
+    for (name, bad) in [
+        ("volatile", broken_tail),
+        ("divisor", broken_div),
+        ("exit", broken_exit),
+        ("leak", broken_leak),
+    ] {
+        let src = format!("{header}{}{}", good("emit1"), good("emit2")) + &bad;
+        let out = ir::serialize(&legalize_pic18(parse(&src)));
+        assert_eq!(
+            out.matches("call i8 @__udec_u32(i32 %v0, @buf)").count(),
+            2,
+            "{name}: the two good loops still share:\n{out}"
+        );
+        assert!(
+            out.contains("__udiv_u32"),
+            "{name}: the broken loop stays expanded:\n{out}"
+        );
+    }
+}
