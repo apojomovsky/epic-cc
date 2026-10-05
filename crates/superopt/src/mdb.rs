@@ -62,7 +62,19 @@ fn gensym(line: &str, case_idx: usize, labels: &[&str]) -> String {
     {
         return format!("{op} {operand}_c{case_idx}");
     }
-    line.to_string()
+    // A table-address literal (`MOVLW LOW(tbl)`) names the same
+    // case-local label: suffix it like a branch target so each
+    // repetition addresses its own table (epic-cc#832).
+    let mut out = line.to_string();
+    for label in labels {
+        for lit in ["LOW", "HIGH", "UPPER"] {
+            out = out.replace(
+                &format!("{lit}({label})"),
+                &format!("{lit}({label}_c{case_idx})"),
+            );
+        }
+    }
+    out
 }
 
 /// Replay `cases` against `candidate` on hardware. `out_base` is the
@@ -362,6 +374,30 @@ mod tests {
         assert!(batch.src.contains("lane_skip_c1:"));
         assert!(batch.src.contains("bra lane_skip_c0"));
         assert!(!batch.src.contains("lane_skip:"));
+        let words = asm::assemble_pic18(&batch.src);
+        assert!(!words.is_empty());
+    }
+
+    #[test]
+    fn gensym_uniquifies_label_literals_per_case() {
+        // A `LOW(label)` table address names the same case-local label
+        // as a branch target: each repetition must address its own
+        // table (epic-cc#832).
+        let candidate: Candidate = vec![
+            "bra tab_end",
+            "tab:",
+            "db 0x34, 0x12",
+            "tab_end:",
+            "movlw LOW(tab)",
+            "movwf 0x040,A",
+        ];
+        let cases = specs::bitmask_eq1_pr();
+        let batch = build_batch(&candidate, &cases[..2], 0x100);
+        assert!(batch.src.contains("tab_c0:"));
+        assert!(batch.src.contains("tab_c1:"));
+        assert!(batch.src.contains("LOW(tab_c0)"));
+        assert!(batch.src.contains("LOW(tab_c1)"));
+        assert!(!batch.src.contains("LOW(tab)"));
         let words = asm::assemble_pic18(&batch.src);
         assert!(!words.is_empty());
     }

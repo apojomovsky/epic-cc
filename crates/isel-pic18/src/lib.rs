@@ -11,7 +11,9 @@ use std::collections::{HashMap, HashSet};
 
 use device::Device;
 use ir::{Block, Func, Icmp, Inst, Module, SrcLoc, Ty, Val};
-use iselcore::{resolve_pointers, ssa_key, Base, PtrResolution, Slot};
+use iselcore::{
+    flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot,
+};
 
 /// The high Access Bank segment's start: every classic-mode PIC18's SFRs
 /// live at `0xF60-0xFFF` (160 bytes) by the core's own linear-addressing
@@ -146,6 +148,10 @@ struct Gen<'m> {
     /// its folded `(base, k, terms)` by `iselcore::resolve_pointers`; see
     /// ADR-009.
     resolved: &'m PtrResolution,
+    /// Flash-pointer provenance, computed once per module by
+    /// `iselcore::flash_provenance`: regs holding vtable-derived flash
+    /// addresses lower through runtime `TBLRD` (epic-cc#832).
+    prov: FlashProvenance,
     /// Fixed, `BSR`-independent return-value region (up to 4 bytes, from `device.fixed_retval`).
     /// Holds call results independent of the bank selection.
     retval_lo: u16,
@@ -3225,6 +3231,44 @@ impl<'m> Gen<'m> {
         self.emit_copy_byte(0xFF5, dst); // TABLAT -> dst
     }
 
+    /// One flash-pointer byte read (epic-cc#832): `TBLPTR` seeds from the
+    /// two RAM bytes at `slot` (a vptr value: the 16-bit flash byte
+    /// address of a vtable slot) plus `byte_off`, then `TBLRD*` loads
+    /// `TABLAT` into `dst`. The static `TBLPTR` sharing does not apply:
+    /// the base is a runtime value, so every byte reseeds. Staging stays
+    /// sound the same way as the const path: each `emit` drains the
+    /// previous byte's staged `TABLAT` copy before the next seed runs.
+    fn emit_flash_ptr_load_byte(&mut self, slot: u16, byte_off: u8, dst: u16) {
+        let (la, lf) = self.operand(slot);
+        self.emit(format!(
+            "    MOVF 0x{lf:03X},W,{}",
+            if la == 0 { "A" } else { "B" }
+        ));
+        self.emit("    MOVWF 0xF6,A".to_string()); // TBLPTRL
+        let (ha, hf) = self.operand(slot + 1);
+        self.emit(format!(
+            "    MOVF 0x{hf:03X},W,{}",
+            if ha == 0 { "A" } else { "B" }
+        ));
+        self.emit("    MOVWF 0xF7,A".to_string()); // TBLPTRH
+                                                   // `TBLPTRU` stays zero: a vptr value is only two bytes wide (its
+                                                   // initializer writes `LOW`/`HIGH`), so a table above 64 KB is
+                                                   // unrepresentable long before this seed runs, and every PIC18 part
+                                                   // here is smaller still.
+        self.emit("    CLRF 0xF8,A".to_string()); // TBLPTRU
+        if byte_off != 0 {
+            self.emit(format!("    MOVLW 0x{byte_off:02X}"));
+            self.emit("    ADDWF 0xF6,F,A".to_string());
+            self.emit("    MOVLW 0x00".to_string());
+            self.emit("    ADDWFC 0xF7,F,A".to_string());
+            // `W` still holds zero: the upper byte consumes only the carry.
+            self.emit("    ADDWFC 0xF8,F,A".to_string());
+        }
+        self.emit("    TBLRD*".to_string());
+        self.emit_copy_byte(0xFF5, dst); // TABLAT -> dst
+        self.tblptr_holds = None;
+    }
+
     /// `_delay(cycles)` with a constant argument: an inline counted loop
     /// taking exactly that many instruction cycles (epic-cc#700). Counters
     /// are the retval bytes (`retval_lo..`, dead at a void call and covered
@@ -3630,6 +3674,26 @@ impl<'m> Gen<'m> {
                     }
                     return;
                 }
+                // A load through a vptr-derived reg reads program memory:
+                // seed `TBLPTR` from the reg's two bytes and `TBLRD` each
+                // byte (epic-cc#832). A maybe-flash reg is a shape the
+                // runtime sequence does not serve: panic, never emit a
+                // data-memory read of a flash address.
+                if let Val::Reg(r) = &ptr_val {
+                    let key = ssa_key(self.cur_func, r);
+                    if self.prov.flash.contains(&key) {
+                        let src = self.slot_addr(self.cur_func, r).direct();
+                        for kk in 0..l.ty.bytes() {
+                            self.emit_flash_ptr_load_byte(src, kk, dst + u16::from(kk));
+                        }
+                        return;
+                    }
+                    if self.prov.mixed.contains(&key) {
+                        panic!(
+                            "isel-pic18: load through maybe-flash address %{r} is not supported (unserved vtable dispatch shape, epic-cc#832)"
+                        );
+                    }
+                }
                 // FSR0 seeds once (byte_off 0); indirect bytes walk
                 // POSTINC0 (this loop is the whole ordering contract
                 // ADR-009 needed, epic-cc#471). Direct addresses are
@@ -3714,6 +3778,17 @@ impl<'m> Gen<'m> {
                     panic!(
                         "isel-pic18: ROM is not writable: store through const global {ptr_val:?}"
                     );
+                }
+                // A store through a flash-derived address is a write to ROM
+                // through a runtime pointer: panic like the const-base case
+                // above, never emit it as a RAM write (epic-cc#832).
+                if let Val::Reg(r) = &ptr_val {
+                    let key = ssa_key(self.cur_func, r);
+                    if self.prov.flash.contains(&key) || self.prov.mixed.contains(&key) {
+                        panic!(
+                            "isel-pic18: ROM is not writable: store through flash-derived address %{r} (epic-cc#832)"
+                        );
+                    }
                 }
                 // A W-threaded store (epic-cc#863): the folded load left
                 // the byte in W, so each store writes it back out with no
@@ -8517,6 +8592,9 @@ pub fn select_with_opts(
     // Every pointer reg in the module, folded once up front; later tasks'
     // pointer emitters consume it via `Gen::resolved_for`.
     let resolved = resolve_pointers(m);
+    // Flash-pointer provenance for C++ vtable dispatch, folded once up
+    // front beside the pointer resolution (epic-cc#832).
+    let prov = flash_provenance(m);
     // Priority ISRs (epic-cc#346): at most one handler per vector. A lone
     // handler of any priority keeps the P5 compatibility wiring (body at
     // the 0x0008 vector, fixed save block); a high/low pair uses priority
@@ -8612,6 +8690,7 @@ pub fn select_with_opts(
             m,
             addrs,
             resolved: &resolved,
+            prov: prov.clone(),
             retval_lo: common_lo,
             access_bank_hi,
             bsr: None,
@@ -9261,6 +9340,7 @@ pub fn select_with_opts(
                 m,
                 addrs,
                 resolved: &resolved,
+                prov: prov.clone(),
                 retval_lo: common_lo,
                 access_bank_hi,
                 bsr: None,
@@ -9596,6 +9676,7 @@ mod tests {
                 m: &m,
                 addrs: &addrs,
                 resolved: &resolved,
+                prov: FlashProvenance::default(),
                 retval_lo: 0,
                 access_bank_hi: 0x5F,
                 bsr: None,
@@ -9627,6 +9708,7 @@ mod tests {
                 m: &m,
                 addrs: &addrs,
                 resolved: &resolved,
+                prov: FlashProvenance::default(),
                 retval_lo: 0,
                 access_bank_hi: 0x5F,
                 bsr: None,
@@ -9673,6 +9755,7 @@ mod p3_gen_tests {
             m,
             addrs,
             resolved,
+            prov: FlashProvenance::default(),
             retval_lo: 0,
             access_bank_hi: 0x5F,
             bsr: None,

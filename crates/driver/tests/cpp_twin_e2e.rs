@@ -1,8 +1,9 @@
 //! #461 oracle, secondary: C-twin differential. For the virtual and
 //! RAII fixtures, the equivalent C program runs in the same sim and the
 //! named globals must agree. Catches vtable-layout and cleanup-path bugs
-//! hand asserts could miss. Dispatch sequences stay sim-only until the
-//! `mdb` replay lands with #832 (docs/40 §5).
+//! hand asserts could miss. The dispatch sequence replays on hardware
+//! through the `tblrd-flash-ptr` superopt spec (#832); per-fixture runs
+//! stay sim-only (docs/40 §5).
 
 use std::collections::HashMap;
 use std::process::Command;

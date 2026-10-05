@@ -40,7 +40,10 @@
 
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
-use iselcore::{find_value_folds, resolve_pointers, ssa_key, Base, PtrResolution, Slot};
+use iselcore::{
+    find_value_folds, flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance,
+    PtrResolution, Slot,
+};
 use std::collections::{HashMap, HashSet};
 
 /// The recipe a routine function emits, or `None` if the name is not a
@@ -167,6 +170,10 @@ struct Gen<'m> {
     /// emit nothing; each `load`/`store`/`memcpy` through a pointer reg
     /// lowers the pointer at its use.
     resolved: &'m PtrResolution,
+    /// Flash-pointer provenance (`iselcore::flash_provenance`): a load or
+    /// store through a flash-derived reg is C++ virtual dispatch over a
+    /// flash vtable, PIC18-only, so this backend panics on it (epic-cc#832).
+    prov: FlashProvenance,
     scratch: u16,
     retval_lo: u16,
     cur_func: &'m str,
@@ -3219,6 +3226,16 @@ impl<'m> Gen<'m> {
                         panic!("isel: pointer {:?} is not @global, %reg or a literal", l.ptr)
                     });
                     let ptr = Val::Reg(r.to_string());
+                    // C++ virtual dispatch reads its vtable from flash via
+                    // runtime `TBLRD`, which only PIC18 lowers: panic here
+                    // rather than misreading a flash address as RAM
+                    // (epic-cc#832).
+                    let key = ssa_key(self.cur_func, r);
+                    if self.prov.flash.contains(&key) || self.prov.mixed.contains(&key) {
+                        panic!(
+                            "isel: load through flash-derived address %{r} is C++ virtual dispatch (PIC18-only, epic-cc#832)"
+                        );
+                    }
                     for k in 0..l.ty.bytes() {
                         self.emit_ptr_load_byte(&ptr, k);
                         self.emit_w_store(dst + u16::from(k));
@@ -3266,6 +3283,15 @@ impl<'m> Gen<'m> {
                         );
                     }
                     let ptr = Val::Reg(r.to_string());
+                    // A store through a flash-derived address would write
+                    // ROM through a runtime pointer: panic like the const
+                    // case above (epic-cc#832).
+                    let key = ssa_key(self.cur_func, r);
+                    if self.prov.flash.contains(&key) || self.prov.mixed.contains(&key) {
+                        panic!(
+                            "isel: store through flash-derived address %{r} is C++ virtual dispatch (PIC18-only, epic-cc#832)"
+                        );
+                    }
                     for k in 0..s.ty.bytes() {
                         self.emit_ptr_store_byte(&ptr, k, &s.val);
                     }
@@ -7998,6 +8024,9 @@ pub fn select_with_locs(
     // slots, alloca buffers); `gep` itself emits nothing. The fold is shared
     // with isel-pic18 in `iselcore::resolve_pointers`.
     let resolved = resolve_pointers(m);
+    // Flash-pointer provenance for the C++ dispatch panic below: computed
+    // once beside the pointer resolution (epic-cc#832).
+    let prov = flash_provenance(m);
     // Value folds for every function (epic-cc#875): loads whose byte never
     // stages, over the same mapped-global set `alloc` places by, so a
     // skipped load reads an address both stages agree on. Pass-independent
@@ -8055,6 +8084,7 @@ pub fn select_with_locs(
                 staged: &staged,
                 pool: &pool,
                 resolved: &resolved,
+                prov: prov.clone(),
                 scratch,
                 retval_lo,
                 cur_func: &f.name,
@@ -8269,6 +8299,7 @@ pub fn select_with_locs(
                 staged: &staged,
                 pool: &pool,
                 resolved: &resolved,
+                prov: prov.clone(),
                 scratch,
                 retval_lo,
                 cur_func: &f.name,
@@ -8543,6 +8574,7 @@ pub fn select_with_locs(
                             staged: &staged,
                             pool: &pool,
                             resolved: &resolved,
+                            prov: prov.clone(),
                             scratch,
                             retval_lo,
                             cur_func: &f.name,

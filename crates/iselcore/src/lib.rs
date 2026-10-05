@@ -981,3 +981,249 @@ pub fn find_value_folds(
 pub fn pool_member(g: &ir::Global) -> bool {
     g.is_const && g.addr.is_none() && !g.bytes.is_empty() && g.bytes.len() <= 255
 }
+
+/// Flash-pointer provenance for C++ vtable dispatch (epic-cc#832).
+/// `flash` holds regs proven to carry a vtable (flash) address: `load
+/// ptr` results read wholly from vptr fields, closed under all-flash
+/// phi/select arms. `mixed` holds partially flash derivations and `gep`
+/// over flash regs: unserved shapes every backend panics on. C programs
+/// have no nonzero-addend refs, so both sets stay empty there.
+#[derive(Clone, Debug, Default)]
+pub struct FlashProvenance {
+    pub flash: HashSet<String>,
+    pub mixed: HashSet<String>,
+}
+
+/// One ultimate address base behind a pointer value: a global plus a
+/// constant byte offset, a reg already proven to hold a flash address, or
+/// an untracked runtime value.
+enum ProvBase {
+    Global(String, u16),
+    FlashAddr,
+    Unknown,
+}
+
+/// Whether global `g`'s bytes `[off, off + n)` are all vptr fields: every
+/// byte carries a nonzero-addend ref into a `const` vtable (`_ZTV*`,
+/// Itanium ABI prefix), the folded constant GEP of a vptr initializer.
+/// The target check is load-bearing: a plain constant GEP initializer
+/// (`&arr[2]` in C) folds to the same nonzero-addend shape but names a
+/// RAM address, and must never seed flash provenance.
+fn vptr_covered(m: &Module, g: &str, off: u16, n: u8) -> bool {
+    let is_vtable =
+        |t: &str| t.starts_with("_ZTV") && m.globals.iter().any(|x| x.name == t && x.is_const);
+    let Some(gl) = m.globals.iter().find(|x| x.name == g) else {
+        return false;
+    };
+    (0..n).all(|i| {
+        let pos = off.wrapping_add(u16::from(i)) as usize;
+        gl.refs
+            .iter()
+            .any(|(p, t, add)| *p == pos && *add != 0 && is_vtable(t))
+    })
+}
+
+/// Flatten a pointer `Val` to its ultimate global bases, following
+/// constant `gep` chains and phi/select arms. A reg defined by anything
+/// else (a load, call, param, alloca, dynamic `gep` term) is `Unknown`.
+/// A reg already in `flash` surfaces as a `FlashAddr` base: dereferencing
+/// one is the slot-load shape, not another vptr load.
+fn prov_bases(
+    defs: &HashMap<String, &Inst>,
+    v: &ir::Val,
+    k: u16,
+    func: &str,
+    flash: &HashSet<String>,
+) -> Vec<ProvBase> {
+    match v {
+        ir::Val::Global(g) => vec![ProvBase::Global(g.clone(), k)],
+        ir::Val::Const(_) => vec![ProvBase::Unknown],
+        ir::Val::Reg(r) => {
+            if flash.contains(&ssa_key(func, r)) {
+                return vec![ProvBase::FlashAddr];
+            }
+            let Some(inst) = defs.get(r) else {
+                return vec![ProvBase::Unknown];
+            };
+            match inst {
+                Inst::Gep(g) => {
+                    if !g.terms.is_empty() {
+                        return vec![ProvBase::Unknown];
+                    }
+                    let nk = k.wrapping_add(g.k);
+                    match &g.base {
+                        GepBase::Global(n) => vec![ProvBase::Global(n.clone(), nk)],
+                        GepBase::Reg(r2) => {
+                            prov_bases(defs, &ir::Val::Reg(r2.clone()), nk, func, flash)
+                        }
+                    }
+                }
+                Inst::Select(s) if s.ptr => prov_bases(defs, &s.a, k, func, flash)
+                    .into_iter()
+                    .chain(prov_bases(defs, &s.b, k, func, flash))
+                    .collect(),
+                Inst::Phi(p) if p.ptr => p
+                    .incoming
+                    .iter()
+                    .flat_map(|(av, _)| prov_bases(defs, av, k, func, flash))
+                    .collect(),
+                _ => vec![ProvBase::Unknown],
+            }
+        }
+    }
+}
+
+/// Classify every `load ptr` result as holding a flash (vptr) address or
+/// not, and every phi/select/gep reg deriving from one as flash or
+/// mixed. Runs to fixpoint: one pass seeds direct vptr loads, later
+/// passes close over arms of newly flash regs.
+pub fn flash_provenance(m: &Module) -> FlashProvenance {
+    let mut out = FlashProvenance::default();
+    loop {
+        let mut progressed = false;
+        for f in &m.funcs {
+            let mut defs: HashMap<String, &Inst> = HashMap::new();
+            for b in &f.blocks {
+                for i in &b.insts {
+                    match i {
+                        Inst::Gep(g) => {
+                            defs.insert(g.dst.clone(), i);
+                        }
+                        Inst::Select(s) => {
+                            defs.insert(s.dst.clone(), i);
+                        }
+                        Inst::Phi(p) => {
+                            defs.insert(p.dst.clone(), i);
+                        }
+                        Inst::Load(l) => {
+                            defs.insert(l.dst.clone(), i);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for b in &f.blocks {
+                for i in &b.insts {
+                    match i {
+                        Inst::Load(l) if l.ptr_ty => {
+                            let key = ssa_key(&f.name, &l.dst);
+                            if out.flash.contains(&key) || out.mixed.contains(&key) {
+                                continue;
+                            }
+                            let ptr = if let Some(g) = l.ptr.strip_prefix('@') {
+                                ir::Val::Global(g.to_string())
+                            } else if let Some(r) = l.ptr.strip_prefix('%') {
+                                ir::Val::Reg(r.to_string())
+                            } else {
+                                continue;
+                            };
+                            let bases = prov_bases(&defs, &ptr, 0, &f.name, &out.flash);
+                            if bases.is_empty() {
+                                continue;
+                            }
+                            let n = l.ty.bytes();
+                            let (mut covered, mut addrs) = (0usize, 0usize);
+                            for bse in &bases {
+                                match bse {
+                                    ProvBase::FlashAddr => addrs += 1,
+                                    ProvBase::Global(g, off) => {
+                                        if vptr_covered(m, g, *off, n) {
+                                            covered += 1;
+                                        }
+                                    }
+                                    ProvBase::Unknown => {}
+                                }
+                            }
+                            // All bases already flash addresses: this load
+                            // dereferences one (the slot-load shape). Its dst
+                            // needs no mark: backends route on the ptr reg's
+                            // own membership. Anything partly flash-derived
+                            // is a shape the runtime sequence does not serve.
+                            if addrs == bases.len() {
+                                continue;
+                            }
+                            if covered == bases.len() {
+                                out.flash.insert(key);
+                                progressed = true;
+                            } else if covered > 0 || addrs > 0 {
+                                out.mixed.insert(key);
+                                progressed = true;
+                            }
+                        }
+                        Inst::Select(s) if s.ptr => {
+                            let key = ssa_key(&f.name, &s.dst);
+                            if out.flash.contains(&key) || out.mixed.contains(&key) {
+                                continue;
+                            }
+                            let arms = [&s.a, &s.b];
+                            let (mut fc, mut mc, mut uc) = (0, 0, 0);
+                            for a in arms {
+                                match a {
+                                    ir::Val::Reg(r) if out.flash.contains(&ssa_key(&f.name, r)) => {
+                                        fc += 1;
+                                    }
+                                    ir::Val::Reg(r) if out.mixed.contains(&ssa_key(&f.name, r)) => {
+                                        mc += 1;
+                                    }
+                                    _ => uc += 1,
+                                }
+                            }
+                            if mc > 0 || (fc > 0 && uc > 0) {
+                                out.mixed.insert(key);
+                                progressed = true;
+                            } else if fc == 2 {
+                                out.flash.insert(key);
+                                progressed = true;
+                            }
+                        }
+                        Inst::Phi(p) if p.ptr => {
+                            let key = ssa_key(&f.name, &p.dst);
+                            if out.flash.contains(&key) || out.mixed.contains(&key) {
+                                continue;
+                            }
+                            let (mut fc, mut mc, mut uc) = (0, 0, 0);
+                            for (av, _) in &p.incoming {
+                                match av {
+                                    ir::Val::Reg(r) if out.flash.contains(&ssa_key(&f.name, r)) => {
+                                        fc += 1;
+                                    }
+                                    ir::Val::Reg(r) if out.mixed.contains(&ssa_key(&f.name, r)) => {
+                                        mc += 1;
+                                    }
+                                    _ => uc += 1,
+                                }
+                            }
+                            if mc > 0 || (fc > 0 && uc > 0) {
+                                out.mixed.insert(key);
+                                progressed = true;
+                            } else if fc > 0 && uc == 0 {
+                                out.flash.insert(key);
+                                progressed = true;
+                            }
+                        }
+                        Inst::Gep(g) => {
+                            let base_flash = match &g.base {
+                                GepBase::Global(_) => false,
+                                GepBase::Reg(r) => {
+                                    out.flash.contains(&ssa_key(&f.name, r))
+                                        || out.mixed.contains(&ssa_key(&f.name, r))
+                                }
+                            };
+                            if base_flash {
+                                let key = ssa_key(&f.name, &g.dst);
+                                if out.mixed.insert(key) {
+                                    progressed = true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    out
+}
