@@ -284,9 +284,10 @@ fn cases() -> Vec<Case> {
     });
     // One control-loop pass through the vendored control demo
     // (epic-cc#873): PIC18 only, like the demo it comes from. Init only
-    // programs Timer2 and never enables GIE, and the ADC plant resolves
-    // through the demo's sim override, so the pass runs ISR-free with no
-    // timer model: the ladder times it like any other Marks row.
+    // programs Timer2 and never enables GIE, so the pass runs ISR-free
+    // with no timer model: the ladder times it like any other Marks
+    // row. The vendor oversample and average helpers are __EPIC_CC__
+    // stubs, so the pass pins the PID update and PWM duty.
     out.push(Case {
         name: "scen-control-pass-18f4550".to_string(),
         device: "18F4550",
