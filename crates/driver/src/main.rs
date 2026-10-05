@@ -510,9 +510,12 @@ fn main() {
     // Core-gated inside: every other core keeps byte-identical IR.
     driver::const_runs::run(&mut m, device.core);
     // The decimal-digit helper recipe exists only in the PIC18 backend, so
-    // only that core shares the loops (epic-cc#722). Every other core keeps
-    // byte-identical IR through the shared entry.
-    m = if device.core == device::Core::Pic18 {
+    // only that core shares the loops (epic-cc#722). Sharing stays inline
+    // under `-O2` like code factoring: the speed profile keeps the loops
+    // expanded, and every `-O2` row stays byte-identical. Every other core
+    // keeps byte-identical IR through the shared entry.
+    m = if device.core == device::Core::Pic18 && !matches!(cli.opt_level, driver::cli::OptLevel::O2)
+    {
         legalize::legalize_pic18(m)
     } else {
         legalize::legalize(m)

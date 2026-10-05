@@ -107,6 +107,7 @@ fn the_shared_digit_helper_stores_the_right_digits() {
     };
     let in_addr = equ("in");
     let buf_addr = equ("buf");
+    let buf2_addr = equ("buf2");
     let n_addr = equ("n");
 
     // Values around the byte and carry boundaries, the 16-bit edge, powers
@@ -137,6 +138,8 @@ fn the_shared_digit_helper_stores_the_right_digits() {
         };
         let got: Vec<u8> = (0..want.len()).map(|i| p.ram()[buf_addr + i]).collect();
         assert_eq!(got, want, "digits of {v}");
+        let got2: Vec<u8> = (0..want.len()).map(|i| p.ram()[buf2_addr + i]).collect();
+        assert_eq!(got2, want, "second digits of {v}");
         assert_eq!(p.ram()[n_addr] as usize, want.len(), "count of {v}");
     }
 }

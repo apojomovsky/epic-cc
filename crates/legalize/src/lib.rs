@@ -531,40 +531,7 @@ fn narrow_div_rem_tails(m: Module) -> Module {
 fn decimal_digit_loops(m: Module, used: &mut Vec<String>) -> Module {
     let mut funcs = Vec::with_capacity(m.funcs.len());
     for f in m.funcs {
-        // Register -> user (block, inst) sites, for the no-outside-use
-        // checks below. `inst_reads` covers every operand shape.
-        let mut users: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-        for (bi, b) in f.blocks.iter().enumerate() {
-            for (ii, inst) in b.insts.iter().enumerate() {
-                for r in inst_reads(inst) {
-                    users.entry(r).or_default().push((bi, ii));
-                }
-            }
-        }
-        // Block label -> index, plus every block's successors for the
-        // single-entry-predecessor check.
-        let index: HashMap<&str, usize> = f
-            .blocks
-            .iter()
-            .enumerate()
-            .map(|(bi, b)| (b.label.as_str(), bi))
-            .collect();
-        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); f.blocks.len()];
-        for (bi, b) in f.blocks.iter().enumerate() {
-            for s in block_successors(&b.insts) {
-                if let Some(&si) = index.get(s.as_str()) {
-                    preds[si].push(bi);
-                }
-            }
-        }
-        // Collect matches first: rewriting drops blocks, so indices stay
-        // valid only while the block list is untouched.
-        let mut hits: Vec<DigitLoop> = Vec::new();
-        for (bi, b) in f.blocks.iter().enumerate() {
-            if let Some(hit) = match_digit_loop(&f, bi, b, &users, &preds) {
-                hits.push(hit);
-            }
-        }
+        let hits = digit_loop_hits(&f);
         if hits.is_empty() {
             funcs.push(f);
             continue;
@@ -717,6 +684,46 @@ fn block_successors(insts: &[Inst]) -> Vec<String> {
         }
         _ => Vec::new(),
     }
+}
+
+/// Matches in one function, without rewriting: the price gate counts
+/// these before the pass commits to emitting the helper.
+fn digit_loop_hits(f: &Func) -> Vec<DigitLoop> {
+    // Register -> user (block, inst) sites, for the no-outside-use
+    // checks below. `inst_reads` covers every operand shape.
+    let mut users: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            for r in inst_reads(inst) {
+                users.entry(r).or_default().push((bi, ii));
+            }
+        }
+    }
+    // Block label -> index, plus every block's successors for the
+    // single-entry-predecessor check.
+    let index: HashMap<&str, usize> = f
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(bi, b)| (b.label.as_str(), bi))
+        .collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); f.blocks.len()];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for s in block_successors(&b.insts) {
+            if let Some(&si) = index.get(s.as_str()) {
+                preds[si].push(bi);
+            }
+        }
+    }
+    // Collect matches first: rewriting drops blocks, so indices stay
+    // valid only while the block list is untouched.
+    let mut hits: Vec<DigitLoop> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        if let Some(hit) = match_digit_loop(f, bi, b, &users, &preds) {
+            hits.push(hit);
+        }
+    }
+    hits
 }
 
 /// Match one self-loop block against the decimal-digit idiom. Returns the
