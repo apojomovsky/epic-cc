@@ -21,8 +21,9 @@ follow: inputs are volatile globals with nonzero initializers, loaded
 inside the timed region; results are sunk to a volatile global before
 the `2` store. The load, compute, sink chain is data-dependent, so the
 optimizer cannot hoist the work above the `1` or sink it below the `2`,
-under either profile. Scenario rows instead pin through cross-TU calls
-the optimizer cannot see through, with volatile sinks before the `2`.
+under either profile. Scenario rows instead pin through the marker
+stores around calls with observable side effects (SFR writes), which
+the optimizer must keep between the `1` and the `2`.
 
 ## ISR fixtures
 
