@@ -2413,6 +2413,7 @@ fn shares_decimal_digit_loops_on_pic18_only() {
     let broken_tail = loop_fn("emit3", "store volatile i8 %d %p");
     let broken_div = good("emit3").replace("udiv i32 %cur, 10", "udiv i32 %cur, 11");
     let broken_exit = good("emit3").replace("icmp ult i32 %cur, 10", "icmp ule i32 %cur, 10");
+    let broken_swap = good("emit3").replace("icmp ult i32 %cur, 10", "icmp ult i32 10, %cur");
     let broken_leak = good("emit3").replace(
         "block exit:\n    ret void",
         "block exit:\n    %leak = add i32 %q, %v0\n    store i32 %leak @vin\n    ret void",
@@ -2421,6 +2422,7 @@ fn shares_decimal_digit_loops_on_pic18_only() {
         ("volatile", broken_tail),
         ("divisor", broken_div),
         ("exit", broken_exit),
+        ("swap", broken_swap),
         ("leak", broken_leak),
     ] {
         let src = format!("{header}{}{}", good("emit1"), good("emit2")) + &bad;

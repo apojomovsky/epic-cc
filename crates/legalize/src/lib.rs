@@ -687,18 +687,13 @@ fn find_decimal_sites(f: &Func) -> Vec<(usize, DecimalSite)> {
             continue;
         }
         let Inst::Icmp(ic) = &insts[11] else { continue };
-        if ic.pred != "ult" || ic.ty != Ty::I32 {
-            continue;
-        }
-        let carms = [&ic.a, &ic.b].map(|a| match a {
-            Val::Reg(x) => Some(x.as_str()),
-            _ => None,
-        });
-        if !carms.contains(&Some(v.as_str())) {
-            continue;
-        }
-        let is10 = [&ic.a, &ic.b].iter().any(|a| **a == Val::Const(10));
-        if !is10 {
+        // `ult` is not commutative: the value must be the first arm and 10
+        // the second, so the loop exits exactly when v < 10 (review #722).
+        if ic.pred != "ult"
+            || ic.ty != Ty::I32
+            || ic.a != Val::Reg(v.clone())
+            || ic.b != Val::Const(10)
+        {
             continue;
         }
         let cc = ic.dst.clone();
