@@ -520,8 +520,10 @@ fn main() {
         ));
     }
 
-    // 6. alloc: complete overlay address map (globals + locals per function)
-    let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
+    // 6. alloc: complete overlay address map (globals + locals per function).
+    // `--const-pool` (epic-cc#816) also gates pooled-const RAM copies here,
+    // so the map agrees with isel's pooled address rewrite below.
+    let layout = alloc::allocate_with_pool(device, &m, &callgraph::edges_text(&cg), cli.const_pool);
     if let Some(map_path) = &cli.map {
         std::fs::write(map_path, driver::report::map_text(&device, &layout)).expect("write map");
     }
@@ -545,10 +547,11 @@ fn main() {
     let mut chunks: HashMap<String, Vec<String>> = HashMap::new();
     let (asm, mut locs) = match device.core {
         device::Core::Pic14 => {
-            // Pooled string table (epic-cc#815): additive and default
-            // off, so unflagged output stays bit-identical. The pool
-            // forms over alloc's address-taken set; emission reuses the
-            // per-const table path inside isel.
+            // Pooled string table (epic-cc#815, addresses and gating per
+            // epic-cc#816): additive and default off, so unflagged output
+            // stays bit-identical. The pool forms over alloc's
+            // address-taken set; emission reuses the per-const table path
+            // inside isel.
             let pool = if cli.const_pool {
                 isel::build_pool(&m, &layout.address_taken_consts)
             } else {

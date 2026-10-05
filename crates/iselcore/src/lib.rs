@@ -973,3 +973,11 @@ pub fn find_value_folds(
     }
     out
 }
+
+/// Whether a const global joins the pooled flash string table
+/// (epic-cc#815): unmapped, non-empty, and fitting one RETLW chunk.
+/// `build_pool` and alloc's copy gating both call this, so membership
+/// agrees by construction instead of by duplicated filters.
+pub fn pool_member(g: &ir::Global) -> bool {
+    g.is_const && g.addr.is_none() && !g.bytes.is_empty() && g.bytes.len() <= 255
+}
