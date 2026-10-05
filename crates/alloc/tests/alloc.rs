@@ -2302,7 +2302,7 @@ fn homing_module(extra_main: &str) -> ir::Module {
 
 #[test]
 fn single_use_scalar_arg_homes_into_the_callee_param_slot() {
-    let out = allocate(&PIC16F877A, &homing_module(""), "edge main callee\n");
+    let out = allocate(&PIC18F4550, &homing_module(""), "edge main callee\n");
     assert_eq!(
         out.locals["main::v"], out.locals["callee::p"],
         "the def must target the param slot"
@@ -2312,7 +2312,7 @@ fn single_use_scalar_arg_homes_into_the_callee_param_slot() {
 #[test]
 fn multi_use_arg_value_keeps_its_caller_slot() {
     let out = allocate(
-        &PIC16F877A,
+        &PIC18F4550,
         &homing_module("store i8 %v, ptr @out\n"),
         "edge main callee\n",
     );
@@ -2342,7 +2342,7 @@ fn call_between_def_and_use_blocks_homing() {
              call void @callee(i8 %v)\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge main callee\nedge main other\n");
+    let out = allocate(&PIC18F4550, &m, "edge main callee\nedge main other\n");
     assert_ne!(
         out.locals["main::v"], out.locals["callee::p"],
         "a call between def and call must keep the copy"
@@ -2369,7 +2369,7 @@ fn isr_reachable_callee_blocks_homing() {
              call void @callee(i8 %v)\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge main callee\nedge isr callee\n");
+    let out = allocate(&PIC18F4550, &m, "edge main callee\nedge isr callee\n");
     assert_ne!(
         out.locals["main::v"], out.locals["callee::p"],
         "an ISR-reachable callee must keep its site copies"
@@ -2390,7 +2390,7 @@ fn width_mismatched_arg_keeps_its_caller_slot() {
              call void @callee(i8 %v)\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge main callee\n");
+    let out = allocate(&PIC18F4550, &m, "edge main callee\n");
     assert_ne!(
         out.locals["main::v"], out.locals["callee::p"],
         "a narrow arg cannot cover a wide param slot"
@@ -2399,8 +2399,8 @@ fn width_mismatched_arg_keeps_its_caller_slot() {
 
 #[test]
 fn call_result_arg_homes_into_the_callee_param_slot() {
-    // A call result lands through the retval bytes into its dst slot on
-    // both cores, so chaining calls homes the same way a plain def does.
+    // A call result lands through the retval bytes into its dst slot, so
+    // chaining calls homes the same way a plain def does.
     let m = parse(
         "global out i8\n\
          fn gen(i8) ()\n\
@@ -2417,7 +2417,7 @@ fn call_result_arg_homes_into_the_callee_param_slot() {
              call void @callee(i8 %x)\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge main gen\nedge main callee\n");
+    let out = allocate(&PIC18F4550, &m, "edge main gen\nedge main callee\n");
     assert_eq!(
         out.locals["main::x"], out.locals["callee::p"],
         "a chained call result must target the param slot"
@@ -2444,7 +2444,7 @@ fn cross_block_def_homes_with_a_clean_path() {
            block done:\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge main callee\n");
+    let out = allocate(&PIC18F4550, &m, "edge main callee\n");
     assert_eq!(
         out.locals["main::v"], out.locals["callee::p"],
         "a dominated call with no call between must home"
@@ -2473,7 +2473,7 @@ fn call_on_the_path_blocks_cross_block_homing() {
              call void @callee(i8 %v)\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge main callee\nedge main other\n");
+    let out = allocate(&PIC18F4550, &m, "edge main callee\nedge main other\n");
     assert_ne!(
         out.locals["main::v"], out.locals["callee::p"],
         "a call on the def-to-call path must keep the copy"
@@ -2502,7 +2502,7 @@ fn phi_arg_homes_into_the_callee_param_slot() {
              call void @callee(i8 %v)\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge main callee\n");
+    let out = allocate(&PIC18F4550, &m, "edge main callee\n");
     assert_eq!(
         out.locals["main::v"], out.locals["callee::p"],
         "a phi feeding one call must target the param slot"
@@ -2524,7 +2524,7 @@ fn passed_through_param_homes_into_the_callee_param_slot() {
              call void @callee(i8 %q)\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge mid callee\n");
+    let out = allocate(&PIC18F4550, &m, "edge mid callee\n");
     assert_eq!(
         out.locals["mid::q"], out.locals["callee::p"],
         "a passed-through param must target the param slot"
@@ -2548,7 +2548,7 @@ fn call_before_the_use_blocks_param_homing() {
              call void @callee(i8 %q)\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge mid callee\nedge mid other\n");
+    let out = allocate(&PIC18F4550, &m, "edge mid callee\nedge mid other\n");
     assert_ne!(
         out.locals["mid::q"], out.locals["callee::p"],
         "an entry-prefix call may clobber the param slot"
@@ -2573,7 +2573,7 @@ fn pass_through_chains_resolve_to_the_final_param_slot() {
              call void @mid(i8 %v)\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge outer mid\nedge mid inner\n");
+    let out = allocate(&PIC18F4550, &m, "edge outer mid\nedge mid inner\n");
     assert_eq!(
         out.locals["outer::v"], out.locals["inner::q"],
         "a chained def must reach the final param slot"
@@ -2609,7 +2609,7 @@ fn second_homed_source_in_one_caller_keeps_its_slot() {
            block done:\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge main callee\n");
+    let out = allocate(&PIC18F4550, &m, "edge main callee\n");
     let ahomed = out.locals["main::a"] == out.locals["callee::p"];
     let bhomed = out.locals["main::b"] == out.locals["callee::p"];
     assert!(
@@ -2649,7 +2649,7 @@ fn cross_block_writers_to_one_slot_do_not_both_home() {
            block 5:\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge main callee\n");
+    let out = allocate(&PIC18F4550, &m, "edge main callee\n");
     let a = out.locals["main::a"] == out.locals["callee::p"];
     let bb = out.locals["main::bb"] == out.locals["callee::p"];
     assert!(
@@ -2689,7 +2689,7 @@ fn chained_sites_converging_on_one_slot_do_not_both_home() {
              call void @g(i1 1, i8 %v1, i8 %v2)\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge main g\nedge g h\n");
+    let out = allocate(&PIC18F4550, &m, "edge main g\nedge g h\n");
     let v1 = out.locals["main::v1"] == out.locals["h::q"];
     let v2 = out.locals["main::v2"] == out.locals["h::q"];
     assert!(
@@ -2732,7 +2732,7 @@ fn sibling_callee_writers_do_not_both_home() {
            block 5:\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge main c1\nedge main c2\n");
+    let out = allocate(&PIC18F4550, &m, "edge main c1\nedge main c2\n");
     let a = out.locals["main::a"] == out.locals["c1::p"];
     let bb = out.locals["main::bb"] == out.locals["c2::p"];
     assert!(
@@ -2765,12 +2765,65 @@ fn two_params_homed_to_one_slot_do_not_both_home() {
            block 3:\n\
              ret void\n",
     );
-    let out = allocate(&PIC16F877A, &m, "edge f g\n");
+    let out = allocate(&PIC18F4550, &m, "edge f g\n");
     let p1 = out.locals["f::p1"] == out.locals["g::p"];
     let p2 = out.locals["f::p2"] == out.locals["g::p"];
     assert!(
         !(p1 && p2),
         "tied writes to one slot must not both home (p1={p1}, p2={p2})"
+    );
+}
+
+#[test]
+fn pic14_same_bank_arg_still_homes() {
+    // epic-cc#849 prices bank selects, it does not ban homing: the tiny
+    // frame sits in one bank, so the retargeted def needs no new BANKSEL
+    // and the deleted copy is a pure saving.
+    let out = allocate(&PIC16F877A, &homing_module(""), "edge main callee\n");
+    assert_eq!(
+        out.locals["main::v"], out.locals["callee::p"],
+        "a same-bank site must still home on a banked core"
+    );
+}
+
+#[test]
+fn pic14_cross_bank_arg_keeps_its_copy() {
+    // epic-cc#849: `%v` is defined first (lowest slot, bank 0) but the
+    // fifty live i16s push the callee base into bank 1, so homing would
+    // move the deleted copy's bank selects onto the retargeted def.
+    let mut src = String::from(
+        "global out i8\n\
+         global sink i16\n\
+         fn callee(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v = add i8 1, 2\n",
+    );
+    for n in 0..50 {
+        src.push_str(&format!("%t{n} = add i16 {n}, 1\n"));
+    }
+    src.push_str("call void @callee(i8 %v)\n");
+    for n in 0..50 {
+        src.push_str(&format!("store i16 %t{n}, ptr @sink\n"));
+    }
+    src.push_str("ret void\n");
+    let out = allocate(&PIC16F877A, &parse(&src), "edge main callee\n");
+    assert!(
+        out.locals["main::v"] < 0x80,
+        "the first slot must stay in bank 0: {:#x}",
+        out.locals["main::v"]
+    );
+    assert!(
+        out.locals["callee::p"] >= 0xA0,
+        "the pushed callee base must reach bank 1: {:#x}",
+        out.locals["callee::p"]
+    );
+    assert_ne!(
+        out.locals["main::v"], out.locals["callee::p"],
+        "a cross-bank site must keep the site copy"
     );
 }
 
