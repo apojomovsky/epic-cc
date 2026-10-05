@@ -9133,6 +9133,20 @@ pub fn select_with_locs(
                 );
             }
         }
+        // Pool log variant (epic-cc#817): its entry label shares the
+        // namespace, so a user const with the same name fails here,
+        // not as a silent assembler overwrite.
+        if !pool.chunks.is_empty() && m.funcs.iter().any(|f| f.name == LOG_POOL_CALLEE) {
+            if let Some(prev) = labels.insert(
+                LOG_POOL_VARIANT.to_string(),
+                "pool log variant entry".to_string(),
+            ) {
+                panic!(
+                    "isel: const-table label collision: `{}` is both {prev} and pool log variant entry",
+                    LOG_POOL_VARIANT
+                );
+            }
+        }
     }
     let mut addr = section_start;
     for g in consts {
