@@ -692,6 +692,7 @@ pub fn is_runtime_routine(name: &str) -> bool {
             | "__urem_u16"
             | "__udiv_u32"
             | "__urem_u32"
+            | "__udec_u32"
             | "__sdiv_i8"
             | "__srem_i8"
             | "__sdiv_i16"

@@ -2349,3 +2349,180 @@ fn fills_indirect_callees_from_vtable_refs() {
         .expect("indirect call");
     assert_eq!(call.callees, vec!["tick".to_string()]);
 }
+
+/// The u32 decimal-digit loop (epic-cc#722): clang inlines the TU-static
+/// emitter into every caller, so `put_u16`/`put_idec` each carry this exact
+/// shape. `legalize_pic18` shares it as one `__udec_u32` call taking the
+/// initial value and the digit buffer, returning the count. The count's
+/// writeout-length zext is an outside use the rewrite must accept.
+#[test]
+fn decimal_digit_loop_becomes_shared_helper_call() {
+    let src = "global buf i8\n\
+         fn emit(i16) (v0=i16)\n\
+           block entry:\n\
+             %init = zext i16 %v0 to i32\n\
+             br loop\n\
+           block loop:\n\
+             %v = phi i32 %q loop %init entry\n\
+             %i = phi i8 %c loop 0 entry\n\
+             %q = udiv i32 %v, 10\n\
+             %m = mul i32 %q, 246\n\
+             %s = add i32 %m, %v\n\
+             %t = trunc i32 %s to i8\n\
+             %d = or i8 %t, 48\n\
+             %z = zext i8 %i to i16\n\
+             %p = gep @buf +0 +1*%z\n\
+             store i8 %d %p\n\
+             %c = add i8 %i, 1\n\
+             %e = icmp ult i32 %v, 10\n\
+             br i1 %e exit, loop\n\
+           block exit:\n\
+             %k = icmp eq i8 %c, 0\n\
+             %w = zext i8 %c to i16\n\
+             br done\n\
+           block done:\n\
+             ret void\n";
+    let text = ir::serialize(&legalize::legalize_pic18(ir::parse(src)));
+    assert!(
+        text.contains("%c = call i8 @__udec_u32(i32 %init, @buf)"),
+        "missing shared call:\n{text}"
+    );
+    assert!(
+        !text.contains("udiv i32 %v, 10"),
+        "loop not removed:\n{text}"
+    );
+    assert!(
+        text.contains("fn __udec_u32(i8) (val=i32, buf=ptr)"),
+        "missing helper signature:\n{text}"
+    );
+    assert!(
+        text.contains("%__scr = alloca 12"),
+        "missing scratch:\n{text}"
+    );
+    assert!(
+        !text.contains("__udiv_u32"),
+        "udiv must be absorbed:\n{text}"
+    );
+}
+
+/// The shared entry is PIC18-only: the generic entry lowers the same loop
+/// through the per-site `__udiv_u32` call instead.
+#[test]
+fn decimal_digit_loop_stays_per_site_without_pic18() {
+    let src = "global buf i8\n\
+         fn emit(i16) (v0=i16)\n\
+           block entry:\n\
+             %init = zext i16 %v0 to i32\n\
+             br loop\n\
+           block loop:\n\
+             %v = phi i32 %q loop %init entry\n\
+             %i = phi i8 %c loop 0 entry\n\
+             %q = udiv i32 %v, 10\n\
+             %m = mul i32 %q, 246\n\
+             %s = add i32 %m, %v\n\
+             %t = trunc i32 %s to i8\n\
+             %d = or i8 %t, 48\n\
+             %z = zext i8 %i to i16\n\
+             %p = gep @buf +0 +1*%z\n\
+             store i8 %d %p\n\
+             %c = add i8 %i, 1\n\
+             %e = icmp ult i32 %v, 10\n\
+             br i1 %e exit, loop\n\
+           block exit:\n\
+             %k = icmp eq i8 %c, 0\n\
+             %w = zext i8 %c to i16\n\
+             br done\n\
+           block done:\n\
+             ret void\n";
+    let text = ir::serialize(&legalize(ir::parse(src)));
+    assert!(!text.contains("__udec_u32"), "must not share:\n{text}");
+    assert!(
+        text.contains("@__udiv_u32"),
+        "udiv must lower per site:\n{text}"
+    );
+}
+
+/// A volatile digit store is not the emitter idiom: the loop is left for
+/// the generic lowering.
+#[test]
+fn decimal_digit_loop_with_volatile_store_is_left_alone() {
+    let src = "global buf i8\n\
+         fn emit(i16) (v0=i16)\n\
+           block entry:\n\
+             %init = zext i16 %v0 to i32\n\
+             br loop\n\
+           block loop:\n\
+             %v = phi i32 %q loop %init entry\n\
+             %i = phi i8 %c loop 0 entry\n\
+             %q = udiv i32 %v, 10\n\
+             %m = mul i32 %q, 246\n\
+             %s = add i32 %m, %v\n\
+             %t = trunc i32 %s to i8\n\
+             %d = or i8 %t, 48\n\
+             %z = zext i8 %i to i16\n\
+             %p = gep @buf +0 +1*%z\n\
+             store volatile i8 %d %p\n\
+             %c = add i8 %i, 1\n\
+             %e = icmp ult i32 %v, 10\n\
+             br i1 %e exit, loop\n\
+           block exit:\n\
+             %k = icmp eq i8 %c, 0\n\
+             br done\n\
+           block done:\n\
+             ret void\n";
+    let text = ir::serialize(&legalize::legalize_pic18(ir::parse(src)));
+    assert!(
+        !text.contains("__udec_u32"),
+        "volatile store must bail:\n{text}"
+    );
+    assert!(
+        text.contains("@__udiv_u32"),
+        "udiv must lower per site:\n{text}"
+    );
+}
+
+/// A conditionally entered digit loop is shared through a fresh edge block,
+/// so the call runs only on the loop path and the other arm is untouched.
+#[test]
+fn decimal_digit_loop_with_conditional_entry_splits_edge() {
+    let src = "global buf i8\n\
+         fn emit(i16) (v0=i16)\n\
+           block entry:\n\
+             %init = zext i16 %v0 to i32\n\
+             %neg = icmp slt i32 %init, 0\n\
+             br i1 %neg cold, loop\n\
+           block cold:\n\
+             ret void\n\
+           block loop:\n\
+             %v = phi i32 %q loop %init entry\n\
+             %i = phi i8 %c loop 0 entry\n\
+             %q = udiv i32 %v, 10\n\
+             %m = mul i32 %q, 246\n\
+             %s = add i32 %m, %v\n\
+             %t = trunc i32 %s to i8\n\
+             %d = or i8 %t, 48\n\
+             %z = zext i8 %i to i16\n\
+             %p = gep @buf +0 +1*%z\n\
+             store i8 %d %p\n\
+             %c = add i8 %i, 1\n\
+             %e = icmp ult i32 %v, 10\n\
+             br i1 %e exit, loop\n\
+           block exit:\n\
+             %k = icmp eq i8 %c, 0\n\
+             br done\n\
+           block done:\n\
+             ret void\n";
+    let text = ir::serialize(&legalize::legalize_pic18(ir::parse(src)));
+    assert!(
+        text.contains("%c = call i8 @__udec_u32(i32 %init, @buf)"),
+        "missing shared call:\n{text}"
+    );
+    assert!(
+        text.contains("br i1 %neg cold loop__udec"),
+        "edge not split:\n{text}"
+    );
+    assert!(
+        !text.contains("udiv i32 %v, 10"),
+        "loop not removed:\n{text}"
+    );
+}

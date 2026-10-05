@@ -509,7 +509,14 @@ fn main() {
     // ISR analysis reads the same memcpy shapes clang emits (epic-cc#639).
     // Core-gated inside: every other core keeps byte-identical IR.
     driver::const_runs::run(&mut m, device.core);
-    m = legalize::legalize(m);
+    // The decimal-digit helper recipe exists only in the PIC18 backend, so
+    // only that core shares the loops (epic-cc#722). Every other core keeps
+    // byte-identical IR through the shared entry.
+    m = if device.core == device::Core::Pic18 {
+        legalize::legalize_pic18(m)
+    } else {
+        legalize::legalize(m)
+    };
     let cg = callgraph::build(&m);
     // A too-deep call chain is the program's fault (recursion or nesting
     // past the silicon stack), so it reports as an error, not an ICE.

@@ -6084,6 +6084,48 @@ impl<'m> Gen<'m> {
         self.emit("    RETURN".to_string());
     }
 
+    /// The u32 decimal-digit loop shared by the repeated conversion tails
+    /// (epic-cc#722): `val` holds the remaining value, `buf` the digit
+    /// buffer address. Emits one ASCII digit per quotient step through
+    /// POSTINC0 and returns the digit count. The divisor lives in scratch
+    /// (the divmod loop reads it from an address), and the caller's FSR0
+    /// is saved and restored around the POSTINC stores.
+    fn emit_udec_u32(&mut self, name: &str, scr: u16) {
+        let val = self.slot_addr(name, "val").direct();
+        let buf = self.slot_addr(name, "buf").direct();
+        let den = scr;
+        let rem = scr + 4;
+        let cnt = scr + 8;
+        let n = scr + 9;
+        let fsr = scr + 10;
+        self.emit_copy_byte(0xFE9, fsr);
+        self.emit_copy_byte(0xFEA, fsr + 1);
+        self.emit_copy_byte(buf, 0xFE9);
+        self.emit_copy_byte(buf + 1, 0xFEA);
+        self.emit_banked("CLRF", n, "");
+        self.emit("    MOVLW 0x0A".to_string());
+        self.emit_banked("MOVWF", den, "");
+        self.emit_banked("CLRF", den + 1, "");
+        self.emit_banked("CLRF", den + 2, "");
+        self.emit_banked("CLRF", den + 3, "");
+        let l_digit = self.fresh_label();
+        self.emit_label(&l_digit);
+        self.emit_divmod_loop(val, den, rem, cnt, 4, 4);
+        self.emit_banked("MOVF", rem, ",W");
+        self.emit("    ADDLW 0x30".to_string());
+        self.emit("    MOVWF 0xFEE,A".to_string());
+        self.emit_banked("INCF", n, ",F");
+        self.emit_banked("MOVF", val, ",W");
+        self.emit_banked("IORWF", val + 1, ",W");
+        self.emit_banked("IORWF", val + 2, ",W");
+        self.emit_banked("IORWF", val + 3, ",W");
+        self.emit(format!("    BNZ {l_digit}"));
+        self.store_retval(n, 1);
+        self.emit_copy_byte(fsr, 0xFE9);
+        self.emit_copy_byte(fsr + 1, 0xFEA);
+        self.emit("    RETURN".to_string());
+    }
+
     /// The variable-count shift recipe (all nine `__shl_*`/`__lshr_*`/
     /// `__ashr_*`): mask the count to `width-1` (`__scr[0]` = masked
     /// count), then a bounded loop over the `val` param slot with
@@ -8114,6 +8156,7 @@ impl<'m> Gen<'m> {
             "__urem_u16" => self.emit_divmod(name, 2, scr, false),
             "__udiv_u32" => self.emit_divmod(name, 4, scr, true),
             "__urem_u32" => self.emit_divmod(name, 4, scr, false),
+            "__udec_u32" => self.emit_udec_u32(name, scr),
             "__sdiv_i8" => self.emit_sdivmod(name, 1, scr, true),
             "__srem_i8" => self.emit_sdivmod(name, 1, scr, false),
             "__sdiv_i16" => self.emit_sdivmod(name, 2, scr, true),
