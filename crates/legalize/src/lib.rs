@@ -335,8 +335,10 @@ fn sink_ptr_select_funcs(m: Module) -> Module {
 /// no text-level factorer can share the copies. Rewrites each matching
 /// header into `%n = call i8 @__udec_u32(i32 %v0, ptr @buf)` plus a direct
 /// branch to the exit block; the exit's `n == 0` check stays (always
-/// false, one dead compare) so the rewrite touches one block only.
-/// Returns whether any loop fired, so the caller records the routine.
+/// false, one dead compare) so the rewrite touches one block only. Returns
+/// whether sharing fired, so the caller records the routine. Firing needs
+/// at least two sites module-wide: one lone loop stays expanded, since a
+/// call plus the helper body cost more than the inline loop.
 ///
 /// Fires only when the shape is exact and loop-local: a self-edge plus one
 /// preheader, the value phi fed from that preheader, the count phi from
