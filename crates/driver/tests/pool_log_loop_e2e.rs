@@ -1,12 +1,10 @@
 //! Pool-reader log loop (epic-cc#817): the mdb `epic_harness_log` byte
-//! loop over a pool-resident string lowers as `idx = ptr - POOL_BASE`
-//! once (here an (in-chunk index, chunk id) pair per call), then the
-//! existing table `CALL` per byte with the index advancing alongside.
-//! The fixture mixes direct, select, and RAM call sites; `g_sel` stays
-//! 0, so the else arms log. Proof is sim execution: the pooled build
-//! links with no literal RAM copies and its transcript is byte-identical
-//! to the RAM-backed build. The pool spans two chunks with logged
-//! shorts in each, so both dispatch paths run.
+//! loop over a pool string lowers to an (index, chunk id) pair per call,
+//! then the existing table `CALL` per byte. The fixture mixes direct,
+//! select, and RAM sites; `g_sel` stays 0, so the else arms log. Proof
+//! is sim execution: the pooled build links with no literal RAM copies
+//! and its transcript is byte-identical to the RAM-backed build. Both
+//! pool chunks hold logged shorts, so both dispatch paths run.
 
 use std::process::Command;
 

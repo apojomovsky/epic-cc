@@ -810,8 +810,8 @@ impl<'m> Gen<'m> {
     fn emit_ptr_load_byte(&mut self, ptr: &Val, byte_off: u8) {
         match ptr {
             Val::Reg(r) => {
-                // Pool log variant (epic-cc#817): slots holding
-                // pool-relative indices read via the pool readers.
+                // Pool log variant (epic-cc#817): index-pair slots read
+                // via the matching pool reader.
                 if self.pool_log
                     && (self.pool_slots.contains(&ssa_key(self.cur_func, r))
                         || matches!(self.resolved_for(r),
