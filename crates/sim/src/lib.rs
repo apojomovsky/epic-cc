@@ -86,6 +86,18 @@ pub const PIC18_TMR0IE: u8 = 1 << 5;
 pub const PIC18_INT0IE: u8 = 1 << 4;
 pub const PIC18_TMR0IF: u8 = 1 << 2;
 pub const PIC18_INT0IF: u8 = 1 << 1;
+/// PIC18 Timer2 match path (DS39632E section 12, table 9-5/9-6): T2CON
+/// holds the on switch plus prescaler/postscaler, PR2 the period, PIR1
+/// the TMR2IF match flag and PIE1 its enable. IPR routing is not
+/// modelled: POR leaves every peripheral high priority, so the match
+/// vectors through the high path on GIEH plus TMR2IE.
+pub const PIC18_T2CON: usize = 0xFCA;
+pub const PIC18_PR2: usize = 0xFCB;
+pub const PIC18_PIE1: usize = 0xF9D;
+pub const PIC18_PIR1: usize = 0xF9E;
+pub const PIC18_T2CON_TMR2ON: u8 = 1 << 2;
+pub const PIC18_TMR2IE: u8 = 1 << 1;
+pub const PIC18_TMR2IF: u8 = 1 << 1;
 pub const PIC18_HI_VECTOR: u32 = 0x0008;
 pub const PIC18_LO_VECTOR: u32 = 0x0018;
 /// PIC18 power-on reset latches (DS39632E Table 5-1, as recorded in the
@@ -2072,6 +2084,10 @@ pub struct Pic18 {
     /// The data-EEPROM cell array behind the EEADR/EEDATA/EECON1/EECON2
     /// register file.
     eeprom: Eeprom,
+    /// Instruction cycles banked toward the next Timer2 match
+    /// (prescaler x (PR2+1) x postscaler per TMR2IF). Reset while
+    /// TMR2ON is clear so enabling never fires a stale burst.
+    timer2_acc: u64,
 }
 
 impl Pic18 {
@@ -2093,6 +2109,7 @@ impl Pic18 {
             pending_lo: false,
             isr_stack: Vec::new(),
             jump_target: None,
+            timer2_acc: 0,
         }
     }
     pub fn ram(&self) -> &[u8; 4096] {
@@ -2156,6 +2173,7 @@ impl Pic18 {
             self.pending = false;
             self.enter_isr();
             self.cycles += 2; // vector entry; the handler runs next
+            self.tick_timer2(2);
             return;
         }
         // The low vector is checked second: a pending high request
@@ -2164,6 +2182,7 @@ impl Pic18 {
             self.pending_lo = false;
             self.enter_isr_low();
             self.cycles += 2; // vector entry; the handler runs next
+            self.tick_timer2(2);
             return;
         }
         let word = self.prog[(self.pc / 2) as usize];
@@ -2242,7 +2261,9 @@ impl Pic18 {
         // PCLATU:PCLATH:W; its linear next is void.
         let jumped = self.jump_target.take();
         let next = jumped.unwrap_or(next);
-        self.cycles += cost18(word, pc, next, jumped.is_some());
+        let delta = cost18(word, pc, next, jumped.is_some());
+        self.cycles += delta;
+        self.tick_timer2(delta);
         self.pc = next;
         if (self.pc / 2) as usize >= self.prog.len() {
             self.halted = true;
@@ -3067,15 +3088,43 @@ impl Pic18 {
         self.pc = PIC18_LO_VECTOR;
         self.isr_stack.push(false);
     }
+    /// Bank `delta` instruction cycles into Timer2. A match sets PIR1
+    /// TMR2IF and latches the high request; the dispatch clears the flag
+    /// and the vector entry consumes the latch. Period is prescaler x
+    /// (PR2+1) x postscaler from live T2CON/PR2, so firmware that
+    /// reprograms the timer mid-run retunes the model with it.
+    fn tick_timer2(&mut self, delta: u64) {
+        if self.ram[PIC18_T2CON] & PIC18_T2CON_TMR2ON == 0 {
+            self.timer2_acc = 0;
+            return;
+        }
+        let t2con = self.ram[PIC18_T2CON];
+        let pre = match t2con & 0x03 {
+            0 => 1,
+            1 => 4,
+            _ => 16,
+        };
+        let post = ((t2con >> 3) & 0x0F) as u64 + 1;
+        let period = pre * (self.ram[PIC18_PR2] as u64 + 1) * post;
+        self.timer2_acc += delta;
+        while self.timer2_acc >= period {
+            self.timer2_acc -= period;
+            self.ram[PIC18_PIR1] |= PIC18_TMR2IF;
+            self.pending = true;
+        }
+    }
     /// A latched request with GIEH set and either modelled source enabled
-    /// (INT0IE or TMR0IE). Readiness keys off the enables, not the flag
-    /// bits: firmware unmasks with wholesale INTCON writes that clear the
-    /// flags, while the latch itself records the peripheral event.
+    /// (INT0IE, TMR0IE, or PIE1 TMR2IE). Readiness keys off the enables,
+    /// not the flag bits: firmware unmasks with wholesale INTCON writes
+    /// that clear the flags, while the latch itself records the
+    /// peripheral event.
     fn interrupt_ready(&self) -> bool {
         let intcon = self.ram[PIC18_INTCON];
         self.pending
             && intcon & PIC18_GIEH != 0
-            && (intcon & PIC18_INT0IE != 0 || intcon & PIC18_TMR0IE != 0)
+            && (intcon & PIC18_INT0IE != 0
+                || intcon & PIC18_TMR0IE != 0
+                || self.ram[PIC18_PIE1] & PIC18_TMR2IE != 0)
     }
     /// A latched low request with GIEH and GIEL set and either modelled
     /// source enabled (GIEH gates everything when IPEN = 1).
@@ -3314,6 +3363,111 @@ mod pic18_interrupt {
         pic.request_low_interrupt();
         pic.run(1); // the boundary serves the high request first
         assert_eq!(pic.pc(), PIC18_HI_VECTOR, "high wins over a latched low");
+    }
+}
+
+#[cfg(test)]
+mod pic18_timer2 {
+    use super::{
+        Pic18, PIC18_GIEH, PIC18_HI_VECTOR, PIC18_INTCON, PIC18_PIE1, PIC18_PIR1, PIC18_PR2,
+        PIC18_T2CON, PIC18_T2CON_TMR2ON, PIC18_TMR2IE, PIC18_TMR2IF,
+    };
+
+    fn pic_armed(t2con: u8, pr2: u8) -> Pic18 {
+        let mut pic = Pic18::new(vec![0u16; 64]);
+        pic.ram[PIC18_T2CON] = t2con;
+        pic.ram[PIC18_PR2] = pr2;
+        pic.ram[PIC18_PIE1] = PIC18_TMR2IE;
+        pic.ram[PIC18_INTCON] = PIC18_GIEH;
+        pic
+    }
+
+    #[test]
+    fn match_sets_flag_and_vectors_on_tmr2ie() {
+        // 1:1 prescaler, 1:1 postscaler, PR2 3: match every 4 cycles.
+        let mut pic = pic_armed(PIC18_T2CON_TMR2ON, 3);
+        pic.run(4);
+        assert_eq!(
+            pic.ram()[PIC18_PIR1] & PIC18_TMR2IF,
+            PIC18_TMR2IF,
+            "four banked cycles must set TMR2IF"
+        );
+        pic.run(1);
+        assert_eq!(pic.pc(), PIC18_HI_VECTOR, "match must vector on TMR2IE");
+        assert!(!pic.interrupt_pending(), "the latch is consumed on entry");
+    }
+
+    #[test]
+    fn prescaler_stretches_the_period() {
+        // 1:4 prescaler, PR2 0: match every 4 cycles.
+        let mut pic = pic_armed(PIC18_T2CON_TMR2ON | 0x01, 0);
+        pic.run(3);
+        assert_eq!(pic.ram()[PIC18_PIR1] & PIC18_TMR2IF, 0, "three is short");
+        pic.run(1);
+        assert_eq!(
+            pic.ram()[PIC18_PIR1] & PIC18_TMR2IF,
+            PIC18_TMR2IF,
+            "four must match"
+        );
+    }
+
+    #[test]
+    fn postscaler_stretches_the_period() {
+        // 1:2 postscaler, PR2 0: match every 2 cycles.
+        let mut pic = pic_armed(PIC18_T2CON_TMR2ON | 0x08, 0);
+        pic.run(1);
+        assert_eq!(pic.ram()[PIC18_PIR1] & PIC18_TMR2IF, 0, "one is short");
+        pic.run(1);
+        assert_eq!(
+            pic.ram()[PIC18_PIR1] & PIC18_TMR2IF,
+            PIC18_TMR2IF,
+            "two must match"
+        );
+    }
+
+    #[test]
+    fn timer_off_sets_no_flag() {
+        let mut pic = Pic18::new(vec![0u16; 64]);
+        pic.ram[PIC18_PR2] = 0;
+        pic.ram[PIC18_PIE1] = PIC18_TMR2IE;
+        pic.ram[PIC18_INTCON] = PIC18_GIEH;
+        pic.run(16);
+        assert_eq!(
+            pic.ram()[PIC18_PIR1] & PIC18_TMR2IF,
+            0,
+            "TMR2ON clear: idle"
+        );
+        assert!(!pic.interrupt_pending(), "no latch while off");
+        assert_ne!(pic.pc(), PIC18_HI_VECTOR, "must not vector while off");
+    }
+
+    #[test]
+    fn match_without_enable_sets_flag_but_stays_linear() {
+        let mut pic = Pic18::new(vec![0u16; 64]);
+        pic.ram[PIC18_T2CON] = PIC18_T2CON_TMR2ON;
+        pic.ram[PIC18_PR2] = 1;
+        pic.ram[PIC18_INTCON] = PIC18_GIEH;
+        pic.run(2);
+        assert_eq!(
+            pic.ram()[PIC18_PIR1] & PIC18_TMR2IF,
+            PIC18_TMR2IF,
+            "flag sets without the enable"
+        );
+        assert_eq!(pic.pc(), 4, "no enable: must not vector");
+    }
+
+    #[test]
+    fn match_stays_pending_while_gie_is_clear() {
+        let mut pic = Pic18::new(vec![0u16; 64]);
+        pic.ram[PIC18_T2CON] = PIC18_T2CON_TMR2ON;
+        pic.ram[PIC18_PR2] = 1;
+        pic.ram[PIC18_PIE1] = PIC18_TMR2IE;
+        pic.run(2);
+        assert!(pic.interrupt_pending(), "match must latch");
+        assert_eq!(pic.pc(), 4, "GIE clear: must not vector");
+        pic.ram[PIC18_INTCON] = PIC18_GIEH;
+        pic.run(1);
+        assert_eq!(pic.pc(), PIC18_HI_VECTOR, "must vector once GIE goes up");
     }
 }
 
