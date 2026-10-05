@@ -16,12 +16,13 @@ procedure works in MPLAB SIM: load the identical HEX, watch the data
 address from the MAP file, and read the stopwatch at each write.
 
 The markers are plain volatile stores, so they compile unchanged under
-the reference compiler. Anti-folding rule every kernel follows: inputs
-are volatile globals with nonzero initializers, loaded inside the timed
-region; results are sunk to a volatile global before the `2` store. The
-load, compute, sink chain is data-dependent, so the optimizer cannot
-hoist the work above the `1` or sink it below the `2`, under either
-profile.
+the reference compiler. Anti-folding rule the hand-written kernels
+follow: inputs are volatile globals with nonzero initializers, loaded
+inside the timed region; results are sunk to a volatile global before
+the `2` store. The load, compute, sink chain is data-dependent, so the
+optimizer cannot hoist the work above the `1` or sink it below the `2`,
+under either profile. Scenario rows instead pin through cross-TU calls
+the optimizer cannot see through, with volatile sinks before the `2`.
 
 ## ISR fixtures
 
