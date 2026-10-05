@@ -12,7 +12,7 @@
 use super::sidecar;
 use alloc::AllocLayout;
 use device::Device;
-use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Val};
+use ir::{Bin, BinOp, Icmp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use irparse::DebugVars;
 
 /// The address-to-source-line table: one `file:line:col <addr>` record per
@@ -128,16 +128,18 @@ pub fn var_table_text(device: &Device, layout: &AllocLayout, vars: &DebugVars) -
 /// How much of the fixed region the emitted program can touch.
 /// `retval_bytes` is the widest touched retval byte count; `flag` is the
 /// PIC18 borrow-chain spill bit in retval byte 0 (it shares the byte, so
-/// it only ever raises the count to 1). PIC14 scratch stays out: it is
-/// always counted, its uses are too broad to mirror cheaply.
+/// it only ever raises the count to 1). `scratch` is the PIC14/PIC14E
+/// common-RAM scratch byte; `memcpy_park` is the dynamic-memcpy index
+/// and hold bytes, `memcpy_hold` the constant-memcpy hold byte (PIC14E
+/// parks the byte across an indirect destination setup). PIC18 and
+/// baseline leave all three false: their fixed regions have none.
 pub struct FixedUses {
     pub retval_bytes: u8,
     pub flag: bool,
+    pub scratch: bool,
+    pub memcpy_park: bool,
+    pub memcpy_hold: bool,
 }
-
-/// The fixed bytes the module's lowering can touch, per core. Every arm
-/// mirrors an isel emission site, so a site missing here undercounts RAM:
-/// the `fixed_uses` e2e test scans emitted asm for fixed-range refs over
 /// the fixture corpus and fails any row the scan beats. Verbatim inline
 /// asm is outside the model: it can name any byte, fixed or otherwise.
 /// Each predicate fires on shapes that MIGHT touch, so misses default
@@ -151,8 +153,171 @@ pub struct FixedUses {
 ///
 /// PIC14/PIC14E (isel, isel-pic14e): same call/return widths, plus the
 /// dynamic-memcpy counters (2, constant lengths unroll), the `_delay`
-/// counters, the large-const-table index (1, tables over 255 bytes), and
-/// the signed-wide-compare spill (1, unsigned chains fold in place).
+/// counters, the large-const-table index (1, tables over 255 bytes), the
+/// signed-wide-compare spill (1, unsigned chains fold in place), the
+/// scratch byte (below), the dynamic-memcpy park bytes (2), and the
+/// PIC14E constant-memcpy hold byte (1, below).
+///
+/// Scratch groups, each mirroring an emission site: const-table reads
+/// (any size, plus the pool-log variant), general dynamic address sums,
+/// wide compares (multi-byte equality, signed or const-byte ordered
+/// chains), and wide ALU (32-bit add/sub, const-LHS sub past byte 0).
+/// Switches desugar to branches before isel, so they need no group.
+/// PIC14E differs twice: every equality fold stores scratch, and its
+/// FSR setups keep the fast shape for empty term lists. Its constant
+/// memcpy parks the byte in the hold byte across an indirect
+/// destination setup; indirectness needs alloc addresses, so any
+/// constant memcpy counts there.
+/// Whether `name` is a flash const table. A const with a RAM copy
+/// lowers through RAM instead, but the copy decision lives in alloc,
+/// invisible to this scan, so a const base always counts as a read.
+fn is_const_table(module: &Module, name: &str) -> bool {
+    module.globals.iter().any(|g| g.name == name && g.is_const)
+}
+
+/// Whether `name` is a plain pointer param of `func`: its slot holds a
+/// runtime address, so every access through it sets up FSR. Mirrors
+/// isel's `param_holds_addr`, which reads the same `ptr` flag.
+fn param_holds_addr(module: &Module, func: &str, name: &str) -> bool {
+    module
+        .funcs
+        .iter()
+        .find(|f| f.name == func)
+        .is_some_and(|f| f.params.iter().any(|p| p.name == name && p.ptr))
+}
+
+/// Whether an FSR setup over `terms` accumulates through scratch.
+/// Direct bases keep the fast single-register shape for an empty or
+/// single scale-1 term list. An indirect slot has no fast shape on
+/// PIC14 (its setup always accumulates); PIC14E keeps it there too.
+fn ptr_terms_scratch(core: device::Core, indirect: bool, terms: &[(u16, String)]) -> bool {
+    match terms {
+        [] => false,
+        [(1, _)] => indirect && core == device::Core::Pic14,
+        _ => true,
+    }
+}
+
+/// Whether the dynamic-memcpy per-byte FSR setup touches scratch. This
+/// path always builds FSR, so PIC14 accumulates even over an empty term
+/// list (only the single scale-1 shape stays fast); PIC14E keeps the
+/// fast shape for empty lists too.
+fn memcpy_terms_scratch(core: device::Core, terms: &[(u16, String)]) -> bool {
+    match core {
+        device::Core::Pic14 => !matches!(terms, [(1, _)]),
+        _ => !matches!(terms, [] | [(1, _)]),
+    }
+}
+
+/// Whether one pointer operand's lowering touches scratch. A const base
+/// counts when `const_read` holds: loads, byval args, and memcpy
+/// sources park the table byte across the PCLATH restore, while stores
+/// to const panic in isel, so they pass false. RAM bases count only
+/// when their term list leaves the fast FSR shape. An unresolvable
+/// register counts: shapes isel rejects never reach a report.
+fn ptr_scratch(
+    module: &Module,
+    resolved: &iselcore::PtrResolution,
+    func: &str,
+    core: device::Core,
+    ptr: &Val,
+    const_read: bool,
+) -> bool {
+    match ptr {
+        Val::Global(name) => const_read && is_const_table(module, name),
+        Val::Reg(r) => {
+            let Some((base, _, terms)) = resolved.get(&iselcore::ssa_key(func, r)) else {
+                return true;
+            };
+            match base {
+                iselcore::Base::Global(name) => {
+                    if is_const_table(module, name) {
+                        const_read
+                    } else {
+                        ptr_terms_scratch(core, false, terms)
+                    }
+                }
+                iselcore::Base::Slot(sname, indirect) => {
+                    let ind = *indirect || param_holds_addr(module, func, sname);
+                    ptr_terms_scratch(core, ind, terms)
+                }
+            }
+        }
+        Val::Const(_) => false,
+    }
+}
+
+/// The `@global`/`%reg`/literal pointer strings loads and stores carry.
+/// Direct globals and literals lower as plain file accesses; only a
+/// register takes the pointer machinery above.
+fn str_ptr_scratch(
+    module: &Module,
+    resolved: &iselcore::PtrResolution,
+    func: &str,
+    core: device::Core,
+    ptr: &str,
+    const_read: bool,
+) -> bool {
+    match ptr.strip_prefix('%') {
+        Some(r) => ptr_scratch(
+            module,
+            resolved,
+            func,
+            core,
+            &Val::Reg(r.to_string()),
+            const_read,
+        ),
+        None => false,
+    }
+}
+
+/// The term list one side of a dynamic memcpy builds FSR over. Globals
+/// carry an empty list; an unresolvable register counts at the call
+/// site instead, so this returns `None` there.
+fn memcpy_side_terms<'a>(
+    resolved: &'a iselcore::PtrResolution,
+    func: &str,
+    side: &Val,
+) -> Option<&'a [(u16, String)]> {
+    match side {
+        Val::Reg(r) => resolved
+            .get(&iselcore::ssa_key(func, r))
+            .map(|(_, _, terms)| terms.as_slice()),
+        Val::Global(_) | Val::Const(_) => Some(&[]),
+    }
+}
+
+/// Whether an integer compare touches scratch. Equality folds wide
+/// values through it (PIC14E stores the fold byte even for one byte).
+/// An ordered compare spills the signed high byte there and folds
+/// const bytes through it; an equality-needing ordered compare
+/// appends the fold over wide values.
+fn icmp_scratch(core: device::Core, ic: &Icmp) -> bool {
+    let n = ic.ty.bytes();
+    let a_const = matches!(ic.a, Val::Const(_));
+    match ic.pred.as_str() {
+        "eq" | "ne" => core == device::Core::Pic14e || n > 1,
+        _ => {
+            let signed = matches!(ic.pred.as_str(), "slt" | "sle" | "sgt" | "sge");
+            let need_z = matches!(ic.pred.as_str(), "ugt" | "ule" | "sgt" | "sle");
+            (need_z && n > 1)
+                || (n == 1 && signed && !a_const)
+                || (n > 1 && !a_const && (signed || matches!(ic.b, Val::Const(_))))
+        }
+    }
+}
+
+/// Whether an integer binop touches scratch. The 32-bit add and sub
+/// chains stage each higher byte through it, as does the const-LHS
+/// sub past the first byte. Narrower widths fold in place.
+fn bin_scratch(bin: &Bin) -> bool {
+    match (&bin.op, &bin.ty) {
+        (BinOp::Add, Ty::I32) | (BinOp::Sub, Ty::I32) => true,
+        (BinOp::Sub, Ty::I16) => matches!(bin.a, Val::Const(_)),
+        _ => false,
+    }
+}
+
 pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
     let mut retval: u8 = 0;
     let mut flag = false;
@@ -160,6 +325,15 @@ pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
     let mut memcpy = false;
     let mut big_table = false;
     let mut wide_icmp = false;
+    let mut scratch = false;
+    let mut memcpy_park = false;
+    let mut memcpy_hold = false;
+    // The pointer resolution isel lowers through: term shapes decide
+    // the fast FSR path (no scratch) from the accumulating one.
+    let resolved = match core {
+        device::Core::Pic14 | device::Core::Pic14e => Some(iselcore::resolve_pointers(module)),
+        _ => None,
+    };
     for f in &module.funcs {
         if let Some(t) = f.ret {
             retval = retval.max(t.bytes());
@@ -192,6 +366,17 @@ pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
                         } else if c.func == "_delay" {
                             delay = delay.max(3);
                         }
+                        // Byval args copy through the shared pointer
+                        // machinery, table reads included.
+                        if let Some(res) = &resolved {
+                            for arg in &c.args {
+                                if arg.byval.is_some()
+                                    && ptr_scratch(module, res, &f.name, core, &arg.val, true)
+                                {
+                                    scratch = true;
+                                }
+                            }
+                        }
                     }
                     Inst::Bin(bin) => {
                         if core == device::Core::Pic18
@@ -201,12 +386,40 @@ pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
                         {
                             flag = true;
                         }
+                        if resolved.is_some() && bin_scratch(bin) {
+                            scratch = true;
+                        }
                     }
                     Inst::Memcpy(m) => {
                         // A constant length unrolls per byte with no
                         // counters; only the dynamic loop borrows them.
                         if matches!(m.len, MemLen::Reg(_)) {
                             memcpy = true;
+                            // The loop state parks in the 0x7E/0x7F
+                            // common bytes, outside the counted region.
+                            memcpy_park = true;
+                            if let Some(res) = &resolved {
+                                for side in [&m.src, &m.dst] {
+                                    match memcpy_side_terms(res, &f.name, side) {
+                                        Some(terms) => {
+                                            scratch |= memcpy_terms_scratch(core, terms);
+                                        }
+                                        None => scratch = true,
+                                    }
+                                }
+                            }
+                        } else if let Some(res) = &resolved {
+                            // A constant length unrolls into per-byte
+                            // load/store shapes over the same machinery.
+                            // PIC14E also parks the byte in the hold byte
+                            // across an indirect destination setup; the
+                            // setup decision needs alloc addresses, so
+                            // every constant copy counts there.
+                            if core == device::Core::Pic14e {
+                                memcpy_hold = true;
+                            }
+                            scratch |= ptr_scratch(module, res, &f.name, core, &m.src, true);
+                            scratch |= ptr_scratch(module, res, &f.name, core, &m.dst, false);
                         }
                     }
                     Inst::Icmp(ic) => {
@@ -217,6 +430,25 @@ pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
                         {
                             wide_icmp = true;
                         }
+                        if resolved.is_some() && icmp_scratch(core, ic) {
+                            scratch = true;
+                        }
+                    }
+                    Inst::Load(l) => {
+                        // Direct globals and literals lower as plain
+                        // file reads; only a register reads tables.
+                        if let Some(res) = &resolved {
+                            if str_ptr_scratch(module, res, &f.name, core, &l.ptr, true) {
+                                scratch = true;
+                            }
+                        }
+                    }
+                    Inst::Store(s) => {
+                        if let Some(res) = &resolved {
+                            if str_ptr_scratch(module, res, &f.name, core, &s.ptr, false) {
+                                scratch = true;
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -226,10 +458,24 @@ pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
     if module.globals.iter().any(|g| g.is_const && g.size > 255) {
         big_table = true;
     }
+    // The pool-log variant parks table bytes in scratch across its
+    // reader restores. Its emission needs a nonempty pool, which this
+    // scan cannot see, so the callee's presence counts on its own.
+    if resolved.is_some()
+        && module
+            .funcs
+            .iter()
+            .any(|f| f.name == iselcore::LOG_POOL_CALLEE)
+    {
+        scratch = true;
+    }
     match core {
         device::Core::Pic18 => FixedUses {
             retval_bytes: retval.max(delay),
             flag,
+            scratch: false,
+            memcpy_park: false,
+            memcpy_hold: false,
         },
         device::Core::Pic14 | device::Core::Pic14e => {
             let mut r = retval.max(delay);
@@ -242,18 +488,26 @@ pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
             FixedUses {
                 retval_bytes: r,
                 flag: false,
+                scratch,
+                memcpy_park,
+                memcpy_hold,
             }
         }
         device::Core::PicBaseline => FixedUses {
             retval_bytes: 4,
             flag: true,
+            scratch: false,
+            memcpy_park: false,
+            memcpy_hold: false,
         },
     }
 }
 
 /// The fixed bytes the program occupies outside the overlay: PIC14's
-/// common-RAM scratch (1, always) + the touched retval bytes from
-/// `fixed_uses`, plus the ISR save area (9) when the program has an ISR.
+/// touched scratch byte (0x70) + the touched retval bytes from
+/// `fixed_uses` + the memcpy park bytes (both 0x7E/0x7F for the
+/// dynamic loop, 0x7F alone for a PIC14E constant copy), plus the
+/// ISR save area (9) when the program has an ISR.
 /// PIC18's touched retval/flag bytes (the flag shares byte 0), plus the
 /// ISR save area (12) when present. Every ISR prologue saves and
 /// restores all 4 retval bytes, so `has_isr` forces the full count even
@@ -265,7 +519,17 @@ pub fn fixed_bytes(device: &Device, has_isr: bool, uses: &FixedUses) -> u16 {
     let touched = if has_isr { 4 } else { uses.retval_bytes.min(4) };
     match device.core {
         device::Core::Pic14 | device::Core::Pic14e => {
-            let base = 1 + u16::from(touched); // scratch + retval
+            // The prologue saves scratch alongside retval, so an ISR
+            // forces it even when the scan finds no other use.
+            let base = u16::from(uses.scratch || has_isr)
+                + u16::from(touched)
+                + if uses.memcpy_park {
+                    2
+                } else if uses.memcpy_hold {
+                    1
+                } else {
+                    0
+                };
             if has_isr {
                 // The ISR save area (W/STATUS/PCLATH/FSR/retval x4/scratch
                 // = 9 bytes) sits right after the retval region.
@@ -471,7 +735,7 @@ pub fn render_size(
         device::Core::PicBaseline => "common",
     };
     out.push_str(&format!(
-        "    {fixed_name}: {fixed}/{fixed_total} bytes (fixed scratch/retval/ISR save)\n"
+        "    {fixed_name}: {fixed}/{fixed_total} bytes (fixed scratch/retval/park/ISR save)\n"
     ));
     if layout.isr_bytes > 0 {
         out.push_str(&format!(
@@ -485,7 +749,9 @@ pub fn render_size(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ir::{Bin, Block, Call, CallArg, Func, Global, Icmp, MemLen, Memcpy, Ty};
+    use ir::{
+        Bin, Block, Call, CallArg, Func, Gep, GepBase, Global, Icmp, Load, MemLen, Memcpy, Ty,
+    };
 
     fn void_main(insts: Vec<Inst>) -> Module {
         Module {
@@ -515,6 +781,10 @@ mod tests {
         device::Core::Pic14
     }
 
+    fn pic14e() -> device::Core {
+        device::Core::Pic14e
+    }
+
     #[test]
     fn empty_program_touches_no_fixed_bytes() {
         let m = void_main(vec![]);
@@ -522,6 +792,9 @@ mod tests {
         assert_eq!((u18.retval_bytes, u18.flag), (0, false));
         let u14 = fixed_uses(&m, pic14());
         assert_eq!((u14.retval_bytes, u14.flag), (0, false));
+        assert!(!u14.scratch);
+        assert!(!u14.memcpy_park);
+        assert!(!u14.memcpy_hold);
     }
 
     #[test]
@@ -655,5 +928,193 @@ mod tests {
         let depth = plan.nests.iter().map(Vec::len).max().unwrap_or(0) as u8;
         assert_eq!(fixed_uses(&m, pic18()).retval_bytes, depth);
         assert_eq!(fixed_uses(&m, pic14()).retval_bytes, depth);
+    }
+
+    fn bin_op(op: BinOp, ty: Ty, a: Val, b: Val) -> Inst {
+        Inst::Bin(Bin {
+            dst: "r".to_string(),
+            op,
+            ty,
+            a,
+            b,
+            loc: None,
+        })
+    }
+
+    fn icmp_op(pred: &str, ty: Ty, a: Val, b: Val) -> Inst {
+        Inst::Icmp(Icmp {
+            dst: "c".to_string(),
+            pred: pred.to_string(),
+            ty,
+            a,
+            b,
+            loc: None,
+        })
+    }
+
+    #[test]
+    fn narrow_alu_skips_pic14_scratch() {
+        let add = bin_op(BinOp::Add, Ty::I8, Val::Reg("x".to_string()), Val::Const(1));
+        let u = fixed_uses(&void_main(vec![add]), pic14());
+        assert!(!u.scratch);
+        assert!(!u.memcpy_park);
+        let sub8 = bin_op(BinOp::Sub, Ty::I8, Val::Const(7), Val::Reg("x".to_string()));
+        assert!(!fixed_uses(&void_main(vec![sub8]), pic14()).scratch);
+        let sub16 = bin_op(
+            BinOp::Sub,
+            Ty::I16,
+            Val::Reg("x".to_string()),
+            Val::Reg("y".to_string()),
+        );
+        assert!(!fixed_uses(&void_main(vec![sub16]), pic14()).scratch);
+    }
+
+    #[test]
+    fn wide_alu_touches_pic14_scratch() {
+        let add32 = bin_op(
+            BinOp::Add,
+            Ty::I32,
+            Val::Reg("x".to_string()),
+            Val::Reg("y".to_string()),
+        );
+        assert!(fixed_uses(&void_main(vec![add32.clone()]), pic14()).scratch);
+        assert!(fixed_uses(&void_main(vec![add32]), pic14e()).scratch);
+        let sub16 = bin_op(
+            BinOp::Sub,
+            Ty::I16,
+            Val::Const(7),
+            Val::Reg("x".to_string()),
+        );
+        assert!(fixed_uses(&void_main(vec![sub16]), pic14()).scratch);
+    }
+
+    #[test]
+    fn wide_eq_touches_pic14_scratch() {
+        let wide = icmp_op(
+            "eq",
+            Ty::I16,
+            Val::Reg("x".to_string()),
+            Val::Reg("y".to_string()),
+        );
+        assert!(fixed_uses(&void_main(vec![wide]), pic14()).scratch);
+        let narrow = icmp_op(
+            "eq",
+            Ty::I8,
+            Val::Reg("x".to_string()),
+            Val::Reg("y".to_string()),
+        );
+        assert!(!fixed_uses(&void_main(vec![narrow.clone()]), pic14()).scratch);
+        assert!(fixed_uses(&void_main(vec![narrow]), pic14e()).scratch);
+    }
+
+    #[test]
+    fn ordered_cmp_scratch_follows_borrow_shape() {
+        let reg = || Val::Reg("x".to_string());
+        // Unsigned reg-reg chain without equality folds in place.
+        let ult = icmp_op("ult", Ty::I16, reg(), Val::Reg("y".to_string()));
+        assert!(!fixed_uses(&void_main(vec![ult]), pic14()).scratch);
+        // Equality-needing, signed, and const-byte chains spill.
+        let ugt = icmp_op("ugt", Ty::I16, reg(), Val::Reg("y".to_string()));
+        assert!(fixed_uses(&void_main(vec![ugt]), pic14()).scratch);
+        let slt = icmp_op("slt", Ty::I16, reg(), Val::Reg("y".to_string()));
+        assert!(fixed_uses(&void_main(vec![slt]), pic14()).scratch);
+        let const_rhs = icmp_op("ult", Ty::I16, reg(), Val::Const(9));
+        assert!(fixed_uses(&void_main(vec![const_rhs]), pic14()).scratch);
+        let signed8 = icmp_op("slt", Ty::I8, reg(), Val::Reg("y".to_string()));
+        assert!(fixed_uses(&void_main(vec![signed8]), pic14()).scratch);
+        let unsigned8 = icmp_op("ult", Ty::I8, reg(), Val::Reg("y".to_string()));
+        assert!(!fixed_uses(&void_main(vec![unsigned8]), pic14()).scratch);
+    }
+
+    fn table_module(is_const: bool, terms: Vec<(u16, String)>) -> Module {
+        let mut m = void_main(vec![
+            Inst::Gep(Gep {
+                dst: "p".to_string(),
+                base: GepBase::Global("tab".to_string()),
+                k: 0,
+                terms,
+                loc: None,
+            }),
+            Inst::Load(Load {
+                dst: "v".to_string(),
+                ty: Ty::I8,
+                ptr: "%p".to_string(),
+                ptr_ty: false,
+                volatile: false,
+                loc: None,
+            }),
+        ]);
+        m.globals.push(Global {
+            name: "tab".to_string(),
+            ty: Ty::I8,
+            is_const,
+            size: 16,
+            bytes: vec![],
+            refs: vec![],
+            addr: None,
+        });
+        m
+    }
+
+    #[test]
+    fn const_table_load_touches_scratch() {
+        assert!(fixed_uses(&table_module(true, vec![]), pic14()).scratch);
+        assert!(fixed_uses(&table_module(true, vec![]), pic14e()).scratch);
+        assert!(!fixed_uses(&table_module(false, vec![]), pic14()).scratch);
+    }
+
+    #[test]
+    fn general_index_sum_touches_scratch() {
+        // One scale-1 term keeps the fast FSR shape on both cores.
+        let fast = table_module(false, vec![(1, "i".to_string())]);
+        assert!(!fixed_uses(&fast, pic14()).scratch);
+        assert!(!fixed_uses(&fast, pic14e()).scratch);
+        // Two terms accumulate through scratch.
+        let slow = table_module(false, vec![(1, "i".to_string()), (1, "j".to_string())]);
+        assert!(fixed_uses(&slow, pic14()).scratch);
+        assert!(fixed_uses(&slow, pic14e()).scratch);
+    }
+
+    #[test]
+    fn dynamic_memcpy_touches_park_bytes() {
+        let reg = Inst::Memcpy(Memcpy {
+            dst: Val::Reg("d".to_string()),
+            src: Val::Reg("s".to_string()),
+            len: MemLen::Reg(Val::Reg("n".to_string())),
+            loc: None,
+        });
+        let u = fixed_uses(&void_main(vec![reg]), pic14());
+        assert!(u.memcpy_park);
+        assert!(u.scratch);
+        // Plain globals take the empty term list: PIC14 still
+        // accumulates the per-byte setup, PIC14E keeps it fast.
+        let global = Inst::Memcpy(Memcpy {
+            dst: Val::Global("d".to_string()),
+            src: Val::Global("s".to_string()),
+            len: MemLen::Reg(Val::Reg("n".to_string())),
+            loc: None,
+        });
+        let u14 = fixed_uses(&void_main(vec![global.clone()]), pic14());
+        assert!(u14.memcpy_park);
+        assert!(u14.scratch);
+        let u14e = fixed_uses(&void_main(vec![global]), pic14e());
+        assert!(u14e.memcpy_park);
+        assert!(!u14e.scratch);
+    }
+
+    #[test]
+    fn const_memcpy_holds_on_pic14e_only() {
+        let copy = Inst::Memcpy(Memcpy {
+            dst: Val::Global("d".to_string()),
+            src: Val::Global("s".to_string()),
+            len: MemLen::Const(4),
+            loc: None,
+        });
+        let u14 = fixed_uses(&void_main(vec![copy.clone()]), pic14());
+        assert!(!u14.memcpy_park);
+        assert!(!u14.memcpy_hold);
+        let u14e = fixed_uses(&void_main(vec![copy]), pic14e());
+        assert!(!u14e.memcpy_park);
+        assert!(u14e.memcpy_hold);
     }
 }

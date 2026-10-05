@@ -7,7 +7,7 @@
 name = "add-16f877a"
 device = "16F877A"
 flash_words = 10
-ram_bytes = 4
+ram_bytes = 3
 
 [[entry]]
 name = "add-18f4550"
@@ -151,7 +151,7 @@ ram_bytes = 30
 name = "hal-pic14e-blink-16f1937"
 device = "16F1937"
 flash_words = 100
-ram_bytes = 7
+ram_bytes = 6
 
 [[entry]]
 name = "hal-pic16-encoder-full-16f877a"
@@ -188,7 +188,7 @@ name = "add-16f877a"
 device = "16F877A"
 profile = "O2"
 flash_words = 10
-ram_bytes = 4
+ram_bytes = 3
 
 [[entry]]
 name = "add-18f4550"
