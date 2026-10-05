@@ -23,7 +23,7 @@ name = "speed-mul-u8-16f877a"
 device = "16F877A"
 cycles = 128
 flash_words = 51
-ram_bytes = 17
+ram_bytes = 16
 
 [[entry]]
 name = "speed-mul-u8-16f877a"
@@ -31,7 +31,7 @@ device = "16F877A"
 profile = "O2"
 cycles = 128
 flash_words = 51
-ram_bytes = 17
+ram_bytes = 16
 
 [[entry]]
 name = "speed-mul-u16-18f4550"
@@ -53,7 +53,7 @@ name = "speed-mul-u16-16f877a"
 device = "16F877A"
 cycles = 332
 flash_words = 84
-ram_bytes = 34
+ram_bytes = 33
 
 [[entry]]
 name = "speed-mul-u16-16f877a"
@@ -61,7 +61,7 @@ device = "16F877A"
 profile = "O2"
 cycles = 332
 flash_words = 84
-ram_bytes = 34
+ram_bytes = 33
 
 [[entry]]
 name = "speed-mul-u32-18f4550"
@@ -83,7 +83,7 @@ name = "speed-mul-u32-16f877a"
 device = "16F877A"
 cycles = 689
 flash_words = 148
-ram_bytes = 49
+ram_bytes = 48
 
 [[entry]]
 name = "speed-mul-u32-16f877a"
@@ -91,7 +91,7 @@ device = "16F877A"
 profile = "O2"
 cycles = 689
 flash_words = 148
-ram_bytes = 49
+ram_bytes = 48
 
 [[entry]]
 name = "speed-divmod-u8-18f4550"
@@ -113,7 +113,7 @@ name = "speed-divmod-u8-16f877a"
 device = "16F877A"
 cycles = 356
 flash_words = 90
-ram_bytes = 16
+ram_bytes = 15
 
 [[entry]]
 name = "speed-divmod-u8-16f877a"
@@ -121,7 +121,7 @@ device = "16F877A"
 profile = "O2"
 cycles = 356
 flash_words = 90
-ram_bytes = 16
+ram_bytes = 15
 
 [[entry]]
 name = "speed-divmod-u16-18f4550"
@@ -143,7 +143,7 @@ name = "speed-divmod-u16-16f877a"
 device = "16F877A"
 cycles = 752
 flash_words = 116
-ram_bytes = 29
+ram_bytes = 28
 
 [[entry]]
 name = "speed-divmod-u16-16f877a"
@@ -151,7 +151,7 @@ device = "16F877A"
 profile = "O2"
 cycles = 752
 flash_words = 116
-ram_bytes = 29
+ram_bytes = 28
 
 [[entry]]
 name = "speed-divmod-u32-18f4550"
@@ -173,7 +173,7 @@ name = "speed-divmod-u32-16f877a"
 device = "16F877A"
 cycles = 2676
 flash_words = 224
-ram_bytes = 52
+ram_bytes = 51
 
 [[entry]]
 name = "speed-divmod-u32-16f877a"
@@ -181,7 +181,7 @@ device = "16F877A"
 profile = "O2"
 cycles = 2676
 flash_words = 224
-ram_bytes = 52
+ram_bytes = 51
 
 [[entry]]
 name = "speed-shift-18f4550"
@@ -203,7 +203,7 @@ name = "speed-shift-16f877a"
 device = "16F877A"
 cycles = 536
 flash_words = 216
-ram_bytes = 44
+ram_bytes = 43
 
 [[entry]]
 name = "speed-shift-16f877a"
@@ -211,7 +211,7 @@ device = "16F877A"
 profile = "O2"
 cycles = 536
 flash_words = 216
-ram_bytes = 44
+ram_bytes = 43
 
 [[entry]]
 name = "speed-memcpy-32-18f4550"
