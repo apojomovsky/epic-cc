@@ -7959,36 +7959,22 @@ pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec
 /// move a reader base across a page boundary (see the pass-B note in
 /// `select`), so no reader base can drift across a page boundary between
 /// the passes: the pages hold in the final text.
-fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usize)> {
+fn reader_pages(
+    consts: &[&ir::Global],
+    staged: &HashSet<String>,
+    staged_len: &HashMap<String, usize>,
+    table_start: usize,
+) -> Vec<(String, usize)> {
     let mut pages = Vec::new();
-    let mut addr = table_start;
-    for g in consts {
-        let size = g.bytes.len();
-        if size >= 256 {
-            // Reader entry (6 words), `.align 256`, chunk 0 base at the
-            // aligned address; chunks c >= 1 sit exactly +256c later, and
-            // their reader entries are emitted AFTER the table (6 words
-            // each, in chunk order).
-            let n_chunks = ((size + 255) / 256).max(2);
-            let aligned = ((addr + 6) + 255) & !255;
-            pages.push((format!("__read_{}", g.name), aligned / 0x800));
-            for c in 1..n_chunks {
-                let entry = if c == 1 {
-                    format!("__read_{}_hi", g.name)
-                } else {
-                    format!("__read_{}_hi{c}", g.name)
-                };
-                pages.push((entry, (aligned + 256 * c) / 0x800));
-            }
-            addr = aligned + 256 * (n_chunks - 1) + (size - 256) + 6 * (n_chunks - 1);
-        } else {
-            // Single table: base sits 6 words (the reader entry) after the
-            // section's running address. A base that would cross its window
-            // is 256-aligned by the emitter (the same fold), so the page
-            // PCLATH holds after the call is the ALIGNED base's page.
-            let aligned = window_align(addr + 6, size);
-            pages.push((format!("__read_{}", g.name), aligned / 0x800));
-            addr = aligned + size;
+    for p in place_consts(consts, staged, staged_len, table_start) {
+        pages.push((format!("__read_{}", p.name), p.chunks[0].base_at / 0x800));
+        for (c, ch) in p.chunks.iter().enumerate().skip(1) {
+            let entry = if c == 1 {
+                format!("__read_{}_hi", p.name)
+            } else {
+                format!("__read_{}_hi{c}", p.name)
+            };
+            pages.push((entry, ch.base_at / 0x800));
         }
     }
     pages
@@ -8007,6 +7993,449 @@ fn window_align(base: usize, size: usize) -> usize {
     } else {
         (base + 255) & !255
     }
+}
+/// Nominal pre-banking words of a staged const's `__stage_` routine: five
+/// words per byte (PAGE set, PCLATH set, index, CALL, store) plus RETURN.
+/// Banking and peephole change the count, so the section model carries the
+/// measured post-banking length; this is only the nominal input.
+fn staged_routine_words(nbytes: usize) -> usize {
+    5 * nbytes + 1
+}
+
+/// One const's placed section units: post-banking addresses shared by the
+/// emitter, `reader_pages`, and the model verifier, so the window fold,
+/// the page pins, and the restore map cannot drift apart (epic-cc#844).
+struct ConstPlace {
+    name: String,
+    staged_len: usize,
+    chunks: Vec<ChunkPlace>,
+}
+
+/// One table chunk: its 6-word reader entry address and its base address.
+/// `pin` emits `.org reader_at` before the entry, keeping it wholly in one
+/// page; `align` emits `.align 256` before the table.
+struct ChunkPlace {
+    reader_at: usize,
+    base_at: usize,
+    align: bool,
+    pin: bool,
+}
+
+/// Lay out the const section from `start`: staged routines (nominal length
+/// plus measured banking growth), 6-word readers page-pinned when they
+/// would straddle, tables window-aligned. Chunked tables keep today's
+/// shape (aligned chunk 0, +256c chunks, readers after the table).
+fn place_consts(
+    consts: &[&ir::Global],
+    staged: &HashSet<String>,
+    staged_len: &HashMap<String, usize>,
+    start: usize,
+) -> Vec<ConstPlace> {
+    let mut addr = start;
+    let mut out = Vec::with_capacity(consts.len());
+    for g in consts {
+        let size = g.bytes.len();
+        let slen = if staged.contains(&g.name) {
+            staged_len
+                .get(&g.name)
+                .copied()
+                .unwrap_or_else(|| staged_routine_words(size))
+        } else {
+            0
+        };
+        // A reader straddling a page boundary moves to the next page start.
+        // The entry itself is branchless, but its CALL's PAGE() set and the
+        // caller's post-call restore assume one page (epic-cc#844).
+        let pin_reader = |at: usize| -> (usize, bool) {
+            if at / 0x800 != (at + 5) / 0x800 {
+                ((at + 0x7FF) & !0x7FF, true)
+            } else {
+                (at, false)
+            }
+        };
+        let mut at = addr + slen;
+        let mut chunks = Vec::new();
+        if size >= 256 {
+            let n_chunks = ((size + 255) / 256).max(2);
+            let (reader, pin) = pin_reader(at);
+            let base0 = ((reader + 6) + 255) & !255;
+            chunks.push(ChunkPlace {
+                reader_at: reader,
+                base_at: base0,
+                align: base0 != reader + 6,
+                pin,
+            });
+            at = base0 + size;
+            for c in 1..n_chunks {
+                let (r, p) = pin_reader(at);
+                chunks.push(ChunkPlace {
+                    reader_at: r,
+                    base_at: base0 + 256 * c,
+                    align: false,
+                    pin: p,
+                });
+                at = r + 6;
+            }
+        } else {
+            let (reader, pin) = pin_reader(at);
+            let base = window_align(reader + 6, size);
+            chunks.push(ChunkPlace {
+                reader_at: reader,
+                base_at: base,
+                align: base != reader + 6,
+                pin,
+            });
+            at = base + size;
+        }
+        addr = at;
+        out.push(ConstPlace {
+            name: g.name.clone(),
+            staged_len: slen,
+            chunks,
+        });
+    }
+    out
+}
+
+/// Post-banking word counts of the section's generated routines in `banked`:
+/// `__stage_` extents and `__read_` extents, counting emitted words only.
+/// Directives and pads belong to neither unit; untracked labels (table
+/// bases, functions) keep no extent open.
+fn measure_section_units(banked: &str) -> (HashMap<String, usize>, HashMap<String, usize>) {
+    let mut stage: HashMap<String, usize> = HashMap::new();
+    let mut reader: HashMap<String, usize> = HashMap::new();
+    let mut cur: Option<(bool, String, usize)> = None;
+    let close = |cur: &mut Option<(bool, String, usize)>,
+                 stage: &mut HashMap<String, usize>,
+                 reader: &mut HashMap<String, usize>| {
+        if let Some((is_stage, name, words)) = cur.take() {
+            if is_stage {
+                stage.insert(
+                    name.strip_prefix("__stage_").unwrap_or(&name).to_string(),
+                    words,
+                );
+            } else {
+                reader.insert(name, words);
+            }
+        }
+    };
+    for raw in banked.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+            continue;
+        }
+        if line.starts_with("end") {
+            close(&mut cur, &mut stage, &mut reader);
+            break;
+        }
+        if line.strip_prefix("org ").is_some() {
+            close(&mut cur, &mut stage, &mut reader);
+            continue;
+        }
+        if let Some(l) = line.strip_suffix(':') {
+            let name = l.trim().to_string();
+            if name.starts_with("__stage_") {
+                close(&mut cur, &mut stage, &mut reader);
+                cur = Some((true, name, 0));
+            } else if name.starts_with("__read_") {
+                close(&mut cur, &mut stage, &mut reader);
+                cur = Some((false, name, 0));
+            }
+            continue;
+        }
+        if line.contains(" equ ") || line.strip_prefix(".align ").is_some() {
+            continue;
+        }
+        if line.starts_with(".table ") {
+            // The table data belongs to no routine: the reader's computed
+            // jump lands inside it, so its extent ends at the directive.
+            close(&mut cur, &mut stage, &mut reader);
+            continue;
+        }
+        if let Some((_, _, words)) = cur.as_mut() {
+            *words += 1;
+        }
+    }
+    close(&mut cur, &mut stage, &mut reader);
+    (stage, reader)
+}
+
+/// Check the emitted section against the banked, peepholed final text: each
+/// reader is 6 words inside one page, each staged routine is its modeled
+/// length, each table base fits its window. A mismatch panics loudly here
+/// instead of miscompiling or tripping the assembler's assert (epic-cc#844).
+fn verify_section_model(places: &[ConstPlace], banked: &str) {
+    let lens: HashMap<&str, usize> = places
+        .iter()
+        .map(|p| (p.name.as_str(), p.staged_len))
+        .collect();
+    let mut org = 0usize;
+    let mut cur: Option<(bool, String, usize, usize)> = None;
+    let close = |cur: &mut Option<(bool, String, usize, usize)>, lens: &HashMap<&str, usize>| {
+        if let Some((is_stage, name, start, words)) = cur.take() {
+            if is_stage {
+                let key = name.strip_prefix("__stage_").unwrap_or(&name);
+                let want = lens
+                    .get(key)
+                    .copied()
+                    .unwrap_or_else(|| panic!("isel: staged routine {name} has no modeled length"));
+                assert!(
+                    words == want,
+                    "isel: staged routine {name} is {words} words, modeled {want}: the section model no longer matches banking"
+                );
+            } else {
+                let last = start + words.saturating_sub(1);
+                assert!(
+                    words == 6,
+                    "isel: const reader {name} is {words} words, not 6: the section model no longer matches banking"
+                );
+                assert!(
+                    start / 0x800 == last / 0x800,
+                    "isel: const reader {name} spans pages (0x{start:04X}-0x{last:04X}): pin it to one page"
+                );
+            }
+        }
+    };
+    for raw in banked.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("org ") {
+            close(&mut cur, &lens);
+            org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
+            continue;
+        }
+        if line.starts_with("end") {
+            close(&mut cur, &lens);
+            break;
+        }
+        if let Some(l) = line.strip_suffix(':') {
+            let name = l.trim().to_string();
+            if name.starts_with("__stage_") || name.starts_with("__read_") {
+                close(&mut cur, &lens);
+                cur = Some((name.starts_with("__stage_"), name, org, 0));
+            }
+            continue;
+        }
+        if line.contains(" equ ") {
+            continue;
+        }
+        if let Some(n) = line.strip_prefix(".align ") {
+            let n: usize = n.trim().parse().unwrap();
+            org = (org + n - 1) & !(n - 1);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(".table ") {
+            close(&mut cur, &lens);
+            let mut it = rest.split_whitespace();
+            let name = it.next().unwrap_or("?");
+            let size: usize = it.next().unwrap_or("0").parse().unwrap_or(0);
+            if size <= 255 {
+                assert!(
+                    (org & 0xFF) + size <= 0x100,
+                    "isel: const table {name} of {size} bytes at base 0x{org:03X} crosses its 256-byte window"
+                );
+            } else {
+                assert!(
+                    org & 0xFF == 0,
+                    "isel: const table {name} of {size} bytes at base 0x{org:03X} is not 256-aligned"
+                );
+            }
+            continue;
+        }
+        org += 1;
+        if let Some((_, _, _, words)) = cur.as_mut() {
+            *words += 1;
+        }
+    }
+    close(&mut cur, &lens);
+}
+/// Emit the const-table section from a `place_consts` layout: staged
+/// routines, page-pinned reader entries, window-aligned tables. Positions
+/// come from the layout, so this never recomputes an address (epic-cc#844).
+fn emit_const_section(
+    consts: &[&ir::Global],
+    staged: &HashSet<String>,
+    addrs: &HashMap<String, u16>,
+    scratch: u16,
+    places: &[ConstPlace],
+) -> (Vec<String>, Vec<Option<SrcLoc>>) {
+    let mut out: Vec<String> = Vec::new();
+    let mut locs: Vec<Option<SrcLoc>> = Vec::new();
+    for (g, place) in consts.iter().zip(places.iter()) {
+        // Staged consts (epic-cc#790) get a per-string routine beside
+        // their table: straight-line code with explicit PCLATH sets, so
+        // placement needs no page planning beyond the section's own, and
+        // both passes emit it identically (no page-dependent elision
+        // inside). Every staged use re-copies through it before its call.
+        if staged.contains(&g.name) {
+            let stage = *addrs
+                .get("__const_stage")
+                .expect("isel: staged const with no staging buffer in map");
+            out.push(format!("__stage_{}:", g.name));
+            locs.push(None);
+            // The reader sets PCLATH to HIGH(base) on entry, which can
+            // differ from its own entry page (straddling table), so every
+            // CALL re-sets the entry page: a single hoisted set would
+            // misbranch from the second byte on.
+            for i in 0..g.bytes.len() {
+                out.push(format!("    MOVLW PAGE(__read_{})", g.name));
+                locs.push(None);
+                out.push("    MOVWF PCLATH".to_string());
+                locs.push(None);
+                out.push(format!("    MOVLW 0x{i:02X}"));
+                locs.push(None);
+                out.push(format!("    CALL __read_{}", g.name));
+                locs.push(None);
+                out.push(format!("    MOVWF 0x{:02X}", stage + i as u16));
+                locs.push(None);
+            }
+            out.push("    RETURN".to_string());
+            locs.push(None);
+        }
+        assert!(
+            !g.bytes.is_empty(),
+            "isel: const @{} has no table bytes",
+            g.name
+        );
+        let size = g.bytes.len();
+        // Chunks emitted: 256-byte tables keep the empty chunk-1 + `_hi`
+        // reader (the dispatch's bit-0 test references them); larger tables
+        // get ceil(size/256) chunks.
+        let n_chunks = if size >= 256 {
+            ((size + 255) / 256).max(2)
+        } else {
+            1
+        };
+        assert!(
+            size <= 65535,
+            "isel: const @{} table of {size} bytes exceeds the 65535-byte 16-bit index bound",
+            g.name
+        );
+        // `MOVLW HIGH` clobbers W, so the incoming index (W = byte index)
+        // is stashed in the fixed scratch byte (0x70, free at a const
+        // read) across the PCLATH set, then reloaded for the computed jump.
+        let reader = |out: &mut Vec<String>, locs: &mut Vec<Option<SrcLoc>>, base: &str| {
+            out.push(format!("    MOVWF 0x{:02X}", scratch));
+            locs.push(None);
+            out.push(format!("    MOVLW HIGH({base})"));
+            locs.push(None);
+            out.push("    MOVWF PCLATH".to_string());
+            locs.push(None);
+            out.push(format!("    MOVF 0x{:02X}, W", scratch));
+            locs.push(None);
+            out.push(format!("    ADDLW LOW({base})"));
+            locs.push(None);
+            out.push("    MOVWF PCL".to_string());
+            locs.push(None);
+        };
+        // A pinned reader moves to the next page start: the `.org` pad keeps
+        // the entry wholly in one page (epic-cc#844).
+        let pin = |out: &mut Vec<String>, locs: &mut Vec<Option<SrcLoc>>, ch: &ChunkPlace| {
+            if ch.pin {
+                out.push(format!("    org 0x{:04X}", ch.reader_at));
+                locs.push(None);
+            }
+        };
+        if size >= 256 {
+            // Chunked table: chunk-0 reader, `.align 256`, then each chunk's
+            // RETLWs at `name`, `name_1`, ... (+256c, so every LOW() == 0).
+            // Chunk readers come AFTER the table (`__read_<name>_hi[c]`,
+            // `_hi` for chunk 1); their computed gotos jump into the table,
+            // so they cannot shift the chunks. A 256-byte table keeps the
+            // empty chunk 1, never selected by indices 0..255.
+            pin(&mut out, &mut locs, &place.chunks[0]);
+            out.push(format!("__read_{}:", g.name));
+            locs.push(None);
+            reader(&mut out, &mut locs, &g.name);
+            if place.chunks[0].align {
+                out.push("    .align 256".to_string());
+                locs.push(None);
+            }
+            out.push(format!("    .table {} {size}", g.name));
+            locs.push(None);
+            out.push(format!("{}:", g.name));
+            locs.push(None);
+            for (i, b) in g.bytes[..256].iter().enumerate() {
+                if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
+                    out.push(format!("    RETLW {}", ref_byte_operand(addrs, i, f, *a)));
+                } else {
+                    out.push(format!("    RETLW 0x{b:02X}"));
+                }
+                locs.push(None);
+            }
+            for c in 1..n_chunks {
+                let start = c * 256;
+                let end = (c + 1) * 256;
+                let chunk_label = if c == 1 {
+                    format!("{}_1", g.name)
+                } else {
+                    format!("{}_{}", g.name, c)
+                };
+                out.push(format!("{chunk_label}:"));
+                locs.push(None);
+                for (i, b) in g.bytes[start..end.min(size)].iter().enumerate() {
+                    let abs = start + i;
+                    if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == abs) {
+                        out.push(format!("    RETLW {}", ref_byte_operand(addrs, abs, f, *a)));
+                    } else {
+                        out.push(format!("    RETLW 0x{b:02X}"));
+                    }
+                    locs.push(None);
+                }
+            }
+            // reader entries after the table
+            for c in 1..n_chunks {
+                let chunk_label = if c == 1 {
+                    format!("{}_1", g.name)
+                } else {
+                    format!("{}_{}", g.name, c)
+                };
+                let entry = if c == 1 {
+                    format!("__read_{}_hi", g.name)
+                } else {
+                    format!("__read_{}_hi{c}", g.name)
+                };
+                pin(&mut out, &mut locs, &place.chunks[c]);
+                out.push(format!("{entry}:"));
+                locs.push(None);
+                reader(&mut out, &mut locs, &chunk_label);
+            }
+        } else {
+            // Single-entry table (<= 255 bytes): a base that would cross
+            // its window gets `.align 256` before the `.table` directive,
+            // so the assembler's LOW + size <= 0x100 assert never fires
+            // on a <= 255-byte table (epic-cc#138). A base that already
+            // fits emits no `.align` (no flash waste).
+            pin(&mut out, &mut locs, &place.chunks[0]);
+            out.push(format!("__read_{}:", g.name));
+            locs.push(None);
+            reader(&mut out, &mut locs, &g.name);
+            if place.chunks[0].align {
+                out.push("    .align 256".to_string());
+                locs.push(None);
+            }
+            out.push(format!("    .table {} {size}", g.name));
+            locs.push(None);
+            out.push(format!("{}:", g.name));
+            locs.push(None);
+            for (i, b) in g.bytes[..size].iter().enumerate() {
+                // A ref byte materializes its address half from the alloc
+                // map for RAM targets, else the link-time label literal
+                // (epic-cc#154).
+                if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
+                    out.push(format!("    RETLW {}", ref_byte_operand(addrs, i, f, *a)));
+                } else {
+                    out.push(format!("    RETLW 0x{b:02X}"));
+                }
+                locs.push(None);
+            }
+        }
+        out.push("".to_string());
+        locs.push(None);
+    }
+    (out, locs)
 }
 
 /// The final word address after `text`: the org the assembler reaches
@@ -8825,7 +9254,47 @@ pub fn select_with_locs(
         .last()
         .copied()
         .unwrap_or(if has_isr { 4 } else { 5 });
-    for (entry, page) in reader_pages(&consts, table_start) {
+    // Staged routines change size under banking (BANKSELs in, redundant
+    // PCLATH sets out), and the section model must carry the post-banking
+    // lengths before pass B: its same-page elision consults the reader page
+    // map below, which is wrong when the model misses hundreds of routine
+    // words (epic-cc#844). Banking and peephole see instruction sequences,
+    // never addresses, and every routine opens with a label reset, so one
+    // banking of the pass-A text plus the nominal section measures the exact
+    // growths the final text will show.
+    let staged_len: HashMap<String, usize> = if consts.iter().any(|g| staged.contains(&g.name)) {
+        let nominal = place_consts(&consts, staged, &HashMap::new(), table_start);
+        let (sec_text, _) = emit_const_section(&consts, staged, addrs, scratch, &nominal);
+        let mut m2 = measure.clone();
+        m2.push(sec_text.join("\n"));
+        let banked = banking::assign_banks(device, &m2.join("\n"));
+        let peeped = peephole::optimize(&banked);
+        let (stage_actual, reader_actual) = measure_section_units(&peeped);
+        for (entry, words) in &reader_actual {
+            assert!(
+                *words == 6,
+                "isel: const reader {entry} is {words} words post-banking, not 6"
+            );
+        }
+        let mut lens = HashMap::new();
+        for g in &consts {
+            if staged.contains(&g.name) {
+                lens.insert(
+                    g.name.clone(),
+                    stage_actual.get(&g.name).copied().unwrap_or_else(|| {
+                        panic!(
+                            "isel: staged routine __stage_{} missing from the banked text",
+                            g.name
+                        )
+                    }),
+                );
+            }
+        }
+        lens
+    } else {
+        HashMap::new()
+    };
+    for (entry, page) in reader_pages(&consts, staged, &staged_len, table_start) {
         pages.insert(entry, page);
     }
     // Pool log variant (epic-cc#817): emitted inside the callee's own
@@ -9045,8 +9514,8 @@ pub fn select_with_locs(
             // boundary that neither pass-A nor `addr_b` cross. Checking
             // at `start` is conservative (start >= addr_b, and a pin
             // re-anchors to the map-consistent `table_start`).
-            let pages_a = reader_pages(&consts, table_start);
-            let pages_b = reader_pages(&consts, start);
+            let pages_a = reader_pages(&consts, staged, &staged_len, table_start);
+            let pages_b = reader_pages(&consts, staged, &staged_len, start);
             let drift = pages_a
                 .iter()
                 .zip(&pages_b)
@@ -9148,189 +9617,17 @@ pub fn select_with_locs(
             }
         }
     }
-    let mut addr = section_start;
-    for g in consts {
-        // Staged consts (epic-cc#790) get a per-string routine beside
-        // their table: straight-line code with explicit PCLATH sets, so
-        // placement needs no page planning beyond the section's own, and
-        // both passes emit it identically (no page-dependent elision
-        // inside). Every staged use re-copies through it before its call.
-        if staged.contains(&g.name) {
-            let stage = *addrs
-                .get("__const_stage")
-                .expect("isel: staged const with no staging buffer in map");
-            out.push(format!("__stage_{}:", g.name));
-            locs.push(None);
-            // The reader sets PCLATH to HIGH(base) on entry, which can
-            // differ from its own entry page (straddling table), so every
-            // CALL re-sets the entry page: a single hoisted set would
-            // misbranch from the second byte on.
-            for i in 0..g.bytes.len() {
-                out.push(format!("    MOVLW PAGE(__read_{})", g.name));
-                locs.push(None);
-                out.push("    MOVWF PCLATH".to_string());
-                locs.push(None);
-                out.push(format!("    MOVLW 0x{i:02X}"));
-                locs.push(None);
-                out.push(format!("    CALL __read_{}", g.name));
-                locs.push(None);
-                out.push(format!("    MOVWF 0x{:02X}", stage + i as u16));
-                locs.push(None);
-            }
-            out.push("    RETURN".to_string());
-            locs.push(None);
-        }
-        assert!(
-            !g.bytes.is_empty(),
-            "isel: const @{} has no table bytes",
-            g.name
-        );
-        let size = g.bytes.len();
-        // Chunks emitted: 256-byte tables keep the empty chunk-1 + `_hi`
-        // reader (the dispatch's bit-0 test references them); larger tables
-        // get ceil(size/256) chunks.
-        let n_chunks = if size >= 256 {
-            ((size + 255) / 256).max(2)
-        } else {
-            1
-        };
-        assert!(
-            size <= 65535,
-            "isel: const @{} table of {size} bytes exceeds the 65535-byte 16-bit index bound",
-            g.name
-        );
-        // `MOVLW HIGH` clobbers W, so the incoming index (W = byte index)
-        // is stashed in the fixed scratch byte (0x70, free at a const
-        // read) across the PCLATH set, then reloaded for the computed jump.
-        let reader = |out: &mut Vec<String>, locs: &mut Vec<Option<SrcLoc>>, base: &str| {
-            out.push(format!("    MOVWF 0x{:02X}", scratch));
-            locs.push(None);
-            out.push(format!("    MOVLW HIGH({base})"));
-            locs.push(None);
-            out.push("    MOVWF PCLATH".to_string());
-            locs.push(None);
-            out.push(format!("    MOVF 0x{:02X}, W", scratch));
-            locs.push(None);
-            out.push(format!("    ADDLW LOW({base})"));
-            locs.push(None);
-            out.push("    MOVWF PCL".to_string());
-            locs.push(None);
-        };
-        if size >= 256 {
-            // Chunked table: chunk 0's reader, then `.align 256` (the
-            // assembler pads to the next 256-word boundary, so LOW(name) ==
-            // 0), then the `.table` directive, then each chunk's RETLWs at
-            // `name` (chunk 0), `name_1` (chunk 1), `name_2`, ...: every
-            // chunk base is exactly 256 words after the previous, so every
-            // LOW() == 0. The reader entries come AFTER the table: chunk
-            // c's reader at `__read_<name>_hi[c]` (chunk 1 keeps the `_hi`
-            // name for fixture stability). (The entries' computed
-            // gotos jump into the table; the entry instructions are dead
-            // after MOVWF PCL, so their placement cannot shift the chunks.)
-            // A table of exactly 256 bytes gets this branch too (size >=
-            // 256): chunk 1 is empty (`name_1:` with no RETLWs, its reader
-            // immediately after) and unreachable: every valid index
-            // 0..255 selects chunk 0.
-            out.push(format!("__read_{}:", g.name));
-            locs.push(None);
-            reader(&mut out, &mut locs, &g.name);
-            out.push("    .align 256".to_string());
-            locs.push(None);
-            out.push(format!("    .table {} {size}", g.name));
-            locs.push(None);
-            out.push(format!("{}:", g.name));
-            locs.push(None);
-            for (i, b) in g.bytes[..256].iter().enumerate() {
-                if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
-                    out.push(format!("    RETLW {}", ref_byte_operand(addrs, i, f, *a)));
-                } else {
-                    out.push(format!("    RETLW 0x{b:02X}"));
-                }
-                locs.push(None);
-            }
-            for c in 1..n_chunks {
-                let start = c * 256;
-                let end = (c + 1) * 256;
-                let chunk_label = if c == 1 {
-                    format!("{}_1", g.name)
-                } else {
-                    format!("{}_{}", g.name, c)
-                };
-                out.push(format!("{chunk_label}:"));
-                locs.push(None);
-                for (i, b) in g.bytes[start..end.min(size)].iter().enumerate() {
-                    let abs = start + i;
-                    if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == abs) {
-                        out.push(format!("    RETLW {}", ref_byte_operand(addrs, abs, f, *a)));
-                    } else {
-                        out.push(format!("    RETLW 0x{b:02X}"));
-                    }
-                    locs.push(None);
-                }
-            }
-            // reader entries after the table
-            for c in 1..n_chunks {
-                let chunk_label = if c == 1 {
-                    format!("{}_1", g.name)
-                } else {
-                    format!("{}_{}", g.name, c)
-                };
-                let entry = if c == 1 {
-                    format!("__read_{}_hi", g.name)
-                } else {
-                    format!("__read_{}_hi{c}", g.name)
-                };
-                out.push(format!("{entry}:"));
-                locs.push(None);
-                reader(&mut out, &mut locs, &chunk_label);
-            }
-        } else {
-            // Single-entry table (<= 255 bytes): a base that would cross
-            // its window gets `.align 256` before the `.table` directive,
-            // so the assembler's LOW + size <= 0x100 assert never fires
-            // on a <= 255-byte table (epic-cc#138). A base that already
-            // fits emits no `.align` (no flash waste).
-            out.push(format!("__read_{}:", g.name));
-            locs.push(None);
-            reader(&mut out, &mut locs, &g.name);
-            let base = window_align(addr + 6, size);
-            if base != addr + 6 {
-                out.push("    .align 256".to_string());
-                locs.push(None);
-            }
-            out.push(format!("    .table {} {size}", g.name));
-            locs.push(None);
-            out.push(format!("{}:", g.name));
-            locs.push(None);
-            for (i, b) in g.bytes[..size].iter().enumerate() {
-                // A ref byte materializes its address half from the alloc
-                // map for RAM targets, else the link-time label literal
-                // (epic-cc#154).
-                if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
-                    out.push(format!("    RETLW {}", ref_byte_operand(addrs, i, f, *a)));
-                } else {
-                    out.push(format!("    RETLW 0x{b:02X}"));
-                }
-                locs.push(None);
-            }
-        }
-        // Track the tables' `.align`/RETLW words so the running address
-        // stays consistent (tables are unconstrained, their addresses
-        // don't affect function placement, which is already decided).
-        addr += 6; // reader entry (MOVWF/MOVLW/MOVWF/MOVF/ADDLW/MOVWF PCL)
-        if size >= 256 {
-            addr = (addr + 255) & !255; // `.align 256`
-            addr += 256; // chunk 0 RETLWs
-            addr += size - 256; // chunks 1.. RETLWs
-            addr += 6 * (n_chunks - 1); // chunk reader entries
-        } else {
-            // The `.align 256` the emitter folds in when the natural base
-            // (the running address after the reader entry) would cross its
-            // window, then the RETLWs.
-            addr = window_align(addr, size) + size;
-        }
-        out.push("".to_string());
-        locs.push(None);
+    let places = place_consts(&consts, staged, &staged_len, section_start);
+    let (sec_out, sec_locs) = emit_const_section(&consts, staged, addrs, scratch, &places);
+    out.extend(sec_out);
+    locs.extend(sec_locs);
+    // The model is exact by construction (measured routine lengths, pinned
+    // readers, folded windows), so this re-banking must agree with it word
+    // for word; a disagreement panics here, never as a silent miscompile.
+    if !consts.is_empty() {
+        let banked = banking::assign_banks(device, &out.join("\n"));
+        let peeped = peephole::optimize(&banked);
+        verify_section_model(&places, &peeped);
     }
     out.push("    end".to_string());
     locs.push(None);
