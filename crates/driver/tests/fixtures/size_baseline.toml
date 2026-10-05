@@ -96,8 +96,8 @@ ram_bytes = 19
 [[entry]]
 name = "bench-u16-dec-18f4550"
 device = "18F4550"
-flash_words = 109
-ram_bytes = 31
+flash_words = 67
+ram_bytes = 21
 
 [[entry]]
 name = "bench-struct-scan-18f4550"

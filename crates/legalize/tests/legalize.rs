@@ -2436,3 +2436,63 @@ fn shares_decimal_digit_loops_on_pic18_only() {
         );
     }
 }
+
+/// epic-cc#722: the bench-u16-dec counted loop (i16 counter phi, udiv-10 /
+/// mul-246 / truncating add, indexed byte store, count bump, `eq`-on-count
+/// exit after 5 digits) becomes one void `__udec_u16_5` call on the PIC18
+/// entry, with the routine Func injected; the plain entry keeps the
+/// expanded loop. Unlike the do-while sharing this fires on a single site.
+#[test]
+fn shares_bench_counted_loop_on_pic18_only() {
+    use legalize::legalize_pic18;
+    let base = "global digits i8\nglobal in i16\nfn main(void) ()\n  block 0:\n    %1 = load volatile i16 @in\n    %2 = freeze i16 %1\n    br 3\n  block 3:\n    %4 = phi i16 0 0 %9 3\n    %5 = phi i16 %2 0 %6 3\n    %6 = udiv i16 %5 10\n    %.neg = mul i16 %6 246\n    %7 = add i16 %.neg %5\n    %8 = trunc i16 %7 to i8\n    %scevgep = gep @digits +0 +1*%4\n    store volatile i8 %8 %scevgep\n    %9 = add i16 %4 1\n    %10 = icmp eq i16 %9 5\n    br i1 %10 11 3\n  block 11:\n    ret void\n";
+    let m = legalize_pic18(parse(base));
+    let text = ir::serialize(&m);
+    assert!(
+        text.contains("call void @__udec_u16_5(i16 %2, @digits)"),
+        "counted loop becomes one helper call:\n{text}"
+    );
+    assert!(
+        !text.contains("udiv i16"),
+        "no expanded divide remains:\n{text}"
+    );
+    let helper = m
+        .funcs
+        .iter()
+        .find(|f| f.name == "__udec_u16_5")
+        .expect("routine injected");
+    assert_eq!(helper.ret, None);
+    assert_eq!(helper.params.len(), 2);
+    assert_eq!(helper.params[0].name, "num");
+    assert_eq!(helper.params[0].width, 2);
+    assert!(helper.params[1].ptr);
+    // The plain entry keeps the expanded loop and injects nothing.
+    let plain = ir::serialize(&legalize(parse(base)));
+    assert!(
+        plain.contains("__udiv_u16") && !plain.contains("__udec_u16_5"),
+        "plain entry keeps the loop:\n{plain}"
+    );
+    // Near-misses keep the loop: another divisor, another trip count, an
+    // ult-on-value exit, a leaked quotient.
+    for (name, src) in [
+        ("divisor", base.replace("udiv i16 %5 10", "udiv i16 %5 11")),
+        ("trip", base.replace("icmp eq i16 %9 5", "icmp eq i16 %9 6")),
+        (
+            "exit",
+            base.replace("icmp eq i16 %9 5", "icmp ult i16 %5 10"),
+        ),
+        (
+            "leak",
+            base.replace(
+                "block 11:\n    ret void",
+                "block 11:\n    %leak = add i16 %6 %2\n    store i16 %leak @in\n    ret void",
+            ),
+        ),
+    ] {
+        let out = ir::serialize(&legalize_pic18(parse(&src)));
+        assert!(
+            out.contains("__udiv_u16") && !out.contains("__udec_u16_5"),
+            "{name} keeps the loop:\n{out}"
+        );
+    }
+}
