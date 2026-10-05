@@ -313,11 +313,12 @@ impl<'m> Gen<'m> {
     }
 
     /// Record that W holds the byte at `addr`, unless the address belongs
-    /// to a global: an ISR can rewrite a global at any time and its
-    /// epilogue restores the interrupted W, so a global's cached byte is
-    /// never trustworthy across the next instruction boundary.
+    /// to a global or names an SFR: an ISR can rewrite a global at any
+    /// time and its epilogue restores the interrupted W, while an SFR
+    /// byte is hardware-owned (readback need not equal the last write),
+    /// so neither is trustworthy across the next instruction boundary.
     fn mark_w(&mut self, addr: u16) {
-        self.w_holds = if self.global_addrs.contains(&addr) {
+        self.w_holds = if self.global_addrs.contains(&addr) || addr >= PIC18_SFR_ACCESS_LO {
             None
         } else {
             Some(addr)
@@ -3746,9 +3747,10 @@ impl<'m> Gen<'m> {
                 // keeps the convention every i1 consumer relies on.
                 // Literal-pointer (SFR) store: `inttoptr` form, a direct
                 // physical address. A register/global source copies via
-                // MOVFF (no access bit); a constant goes through W with
-                // `operand`'s access-bit (a=0 for the SFR segment, no
-                // MOVLB).
+                // MOVFF (no access bit), or via a one-word MOVWF when W
+                // still holds the source byte (epic-cc#674); a constant
+                // goes through W with `operand`'s access-bit (a=0 for the
+                // SFR segment, no MOVLB).
                 if s.ptr.starts_with("0x") {
                     let base = self.literal_ptr_addr(&s.ptr);
                     match &s.val {
@@ -3756,7 +3758,7 @@ impl<'m> Gen<'m> {
                         _ => {
                             let src = self.val_addr(&s.val).direct();
                             for i in 0..s.ty.bytes() {
-                                self.emit_copy_byte(src + u16::from(i), base + u16::from(i));
+                                self.emit_copy_byte_or_w(src + u16::from(i), base + u16::from(i));
                             }
                         }
                     }
@@ -3978,6 +3980,13 @@ impl<'m> Gen<'m> {
                             self.emit_banked("SWAPF", dst, ",W");
                             self.emit("    ANDLW 0x0F".to_string());
                             self.emit_banked("MOVWF", dst, "");
+                            // At r == 4 the lane ends here with W holding
+                            // it, so a following copy takes it from W;
+                            // wider amounts rotate the lane after, leaving
+                            // W stale (epic-cc#674).
+                            if r == 4 {
+                                self.mark_w(dst);
+                            }
                             for _ in 4..r {
                                 self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
                                 self.emit_banked("RRCF", dst, ",F");
@@ -4005,6 +4014,11 @@ impl<'m> Gen<'m> {
                             self.emit_banked("SWAPF", dst + m, ",W");
                             self.emit("    ANDLW 0xF0".to_string());
                             self.emit_banked("MOVWF", dst + m, "");
+                            // Same W-stale-after-rotate rule as the LShr
+                            // lone-lane form above (epic-cc#674).
+                            if r == 4 {
+                                self.mark_w(dst + m);
+                            }
                             // Amounts 5-7 (epic-cc#573): one BCF-seeded
                             // rotate per extra bit. The seed cannot be
                             // shared across steps the way the 16-bit
