@@ -3003,8 +3003,30 @@ fn allocate_inner(
     }
     // Homed call args take the resolved callee param slot address: the
     // defining write lands there, so the site copy is a self-copy.
-    // Widths match by admit, so one address covers every byte.
-    for ((caller, val), (callee, param)) in &final_tgt {
+    // Widths match by admit, so one address covers every byte. Bank
+    // pricing (epic-cc#849): without an access bank a site whose caller
+    // and param slots sit in different banks is rejected. A same-bank
+    // site cannot gain a BANKSEL (the def's bank trace is unchanged and
+    // deleting the copy only removes selects). Rejection changes no
+    // frame and rebases no callee: every def keeps its caller slot.
+    let priced: Vec<((String, String), (String, String))> = final_tgt
+        .into_iter()
+        .filter(|((caller, val), (callee, param))| {
+            if device.access_bank.is_some() {
+                return true;
+            }
+            let src = locals
+                .get(&format!("{caller}::{val}"))
+                .copied()
+                .unwrap_or_else(|| panic!("alloc: homed source {caller}::{val} has no slot"));
+            let dst = locals
+                .get(&format!("{callee}::{param}"))
+                .copied()
+                .unwrap_or_else(|| panic!("alloc: homed target {callee}::{param} has no slot"));
+            device.bank_of(src) == device.bank_of(dst)
+        })
+        .collect();
+    for ((caller, val), (callee, param)) in &priced {
         let target = format!("{callee}::{param}");
         let addr = locals
             .get(&target)
