@@ -426,6 +426,16 @@ fn cases() -> Vec<Case> {
             .collect(),
         },
         Case {
+            // No hal-pic14e HAL slice exists in tree, so the 14E blink
+            // is the xc.h tutorial blink (epic-cc#688): SFR bit ops and
+            // delay loops through isel-pic14e MOVLB banking.
+            name: "hal-pic14e-blink-16f1937",
+            device: "16F1937",
+            includes: vec![],
+            defines: vec![],
+            inputs: vec![fixture("xc_blink_pic14e.c")],
+        },
+        Case {
             name: "hal-pic16-encoder-full-16f877a",
             device: "16F877A",
             includes: [

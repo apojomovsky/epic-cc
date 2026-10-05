@@ -144,8 +144,14 @@ ram_bytes = 44
 [[entry]]
 name = "hal-pic18-blink-18f4550"
 device = "18F4550"
-flash_words = 328
+flash_words = 320
 ram_bytes = 30
+
+[[entry]]
+name = "hal-pic14e-blink-16f1937"
+device = "16F1937"
+flash_words = 100
+ram_bytes = 7
 
 [[entry]]
 name = "hal-pic16-encoder-full-16f877a"
@@ -156,25 +162,25 @@ ram_bytes = 326
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 9451
+flash_words = 9426
 ram_bytes = 779
 
 [[entry]]
 name = "hal-pic18-control-demo-18f4550"
 device = "18F4550"
-flash_words = 9946
+flash_words = 9903
 ram_bytes = 977
 
 [[entry]]
 name = "hal-pic18-pid-18f4550"
 device = "18F4550"
-flash_words = 3293
+flash_words = 3247
 ram_bytes = 500
 
 [[entry]]
 name = "hal-pic18-bridge-demo-18f4550"
 device = "18F4550"
-flash_words = 13945
+flash_words = 13908
 ram_bytes = 1312
 
 [[entry]]
@@ -216,5 +222,5 @@ ram_bytes = 339
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
 profile = "O2"
-flash_words = 11075
+flash_words = 10969
 ram_bytes = 822

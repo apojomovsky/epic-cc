@@ -1247,6 +1247,75 @@ fn literal_ptr_reg_store_copies_via_movff() {
 }
 
 #[test]
+fn w_staged_bin_result_stores_to_sfr_via_movwf() {
+    // epic-cc#674: a Bin stages its result through W into a frame slot,
+    // so the following SFR store finds W holding the source byte and
+    // writes a one-word MOVWF instead of a two-word MOVFF. The result
+    // is multi-use, keeping it off the single-use store-source fold
+    // (epic-cc#723): the staging shape the menu-demo pairs take.
+    let m = parse("global a i8\nglobal b i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = or i8 %1, %2\n    store i8 %3 0xF81\n    store i8 %3 @out\n    ret void\n");
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("out", 0x22),
+        ("main::1", 0x30),
+        ("main::2", 0x31),
+        ("main::3", 0x32),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVWF 0x081,A"),
+        "SFR store must take the staged byte from W:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVFF 0x032, 0xF81"),
+        "no two-word copy to the SFR survives:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x20] = 0xB0;
+    p.ram_mut()[0x21] = 0x0D;
+    p.run(200);
+    assert!(p.halted(), "program must run to completion");
+    assert_eq!(p.ram()[0xF81], 0xBD, "SFR takes the OR byte");
+    assert_eq!(p.ram()[0x22], 0xBD, "the second store reads the same slot");
+}
+
+#[test]
+fn nibble_shift_result_stores_via_movwf() {
+    // epic-cc#674: the lone-lane nibble down-shift (lshr by exactly 4)
+    // ends with W holding the lane, so the following store takes it
+    // from W instead of staging a MOVFF.
+    let m = parse("global a i8\nglobal out i8\nglobal out2 i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = lshr i8 %1, 4\n    store i8 %2 @out\n    store i8 %2 @out2\n    ret void\n");
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x21),
+        ("out2", 0x22),
+        ("main::1", 0x23),
+        ("main::2", 0x24),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVWF 0x021,A"),
+        "first store must take the shifted lane from W:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVFF").count(),
+        3,
+        "only the load, the operand copy, and the second store copy:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x20] = 0xB7;
+    p.run(200);
+    assert!(p.halted(), "program must run to completion");
+    assert_eq!(p.ram()[0x21], 0x0B, "out takes the shifted lane");
+    assert_eq!(p.ram()[0x22], 0x0B, "out2 takes the shifted lane");
+}
+
+#[test]
 fn isr_emits_vector_prologue_and_retfie() {
     let m = parse(
         "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
@@ -5102,6 +5171,54 @@ fn const_to_ram_init_ram_ref_materializes_the_alloc_address() {
         !asm.contains("LOW(arr)"),
         "a RAM global has no label to resolve:\n{asm}"
     );
+}
+
+#[test]
+fn ram_init_selects_once_per_bank_run() {
+    // Adjacent banked initializer bytes share one MOVLB, and an
+    // access-bank write between them must not cost a re-select: only a
+    // bank change needs a fresh one. A dropped select would write the
+    // byte 0x100 off, silently.
+    let m = with_bytes(
+        with_bytes(
+            with_bytes(
+                parse(
+                    "global a i8\nglobal b i8\nglobal c i8\n\
+                     fn main(void) ()\n  block entry:\n    ret void\n",
+                ),
+                "a",
+                &[0x11],
+            ),
+            "b",
+            &[0x22],
+        ),
+        "c",
+        &[0x33],
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("a", 0x1F0), ("b", 0x030), ("c", 0x1F1)]),
+        None,
+    );
+    let window = asm
+        .split("__start:")
+        .nth(1)
+        .expect("__start label")
+        .split("    call main")
+        .next()
+        .expect("__start must call main");
+    assert_eq!(
+        window.matches("MOVLB").count(),
+        1,
+        "one select for the bank-1 run, none for the access byte:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    assert_eq!(p.ram()[0x1F0], 0x11, "banked byte a");
+    assert_eq!(p.ram()[0x030], 0x22, "access byte b");
+    assert_eq!(p.ram()[0x1F1], 0x33, "banked byte c after the access write");
 }
 // P7 float tests: bit-exact sim per recipe (add, mul, div, cmp, conversions, RNE)
 fn f32_le(x: f32) -> [u8; 4] {
