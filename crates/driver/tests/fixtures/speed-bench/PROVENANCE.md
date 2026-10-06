@@ -16,12 +16,14 @@ procedure works in MPLAB SIM: load the identical HEX, watch the data
 address from the MAP file, and read the stopwatch at each write.
 
 The markers are plain volatile stores, so they compile unchanged under
-the reference compiler. Anti-folding rule every kernel follows: inputs
-are volatile globals with nonzero initializers, loaded inside the timed
-region; results are sunk to a volatile global before the `2` store. The
-load, compute, sink chain is data-dependent, so the optimizer cannot
-hoist the work above the `1` or sink it below the `2`, under either
-profile.
+the reference compiler. Anti-folding rule the hand-written kernels
+follow: inputs are volatile globals with nonzero initializers, loaded
+inside the timed region; results are sunk to a volatile global before
+the `2` store. The load, compute, sink chain is data-dependent, so the
+optimizer cannot hoist the work above the `1` or sink it below the `2`,
+under either profile. Scenario rows instead pin through the marker
+stores around calls with observable side effects (SFR writes), which
+the optimizer must keep between the `1` and the `2`.
 
 ## ISR fixtures
 
@@ -47,9 +49,17 @@ of an interrupted run against a clean baseline run.
   so no shift of a negative value is needed).
 - `scen-pid-update`: one `epic_pid_update` through the vendored epic-pid
   sources (PIC18 only, like the demo it comes from).
+- `scen-control-pass`: one `control_demo_task_control` pass through the
+  vendored control demo sources (PIC18 only, like the demo it comes
+  from). Init only programs Timer2 and never enables GIE, and the pass
+  injects its ADC reading through the demo's sim override, so it runs
+  ISR-free with no timer model. Note the vendor oversample and average
+  helpers are `__EPIC_CC__` stubs returning 0, so the pass pins the PID
+  update and PWM duty with a zero sample; the injected value only takes
+  effect under the reference compiler.
 - `speed-isr-*`: interrupt latency plus round trip per core.
 
-Menu-tick and control-pass scenarios are deliberately absent: both run
-through `epic_tick_delay_ms`, which spins on a timer flag the sim does
-not model yet (epic-cc#859). They become follow-up rows once the timer
-model lands.
+Menu-tick is still absent: `menu_demo_init` needs the Timer2 tick for
+its LCD startup delays, and the first tick ISR traps in the Timer2
+callback dispatch (epic-cc#918). It becomes a row once that trap is
+fixed.

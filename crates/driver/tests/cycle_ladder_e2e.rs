@@ -282,6 +282,65 @@ fn cases() -> Vec<Case> {
         .map(|f| fixture(f))
         .collect(),
     });
+    // One control-loop pass through the vendored control demo
+    // (epic-cc#873): PIC18 only, like the demo it comes from. Init only
+    // programs Timer2 and never enables GIE, so the pass runs ISR-free
+    // with no timer model: the ladder times it like any other Marks
+    // row. The vendor oversample and average helpers are __EPIC_CC__
+    // stubs, so the pass pins the PID update and PWM duty.
+    out.push(Case {
+        name: "scen-control-pass-18f4550".to_string(),
+        device: "18F4550",
+        kind: Kind::Marks,
+        includes: [
+            "vendor/hal-pic18-base/pic18fxx5x-hal/include/epiccc",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/include",
+            "vendor/hal-pic18-base/epic-common/include",
+            "vendor/hal-pic18-base/epic-taskmgr/include",
+            "vendor/hal-pic18-base/epic-math/include",
+            "vendor/hal-pic18-base/epic-math/tests",
+            "vendor/hal-pic18-base/epic-pid/include",
+            "vendor/hal-pic18-base/epic-adcfilter/include",
+            "vendor/hal-pic18-base/epic-serial/include",
+            "vendor/hal-pic18-control-demo/epic-control-demo/include",
+        ]
+        .iter()
+        .map(|d| fixture(d))
+        .collect(),
+        defines: vec!["PIC18F4550", "FOSC_HZ=48000000", "__EPIC_CC__"],
+        inputs: [
+            "speed-bench/scen-control-pass.c",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/src/peripherals/pic18fxx5x_gpio.c",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer0.c",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer2.c",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/src/peripherals/pic18fxx5x_usart.c",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/src/peripherals/pic18fxx5x_adc.c",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/src/peripherals/pic18fxx5x_ccp.c",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/src/peripherals/pic18fxx5x_eeprom.c",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/src/core/pic18_irq.c",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/src/core/pic18fxx5x_wdt_sleep.c",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/src/epiccc/pic18fxx5x_wdt_sleep_epiccc.c",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/src/epiccc/pic18_isr_vector.c",
+            "vendor/hal-pic18-base/pic18fxx5x-hal/src/epiccc/pic18_irq_dispatch_epiccc_tick.c",
+            "vendor/hal-pic18-control-demo/pic18fxx5x-hal/src/mdb/pic18_harness_mdb.c",
+            "vendor/hal-pic18-base/epic-taskmgr/src/epic_taskmgr.c",
+            "vendor/hal-pic18-base/epic-math/src/common/epic_math_numeric.c",
+            "vendor/hal-pic18-base/epic-math/src/common/epic_math_rand.c",
+            "vendor/hal-pic18-base/epic-math/src/common/epic_math_sqrt.c",
+            "vendor/hal-pic18-base/epic-math/src/pic18/epic_math_addsub.c",
+            "vendor/hal-pic18-base/epic-math/src/pic18/epic_math_bcd.c",
+            "vendor/hal-pic18-base/epic-math/src/pic18/epic_math_div.c",
+            "vendor/hal-pic18-base/epic-math/src/pic18/epic_math_mul.c",
+            "vendor/hal-pic18-base/epic-pid/src/pid.c",
+            "vendor/hal-pic18-base/epic-adcfilter/src/epic_adcfilter.c",
+            "vendor/hal-pic18-base/epic-serial/src/epic_serial.c",
+            "vendor/hal-pic18-control-demo/epic-control-demo/src/control_demo_core.c",
+            "vendor/hal-pic18-control-demo/config_18F4550.c",
+        ]
+        .iter()
+        .map(|f| fixture(f))
+        .collect(),
+    });
     // Interrupt cost, one fixture per core.
     for (name, device, file) in [
         ("speed-isr-18f4550", "18F4550", "speed-isr-18f4550.c"),
