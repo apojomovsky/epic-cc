@@ -1798,6 +1798,119 @@ fn zext_dst_shares_dead_source_base() {
     assert_eq!(out.locals["f::x"], out.locals["f::d"]);
 }
 
+/// Bitmask lanes (epic-cc#763): an or-select lane whose accumulator is
+/// dead after the lane shares its slot, so isel's establish copy becomes
+/// a self-copy skip instead of a MOVFF.
+#[test]
+fn lane_dst_coalesces_with_dead_accumulator() {
+    let m = parse(
+        "global g i8\n\
+         const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %a = add i8 1, 2\n\
+             %f = load i8 @g\n\
+             %t = icmp eq i8 %f, 1\n\
+             %o = or i8 %a, 4\n\
+             %d = select i1 %t, i8 %o, i8 %a\n\
+             store i8 %d, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::a"], out.locals["f::d"]);
+}
+
+/// The same lane with the accumulator read after it: the source is live
+/// past the lane point, so the destination keeps its own slot.
+#[test]
+fn lane_dst_keeps_slot_when_accumulator_live_after() {
+    let m = parse(
+        "global g i8\n\
+         const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %a = add i8 1, 2\n\
+             %f = load i8 @g\n\
+             %t = icmp eq i8 %f, 1\n\
+             %o = or i8 %a, 4\n\
+             %d = select i1 %t, i8 %o, i8 %a\n\
+             %q = add i8 %a, %d\n\
+             store i8 %q, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::a"], out.locals["f::d"]);
+}
+
+/// A two-lane chain collapses onto one slot: each lane's dst is the next
+/// lane's dead-after accumulator, so both pins fire in definition order.
+#[test]
+fn lane_chain_collapses_to_one_slot() {
+    let m = parse(
+        "global g i8\n\
+         const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %a = add i8 1, 2\n\
+             %f = load i8 @g\n\
+             %t1 = icmp eq i8 %f, 1\n\
+             %o1 = or i8 %a, 4\n\
+             %d1 = select i1 %t1, i8 %o1, i8 %a\n\
+             %t2 = icmp ne i8 %f, 0\n\
+             %o2 = or i8 %d1, 8\n\
+             %d2 = select i1 %t2, i8 %o2, i8 %d1\n\
+             store i8 %d2, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::a"], out.locals["f::d1"]);
+    assert_eq!(out.locals["f::d1"], out.locals["f::d2"]);
+}
+
+/// The or-bool tail (`or` over a zexted compare, no select) pins the same
+/// way: bit 0 lands destructively on the dead accumulator.
+#[test]
+fn or_bool_lane_coalesces_with_dead_accumulator() {
+    let m = parse(
+        "global g i8\n\
+         const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %a = add i8 3, 4\n\
+             %f = load i8 @g\n\
+             %t = icmp ne i8 %f, 0\n\
+             %z = zext i1 %t to i8\n\
+             %d = or i8 %a, %z\n\
+             store i8 %d, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::a"], out.locals["f::d"]);
+}
+
+/// A lane inside a loop body repeats each iteration, which linear order
+/// cannot see: the pin punts even when the accumulator looks dead after.
+#[test]
+fn lane_pin_punts_on_cycle() {
+    let m = parse(
+        "global g i8\n\
+         const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             br label %top\n\
+           block top:\n\
+             %a = add i8 1, 2\n\
+             %f = load i8 @g\n\
+             %t = icmp eq i8 %f, 1\n\
+             %o = or i8 %a, 4\n\
+             %d = select i1 %t, i8 %o, i8 %a\n\
+             store i8 %d, ptr @sink\n\
+             br label %top\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::a"], out.locals["f::d"]);
+}
+
 /// A copy inside a loop body repeats each iteration, which linear order
 /// cannot see: the merge punts even when the source looks dead after.
 #[test]
