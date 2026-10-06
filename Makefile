@@ -145,9 +145,9 @@ test: image ## Full suite (ci-test.sh, what CI runs); CRATE=asm scopes to one
 	$(MENU_DEMO_BASE)/epic-taskmgr/src/epic_taskmgr.c \
 	$(MENU_DEMO_BASE)/epic-tick/src/epic_tick.c \
 	$(MENU_DEMO_FIX)/epic-lcd/src/epic_lcd.c \
-	$(MENU_DEMO_FIX)/epic-lcd/src/epic_lcd_gpio4.c \
 	$(MENU_DEMO_BASE)/epic-serial/src/epic_serial.c \
 	$(MENU_DEMO_FIX)/epic-menu-demo/src/menu_demo_core.c \
+	$(MENU_DEMO_FIX)/epic-lcd/src/epic_lcd_gpio4.c \
 	$(MENU_DEMO_FIX)/epic-menu-demo/tests/sim_menu_demo.c \
 	$(MENU_DEMO_FIX)/config_18F4550.c
 REPORT_DATE := $(shell date -u +%F)
