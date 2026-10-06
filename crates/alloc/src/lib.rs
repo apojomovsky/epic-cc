@@ -823,6 +823,169 @@ fn frame_layout(
             coalesce.insert(dst.clone(), s.clone());
         }
     }
+    // Bitmask-lane coalescing (epic-cc#763): an or-select or or-bool lane
+    // destructively updates its accumulator (`acc |= mask` is one `BSF`),
+    // so a dead-after accumulator lets the lane dst share its slot and
+    // isel skips the establish copy. Same positional dead-after test as
+    // the phi/copy pins: the lane point touches both intervals, and a
+    // cycle repeats the lane. The shape mirrors isel-pic18's lane match;
+    // a lane isel rejects still lowers generically (arms read before dst
+    // writes), so a pin that never lanes stays sound.
+    let lane_const = |v: &ir::Val| -> bool { matches!(v, ir::Val::Const(0) | ir::Val::Const(1)) };
+    let lane_cmp = |c: &ir::Icmp| -> bool {
+        if c.ty != ir::Ty::I8 || (c.pred != "eq" && c.pred != "ne") {
+            return false;
+        }
+        match (&c.a, &c.b) {
+            (ir::Val::Reg(_), k) => lane_const(k),
+            (k, ir::Val::Reg(_)) => lane_const(k),
+            _ => false,
+        }
+    };
+    // A lane dst shares its accumulator slot only when every use of the
+    // accumulator is at or before the lane point and nothing past it can
+    // observe the clobber: no later linear use, nothing live out of the
+    // block. A use before the lane reads the pre-lane value, so only
+    // positions past the lane veto.
+    let lane_pin = |acc: &str, dst: &str, pt: (usize, u16)| -> bool {
+        let (Some(&(_, _, w_s, _, mem_s)), Some(&(_, _, w_d, _, mem_d))) =
+            (defs.get(acc), defs.get(dst))
+        else {
+            return false;
+        };
+        if mem_s || mem_d || w_s != w_d {
+            return false;
+        }
+        // Same fixed-region hazard as the phi pin above. (epic-cc#738)
+        if retval_homed.contains(acc) {
+            return false;
+        }
+        if unplaced.contains(acc) || unplaced.contains(dst) {
+            return false;
+        }
+        if on_cycle(pt.0) {
+            return false;
+        }
+        if live_out[pt.0].contains(acc) {
+            return false;
+        }
+        if let Some(us) = uses.get(acc) {
+            if us.iter().any(|&u| u > pt) {
+                return false;
+            }
+        }
+        true
+    };
+    for (mi, b) in order.iter().enumerate() {
+        for (pos, inst) in b.insts.iter().enumerate() {
+            match inst {
+                ir::Inst::Select(s) => {
+                    if s.ptr || s.ty != ir::Ty::I8 {
+                        continue;
+                    }
+                    let ir::Val::Reg(cnd) = &s.cond else {
+                        continue;
+                    };
+                    if uses.get(cnd).is_none_or(|u| u.len() != 1) {
+                        continue;
+                    }
+                    let Some(&(ci_b, ci_p, _, _, _)) = defs.get(cnd) else {
+                        continue;
+                    };
+                    if ci_b != mi || ci_p >= pos as u16 {
+                        continue;
+                    }
+                    let ir::Inst::Icmp(c) = &b.insts[ci_p as usize] else {
+                        continue;
+                    };
+                    if !lane_cmp(c) {
+                        continue;
+                    }
+                    // Or-select: one arm is a single-use `Or` over the
+                    // other arm, the same accumulator reg on both sides.
+                    for (or_v, acc_v) in [(&s.a, &s.b), (&s.b, &s.a)] {
+                        let (ir::Val::Reg(or_r), ir::Val::Reg(acc_r)) = (or_v, acc_v) else {
+                            continue;
+                        };
+                        if uses.get(or_r).is_none_or(|u| u.len() != 1) {
+                            continue;
+                        }
+                        let Some(&(oi_b, oi_p, _, _, _)) = defs.get(or_r) else {
+                            continue;
+                        };
+                        if oi_b != mi || oi_p >= pos as u16 {
+                            continue;
+                        }
+                        let ir::Inst::Bin(ob) = &b.insts[oi_p as usize] else {
+                            continue;
+                        };
+                        if ob.op != ir::BinOp::Or || ob.ty != ir::Ty::I8 {
+                            continue;
+                        }
+                        let mask = match (&ob.a, &ob.b) {
+                            (ir::Val::Reg(a), ir::Val::Const(m)) if a == acc_r => *m,
+                            (ir::Val::Const(m), ir::Val::Reg(a)) if a == acc_r => *m,
+                            _ => continue,
+                        };
+                        if mask <= 0 || mask > 0xFF || (mask as u8).count_ones() != 1 {
+                            continue;
+                        }
+                        if lane_pin(acc_r, &s.dst, (mi, pos as u16)) {
+                            coalesce.insert(s.dst.clone(), acc_r.clone());
+                            break;
+                        }
+                    }
+                }
+                ir::Inst::Bin(ob) => {
+                    // Or-bool tail: bit 0 set exactly when the predicate
+                    // holds, no select involved.
+                    if ob.op != ir::BinOp::Or || ob.ty != ir::Ty::I8 {
+                        continue;
+                    }
+                    let (ir::Val::Reg(acc_r), ir::Val::Reg(z_r)) = (&ob.a, &ob.b) else {
+                        continue;
+                    };
+                    if uses.get(z_r).is_none_or(|u| u.len() != 1) {
+                        continue;
+                    }
+                    let Some(&(zi_b, zi_p, _, _, _)) = defs.get(z_r) else {
+                        continue;
+                    };
+                    if zi_b != mi || zi_p >= pos as u16 {
+                        continue;
+                    }
+                    let ir::Inst::Zext(z) = &b.insts[zi_p as usize] else {
+                        continue;
+                    };
+                    if z.from != ir::Ty::I1 || z.to != ir::Ty::I8 {
+                        continue;
+                    }
+                    let ir::Val::Reg(cnd) = &z.val else {
+                        continue;
+                    };
+                    if uses.get(cnd).is_none_or(|u| u.len() != 1) {
+                        continue;
+                    }
+                    let Some(&(ci_b, ci_p, _, _, _)) = defs.get(cnd) else {
+                        continue;
+                    };
+                    if ci_b != mi || ci_p >= pos as u16 {
+                        continue;
+                    }
+                    let ir::Inst::Icmp(c) = &b.insts[ci_p as usize] else {
+                        continue;
+                    };
+                    if !lane_cmp(c) {
+                        continue;
+                    }
+                    if lane_pin(acc_r, &ob.dst, (mi, pos as u16)) {
+                        coalesce.insert(ob.dst.clone(), acc_r.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 
     // Greedy first-fit coloring: reuse the lowest slot whose interval is
     // disjoint from the new value's; the slot's width grows to the widest
