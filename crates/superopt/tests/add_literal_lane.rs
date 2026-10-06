@@ -364,9 +364,10 @@ fn verify_inplace_sub16_literal() {
 }
 
 /// Low-zero literal add (`k = 0x0100`): byte 0 adds nothing with no
-/// carry-in, so seeding `C` clear once drops the whole lane.
+/// carry-in, so the whole lane drops and the high lane takes the plain
+/// form (its carry-in is provably zero, and the plain op reads none).
 fn add16_lo0_candidate() -> Candidate {
-    vec!["bcf 0xFD8,0,A", "movlw 0x01", "addwfc 0x021,F,A"]
+    vec!["movlw 0x01", "addwf 0x021,F,A"]
 }
 
 #[test]
@@ -374,9 +375,33 @@ fn verify_inplace_add16_low_zero() {
     let c = add16_lo0_candidate();
     assert!(
         verify_construction16(|x| x.wrapping_add(0x0100), &c, false),
-        "BCF-seeded high lane must add 0x0100 over the full domain"
+        "skipped low lane plus plain high lane must add 0x0100 over the full domain"
     );
-    assert_eq!(c.len(), 3, "seeded single lane must stay 3 words");
+    assert_eq!(
+        c.len(),
+        2,
+        "one skipped lane plus one plain lane must stay 2 words"
+    );
+}
+
+/// Low-zero literal subtract (`k = 0x0100`): subtracting nothing never
+/// borrows, so the same skip applies through `SUBWF`.
+fn sub16_lo0_candidate() -> Candidate {
+    vec!["movlw 0x01", "subwf 0x021,F,A"]
+}
+
+#[test]
+fn verify_inplace_sub16_low_zero() {
+    let c = sub16_lo0_candidate();
+    assert!(
+        verify_construction16(|x| x.wrapping_sub(0x0100), &c, false),
+        "skipped low lane plus plain high lane must subtract 0x0100 over the full domain"
+    );
+    assert_eq!(
+        c.len(),
+        2,
+        "one skipped lane plus one plain lane must stay 2 words"
+    );
 }
 
 /// 32-bit plus one: the 16-bit chain composed twice. A skipped middle
