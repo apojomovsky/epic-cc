@@ -264,6 +264,76 @@ pub fn all_specs() -> Vec<Spec> {
             nightly_cases: tblrd_flash_ptr_nightly,
             chunk_cases: 100,
         },
+        Spec {
+            name: "add16-plus1",
+            candidate: add16_plus1_candidate,
+            pr_cases: add16_plus1_pr,
+            nightly_cases: add16_plus1_nightly,
+            chunk_cases: 380,
+        },
+        Spec {
+            name: "sub16-minus1",
+            candidate: sub16_minus1_candidate,
+            pr_cases: sub16_minus1_pr,
+            nightly_cases: sub16_minus1_nightly,
+            chunk_cases: 380,
+        },
+        Spec {
+            name: "add16-lit",
+            candidate: add16_lit_candidate,
+            pr_cases: add16_lit_pr,
+            nightly_cases: add16_lit_nightly,
+            chunk_cases: 380,
+        },
+        Spec {
+            name: "sub16-lit",
+            candidate: sub16_lit_candidate,
+            pr_cases: sub16_lit_pr,
+            nightly_cases: sub16_lit_nightly,
+            chunk_cases: 380,
+        },
+        Spec {
+            name: "add16-lo0",
+            candidate: add16_lo0_candidate,
+            pr_cases: add16_lo0_pr,
+            nightly_cases: add16_lo0_nightly,
+            chunk_cases: 380,
+        },
+        Spec {
+            name: "sub16-lo0",
+            candidate: sub16_lo0_candidate,
+            pr_cases: sub16_lo0_pr,
+            nightly_cases: sub16_lo0_nightly,
+            chunk_cases: 380,
+        },
+        Spec {
+            name: "add32-plus1",
+            candidate: add32_plus1_candidate,
+            pr_cases: add32_plus1_pr,
+            nightly_cases: add32_plus1_nightly,
+            chunk_cases: 250,
+        },
+        Spec {
+            name: "sub32-minus1",
+            candidate: sub32_minus1_candidate,
+            pr_cases: sub32_minus1_pr,
+            nightly_cases: sub32_minus1_nightly,
+            chunk_cases: 250,
+        },
+        Spec {
+            name: "add32-lit",
+            candidate: add32_lit_candidate,
+            pr_cases: add32_lit_pr,
+            nightly_cases: add32_lit_nightly,
+            chunk_cases: 250,
+        },
+        Spec {
+            name: "sub32-lit",
+            candidate: sub32_lit_candidate,
+            pr_cases: sub32_lit_pr,
+            nightly_cases: sub32_lit_nightly,
+            chunk_cases: 250,
+        },
     ]
 }
 
@@ -1080,4 +1150,259 @@ pub fn tblrd_flash_ptr_pr() -> Vec<Case> {
 
 pub fn tblrd_flash_ptr_nightly() -> Vec<Case> {
     tblrd_flash_ptr_cases_over(&[0x00, 0x01, 0x7F, 0x80, 0xFF, 0x2A])
+}
+
+/// In-place literal add/sub lanes (epic-cc#767): the read-modify-write
+/// forms `isel-pic18` emits for same-home `Add`/`Sub` against a constant
+/// and for folded loop increments. Candidates ride the `LO`/`HI` lanes
+/// (`BASE32` lanes for 32-bit), little-endian, the same homes the
+/// lowering computes into.
+fn lit16_cases(k: u16, add: bool, pairs: &[(u8, u8)], w_values: &[u8]) -> Vec<Case> {
+    let mut cases = Vec::new();
+    for &(lo, hi) in pairs {
+        for &w in w_values {
+            for c in [false, true] {
+                let x = (u16::from(hi) << 8) | u16::from(lo);
+                let expect = if add {
+                    x.wrapping_add(k)
+                } else {
+                    x.wrapping_sub(k)
+                };
+                let status = if c { STATUS_C_BIT } else { 0 };
+                cases.push(Case {
+                    entry_w: w,
+                    pokes: vec![(LO, lo), (HI, hi), (STATUS_ADDR, status)],
+                    allowed_changes: vec![LO, HI],
+                    check: Box::new(move |sim: &Pic18| {
+                        sim.ram()[LO] == (expect & 0xFF) as u8
+                            && sim.ram()[HI] == (expect >> 8) as u8
+                    }),
+                });
+            }
+        }
+    }
+    cases
+}
+
+fn lit16_hw(k: u16, add: bool, pr: bool) -> Vec<Case> {
+    let pairs = if pr {
+        sample16_pr()
+    } else {
+        sample16_nightly()
+    };
+    let mut cases = lit16_cases(k, add, &pairs, &[0x00]);
+    cases.extend(lit16_cases(k, add, &CURATED8, W_SAMPLE));
+    cases
+}
+
+fn lit32_cases(k: u32, add: bool, words: &[[u8; 4]], w_values: &[u8]) -> Vec<Case> {
+    let mut cases = Vec::new();
+    for &[b0, b1, b2, b3] in words {
+        for &w in w_values {
+            for c in [false, true] {
+                let x = u32::from(b0)
+                    | (u32::from(b1) << 8)
+                    | (u32::from(b2) << 16)
+                    | (u32::from(b3) << 24);
+                let expect = if add {
+                    x.wrapping_add(k)
+                } else {
+                    x.wrapping_sub(k)
+                };
+                let e = expect.to_le_bytes();
+                let status = if c { STATUS_C_BIT } else { 0 };
+                cases.push(Case {
+                    entry_w: w,
+                    pokes: vec![
+                        (BASE32, b0),
+                        (BASE32 + 1, b1),
+                        (BASE32 + 2, b2),
+                        (BASE32 + 3, b3),
+                        (STATUS_ADDR, status),
+                    ],
+                    allowed_changes: vec![BASE32, BASE32 + 1, BASE32 + 2, BASE32 + 3],
+                    check: Box::new(move |sim: &Pic18| {
+                        sim.ram()[BASE32] == e[0]
+                            && sim.ram()[BASE32 + 1] == e[1]
+                            && sim.ram()[BASE32 + 2] == e[2]
+                            && sim.ram()[BASE32 + 3] == e[3]
+                    }),
+                });
+            }
+        }
+    }
+    cases
+}
+
+fn lit32_hw(k: u32, add: bool, pr: bool) -> Vec<Case> {
+    let words = if pr {
+        sample32_pr_words()
+    } else {
+        sample32_nightly_words()
+    };
+    lit32_cases(k, add, &words, &[0x00])
+}
+
+pub fn add16_plus1_candidate() -> Candidate {
+    vec!["incf 0x020,F,A", "btfsc 0xFD8,0,A", "incf 0x021,F,A"]
+}
+
+pub fn add16_plus1_pr() -> Vec<Case> {
+    lit16_hw(1, true, true)
+}
+
+pub fn add16_plus1_nightly() -> Vec<Case> {
+    lit16_hw(1, true, false)
+}
+
+pub fn sub16_minus1_candidate() -> Candidate {
+    vec!["decf 0x020,F,A", "btfss 0xFD8,0,A", "decf 0x021,F,A"]
+}
+
+pub fn sub16_minus1_pr() -> Vec<Case> {
+    lit16_hw(1, false, true)
+}
+
+pub fn sub16_minus1_nightly() -> Vec<Case> {
+    lit16_hw(1, false, false)
+}
+
+pub fn add16_lit_candidate() -> Candidate {
+    vec![
+        "movlw 0x34",
+        "addwf 0x020,F,A",
+        "movlw 0x12",
+        "addwfc 0x021,F,A",
+    ]
+}
+
+pub fn add16_lit_pr() -> Vec<Case> {
+    lit16_hw(0x1234, true, true)
+}
+
+pub fn add16_lit_nightly() -> Vec<Case> {
+    lit16_hw(0x1234, true, false)
+}
+
+pub fn sub16_lit_candidate() -> Candidate {
+    vec![
+        "movlw 0x34",
+        "subwf 0x020,F,A",
+        "movlw 0x12",
+        "subwfb 0x021,F,A",
+    ]
+}
+
+pub fn sub16_lit_pr() -> Vec<Case> {
+    lit16_hw(0x1234, false, true)
+}
+
+pub fn sub16_lit_nightly() -> Vec<Case> {
+    lit16_hw(0x1234, false, false)
+}
+
+pub fn add16_lo0_candidate() -> Candidate {
+    vec!["movlw 0x01", "addwf 0x021,F,A"]
+}
+
+pub fn add16_lo0_pr() -> Vec<Case> {
+    lit16_hw(0x0100, true, true)
+}
+
+pub fn add16_lo0_nightly() -> Vec<Case> {
+    lit16_hw(0x0100, true, false)
+}
+
+pub fn sub16_lo0_candidate() -> Candidate {
+    vec!["movlw 0x01", "subwf 0x021,F,A"]
+}
+
+pub fn sub16_lo0_pr() -> Vec<Case> {
+    lit16_hw(0x0100, false, true)
+}
+
+pub fn sub16_lo0_nightly() -> Vec<Case> {
+    lit16_hw(0x0100, false, false)
+}
+
+pub fn add32_plus1_candidate() -> Candidate {
+    vec![
+        "incf 0x020,F,A",
+        "btfsc 0xFD8,0,A",
+        "incf 0x021,F,A",
+        "btfsc 0xFD8,0,A",
+        "incf 0x022,F,A",
+        "btfsc 0xFD8,0,A",
+        "incf 0x023,F,A",
+    ]
+}
+
+pub fn add32_plus1_pr() -> Vec<Case> {
+    lit32_hw(1, true, true)
+}
+
+pub fn add32_plus1_nightly() -> Vec<Case> {
+    lit32_hw(1, true, false)
+}
+
+pub fn sub32_minus1_candidate() -> Candidate {
+    vec![
+        "decf 0x020,F,A",
+        "btfss 0xFD8,0,A",
+        "decf 0x021,F,A",
+        "btfss 0xFD8,0,A",
+        "decf 0x022,F,A",
+        "btfss 0xFD8,0,A",
+        "decf 0x023,F,A",
+    ]
+}
+
+pub fn sub32_minus1_pr() -> Vec<Case> {
+    lit32_hw(1, false, true)
+}
+
+pub fn sub32_minus1_nightly() -> Vec<Case> {
+    lit32_hw(1, false, false)
+}
+
+pub fn add32_lit_candidate() -> Candidate {
+    vec![
+        "movlw 0x78",
+        "addwf 0x020,F,A",
+        "movlw 0x56",
+        "addwfc 0x021,F,A",
+        "movlw 0x34",
+        "addwfc 0x022,F,A",
+        "movlw 0x12",
+        "addwfc 0x023,F,A",
+    ]
+}
+
+pub fn add32_lit_pr() -> Vec<Case> {
+    lit32_hw(0x12345678, true, true)
+}
+
+pub fn add32_lit_nightly() -> Vec<Case> {
+    lit32_hw(0x12345678, true, false)
+}
+
+pub fn sub32_lit_candidate() -> Candidate {
+    vec![
+        "movlw 0x78",
+        "subwf 0x020,F,A",
+        "movlw 0x56",
+        "subwfb 0x021,F,A",
+        "movlw 0x34",
+        "subwfb 0x022,F,A",
+        "movlw 0x12",
+        "subwfb 0x023,F,A",
+    ]
+}
+
+pub fn sub32_lit_pr() -> Vec<Case> {
+    lit32_hw(0x12345678, false, true)
+}
+
+pub fn sub32_lit_nightly() -> Vec<Case> {
+    lit32_hw(0x12345678, false, false)
 }
