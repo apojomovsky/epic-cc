@@ -263,6 +263,16 @@ struct Gen<'m> {
     /// arm skips the already-emitted copy.
     store_fwd: HashMap<String, u16>,
     store_consumed: HashSet<String>,
+    /// Loop-increment folds from the per-function pre-scan (epic-cc#767).
+    /// `phi_fold` maps a `Bin` result reg to its own phi-operand reg when
+    /// the increment feeds the phi backedge and every other use already
+    /// reads the new value: the `Bin` arm computes into the phi's slot,
+    /// `Icmp` and phi-copy readers rename to the phi reg, and the
+    /// backedge copy becomes a self-copy `emit_phi_copies` skips.
+    /// `inplace_bins` holds every `Bin` dst the arm may compute
+    /// read-modify-write into its own home, phi-folded or same-homed.
+    phi_fold: HashMap<String, String>,
+    inplace_bins: HashSet<String>,
     /// Value folds from the shared per-function pre-scan (epic-cc#863):
     /// loads whose byte never stages to a slot. `alloc` drops those
     /// slots; the load arm skips them and consumers read the source.
@@ -1424,6 +1434,268 @@ impl<'m> Gen<'m> {
             }
         }
         (fwd, consumed)
+    }
+    /// The register side of an `Add`/`Sub` against a constant: the value
+    /// operand plus the literal. `Add` commutes, so a constant on either
+    /// side qualifies; `k - a` keeps the `SUBLW` lowering and never folds.
+    fn const_bin_reg(op: &ir::BinOp, a: &Val, b: &Val) -> Option<(String, i64)> {
+        match (op, a, b) {
+            (ir::BinOp::Add | ir::BinOp::Sub, Val::Reg(q), Val::Const(k)) => Some((q.clone(), *k)),
+            (ir::BinOp::Add, Val::Const(k), Val::Reg(q)) => Some((q.clone(), *k)),
+            _ => None,
+        }
+    }
+
+    /// In-place literal-add pre-scan (epic-cc#767): same-home `Add`/`Sub`
+    /// against a constant, plus loop increments feeding their own phi
+    /// backedge with the increment on the backedge source. A same-home
+    /// `Bin` reads its operand once, so the destructive update is
+    /// unobservable and the access count matches the staged form. A
+    /// folded increment computes into the phi's slot under the tail and
+    /// edge checks below; every other reader already reads the new
+    /// value, and the backedge copy degrades to a skipped self-copy.
+    fn find_inplace_folds(g: &Gen, f: &Func) -> (HashMap<String, String>, HashSet<String>) {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let home_of = |reg: &str| -> Option<u16> {
+            if let Some(iselcore::LoadFold::Direct(glob)) = g.w_folds.loads.get(reg) {
+                return Some(g.global_addr(glob));
+            }
+            g.addrs.get(&ssa_key(&f.name, reg)).copied()
+        };
+        let dst_home = |r: &str| -> Option<u16> {
+            if let Some(d) = g.store_fwd.get(r) {
+                return Some(*d);
+            }
+            g.addrs.get(&ssa_key(&f.name, r)).copied()
+        };
+        let mut phi_fold: HashMap<String, String> = HashMap::new();
+        let mut inplace: HashSet<String> = HashSet::new();
+        for b in &f.blocks {
+            for (qi, inst) in b.insts.iter().enumerate() {
+                let Inst::Bin(q) = inst else { continue };
+                if !matches!(q.op, ir::BinOp::Add | ir::BinOp::Sub) {
+                    continue;
+                }
+                let n = q.ty.bytes();
+                if n != 1 && n != 2 && n != 4 {
+                    continue;
+                }
+                let Some((qreg, _)) = Self::const_bin_reg(&q.op, &q.a, &q.b) else {
+                    continue;
+                };
+                let r = &q.dst;
+                if g.lane_consumed.contains(r) || g.bit_lanes.contains_key(r) {
+                    continue;
+                }
+                if g.resolved.contains_key(&ssa_key(&f.name, r))
+                    || g.resolved.contains_key(&ssa_key(&f.name, &qreg))
+                {
+                    continue;
+                }
+                if Self::phi_backedge(f, &b.label, &qreg, r, n).is_some() {
+                    if Self::phi_tail_clean(g, f, b, qi, r, &qreg, n, &uses, &home_of) {
+                        phi_fold.insert(r.clone(), qreg.clone());
+                        inplace.insert(r.clone());
+                    }
+                    continue;
+                }
+                if uses.get(&qreg).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                let (Some(home_q), Some(home_r)) = (home_of(&qreg), dst_home(r)) else {
+                    continue;
+                };
+                if home_q == home_r {
+                    inplace.insert(r.clone());
+                }
+            }
+        }
+        (phi_fold, inplace)
+    }
+
+    /// The backedge incoming of `preg`'s phi carrying this `Bin`'s result:
+    /// some block holds `Phi dest == preg` at width `n` with exactly one
+    /// incoming of `%r` from `pred`. `None` when the result feeds no such
+    /// edge (the common case) or the shape is ambiguous.
+    fn phi_backedge(f: &Func, pred: &str, preg: &str, r: &str, n: u8) -> Option<()> {
+        let mut found = false;
+        for h in &f.blocks {
+            for inst in &h.insts {
+                let Inst::Phi(p) = inst else { continue };
+                if p.dst != preg || p.ty.bytes() != n {
+                    continue;
+                }
+                let hits = p
+                    .incoming
+                    .iter()
+                    .filter(|(v, from)| matches!(v, Val::Reg(rr) if rr == r) && from == pred)
+                    .count();
+                if hits == 1 {
+                    if found {
+                        return None;
+                    }
+                    found = true;
+                } else if hits > 1 {
+                    return None;
+                }
+            }
+        }
+        found.then_some(())
+    }
+
+    /// Whether the tail from a folded `Bin` to its block's terminator can
+    /// host the in-place update: every use of the result `%r` is an
+    /// `Icmp` in this same tail (renamed to the phi reg at emission) or a
+    /// phi edge (renamed the same way), the operand `%p` is read nowhere
+    /// else, and the tail holds no call, return, switch, store-shaped
+    /// write, or address-taken read of either home. A writer between
+    /// (`Icmp`/`Load` results) must home outside the phi's lanes.
+    #[allow(clippy::too_many_arguments)]
+    fn phi_tail_clean(
+        g: &Gen,
+        f: &Func,
+        b: &Block,
+        qi: usize,
+        r: &str,
+        preg: &str,
+        n: u8,
+        uses: &HashMap<String, usize>,
+        home_of: &dyn Fn(&str) -> Option<u16>,
+    ) -> bool {
+        if uses.get(preg).copied().unwrap_or(0) != 1 {
+            return false;
+        }
+        let Some(sp) = g.addrs.get(&ssa_key(&f.name, preg)).copied() else {
+            return false;
+        };
+        let lanes = sp..sp + u16::from(n);
+        let disjoint = |dst: &str| -> bool {
+            match home_of(dst) {
+                None => true,
+                Some(a) => a + 1 <= lanes.start || a >= lanes.end,
+            }
+        };
+        let reads_of = |inst: &Inst| {
+            ir::read_vals(inst)
+                .iter()
+                .filter(|v| v.as_str() == r)
+                .count()
+        };
+        let mut phi_reads = 0usize;
+        for ob in &f.blocks {
+            if ob.label == b.label {
+                continue;
+            }
+            for inst in &ob.insts {
+                let nreads = reads_of(inst);
+                if nreads == 0 {
+                    continue;
+                }
+                if !matches!(inst, Inst::Phi(_)) {
+                    return false;
+                }
+                phi_reads += nreads;
+            }
+        }
+        for (ti, inst) in b.insts.iter().enumerate() {
+            if ti <= qi {
+                if let Inst::Phi(_) = inst {
+                    phi_reads += reads_of(inst);
+                    continue;
+                }
+                if reads_of(inst) > 0 {
+                    return false;
+                }
+                continue;
+            }
+            match inst {
+                Inst::Phi(_) => {
+                    phi_reads += reads_of(inst);
+                }
+                Inst::Icmp(c) => {
+                    if g.lane_consumed.contains(&c.dst) || g.bit_lanes.contains_key(&c.dst) {
+                        return false;
+                    }
+                    if !disjoint(&c.dst) {
+                        return false;
+                    }
+                }
+                Inst::Load(l) => {
+                    if reads_of(inst) > 0 || !disjoint(&l.dst) {
+                        return false;
+                    }
+                    let overlap = match Self::static_base(g, &f.name, &l.ptr) {
+                        None => true,
+                        Some(a) => a < lanes.end && a + u16::from(l.ty.bytes()) > lanes.start,
+                    };
+                    if overlap {
+                        return false;
+                    }
+                }
+                Inst::Br(_) | Inst::BrCond(_) => {
+                    if reads_of(inst) > 0 {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        // Copies on `b`'s outgoing edges run after the folded write: any
+        // of them homing inside the phi's lanes would clobber the folded
+        // value before its next read. Only the folded self-copy may touch
+        // the lanes (it emits nothing). Reads need no check: `%p` has no
+        // other reader by the use count above, and renamed `%r` readers
+        // want the new value.
+        let succs: Vec<&str> = match b.insts.last() {
+            Some(Inst::Br(br)) => vec![br.target.as_str()],
+            Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+            Some(Inst::Switch(sw)) => sw
+                .cases
+                .iter()
+                .map(|(_, l)| l.as_str())
+                .chain(std::iter::once(sw.default.as_str()))
+                .collect(),
+            _ => vec![],
+        };
+        for s in succs {
+            let Some(succ) = f.blocks.iter().find(|bb| bb.label == s) else {
+                continue;
+            };
+            for inst in &succ.insts {
+                let Inst::Phi(p) = inst else { continue };
+                for (val, from) in &p.incoming {
+                    if from != &b.label {
+                        continue;
+                    }
+                    let Some(da) = g.addrs.get(&ssa_key(&f.name, &p.dst)).copied() else {
+                        return false;
+                    };
+                    let w = u16::from(p.ty.bytes());
+                    if da + w <= lanes.start || da >= lanes.end {
+                        continue;
+                    }
+                    let renamed = match val {
+                        Val::Reg(x) if x == r || x == preg => Some(sp),
+                        Val::Reg(x) => home_of(x),
+                        _ => None,
+                    };
+                    if da != sp || renamed != Some(sp) {
+                        return false;
+                    }
+                }
+            }
+        }
+        phi_reads >= 1
     }
 
     fn substitute_asm(&self, template: &str, operands: &[ir::AsmOperand]) -> String {
@@ -3877,6 +4149,25 @@ impl<'m> Gen<'m> {
                     .get(&b.dst)
                     .copied()
                     .unwrap_or_else(|| self.slot_addr(self.cur_func, &b.dst).direct());
+                // In-place literal lanes (epic-cc#767): a phi-folded result
+                // computes into its phi's slot (every reader renamed there),
+                // a same-homed `Bin` into its own home. Both shapes proved
+                // sound by `find_inplace_folds`; anything else keeps the
+                // staged lanes below.
+                if matches!(b.op, ir::BinOp::Add | ir::BinOp::Sub) {
+                    if let Some((qreg, k)) = Self::const_bin_reg(&b.op, &b.a, &b.b) {
+                        if let Some(preg) = self.phi_fold.get(&b.dst).cloned() {
+                            if preg == qreg {
+                                let home = self.slot_addr(self.cur_func, &preg).direct();
+                                self.emit_const_bin_inplace(&b.op, n, k, home);
+                                return;
+                            }
+                        } else if self.inplace_bins.contains(&b.dst) {
+                            self.emit_const_bin_inplace(&b.op, n, k, dst);
+                            return;
+                        }
+                    }
+                }
                 if matches!(b.op, ir::BinOp::Shl | ir::BinOp::LShr | ir::BinOp::AShr) {
                     let width = i64::from(n) * 8;
                     let k = match &b.b {
@@ -4297,11 +4588,11 @@ impl<'m> Gen<'m> {
                     "isel-pic18: only i8/i16/i32 Icmp implemented so far (n={n})"
                 );
                 if n == 1 {
-                    self.emit_icmp_byte(c.a.clone(), c.b.clone(), &c.pred, &c.dst);
+                    self.emit_icmp_byte(self.fold_reg(&c.a), self.fold_reg(&c.b), &c.pred, &c.dst);
                 } else if n == 2 {
-                    self.emit_icmp_i16(c.a.clone(), c.b.clone(), &c.pred, &c.dst);
+                    self.emit_icmp_i16(self.fold_reg(&c.a), self.fold_reg(&c.b), &c.pred, &c.dst);
                 } else {
-                    self.emit_icmp_i32(c.a.clone(), c.b.clone(), &c.pred, &c.dst);
+                    self.emit_icmp_i32(self.fold_reg(&c.a), self.fold_reg(&c.b), &c.pred, &c.dst);
                 }
             }
             Inst::Zext(z) => {
@@ -6277,6 +6568,59 @@ impl<'m> Gen<'m> {
         let (a, low) = self.operand(addr);
         let abit = if a == 0 { "A" } else { "B" };
         self.emit(format!("    {op} 0x{low:03X}{rest},{abit}"));
+    }
+    /// In-place literal add/sub lanes (epic-cc#767): `addr` homes operand
+    /// and result, so each lane accumulates into the file register.
+    /// Plus/minus one goes through skip chains, other literals through
+    /// `MOVLW` plus `ADDWF`/`ADDWFC` (or `SUBWF`/`SUBWFB`) with the `,F`
+    /// destination. Leading zero lanes drop: each propagates a zero
+    /// carry/borrow in. Shapes verified in `add_literal_lane.rs`.
+    fn emit_const_bin_inplace(&mut self, op: &ir::BinOp, n: u8, k: i64, addr: u16) {
+        let mask: u64 = (1u64 << (u32::from(n) * 8)) - 1;
+        let ku = (k as u64) & mask;
+        let is_add = matches!(op, ir::BinOp::Add);
+        if ku == 1 || ku == mask {
+            let inc = (is_add && ku == 1) || (!is_add && ku == mask);
+            for i in 0..n {
+                if i > 0 {
+                    self.emit(if inc {
+                        "    BTFSC 0xFD8,0,A".to_string()
+                    } else {
+                        "    BTFSS 0xFD8,0,A".to_string()
+                    });
+                }
+                self.emit_banked(if inc { "INCF" } else { "DECF" }, addr + u16::from(i), ",F");
+            }
+            return;
+        }
+        let mut first = 0u8;
+        while first < n && (ku >> (u32::from(first) * 8)) & 0xFF == 0 {
+            first += 1;
+        }
+        for i in first..n {
+            let byte = ((ku >> (u32::from(i) * 8)) & 0xFF) as u8;
+            self.emit(format!("    MOVLW 0x{byte:02X}"));
+            let mne = match (is_add, i == first) {
+                (true, true) => "ADDWF",
+                (true, false) => "ADDWFC",
+                (false, true) => "SUBWF",
+                (false, false) => "SUBWFB",
+            };
+            self.emit_banked(mne, addr + u16::from(i), ",F");
+        }
+    }
+
+    /// A phi-folded use reads the phi reg instead of the folded result:
+    /// both name the same new value once the `Bin` computes into the
+    /// phi's slot.
+    fn fold_reg(&self, v: &Val) -> Val {
+        match v {
+            Val::Reg(r) => match self.phi_fold.get(r) {
+                Some(p) => Val::Reg(p.clone()),
+                None => v.clone(),
+            },
+            _ => v.clone(),
+        }
     }
 
     fn emit_f32_extract(&mut self, slot: u16, sign: u16, exp: u16, mant: u16, flip: bool) {
@@ -8808,6 +9152,8 @@ pub fn select_with_opts(
             bit_lanes: HashMap::new(),
             lane_consumed: HashSet::new(),
             store_fwd: HashMap::new(),
+            phi_fold: HashMap::new(),
+            inplace_bins: HashSet::new(),
             store_consumed: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
@@ -8835,6 +9181,12 @@ pub fn select_with_opts(
                 .map(|x| x.name.clone())
                 .collect();
         g.w_folds = iselcore::find_value_folds(f, g.m, g.resolved, Some(&access_safe));
+        // In-place literal-add folds for this function (epic-cc#767): same-home
+        // `Bin`s and loop increments feeding their own phi backedge. Runs
+        // after the value folds since same-home detection reads them.
+        let (phi_fold, inplace_bins) = Gen::find_inplace_folds(&g, f);
+        g.phi_fold = phi_fold;
+        g.inplace_bins = inplace_bins;
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
         // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
@@ -8861,10 +9213,14 @@ pub fn select_with_opts(
             for inst in &b.insts {
                 if let Inst::Phi(p) = inst {
                     for (val, pred) in &p.incoming {
+                        // A folded increment's backedge value reads as its
+                        // phi reg: same new value, and the backedge copy
+                        // degrades to a skipped self-copy.
+                        let val = g.fold_reg(val);
                         phi_copies
                             .entry((pred.clone(), b.label.clone()))
                             .or_default()
-                            .push((p.dst.clone(), p.ty, val.clone()));
+                            .push((p.dst.clone(), p.ty, val));
                     }
                 }
             }
@@ -9020,7 +9376,16 @@ pub fn select_with_opts(
             // would materialize a byte nobody reads.
             let fused: Option<FusedChain> = Gen::fusable_icmp(&g, f, b)
                 .cloned()
-                .map(|c| Gen::fused_chain_sources(&g, f, b, &c));
+                .map(|c| Gen::fused_chain_sources(&g, f, b, &c))
+                .map(|mut fc| {
+                    // A phi-folded increment's readers all name the phi reg:
+                    // the fused chain is one of them (the `Icmp` arm never
+                    // sees it). Renaming only the sources keeps the
+                    // `fc.icmp.dst` match below intact.
+                    fc.icmp.a = g.fold_reg(&fc.icmp.a);
+                    fc.icmp.b = g.fold_reg(&fc.icmp.b);
+                    fc
+                });
             let mut terminator: Option<&Inst> = None;
             for inst in &b.insts {
                 match inst {
@@ -9468,6 +9833,8 @@ pub fn select_with_opts(
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
                 store_fwd: HashMap::new(),
+                phi_fold: HashMap::new(),
+                inplace_bins: HashSet::new(),
                 store_consumed: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
@@ -9811,6 +10178,8 @@ mod tests {
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
                 store_fwd: HashMap::new(),
+                phi_fold: HashMap::new(),
+                inplace_bins: HashSet::new(),
                 store_consumed: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
@@ -9843,6 +10212,8 @@ mod tests {
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
                 store_fwd: HashMap::new(),
+                phi_fold: HashMap::new(),
+                inplace_bins: HashSet::new(),
                 store_consumed: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
@@ -9890,6 +10261,8 @@ mod p3_gen_tests {
             bit_lanes: HashMap::new(),
             lane_consumed: HashSet::new(),
             store_fwd: HashMap::new(),
+            phi_fold: HashMap::new(),
+            inplace_bins: HashSet::new(),
             store_consumed: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
