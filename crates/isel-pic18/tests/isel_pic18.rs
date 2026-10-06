@@ -7999,3 +7999,89 @@ fn udiv_u32_recipe_subtracts_with_subwfb_borrow_chain() {
         "no reversed-operand borrow op:\n{asm}"
     );
 }
+
+/// Call-result homing (epic-cc#738): a single-use result stays in the retval
+/// region, so the site copy vanishes and the store reads it there. The full
+/// domain pins the behavior; the listing pins the deleted copy.
+#[test]
+fn homed_call_result_skips_the_site_copy() {
+    let m = parse(
+        "global in i8\nglobal out i8\nfn gen(i8) ()\n  block entry:\n    %g = load i8 @in\n    %h = add i8 %g, 1\n    ret i8 %h\nfn main(void) ()\n  block entry:\n    %x = call i8 @gen()\n    store i8 %x @out\n    ret void\n",
+    );
+    let layout = alloc::allocate(&PIC18F4550, &m, "edge main gen\n");
+    assert_eq!(
+        layout.locals["main::x"], 0x000,
+        "the single-use result must stay in retval"
+    );
+    let mut full: HashMap<String, u16> = HashMap::new();
+    full.extend(layout.globals.clone());
+    full.extend(layout.locals.clone());
+    let asm = select(&PIC18F4550, &m, &full, None);
+    assert_eq!(
+        asm.matches("MOVFF 0x000,").count(),
+        1,
+        "only the store to out may read retval, the site copy is gone:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let start = start_steps(&asm);
+    let (gin, gout) = (layout.globals["in"], layout.globals["out"]);
+    for v in 0..=255u16 {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start);
+        p.ram_mut()[gin as usize] = v as u8;
+        p.run(300);
+        assert!(p.halted(), "program must halt (in={v:#04x})");
+        assert_eq!(
+            p.ram()[gout as usize],
+            v.wrapping_add(1) as u8,
+            "out must be in+1 (in={v:#04x})"
+        );
+    }
+}
+
+/// A directly returned call result never leaves the region: the Ret round
+/// trip skips on the homed slot, and the wrapper costs one CALL.
+#[test]
+fn returned_call_result_never_leaves_retval() {
+    let m = parse(
+        "global in i8\nglobal out i8\nfn gen(i8) ()\n  block entry:\n    %g = load i8 @in\n    %h = add i8 %g, 1\n    ret i8 %h\nfn wrap(i8) ()\n  block entry:\n    %x = call i8 @gen()\n    ret i8 %x\nfn main(void) ()\n  block entry:\n    %y = call i8 @wrap()\n    store i8 %y @out\n    ret void\n",
+    );
+    let layout = alloc::allocate(&PIC18F4550, &m, "edge main wrap\nedge wrap gen\n");
+    assert_eq!(
+        layout.locals["wrap::x"], 0x000,
+        "the forwarded result must stay in retval"
+    );
+    assert_eq!(
+        layout.locals["main::y"], 0x000,
+        "the wrapper result must stay in retval"
+    );
+    let mut full: HashMap<String, u16> = HashMap::new();
+    full.extend(layout.globals.clone());
+    full.extend(layout.locals.clone());
+    let asm = select(&PIC18F4550, &m, &full, None);
+    assert_eq!(
+        asm.matches("MOVFF 0x000,").count(),
+        1,
+        "only the store to out may read retval, both site copies are gone:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVWF 0x000,").count(),
+        1,
+        "only gen's own Ret writes retval, the wrapper round trip skips:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let start = start_steps(&asm);
+    let (gin, gout) = (layout.globals["in"], layout.globals["out"]);
+    for v in [0x00u8, 0x01, 0x7F, 0x80, 0xFE, 0xFF] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start);
+        p.ram_mut()[gin as usize] = v;
+        p.run(400);
+        assert!(p.halted(), "program must halt (in={v:#04x})");
+        assert_eq!(
+            p.ram()[gout as usize],
+            v.wrapping_add(1),
+            "out must be in+1 (in={v:#04x})"
+        );
+    }
+}

@@ -6,16 +6,16 @@
 [[entry]]
 name = "speed-mul-u8-18f4550"
 device = "18F4550"
-cycles = 18
-flash_words = 36
+cycles = 16
+flash_words = 34
 ram_bytes = 16
 
 [[entry]]
 name = "speed-mul-u8-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 18
-flash_words = 36
+cycles = 16
+flash_words = 34
 ram_bytes = 16
 
 [[entry]]
@@ -36,16 +36,16 @@ ram_bytes = 16
 [[entry]]
 name = "speed-mul-u16-18f4550"
 device = "18F4550"
-cycles = 40
-flash_words = 62
+cycles = 36
+flash_words = 58
 ram_bytes = 33
 
 [[entry]]
 name = "speed-mul-u16-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 40
-flash_words = 62
+cycles = 36
+flash_words = 58
 ram_bytes = 33
 
 [[entry]]
@@ -66,16 +66,16 @@ ram_bytes = 33
 [[entry]]
 name = "speed-mul-u32-18f4550"
 device = "18F4550"
-cycles = 110
-flash_words = 140
+cycles = 102
+flash_words = 132
 ram_bytes = 49
 
 [[entry]]
 name = "speed-mul-u32-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 110
-flash_words = 140
+cycles = 102
+flash_words = 132
 ram_bytes = 49
 
 [[entry]]
@@ -96,16 +96,16 @@ ram_bytes = 48
 [[entry]]
 name = "speed-divmod-u8-18f4550"
 device = "18F4550"
-cycles = 308
-flash_words = 88
+cycles = 304
+flash_words = 84
 ram_bytes = 15
 
 [[entry]]
 name = "speed-divmod-u8-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 300
-flash_words = 89
+cycles = 296
+flash_words = 85
 ram_bytes = 15
 
 [[entry]]
@@ -126,16 +126,16 @@ ram_bytes = 15
 [[entry]]
 name = "speed-divmod-u16-18f4550"
 device = "18F4550"
-cycles = 650
-flash_words = 109
+cycles = 634
+flash_words = 102
 ram_bytes = 29
 
 [[entry]]
 name = "speed-divmod-u16-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 634
-flash_words = 115
+cycles = 626
+flash_words = 107
 ram_bytes = 29
 
 [[entry]]
@@ -156,16 +156,16 @@ ram_bytes = 28
 [[entry]]
 name = "speed-divmod-u32-18f4550"
 device = "18F4550"
-cycles = 2044
-flash_words = 170
+cycles = 2020
+flash_words = 159
 ram_bytes = 51
 
 [[entry]]
 name = "speed-divmod-u32-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 1972
-flash_words = 191
+cycles = 1956
+flash_words = 175
 ram_bytes = 51
 
 [[entry]]
@@ -186,16 +186,16 @@ ram_bytes = 51
 [[entry]]
 name = "speed-shift-18f4550"
 device = "18F4550"
-cycles = 538
-flash_words = 232
+cycles = 518
+flash_words = 212
 ram_bytes = 43
 
 [[entry]]
 name = "speed-shift-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 530
-flash_words = 233
+cycles = 510
+flash_words = 213
 ram_bytes = 43
 
 [[entry]]
@@ -276,16 +276,16 @@ ram_bytes = 53
 [[entry]]
 name = "speed-strlen-strcmp-18f4550"
 device = "18F4550"
-cycles = 2259
-flash_words = 236
+cycles = 2243
+flash_words = 229
 ram_bytes = 57
 
 [[entry]]
 name = "speed-strlen-strcmp-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 2051
-flash_words = 240
+cycles = 2043
+flash_words = 232
 ram_bytes = 57
 
 [[entry]]
@@ -426,16 +426,16 @@ ram_bytes = 33
 [[entry]]
 name = "speed-pid-step-18f4550"
 device = "18F4550"
-cycles = 361
-flash_words = 243
+cycles = 353
+flash_words = 235
 ram_bytes = 53
 
 [[entry]]
 name = "speed-pid-step-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 297
-flash_words = 259
+cycles = 289
+flash_words = 251
 ram_bytes = 53
 
 [[entry]]
@@ -456,30 +456,30 @@ ram_bytes = 53
 [[entry]]
 name = "scen-pid-update-18f4550"
 device = "18F4550"
-cycles = 776
-flash_words = 824
+cycles = 764
+flash_words = 812
 ram_bytes = 131
 
 [[entry]]
 name = "scen-pid-update-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 736
-flash_words = 830
+cycles = 724
+flash_words = 818
 ram_bytes = 131
 
 [[entry]]
 name = "scen-control-pass-18f4550"
 device = "18F4550"
-cycles = 824
-flash_words = 4092
+cycles = 812
+flash_words = 4020
 ram_bytes = 653
 
 [[entry]]
 name = "scen-control-pass-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 766
+cycles = 758
 flash_words = 4307
 ram_bytes = 749
 
