@@ -1490,10 +1490,8 @@ fn result_home_ok(
 /// clobber-free window to it. The result already lands in the retval bytes,
 /// so leaving it there deletes the call-site copy: isel's self-copy skip
 /// drops it once placement maps the dst onto the region. Only the copy at
-/// the call site is deleted, so no frame rebases. The region is shared by
-/// every function, but the window proves no interleaving call, which is the
-/// only in-function writer besides opaque asm (also rejected); the ISR
-/// save area covers preemption transparently.
+/// the call site is deleted, so no frame rebases. The window proves no
+/// interleaving call or asm; the ISR save area covers preemption.
 fn home_results(
     m: &Module,
     device: &Device,
