@@ -1695,7 +1695,10 @@ impl<'m> Gen<'m> {
                 }
             }
         }
-        phi_reads >= 1
+        // Exactly the backedge incoming: any second phi reader would
+        // observe the folded home across a path this check never
+        // analyzed, so it stays staged instead.
+        phi_reads == 1
     }
 
     fn substitute_asm(&self, template: &str, operands: &[ir::AsmOperand]) -> String {
