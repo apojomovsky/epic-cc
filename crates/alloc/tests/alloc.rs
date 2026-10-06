@@ -2398,9 +2398,10 @@ fn width_mismatched_arg_keeps_its_caller_slot() {
 }
 
 #[test]
-fn call_result_arg_homes_into_the_callee_param_slot() {
-    // A call result lands through the retval bytes into its dst slot, so
-    // chaining calls homes the same way a plain def does.
+fn chained_call_result_stays_in_the_retval_region() {
+    // A chained call result stays in the retval bytes (epic-cc#738) instead
+    // of homing into the param slot: the site copy reads it there, so the
+    // chain still costs one copy either way.
     let m = parse(
         "global out i8\n\
          fn gen(i8) ()\n\
@@ -2419,8 +2420,260 @@ fn call_result_arg_homes_into_the_callee_param_slot() {
     );
     let out = allocate(&PIC18F4550, &m, "edge main gen\nedge main callee\n");
     assert_eq!(
-        out.locals["main::x"], out.locals["callee::p"],
-        "a chained call result must target the param slot"
+        out.locals["main::x"], 0x000,
+        "a chained call result stays in the retval region"
+    );
+}
+
+#[test]
+fn single_use_call_result_homes_into_retval() {
+    // The result already lands in the retval bytes, so a single clean read
+    // leaves it there and deletes the site copy. (epic-cc#738)
+    let m = parse(
+        "global out i8\n\
+         fn gen(i8) ()\n\
+           block entry:\n\
+             %g = add i8 1, 2\n\
+             ret i8 %g\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = call i8 @gen()\n\
+             store i8 %x, ptr @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main gen\n");
+    assert_eq!(
+        out.locals["main::x"], 0x000,
+        "a single-use result stays in the retval region"
+    );
+}
+
+#[test]
+fn multi_use_call_result_keeps_its_slot() {
+    // Two reads share the value, so only a frame slot survives both.
+    let m = parse(
+        "global out i8\n\
+         fn gen(i8) ()\n\
+           block entry:\n\
+             %g = add i8 1, 2\n\
+             ret i8 %g\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = call i8 @gen()\n\
+             store i8 %x, ptr @out\n\
+             store i8 %x, ptr @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main gen\n");
+    assert_ne!(
+        out.locals["main::x"], 0x000,
+        "a twice-read result cannot live in retval"
+    );
+}
+
+#[test]
+fn call_between_result_and_use_rejects_homing() {
+    // The second call rewrites the retval bytes before the first result is
+    // read; the second result's own window is clean, so only it homes.
+    let m = parse(
+        "global out i8\n\
+         fn gen(i8) ()\n\
+           block entry:\n\
+             %g = add i8 1, 2\n\
+             ret i8 %g\n\
+         fn other(i8) ()\n\
+           block entry:\n\
+             %h = add i8 3, 4\n\
+             ret i8 %h\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = call i8 @gen()\n\
+             %b = call i8 @other()\n\
+             store i8 %a, ptr @out\n\
+             store i8 %b, ptr @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main gen\nedge main other\n");
+    assert_ne!(
+        out.locals["main::a"], 0x000,
+        "a result read past another call cannot live in retval"
+    );
+    assert_eq!(
+        out.locals["main::b"], 0x000,
+        "a result read before the next call stays in retval"
+    );
+}
+
+#[test]
+fn pic14_call_result_never_homes_into_retval() {
+    // The homing gate is the PIC18-only fixed retval reservation.
+    let m = parse(
+        "global out i8\n\
+         fn gen(i8) ()\n\
+           block entry:\n\
+             %g = add i8 1, 2\n\
+             ret i8 %g\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = call i8 @gen()\n\
+             store i8 %x, ptr @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main gen\n");
+    assert_ne!(
+        out.locals["main::x"], 0x000,
+        "PIC14 has no fixed retval region to home into"
+    );
+}
+
+#[test]
+fn wide_call_result_keeps_its_slot() {
+    // The value region holds four bytes; an eight-byte result cannot fit.
+    let m = parse(
+        "global out i64\n\
+         fn gen(i64) ()\n\
+           block entry:\n\
+             ret i64 0\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = call i64 @gen()\n\
+             store i64 %x, ptr @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main gen\n");
+    assert_ne!(
+        out.locals["main::x"], 0x000,
+        "an i64 result cannot live in the 4-byte retval region"
+    );
+}
+
+#[test]
+fn gep_extended_read_rejects_homing() {
+    // The pointer's only raw use is the GEP, but isel re-reads it at every
+    // load through the derived address, including past the later call.
+    // Without the propagation this looks single-use. (epic-cc#738)
+    let m = parse(
+        "global arr i8\n\
+         fn get(i16) ()\n\
+           block entry:\n\
+             ret i16 0\n\
+         fn other(void) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %p = call i16 @get()\n\
+             %g = gep %p +0\n\
+             %v = load i8 %g\n\
+             call void @other()\n\
+             %w = load i8 %g\n\
+             store i8 %w, ptr @arr\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main get\nedge main other\n");
+    assert_ne!(
+        out.locals["main::p"], 0x000,
+        "a GEP address re-read past a call cannot live in retval"
+    );
+}
+
+#[test]
+fn ret_forwarded_call_result_homes_into_retval() {
+    // `return call f()`: the value never leaves the region, and isel skips
+    // the Ret round trip once the slot maps onto it.
+    let m = parse(
+        "fn gen(i8) ()\n\
+           block entry:\n\
+             %g = add i8 1, 2\n\
+             ret i8 %g\n\
+         fn wrap(i8) ()\n\
+           block entry:\n\
+             %x = call i8 @gen()\n\
+             ret i8 %x\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge wrap gen\n");
+    assert_eq!(
+        out.locals["wrap::x"], 0x000,
+        "a directly returned result stays in the retval region"
+    );
+}
+
+#[test]
+fn cross_block_clean_path_homes_into_retval() {
+    // The call dominates the read and no path between them holds a call.
+    let m = parse(
+        "global out i8\n\
+         fn gen(i8) ()\n\
+           block entry:\n\
+             %g = add i8 1, 2\n\
+             ret i8 %g\n\
+         fn main(i1) (c=i1)\n\
+           block entry:\n\
+             %x = call i8 @gen()\n\
+             br i1 %c, label %t, label %f\n\
+           block t:\n\
+             store i8 %x, ptr @out\n\
+             br label %done\n\
+           block f:\n\
+             br label %done\n\
+           block done:\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main gen\n");
+    assert_eq!(
+        out.locals["main::x"], 0x000,
+        "a dominated clean cross-block read stays in retval"
+    );
+}
+
+#[test]
+fn loop_local_result_homes_within_the_iteration() {
+    // Each iteration re-runs the call before the read, so the back edge
+    // cannot carry a clobber into it.
+    let m = parse(
+        "global out i8\n\
+         fn gen(i8) ()\n\
+           block entry:\n\
+             %g = add i8 1, 2\n\
+             ret i8 %g\n\
+         fn main(i1) (c=i1)\n\
+           block entry:\n\
+             br label %loop\n\
+           block loop:\n\
+             %x = call i8 @gen()\n\
+             store i8 %x, ptr @out\n\
+             br i1 %c, label %loop, label %done\n\
+           block done:\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main gen\n");
+    assert_eq!(
+        out.locals["main::x"], 0x000,
+        "a same-block loop result stays in retval"
+    );
+}
+
+#[test]
+fn asm_between_result_and_use_rejects_homing() {
+    // Opaque asm could rewrite the fixed bytes, so any asm in the window
+    // rejects, even with no call in it.
+    let m = parse(
+        "global out i8\n\
+         fn gen(i8) ()\n\
+           block entry:\n\
+             %g = add i8 1, 2\n\
+             ret i8 %g\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = call i8 @gen()\n\
+             asm \"nop\"\n\
+             store i8 %x, ptr @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main gen\n");
+    assert_ne!(
+        out.locals["main::x"], 0x000,
+        "asm in the window vetoes retval homing"
     );
 }
 

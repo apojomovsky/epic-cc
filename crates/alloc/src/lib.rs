@@ -384,6 +384,7 @@ fn frame_layout(
     resolved: &PtrResolution,
     va_size: u16,
     unplaced: &HashSet<String>,
+    retval_homed: &HashSet<String>,
 ) -> FrameLayout {
     let order = block_order(f);
     let idx: HashMap<&str, usize> = order
@@ -731,6 +732,12 @@ fn frame_layout(
                     }
                 }
                 let Some(s) = src else { continue };
+                // A retval-homed incoming lives in the fixed region, which
+                // liveness cannot see: sharing its slot would let a later
+                // call clobber the phi dst invisibly. (epic-cc#738)
+                if retval_homed.contains(&s) {
+                    continue;
+                }
                 if mixed {
                     continue;
                 }
@@ -785,6 +792,10 @@ fn frame_layout(
                 _ => continue,
             };
             let ir::Val::Reg(s) = src else { continue };
+            // Same fixed-region hazard as the phi pin above. (epic-cc#738)
+            if retval_homed.contains(s) {
+                continue;
+            }
             let Some(&(_, _, w_s, _, mem_s)) = defs.get(s) else {
                 continue;
             };
@@ -1356,6 +1367,274 @@ fn entry_path_ok(
     }
     true
 }
+/// Iterative dominators over `order` (entry is block 0); unreachable blocks
+/// keep the full set, which admits nothing through them. The arg-homing
+/// windows above predate this helper and keep their inline copies.
+fn dominators(succ: &HashMap<usize, Vec<usize>>, n: usize) -> Vec<HashSet<usize>> {
+    let mut preds: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, ss) in succ {
+        for s in ss {
+            preds.entry(*s).or_default().push(*i);
+        }
+    }
+    let mut dom: Vec<HashSet<usize>> = vec![(0..n).collect(); n];
+    dom[0] = HashSet::from([0]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 1..n {
+            let mut d: Option<HashSet<usize>> = None;
+            for p in preds.get(&i).map(Vec::as_slice).unwrap_or(&[]) {
+                d = Some(match d {
+                    None => dom[*p].clone(),
+                    Some(d) => d.intersection(&dom[*p]).copied().collect(),
+                });
+            }
+            if let Some(mut d) = d {
+                d.insert(i);
+                if d != dom[i] {
+                    dom[i] = d;
+                    changed = true;
+                }
+            }
+        }
+    }
+    dom
+}
+
+/// Result window for retval homing (epic-cc#738): no call and no inline asm
+/// on any path from the defining call to its single read, either of which
+/// could rewrite the fixed retval bytes in between. A same-block loop needs
+/// no rejection: each iteration re-runs the call before the read, so a
+/// back-edge clobber never reaches one.
+fn result_home_ok(
+    succ: &HashMap<usize, Vec<usize>>,
+    order: &[&ir::Block],
+    dom: &[HashSet<usize>],
+    call_block: usize,
+    call_pos: usize,
+    use_block: usize,
+    use_pos: usize,
+) -> bool {
+    let clobbers = |inst: &ir::Inst| matches!(inst, ir::Inst::Call(_) | ir::Inst::Asm(_));
+    if use_block == call_block {
+        if use_pos <= call_pos {
+            return false;
+        }
+        return !order[call_block].insts[call_pos + 1..use_pos]
+            .iter()
+            .any(clobbers);
+    }
+    if !dom[use_block].contains(&call_block) {
+        return false;
+    }
+    let self_reachable = |x: usize| -> bool {
+        let mut stack = succ.get(&x).cloned().unwrap_or_default();
+        let mut seen: HashSet<usize> = HashSet::new();
+        while let Some(b) = stack.pop() {
+            if b == x {
+                return true;
+            }
+            if seen.insert(b) {
+                stack.extend(succ.get(&b).cloned().unwrap_or_default());
+            }
+        }
+        false
+    };
+    if self_reachable(call_block) || self_reachable(use_block) {
+        return false;
+    }
+    if order[call_block].insts[call_pos + 1..].iter().any(clobbers) {
+        return false;
+    }
+    if order[use_block].insts[..use_pos].iter().any(clobbers) {
+        return false;
+    }
+    let mut preds: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, ss) in succ {
+        for s in ss {
+            preds.entry(*s).or_default().push(*i);
+        }
+    }
+    let mut fwd: HashSet<usize> = HashSet::from([call_block]);
+    let mut stack = vec![call_block];
+    while let Some(b) = stack.pop() {
+        for s in succ.get(&b).cloned().unwrap_or_default() {
+            if fwd.insert(s) {
+                stack.push(s);
+            }
+        }
+    }
+    let mut bwd: HashSet<usize> = HashSet::from([use_block]);
+    stack = vec![use_block];
+    while let Some(b) = stack.pop() {
+        for p in preds.get(&b).cloned().unwrap_or_default() {
+            if bwd.insert(p) {
+                stack.push(p);
+            }
+        }
+    }
+    for b in fwd.intersection(&bwd) {
+        if *b == call_block || *b == use_block {
+            continue;
+        }
+        if order[*b].insts.iter().any(clobbers) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Call results homed into the fixed retval region (epic-cc#738):
+/// `(caller, value)` when the value is a call result with one read and a
+/// clobber-free window to it. The result already lands in the retval bytes,
+/// so leaving it there deletes the call-site copy: isel's self-copy skip
+/// drops it once placement maps the dst onto the region. Only the copy at
+/// the call site is deleted, so no frame rebases. The region is shared by
+/// every function, but the window proves no interleaving call, which is the
+/// only in-function writer besides opaque asm (also rejected); the ISR
+/// save area covers preemption transparently.
+fn home_results(
+    m: &Module,
+    device: &Device,
+    resolved: &PtrResolution,
+) -> HashSet<(String, String)> {
+    let mut homed: HashSet<(String, String)> = HashSet::new();
+    let Some((retval_lo, retval_hi)) = device.fixed_retval else {
+        return homed;
+    };
+    debug_assert!(
+        retval_hi - retval_lo + 1 >= 4,
+        "alloc: fixed_retval must hold a 4-byte result"
+    );
+    for f in &m.funcs {
+        let order = block_order(f);
+        let idx: HashMap<&str, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.label.as_str(), i))
+            .collect();
+        let block_len: Vec<u16> = order.iter().map(|b| b.insts.len() as u16).collect();
+        let mut uses: HashMap<String, HashSet<(usize, u16)>> = HashMap::new();
+        for (i, b) in order.iter().enumerate() {
+            for (pos, inst) in b.insts.iter().enumerate() {
+                if let ir::Inst::Phi(p) = inst {
+                    for (v, pred) in &p.incoming {
+                        let vn = ir::val_name(v);
+                        if vn.is_empty() {
+                            continue;
+                        }
+                        let pi = idx[pred.as_str()];
+                        uses.entry(vn).or_default().insert((pi, block_len[pi]));
+                    }
+                    continue;
+                }
+                for v in ir::read_vals(inst) {
+                    if v.is_empty() {
+                        continue;
+                    }
+                    uses.entry(v).or_default().insert((i, pos as u16));
+                }
+            }
+        }
+        // A GEP's base and term regs are re-read by isel at every load or
+        // store through the derived pointer, so those reads count as uses
+        // of the address value too. Without this a pointer result read
+        // through a GEP past a later call would look single-use.
+        let mut gep_operands: HashMap<String, Vec<String>> = HashMap::new();
+        for b in &order {
+            for inst in &b.insts {
+                if let ir::Inst::Gep(g) = inst {
+                    let mut ops = Vec::new();
+                    if let ir::GepBase::Reg(r) = &g.base {
+                        ops.push(r.clone());
+                    }
+                    ops.extend(g.terms.iter().map(|(_, r)| r.clone()));
+                    gep_operands.insert(g.dst.clone(), ops);
+                }
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (dst, ops) in &gep_operands {
+                let dst_uses: Vec<(usize, u16)> = uses
+                    .get(dst)
+                    .map(|u| u.iter().copied().collect())
+                    .unwrap_or_default();
+                for op in ops {
+                    if let Some(op_uses) = uses.get_mut(op) {
+                        let before = op_uses.len();
+                        op_uses.extend(dst_uses.iter().copied());
+                        if op_uses.len() != before {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        let norm = |t: &str| {
+            t.strip_prefix("label ")
+                .unwrap_or(t)
+                .trim_start_matches('%')
+                .to_string()
+        };
+        let mut succ: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, ob) in order.iter().enumerate() {
+            let mut ss = Vec::new();
+            for inst in &ob.insts {
+                match inst {
+                    ir::Inst::Br(br) => ss.push(idx[&norm(&br.target)[..]]),
+                    ir::Inst::BrCond(bc) => {
+                        ss.push(idx[&norm(&bc.t)[..]]);
+                        ss.push(idx[&norm(&bc.f)[..]]);
+                    }
+                    ir::Inst::Switch(sw) => {
+                        ss.push(idx[&norm(&sw.default)[..]]);
+                        for (_, l) in &sw.cases {
+                            ss.push(idx[&norm(l)[..]]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            succ.insert(i, ss);
+        }
+        let dom = dominators(&succ, order.len());
+        for (bi, b) in order.iter().enumerate() {
+            for (pos, inst) in b.insts.iter().enumerate() {
+                let ir::Inst::Call(c) = inst else { continue };
+                let (Some(d), Some(t)) = (&c.dst, &c.ty) else {
+                    continue;
+                };
+                if !(1..=4).contains(&t.bytes()) {
+                    continue;
+                }
+                if resolved.contains_key(&ssa_key(&f.name, d)) {
+                    continue;
+                }
+                let Some(us) = uses.get(d) else { continue };
+                if us.len() != 1 {
+                    continue;
+                }
+                let &(ub, up) = us.iter().next().expect("alloc: single use");
+                if (ub, up) == (bi, pos as u16) {
+                    continue;
+                }
+                if (up as usize) < order[ub].insts.len()
+                    && matches!(order[ub].insts[up as usize], ir::Inst::Asm(_))
+                {
+                    continue;
+                }
+                if result_home_ok(&succ, &order, &dom, bi, pos, ub, up as usize) {
+                    homed.insert((f.name.clone(), d.clone()));
+                }
+            }
+        }
+    }
+    homed
+}
+
 /// One admitted call site, before the same-caller selection. `def` is the
 /// defining write (the merge block for a phi, whose real writes are the
 /// per-edge copies, so `phi_preds` names those predecessor blocks). Two
@@ -1373,15 +1652,17 @@ struct HomeCand {
 
 /// Caller-computed call args (epic-cc#830): `(caller, value)` to
 /// `(callee, param)` when the value's defining write can target the
-/// callee's param slot, deleting the call-site copy. Sources are
-/// single-use scalar regs (plain defs, call results, phis, caller
-/// params), width-equal, with a clobber-free window the per-shape check
-/// proves: no call between, callee out of ISR reach and unable to reach
-/// back. Sibling frames share RAM, so any intervening call rejects.
+/// callee's param slot, deleting the call-site copy. Sources are single-use
+/// scalar regs (plain defs, call results, phis, caller params), width-equal,
+/// with a clobber-free window the per-shape check proves: no call between,
+/// callee out of ISR reach and unable to reach back. Sibling frames share
+/// RAM, so any intervening call rejects. A retval-homed call result
+/// (epic-cc#738) stays out: both passes would rewrite its address.
 fn home_args(
     m: &Module,
     edges: &HashMap<String, Vec<String>>,
     resolved: &PtrResolution,
+    retval_homed: &HashSet<(String, String)>,
 ) -> HashMap<(String, String), (String, String)> {
     let funcs: HashMap<&str, &ir::Func> = m.funcs.iter().map(|f| (f.name.as_str(), f)).collect();
     let mut called_by: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -1516,6 +1797,9 @@ fn home_args(
                         continue;
                     }
                     let ir::Val::Reg(r) = &arg.val else { continue };
+                    if retval_homed.contains(&(f.name.clone(), r.clone())) {
+                        continue;
+                    }
                     // A caller param passed straight through homes like a
                     // def at entry: callers refresh its slot at every call
                     // site, so only the entry-to-call window needs proving.
@@ -1870,12 +2154,24 @@ fn allocate_inner(
             panic!("alloc: unrecognized callgraph line: {line}");
         }
     }
+    // Call results homed into the fixed retval region (epic-cc#738), computed
+    // before arg homing so chained results stay out of both passes. Frame
+    // layout takes the per-function value names to keep coalescing off the
+    // fixed region, whose clobbers liveness cannot see.
+    let retval_homed = home_results(m, device, &resolved);
+    let retval_in = |name: &str| -> HashSet<String> {
+        retval_homed
+            .iter()
+            .filter(|(fun, _)| fun == name)
+            .map(|(_, val)| val.clone())
+            .collect()
+    };
     // Caller-computed call args (epic-cc#830). The caller keeps its own
     // slot for the value: only the copy at the call site is deleted, so
     // no frame rebases. A homed target that is itself a homed source
     // (pass-through chains) resolves to the final address; mutual
     // pass-throughs with no base slot drop out.
-    let homed = home_args(m, &edges, &resolved);
+    let homed = home_args(m, &edges, &resolved, &retval_homed);
     let mut final_tgt: HashMap<(String, String), (String, String)> = HashMap::new();
     for (src, mut tgt) in homed.clone() {
         let mut seen: HashSet<(String, String)> = HashSet::from([src.clone()]);
@@ -1902,6 +2198,7 @@ fn allocate_inner(
             &resolved,
             floored_va_size(f, &va_sizes),
             unplaced_in(&f.name),
+            &retval_in(&f.name),
         );
         locals_widths.insert(f.name.clone(), fl.widths);
         locals_size.insert(f.name.clone(), fl.size);
@@ -3140,6 +3437,7 @@ fn allocate_inner(
             &resolved,
             floored_va_size(f, &va_sizes),
             unplaced_in(&f.name),
+            &retval_in(&f.name),
         );
         // The frame end the coloring's own slot order produces; every callee
         // base is derived from it (`frame_end` over `locals_widths`), so a
@@ -3203,6 +3501,19 @@ fn allocate_inner(
         let key = format!("{caller}::{val}");
         locals.insert(key.clone(), addr);
         local_width.insert(key, local_width[&target]);
+    }
+    // Homed call results take the fixed retval base: the defining call lands
+    // there, so the site copy is a self-copy. Widths match by admit, so one
+    // base covers every byte, and the PIC18 access bank needs no select. The
+    // frame slot stays allocated, so no frame rebases. (epic-cc#738)
+    if let Some((retval_lo, _)) = device.fixed_retval {
+        for (caller, val) in &retval_homed {
+            let key = format!("{caller}::{val}");
+            if !locals.contains_key(&key) {
+                panic!("alloc: retval-homed {key} has no slot");
+            }
+            locals.insert(key, retval_lo);
+        }
     }
 
     // 7b. Per-bank high-water marks and the ISR region span. Every placed

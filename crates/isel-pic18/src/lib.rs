@@ -9391,7 +9391,17 @@ pub fn select_with_opts(
                 }
                 Some(Inst::Ret(Some((ty, v)), loc)) => {
                     g.cur_loc = loc.clone();
+                    // A call result homed into the retval region (epic-cc#738)
+                    // is already home: the load/store round trip is a
+                    // self-copy through W, so skip it like any coalesced one.
+                    let home = match v {
+                        Val::Reg(r) => g.addrs.get(&ssa_key(&f.name, r)).copied(),
+                        _ => None,
+                    };
                     for i in 0..ty.bytes() {
+                        if home == Some(g.retval_lo) {
+                            continue;
+                        }
                         g.emit_load_w(v, i, false);
                         let (a, f2) = g.operand(g.retval_lo + u16::from(i));
                         let bank = if a == 0 { "A" } else { "B" };
