@@ -4,7 +4,7 @@ name: mdb-oracle
 # pr tier on oracle-input changes, nightly sweep on schedule. Sessions run
 # in epic-hal's private toolchain image (same pull as its family-check).
 # Setup, not code: ghcr.io/<owner>/epic-hal-ci must grant this repo read
-# access, else the pull 401s (legacy pic8-hal-ci fallback included).
+# access, else the pull 401s.
 
 on:
   pull_request:
@@ -114,14 +114,10 @@ jobs:
           mplabx_version="$(grep -m1 '^ARG MPLABX_VERSION=' epic-hal/docker/ci-toolchain/Dockerfile | cut -d= -f2)"
           tag="xc8-v${xc8_version}-dfp${pic16_dfp_version}-${pic18_dfp_version}-${pic1216f1_dfp_version}-mplabx${mplabx_version}"
           image="ghcr.io/${{ github.repository_owner }}/epic-hal-ci:${tag}"
-          legacy_image="ghcr.io/${{ github.repository_owner }}/pic8-hal-ci:${tag}"
           if docker pull "$image"; then
             echo "image=$image" >> "$GITHUB_OUTPUT"
-          elif docker pull "$legacy_image"; then
-            echo "note: pulled legacy $legacy_image (epic-hal-ci not yet published; see epic-hal#55)" >&2
-            echo "image=$legacy_image" >> "$GITHUB_OUTPUT"
           else
-            echo "error: neither $image nor $legacy_image is on GHCR" >&2
+            echo "error: $image is not on GHCR (granted read access?)" >&2
             exit 1
           fi
 
