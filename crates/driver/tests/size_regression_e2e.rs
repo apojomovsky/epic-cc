@@ -491,6 +491,8 @@ fn cases() -> Vec<Case> {
             .map(|d| fixture(d))
             .collect(),
             defines: vec!["PIC18F4550", "FOSC_HZ=48000000", "__EPIC_CC__"],
+            // TU order mirrors the manifest sim build (sources_for): the driver
+            // layout is input-order-sensitive, so the ladder must build the recipe program.
             inputs: [
                 "vendor/hal-pic18-base/pic18fxx5x-hal/src/peripherals/pic18fxx5x_gpio.c",
                 "vendor/hal-pic18-base/pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer0.c",
@@ -508,9 +510,9 @@ fn cases() -> Vec<Case> {
                 "vendor/hal-pic18-base/epic-taskmgr/src/epic_taskmgr.c",
                 "vendor/hal-pic18-base/epic-tick/src/epic_tick.c",
                 "vendor/hal-pic18-menu-demo/epic-lcd/src/epic_lcd.c",
-                "vendor/hal-pic18-menu-demo/epic-lcd/src/epic_lcd_gpio4.c",
                 "vendor/hal-pic18-base/epic-serial/src/epic_serial.c",
                 "vendor/hal-pic18-menu-demo/epic-menu-demo/src/menu_demo_core.c",
+                "vendor/hal-pic18-menu-demo/epic-lcd/src/epic_lcd_gpio4.c",
                 "vendor/hal-pic18-menu-demo/epic-menu-demo/tests/sim_menu_demo.c",
                 "vendor/hal-pic18-menu-demo/config_18F4550.c",
             ]
