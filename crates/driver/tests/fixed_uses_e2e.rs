@@ -1,12 +1,13 @@
-//! epic-cc#837: the fixed-region RAM count must never undercount the bytes
-//! the emitted program touches. `fixed_uses` mirrors isel lowering site by
-//! site, so a site missing there would silently shrink the report below
-//! what the program uses (the PlatformIO pre-flash check reads it). This
-//! test compiles a shape-covering corpus (valued calls, the PIC18
+//! epic-cc#837/#864: the fixed-region RAM count must never undercount the
+//! bytes the emitted program touches. `fixed_uses` mirrors isel lowering
+//! site by site, so a site missing there would silently shrink the report
+//! below what the program uses (the PlatformIO pre-flash check reads it).
+//! This test compiles a shape-covering corpus (valued calls, the PIC18
 //! const-sub flag chain, `_delay`, memcpy, wide compares, large const
 //! tables, ISRs, plus the small-program floor rows) and asserts the
 //! reported `fixed:`/`common:` bytes cover every fixed-range reference
-//! in the emitted asm. It guards the dangerous direction only:
+//! in the emitted asm: retval bytes, the PIC14 scratch byte, and the
+//! dynamic-memcpy park bytes. It guards the dangerous direction only:
 //! overcounting is safe and stays visible in the size baseline, not here.
 //! ISR rows carry `has_isr`: the prologue saves all 4 retval bytes with
 //! no IR shape to scan, so the report forces the full count, and the
@@ -64,6 +65,15 @@ fn cases() -> Vec<Case> {
         name: "add",
         device: "16F1937",
         fixture: "add.c",
+        has_isr: false,
+    });
+    // PIC14E dynamic memcpy over plain pointers parks 0x7E/0x7F but
+    // keeps the fast FSR shape: the row fails if the per-core term
+    // rule drifts toward either backend.
+    out.push(Case {
+        name: "dynamic-memcpy",
+        device: "16F1937",
+        fixture: "dynamic_memcpy.c",
         has_isr: false,
     });
     // ISR rows: the prologue's 4-byte retval save has no IR shape, so
@@ -153,10 +163,16 @@ fn touched_pic18(asm: &str) -> u16 {
     hi.map_or(0, |h| u16::from(h) + 1).max(u16::from(flag))
 }
 
-/// Highest PIC14/PIC14E retval byte the asm references, as a count:
-/// `0x71`..`0x74`. The 0x70 scratch is always counted, never scanned.
-fn touched_pic14(asm: &str) -> u16 {
+/// PIC14/PIC14E fixed bytes the asm references: the retval count from
+/// `0x71`..`0x74`, whether the `0x70` scratch byte appears, and the
+/// dynamic-memcpy park bytes (`0x7E` and `0x7F` each count one: the
+/// dynamic loop uses both, a PIC14E constant copy holds `0x7F` alone).
+/// W-literal operands (`RETLW` table data, `MOVLW` counts) and `equ`
+/// aliases are not touches, same as the PIC18 scan.
+fn touched_pic14(asm: &str) -> (u16, u16, u16) {
     let mut hi = 0u8;
+    let mut scratch = 0u16;
+    let mut park = 0u16;
     for line in asm.lines() {
         if line.contains("LW ") || line.contains("equ") {
             continue;
@@ -166,12 +182,19 @@ fn touched_pic14(asm: &str) -> u16 {
                 hi = hi.max(b);
             }
         }
+        if line.contains("0x70") {
+            scratch = 1;
+        }
+        if line.contains("0x7E") {
+            park |= 1;
+        }
+        if line.contains("0x7F") {
+            park |= 2;
+        }
     }
-    if hi == 0 {
-        0
-    } else {
-        u16::from(hi - 0x71 + 1)
-    }
+    let retval = if hi == 0 { 0 } else { u16::from(hi - 0x71 + 1) };
+    let park = park.count_ones() as u16;
+    (retval, scratch, park)
 }
 
 #[test]
@@ -188,16 +211,25 @@ fn fixed_report_covers_emitted_touches() {
             ("18F4550", true) => 12,
             _ => 9,
         };
-        let (touched, floor) = match c.device {
-            "18F4550" => (touched_pic18(&asm), 0),
-            _ => (touched_pic14(&asm), 1),
+        let touched: u16 = match c.device {
+            "18F4550" => touched_pic18(&asm),
+            _ => {
+                let (retval, scratch, park) = touched_pic14(&asm);
+                println!(
+                    "{}-{}: reported fixed {reported}, touched {retval}+{scratch}+{park}",
+                    c.device, c.name
+                );
+                retval + scratch + park
+            }
         };
-        println!(
-            "{}-{}: reported fixed {reported}, touched retval {touched}",
-            c.device, c.name
-        );
+        if c.device == "18F4550" {
+            println!(
+                "{}-{}: reported fixed {reported}, touched retval {touched}",
+                c.device, c.name
+            );
+        }
         assert!(
-            reported >= floor + isr_base + touched,
+            reported >= isr_base + touched,
             "{} ({}): reported fixed {reported} below touched {touched}:\n{asm}",
             c.name,
             c.device

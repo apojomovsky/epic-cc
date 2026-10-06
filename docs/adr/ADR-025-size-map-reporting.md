@@ -68,6 +68,18 @@ so this is version `2` by the rule above: the `opt_level` key from the
 profiles track plus smaller `ram_bytes.used` on programs that leave
 fixed bytes idle.
 
+## Amendment 2026-10-05: scratch and park bytes counted by use (epic-cc#864)
+
+The #837 amendment left the PIC14/PIC14E scratch byte always counted
+and the memcpy park bytes outside the count. Both are scanned now:
+`fixed_uses` mirrors each scratch emission site per core (const-table
+reads, general dynamic address sums, wide compares, wide ALU, the
+pool-log variant) and each park-byte site (the dynamic loop's 0x7E/0x7F
+pair, the PIC14E constant copy's 0x7F hold), and the ISR prologue still
+forces scratch alongside retval. The emitted code is byte-identical, so
+this stays version `2` by the #837 rule above: the same key, measured
+more precisely.
+
 ## Rationale
 
 * PlatformIO parses build output for size after every build (PIO-1's
