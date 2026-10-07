@@ -65,6 +65,11 @@ TARGET_CACHE_MOUNT ?= $(TARGET_CACHE)
 # TARGET_CACHE_MOUNT override is still in effect when a recipe expands
 # DOCKER_RUN. With := the value is baked in at parse time and check-warnings
 # would silently build into the shared target dir instead of its own.
+# One flock per target cache dir: two builds from the same CURDIR (the
+# main clone under concurrent agents) share one cache dir, and cargo
+# does not serialize across containers, so the second build used to
+# read half-written fingerprints. The lock turns that into a queue.
+GUARD_MAIN_CLONE := bash $(dir $(lastword $(MAKEFILE_LIST)))scripts/check-main-clone-build.sh
 DOCKER_ARGS = --rm \
 	--user $$(id -u):$$(id -g) \
 	-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
@@ -73,12 +78,15 @@ DOCKER_ARGS = --rm \
 	-e "EPIC_CC_GIT_SHA=$(EPIC_CC_GIT_SHA)" \
 	-v $(CURDIR):/workspace -w /workspace
 
-DOCKER_RUN = mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE_MOUNT) && docker run $(DOCKER_ARGS) $(LOCAL_IMAGE)
+DOCKER_RUN = mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE_MOUNT) && flock $(TARGET_CACHE_MOUNT)/.build.lock docker run $(DOCKER_ARGS) $(LOCAL_IMAGE)
 
-.PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check size-report
+.PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check size-report guard-main-clone
 
 bootstrap: ## First-time setup: host deps, git hooks, dev image
 	@bash scripts/bootstrap.sh
+
+guard-main-clone: ## Refuse main-clone builds while agents hold worktrees
+	@$(GUARD_MAIN_CLONE)
 
 doctor: ## Report what first-time setup is missing, change nothing
 	@bash scripts/bootstrap.sh --check-only
@@ -103,13 +111,13 @@ shell: image ## Interactive dev shell inside the container
 	@mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE_MOUNT)
 	docker run -it $(DOCKER_ARGS) $(LOCAL_IMAGE) bash
 
-exec: image ## One-off command: make exec CMD='cargo test -p asm'
+exec: guard-main-clone image ## One-off command: make exec CMD='cargo test -p asm'
 	@$(DOCKER_RUN) bash -c '$(CMD)'
 
 mdb-oracle: ## MDB execution oracle: make mdb-oracle SPEC=<name> [TIER=pr|nightly]
 	@bash scripts/mdb-oracle.sh --spec $(SPEC) --tier $(or $(TIER),pr)
 
-test: image ## Full suite (ci-test.sh, what CI runs); CRATE=asm scopes to one
+test: guard-main-clone image ## Full suite (ci-test.sh, what CI runs); CRATE=asm scopes to one
 	@$(DOCKER_RUN) bash -c '$(if $(CRATE),cargo test -p $(CRATE) --no-fail-fast,bash scripts/ci-test.sh)'
  # Menu-demo ladder inputs. Must match the hal-pic18-menu-demo-18f4550 case
  # in crates/driver/tests/size_regression_e2e.rs; size-report.py fails the
@@ -161,7 +169,7 @@ size-report: image ## Regenerate crates/driver/tests/fixtures/SIZE_REPORT.md fro
 ci-local: image ## EXACT CI, locally: docker epic-cc-ci bash scripts/ci-test.sh, run before git push (see #99)
 	@$(DOCKER_RUN) bash scripts/ci-test.sh
 
-compile: image ## Compile C to HEX and print it: FILE=x.c TARGET=p16f887
+compile: guard-main-clone image ## Compile C to HEX and print it: FILE=x.c TARGET=p16f887
 	@$(DOCKER_RUN) bash -c 'cargo run -q -p driver -- $(FILE) -o /tmp/out.hex --target $(TARGET) && cat /tmp/out.hex'
 
 info: image ## Toolchain versions + env vars from the image
