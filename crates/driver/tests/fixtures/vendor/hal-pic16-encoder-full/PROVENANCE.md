@@ -44,6 +44,17 @@ lib/serial/src/epic_serial.c
 lib/encoder/examples/example_encoder.c
 ```
 
+The `epic-encoder` sim variant (epic-cc#931) swaps the target harness for
+the sim one and links the serial-tick dispatch instead of the plain
+serial dispatch:
+
+```
+hal/pic14/core/src/epiccc/pic16_irq_dispatch_serial_tick_epiccc.c
+hal/pic14/core/src/epiccc/pic16_irq_dispatch_tiers_inc.h
+hal/pic14/16f87xa/src/mdb/pic16_harness_mdb.c
+lib/encoder/tests/sim_encoder.c
+```
+
 Plus the full `include/` tree of each of `hal/pic14/core`,
 `hal/pic14/16f87xa`, `common`, `lib/tick`, `lib/encoder`,
 `lib/serial` (headers only, copied wholesale rather than
