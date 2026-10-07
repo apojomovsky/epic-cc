@@ -7765,14 +7765,16 @@ enum FitVerdict {
 /// schedule, banking, and peephole the driver runs) and decide: ship it,
 /// repair it, or fail loudly. Over-limit unsplit functions join `force_split`
 /// (the next pass plans their chunks), over-limit chunks are re-split from
-/// real block sizes, and any page-level overflow re-places everything with
-/// the measured reals. A repair state that repeats a previous one cannot make
+/// real block sizes, page-level overflow re-places everything with the
+/// measured reals, and a backward section pin re-lays the section at the
+/// measured code end. A repair state that repeats a previous one cannot make
 /// progress, so it fails instead of oscillating.
 fn assess_fit(
     device: &Device,
     m: &Module,
     asm: &str,
     chunks: &HashMap<String, Vec<String>>,
+    table_start: usize,
     rep: &Repair,
 ) -> FitVerdict {
     // The driver's own post passes, so the measured layout is the shipped
@@ -7831,11 +7833,17 @@ fn assess_fit(
         section_base: rep.section_base,
         seen: rep.seen.clone(),
     };
-    // A backward pad means planned absolute addresses ran past the banked
-    // text: the const-section pin is the one absolute pad after the code,
-    // so re-lay the section at the furthest position any pad needed while
-    // re-placing everything else with the measured reals.
-    if let Some(at) = layout.backward_orgs.iter().map(|(_, at)| *at).max() {
+    // A backward section pin means the planned section base ran past the
+    // banked code end: re-lay the section at the measured end next pass, so
+    // the elision map and the emission agree by construction. Other backward
+    // pads (function anchors) re-place with the measured reals instead.
+    if let Some(at) = layout
+        .backward_orgs
+        .iter()
+        .filter(|(target, _)| *target == table_start)
+        .map(|(_, at)| *at)
+        .max()
+    {
         next.section_base = Some(at);
     }
     let mut replace = !layout.backward_orgs.is_empty();
@@ -9881,10 +9889,13 @@ pub fn select_with_locs(
             // the final addresses are exactly the pass-A ones and the map stays
             // exact, but only when a base's page actually changes (the common
             // case, a small drift that stays within the mapped page, needs no
-            // pin). The pin must jump forward in the final text: when banking
-            // grows the code past `table_start`, pinning back would overwrite
-            // emitted words (epic-cc#923), so the repair loop re-lays the
-            // section at the measured end instead (see `Repair::section_base`).
+            // pin). When banking grows the code past `table_start`, the pin
+            // jumps backward in the final text; that never assembles (the
+            // assembler rejects backward `.org`, epic-cc#923), but inside the
+            // repair loop a backward pin is fuel, not failure: the assess
+            // step relays its position into the next pass's `section_base`
+            // and re-lays the section there, so only backward-org-free
+            // passes ever ship.
             // A module without consts has no section to pin.
             //
             // The window-fit accounting runs at the FINAL post-banking
@@ -9924,7 +9935,7 @@ pub fn select_with_locs(
                     .iter()
                     .zip(&pages_b)
                     .any(|((_, pa), (_, pb))| pa != pb);
-                if drift && table_start >= start {
+                if drift {
                     out.push(format!("    org 0x{table_start:04X}"));
                     locs.push(None);
                     start = table_start;
@@ -10039,7 +10050,7 @@ pub fn select_with_locs(
             .iter()
             .map(|(name, plan)| (name.clone(), plan.entries.clone()))
             .collect();
-        match assess_fit(device, m, &out.join("\n"), &chunk_map, &rep) {
+        match assess_fit(device, m, &out.join("\n"), &chunk_map, table_start, &rep) {
             FitVerdict::Fit => {
                 let chunks: HashMap<String, Vec<String>> = plans
                     .into_iter()
