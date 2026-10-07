@@ -3538,6 +3538,66 @@ fn a_six_byte_copy_run_becomes_a_postinc_loop() {
 }
 
 #[test]
+fn a_w_shortcut_store_after_a_loop_run_keeps_the_source_byte() {
+    // A Bin-held byte copied out after a 6-byte staged run: the W
+    // shortcut must reload the source byte when the drain loops, or
+    // the MOVWF writes the loop-clobbered W instead (epic-cc#910).
+    let m = parse(
+        "global a i8\n\
+         global b i8\n\
+         global src i8\n\
+         global dst i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @a\n\
+             %2 = load i8 @b\n\
+             %3 = add i8 %1, %2\n\
+             memcpy @dst @src 6\n\
+             store i8 %3 @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("out", 0x22),
+        ("main::1", 0x30),
+        ("main::2", 0x31),
+        ("main::3", 0x32),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVLW 0x06"),
+        "the 6-run must still drain as a loop:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let start = start_steps(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start);
+    p.ram_mut()[0x20] = 0x11;
+    p.ram_mut()[0x21] = 0x22;
+    for i in 0..6u16 {
+        p.ram_mut()[0x100 + i as usize] = 0xA0 + i as u8;
+    }
+    p.run(400);
+    assert!(p.halted(), "program must run to completion");
+    assert_eq!(
+        p.ram()[0x22],
+        0x33,
+        "out must hold a+b, not the loop residue in W"
+    );
+    for i in 0..6u16 {
+        assert_eq!(
+            p.ram()[0x110 + i as usize],
+            0xA0 + i as u8,
+            "memcpy byte {i} must survive"
+        );
+    }
+}
+
+#[test]
 fn speed_profile_drains_long_copy_runs_straight() {
     // With `copy_loop` off (the `-O2` drain, epic-cc#883) a 12-byte run
     // stays twelve MOVFFs: the loop wins flash at roughly 3x the cycles
