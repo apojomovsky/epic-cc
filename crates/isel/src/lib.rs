@@ -7725,6 +7725,333 @@ fn rewrite_restores(func: &str, entries: &[String], lines: Vec<String>) -> Vec<S
     out
 }
 
+/// Repair passes over placement and emission before giving up loudly.
+const FIT_REPAIR_PASSES: usize = 8;
+
+/// Refined chunk content bound: real block sizes pack to this, leaving the
+/// rest of the page for the linking GOTO, banking drift between the measure
+/// and the final text, and the next chunk's slack. The repair loop backstops
+/// the margin, so it only sets convergence speed, never correctness.
+const REPACK_CONTENT_LIMIT: usize = 0x800 - 64;
+
+/// Page-fit repair state across emission passes (epic-cc#931, epic-cc#923).
+/// Placement sizes are measured in an earlier banking context than the final
+/// text (module order, no pads or links, unscheduled), so a unit that fits
+/// the plan can overflow its page after the driver's banking. Each pass
+/// measures the real final-context sizes and repairs: split an over-limit
+/// function, re-split an over-limit chunk from real block sizes, re-place
+/// with the latest reals, and re-lay the const section at the measured code
+/// end when its pin would jump backward. Empty on the first pass, so fitting
+/// programs emit byte-identical text to the unrepaired pipeline.
+#[derive(Default)]
+struct Repair {
+    force_split: HashSet<String>,
+    entries: HashMap<String, Vec<String>>,
+    func_sizes: HashMap<String, usize>,
+    chunk_sizes: HashMap<String, usize>,
+    section_base: Option<usize>,
+    seen: Vec<String>,
+}
+
+/// The repair loop's verdict on one emitted pass.
+enum FitVerdict {
+    Fit,
+    Again(Repair),
+    Broken(String),
+    NoConverge(String),
+}
+
+/// Check one emitted pass against its real final-context layout (the same
+/// schedule, banking, and peephole the driver runs) and decide: ship it,
+/// repair it, or fail loudly. Over-limit unsplit functions join `force_split`
+/// (the next pass plans their chunks), over-limit chunks are re-split from
+/// real block sizes, page-level overflow re-places everything with the
+/// measured reals, and a backward section pin re-lays the section at the
+/// measured code end. A repair state that repeats a previous one cannot make
+/// progress, so it fails instead of oscillating.
+fn assess_fit(
+    device: &Device,
+    m: &Module,
+    asm: &str,
+    chunks: &HashMap<String, Vec<String>>,
+    table_start: usize,
+    rep: &Repair,
+) -> FitVerdict {
+    // The driver's own post passes, so the measured layout is the shipped
+    // one by construction: schedule, banking, and peephole are deterministic
+    // text passes, and the driver runs them unchanged on this text.
+    let probe = post_pass(device, asm);
+    let layout = measure_fit_layout(&probe, &fit_targets(m, chunks));
+    // Label spans per extent, in text order. Non-block labels (fresh `tmpN`
+    // branch labels, the pool variant entry) sit between their owner's words,
+    // so per-block sizes fold them into the enclosing block within the same
+    // extent: another function's labels can never appear inside it, since
+    // every function entry opens its own extent.
+    let mut spans: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+    for e in &layout.extents {
+        let mut blocks: Vec<(String, usize)> = Vec::new();
+        for (i, (label, start)) in e.blocks.iter().enumerate() {
+            let end = e.blocks.get(i + 1).map(|(_, s)| *s).unwrap_or(e.end);
+            blocks.push((label.clone(), end.saturating_sub(*start)));
+        }
+        spans.insert(e.name.clone(), blocks);
+    }
+    let block_labels = |func: &str| -> Option<Vec<String>> {
+        m.funcs.iter().find(|f| f.name == func).map(|f| {
+            f.blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| block_asm_label(func, i, &b.label))
+                .collect()
+        })
+    };
+    // Same exclusions the split derivation applies: the ISR must share page
+    // 0 with `__start`, and naked bodies and runtime routines have no IR
+    // block labels to split at.
+    let splittable = |func: &str| -> bool {
+        m.funcs
+            .iter()
+            .find(|f| f.name == func)
+            .is_some_and(|f| !f.isr && !f.naked && routine_recipe(&f.name).is_none())
+    };
+    let owner_of = |name: &str| -> Option<(String, bool)> {
+        for (func, entries) in chunks {
+            if entries.iter().any(|e| e == name) {
+                return Some((func.clone(), true));
+            }
+        }
+        if m.funcs.iter().any(|f| f.name == name) {
+            return Some((name.to_string(), false));
+        }
+        None
+    };
+    let mut next = Repair {
+        force_split: rep.force_split.clone(),
+        entries: rep.entries.clone(),
+        func_sizes: HashMap::new(),
+        chunk_sizes: HashMap::new(),
+        section_base: rep.section_base,
+        seen: rep.seen.clone(),
+    };
+    // A backward section pin means the planned section base ran past the
+    // banked code end: re-lay the section at the measured end next pass, so
+    // the elision map and the emission agree by construction. Other backward
+    // pads (function anchors) re-place with the measured reals instead.
+    if let Some(at) = layout
+        .backward_orgs
+        .iter()
+        .filter(|(target, _)| *target == table_start)
+        .map(|(_, at)| *at)
+        .max()
+    {
+        next.section_base = Some(at);
+    }
+    let mut replace = !layout.backward_orgs.is_empty();
+    let mut refines: Vec<String> = Vec::new();
+    for e in &layout.extents {
+        if e.end <= e.start {
+            continue;
+        }
+        let last = e.end - 1;
+        if !e.has_branch || last / 0x800 == e.start / 0x800 {
+            continue;
+        }
+        let size = e.end - e.start;
+        let Some((owner, split)) = owner_of(&e.name) else {
+            return FitVerdict::Broken(format!(
+                "isel: page-fit repair cannot place extent {} (0x{:04X}-0x{last:04X}): no owning function",
+                e.name, e.start
+            ));
+        };
+        if size <= 0x800 {
+            // Fits a page alone: its page-mates grew around it. Re-place.
+            replace = true;
+            continue;
+        }
+        if !split {
+            if splittable(&owner) {
+                next.force_split.insert(owner);
+            } else {
+                return FitVerdict::Broken(format!(
+                    "isel: page-fit repair cannot split @{owner} of {size} words"
+                ));
+            }
+            continue;
+        }
+        refines.push(owner);
+    }
+    if replace {
+        // Re-place every unit with its measured real: functions by name,
+        // chunks by entry label. Refined chunks get refiner sizes below.
+        for e in &layout.extents {
+            if e.end <= e.start {
+                continue;
+            }
+            if chunks.values().any(|es| es.contains(&e.name)) {
+                next.chunk_sizes
+                    .entry(e.name.clone())
+                    .or_insert(e.end - e.start);
+            } else if m.funcs.iter().any(|f| f.name == e.name) {
+                next.func_sizes.insert(e.name.clone(), e.end - e.start);
+            }
+        }
+    }
+    for owner in &refines {
+        let Some(labels) = block_labels(owner) else {
+            return FitVerdict::Broken(format!(
+                "isel: page-fit repair cannot re-split @{owner}: no IR blocks"
+            ));
+        };
+        // Fold interior non-block labels (fresh `tmpN` branch labels, the
+        // pool variant entry) into their enclosing IR block: within one of
+        // the owner's extents they can only hold the owner's words.
+        let set: HashSet<&str> = labels.iter().map(String::as_str).collect();
+        let mut sizes: HashMap<String, usize> = HashMap::new();
+        let empty: Vec<(String, usize)> = Vec::new();
+        for extent in chunks.get(owner).iter().flat_map(|es| es.iter()) {
+            let mut cur: Option<String> = None;
+            let mut acc = 0usize;
+            for (label, span) in spans.get(extent).unwrap_or(&empty) {
+                if set.contains(label.as_str()) {
+                    if let Some(prev) = cur.take() {
+                        sizes.insert(prev, acc);
+                    }
+                    cur = Some(label.clone());
+                    acc = *span;
+                } else if cur.is_some() {
+                    acc += *span;
+                }
+            }
+            if let Some(prev) = cur.take() {
+                if let Some(prior) = sizes.remove(&prev) {
+                    acc += prior;
+                }
+                sizes.insert(prev, acc);
+            }
+        }
+        for label in &labels {
+            if !sizes.contains_key(label) {
+                return FitVerdict::Broken(format!(
+                    "isel: block {label} of @{owner} missing from the final text"
+                ));
+            }
+        }
+        let (entries, chunk_sizes) = repack_entries(owner, &labels, &sizes);
+        if let Some(old) = chunks.get(owner) {
+            for entry in old {
+                next.chunk_sizes.remove(entry);
+            }
+        }
+        next.entries.insert(owner.clone(), entries);
+        next.chunk_sizes.extend(chunk_sizes);
+    }
+    if next.force_split == rep.force_split
+        && next.entries == rep.entries
+        && next.section_base == rep.section_base
+        && !replace
+    {
+        return FitVerdict::Fit;
+    }
+    let mut keys: Vec<String> = next.force_split.iter().cloned().collect();
+    keys.sort();
+    let mut entry_keys: Vec<(&String, &Vec<String>)> = next.entries.iter().collect();
+    entry_keys.sort();
+    for (func, entries) in entry_keys {
+        keys.push(format!("{func}={}", entries.join(",")));
+    }
+    let mut size_keys: Vec<(&String, &usize)> = next.func_sizes.iter().collect();
+    size_keys.sort();
+    for (name, size) in size_keys {
+        keys.push(format!("{name}={size}"));
+    }
+    let mut chunk_keys: Vec<(&String, &usize)> = next.chunk_sizes.iter().collect();
+    chunk_keys.sort();
+    for (entry, size) in chunk_keys {
+        keys.push(format!("{entry}={size}"));
+    }
+    if let Some(base) = next.section_base {
+        keys.push(format!("secbase=0x{base:04X}"));
+    }
+    let fingerprint = keys.join(";");
+    if rep.seen.contains(&fingerprint) {
+        return FitVerdict::NoConverge(format!(
+            "isel: page-fit repair did not converge (placement oscillates): {fingerprint}"
+        ));
+    }
+    next.seen.push(fingerprint);
+    FitVerdict::Again(next)
+}
+
+/// Re-split one function from real final-context block sizes: the greedy
+/// packing `chunk_entries` does, but over measured words instead of a
+/// differently-banked plan, and to a tighter bound that leaves headroom for
+/// the next pass's drift. Returns the entries plus each chunk's placement
+/// size (content with the linking GOTO and slack the placer reserves). A lone
+/// block past one page stays a precise error: no GOTO can split straight-line
+/// code, whatever the context measures.
+fn repack_entries(
+    func: &str,
+    block_labels: &[String],
+    sizes: &HashMap<String, usize>,
+) -> (Vec<String>, HashMap<String, usize>) {
+    let mut sizes_ordered: Vec<(String, usize)> = Vec::new();
+    for label in block_labels {
+        let size = sizes.get(label).copied().unwrap_or(0);
+        if size > 0x800 {
+            panic!(
+                "isel: function @{func} block {label} of {size} words exceeds a 2048-word page (0x800): a single block cannot span pages"
+            );
+        }
+        sizes_ordered.push((label.clone(), size));
+    }
+    if sizes_ordered.is_empty() {
+        panic!("isel: function @{func} has no block labels to split across pages");
+    }
+    let mut chunks: Vec<Vec<(String, usize)>> = vec![Vec::new()];
+    let mut acc = 0usize;
+    for (label, size) in &sizes_ordered {
+        if acc + *size > REPACK_CONTENT_LIMIT && acc > 0 {
+            chunks.push(Vec::new());
+            acc = 0;
+        }
+        chunks
+            .last_mut()
+            .expect("repack always holds an open chunk")
+            .push((label.clone(), *size));
+        acc += *size;
+    }
+    let mut entries: Vec<String> = Vec::new();
+    let mut chunk_sizes: HashMap<String, usize> = HashMap::new();
+    let n = chunks.len();
+    for (k, chunk) in chunks.iter().enumerate() {
+        let entry = chunk[0].0.clone();
+        let content: usize = chunk.iter().map(|(_, s)| *s).sum();
+        // Same reserves the placer applies to planned chunks: the linking
+        // GOTO's words plus banking slack around it, and the unproven-entry
+        // slack for non-first chunks.
+        let mut size = content;
+        if k + 1 < n {
+            size += 5;
+        }
+        if k > 0 {
+            size += 2;
+        }
+        entries.push(entry.clone());
+        chunk_sizes.insert(entry, size);
+    }
+    (entries, chunk_sizes)
+}
+
+/// The driver's post-isel text passes as one function: schedule, banking,
+/// then peephole. The repair loop measures this output, and the driver runs
+/// the same passes on the shipped text, so the measurement is exact.
+fn post_pass(device: &Device, asm: &str) -> String {
+    peephole::optimize(&banking::assign_banks(
+        device,
+        &schedule::schedule(device, asm),
+    ))
+}
+
 /// Whether a banked line occupies a flash word, the `word_size` rule one
 /// line at a time so the chunk walk counts exactly what placement counts.
 fn line_is_word(raw: &str) -> bool {
@@ -7829,23 +8156,43 @@ pub fn verify_page_fit(m: &Module, asm: &str) {
     verify_page_fit_split(m, asm, &HashMap::new());
 }
 
-/// `verify_page_fit` plus cross-page chunks (epic-cc#841): each chunk
-/// entry in `chunks` (function name to ordered chunk entry labels, the
-/// same map `select_with_locs` returns) opens its own checked extent, so
-/// a split function passes chunk by chunk while everything else keeps
-/// the single-extent rule. The linking GOTOs land exactly on entries.
-pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec<String>>) {
-    let funcs: Vec<&str> = m.funcs.iter().map(|f| f.name.as_str()).collect();
-    // `__read_<name>` / `__read_<name>_hi` reader entries: CALL targets of
-    // `PAGE(__read_*)` sets, so each must lie inside one page too.
-    let mut readers: Vec<String> = Vec::new();
+/// One checked extent in the final text: a function, a split chunk, `__start`,
+/// a reader entry, or a staging routine. `blocks` records every label seen
+/// while the extent is open with the word address each sits at, so repair can
+/// re-derive per-block sizes without re-reading the text.
+struct FitExtent {
+    name: String,
+    start: usize,
+    end: usize,
+    has_branch: bool,
+    blocks: Vec<(String, usize)>,
+}
+
+/// The final text's layout for page-fit decisions: every checked extent plus
+/// each `.org` that jumps backward (the assembler's own failure, which the
+/// straddle check alone cannot see).
+struct FitLayout {
+    extents: Vec<FitExtent>,
+    backward_orgs: Vec<(usize, usize)>,
+}
+
+/// Labels that open their own checked extent: every function, `__start`, the
+/// const-table reader entries (CALL targets of `PAGE(__read_*)` sets), the
+/// staging routines, and the cross-page chunk entries. Shared by the verifier
+/// and the repair loop so the two can never disagree on what an extent is.
+fn fit_targets(m: &Module, chunks: &HashMap<String, Vec<String>>) -> HashSet<String> {
+    let mut targets: HashSet<String> = HashSet::new();
+    targets.insert("__start".to_string());
+    for f in &m.funcs {
+        targets.insert(f.name.clone());
+    }
     for g in &m.globals {
         if g.is_const {
-            readers.push(format!("__read_{}", g.name));
+            targets.insert(format!("__read_{}", g.name));
             if g.bytes.len() >= 256 {
                 let n_chunks = ((g.bytes.len() + 255) / 256).max(2);
                 for c in 1..n_chunks {
-                    readers.push(if c == 1 {
+                    targets.insert(if c == 1 {
                         format!("__read_{}_hi", g.name)
                     } else {
                         format!("__read_{}_hi{c}", g.name)
@@ -7854,24 +8201,32 @@ pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec
             }
         }
     }
-    let mut org = 0usize;
-    let mut cur: Option<(String, usize, bool)> = None;
-    // A straddle fails only with a branch inside: every CALL sets its own
-    // page, RETURN needs none, and sequential execution increments the
-    // full PC across boundaries, so a branchless extent (a staging routine,
-    // a reader entry) runs correctly on either page. A GOTO relies on the
-    // ambient PCLATH matching its target's page, which a straddle breaks.
-    let check = |name: &str, s: usize, e: usize, has_branch: bool| {
-        if e <= s {
-            return; // empty extent (a label with no words before the next target)
+    for entries in chunks.values() {
+        for entry in entries {
+            targets.insert(entry.clone());
         }
-        let last = e - 1;
-        if has_branch && last / 0x800 != s / 0x800 {
-            panic!(
-                "isel: post-banking page-fit failure: {name} spans pages (0x{s:04X}-0x{last:04X}): the banking pass grew it across a page boundary; its label resolves to page {} while its tail sits in page {}",
-                s / 0x800,
-                last / 0x800
-            );
+    }
+    targets
+}
+
+/// Walk the final text with the assembler's pass-1 semantics (`.org` jumps,
+/// `.align N` pads, labels/`equ`/`.table`/`list`/`radix`/`end` emit none)
+/// and record every checked extent from its opening target label to the next
+/// one (or the program end). A straddle fails only with a branch inside, so
+/// `has_branch` tracks GOTOs per extent; block starts let repair re-derive
+/// per-block sizes. Mirrors the walk `verify_page_fit_split` always ran, so
+/// the verifier and the repair loop measure the same layout by construction.
+fn measure_fit_layout(asm: &str, targets: &HashSet<String>) -> FitLayout {
+    let mut layout = FitLayout {
+        extents: Vec::new(),
+        backward_orgs: Vec::new(),
+    };
+    let mut org = 0usize;
+    let mut cur: Option<FitExtent> = None;
+    let close = |cur: &mut Option<FitExtent>, end: usize, layout: &mut FitLayout| {
+        if let Some(mut e) = cur.take() {
+            e.end = end;
+            layout.extents.push(e);
         }
     };
     for raw in asm.lines() {
@@ -7881,10 +8236,10 @@ pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec
         }
         if let Some(rest) = line.strip_prefix("org ") {
             let target = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
-            if let Some((name, s, b)) = &cur {
-                check(name, *s, target, *b);
+            close(&mut cur, target, &mut layout);
+            if target < org {
+                layout.backward_orgs.push((target, org));
             }
-            cur = None;
             org = target;
             continue;
         }
@@ -7895,23 +8250,23 @@ pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec
             let name = l.trim().to_string();
             // Staging routines (`__stage_<const>`, the per-site RAM copies)
             // open their own extents: without a boundary their words would
-            // accrue to the previous function. Branchless extents may still
-            // straddle (see `check`); prefix-matched since isel emits no
-            // other `__stage_` labels.
-            let is_target = funcs.contains(&name.as_str())
-                || name == "__start"
-                || readers.contains(&name)
-                || name.starts_with("__stage_")
-                || chunks.values().any(|entries| entries.contains(&name));
-            if is_target {
-                if let Some((prev, s, b)) = &cur {
-                    check(prev, *s, org, *b);
-                }
-                cur = Some((name, org, false));
+            // accrue to the previous function. Prefix-matched since isel
+            // emits no other `__stage_` labels.
+            if targets.contains(&name) || name.starts_with("__stage_") {
+                close(&mut cur, org, &mut layout);
+                cur = Some(FitExtent {
+                    name: name.clone(),
+                    start: org,
+                    end: org,
+                    has_branch: false,
+                    blocks: vec![(name, org)],
+                });
+            } else if let Some(e) = cur.as_mut() {
+                // Internal (block) labels keep the current target's extent
+                // open: the words after them still belong to the function
+                // whose label opened the extent.
+                e.blocks.push((name, org));
             }
-            // Internal (block) labels keep the current target's extent open:
-            // the words after them still belong to the function whose label
-            // opened the extent.
             continue;
         }
         if line.contains(" equ ") {
@@ -7927,21 +8282,41 @@ pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec
             // straddle a page boundary (reads are 256-byte-window based, not
             // page based, the reader's computed jump reaches across), so the
             // reader entry's extent must END here, not include the table.
-            if let Some((name, s, b)) = &cur {
-                check(name, *s, org, *b);
-            }
-            cur = None;
+            close(&mut cur, org, &mut layout);
             continue;
         }
         if line.starts_with("GOTO ") || line.starts_with("goto ") {
-            if let Some((_, _, b)) = cur.as_mut() {
-                *b = true;
+            if let Some(e) = cur.as_mut() {
+                e.has_branch = true;
             }
         }
         org += 1;
     }
-    if let Some((name, s, b)) = &cur {
-        check(name, *s, org, *b);
+    close(&mut cur, org, &mut layout);
+    layout
+}
+
+/// `verify_page_fit` plus cross-page chunks (epic-cc#841): each chunk
+/// entry in `chunks` (function name to ordered chunk entry labels, the
+/// same map `select_with_locs` returns) opens its own checked extent, so
+/// a split function passes chunk by chunk while everything else keeps
+/// the single-extent rule. The linking GOTOs land exactly on entries.
+pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec<String>>) {
+    let targets = fit_targets(m, chunks);
+    for e in &measure_fit_layout(asm, &targets).extents {
+        if e.end <= e.start {
+            continue; // empty extent (a label with no words before the next target)
+        }
+        let last = e.end - 1;
+        if e.has_branch && last / 0x800 != e.start / 0x800 {
+            panic!(
+                "isel: post-banking page-fit failure: {} spans pages (0x{:04X}-0x{last:04X}): the banking pass grew it across a page boundary; its label resolves to page {} while its tail sits in page {}",
+                e.name,
+                e.start,
+                e.start / 0x800,
+                last / 0x800
+            );
+        }
     }
 }
 
@@ -9010,632 +9385,627 @@ pub fn select_with_locs(
             post.insert(prev.clone(), org - s);
         }
     }
-    // Cross-page functions (epic-cc#841): a function past one page is no
-    // longer always an error. Whole-program sim mains genuinely exceed it
-    // with no inlining involved, so each is re-emitted with PCLATH sets
-    // before internal GOTOs, planned into page-sized chunks, and placed
-    // chunk by chunk below. Naked bodies and runtime routines keep the
-    // precise error (no IR block labels to split at); the ISR keeps its
-    // page-0 assert in placement (it must share page 0 with `__start`).
-    let mut split_set: HashSet<String> = HashSet::new();
-    for (name, size) in &post {
-        if *size <= 0x800 {
-            continue;
+    let pre_len = out.len();
+    let pre_loc_len = locs.len();
+    let mut rep = Repair::default();
+    for _pass in 0..FIT_REPAIR_PASSES {
+        out.truncate(pre_len);
+        locs.truncate(pre_loc_len);
+        for (name, size) in &rep.func_sizes {
+            post.insert(name.clone(), *size);
         }
-        // `post` also measures `__start`, which is placed with the ISR,
-        // never alone: only module functions split.
-        let Some(f) = order.iter().find(|f| &f.name == name) else {
-            continue;
-        };
-        // The ISR keeps its page-0 assert in placement below (it must
-        // share page 0 with `__start`, so spanning never applies to it).
-        if f.isr {
-            continue;
-        }
-        if f.naked || routine_recipe(&f.name).is_some() {
-            panic!("isel: function @{name} of {size} words exceeds a 2048-word page (0x800)");
-        }
-        split_set.insert(name.clone());
-    }
-    // Pass A2: split members are re-emitted raw with the split discipline
-    // plus goto sets, measured through a second whole-text banking, and
-    // planned there. Pass B emits the raw text, so the driver's banking is
-    // the single pass that banks it: banking twice in different contexts
-    // re-inserts BANKSELs around already-selected PCLATH sets, growing
-    // chunks past placement. Downstream deltas are elided restores
-    // (shrink-only) and links plus entry proofs, both reserved below.
-    let mut plans: HashMap<String, SplitPlan> = HashMap::new();
-    let mut raw_final: HashMap<String, (Vec<String>, Vec<Option<SrcLoc>>)> = HashMap::new();
-    if !split_set.is_empty() {
-        let mut tmp2 = 0u32;
-        let mut a2_raw: HashMap<String, (Vec<String>, Vec<Option<SrcLoc>>)> = HashMap::new();
-        for f in &order {
-            if !split_set.contains(&f.name) {
+        // Cross-page functions (epic-cc#841): a function past one page is no
+        // longer always an error. Whole-program sim mains genuinely exceed it
+        // with no inlining involved, so each is re-emitted with PCLATH sets
+        // before internal GOTOs, planned into page-sized chunks, and placed
+        // chunk by chunk below. Naked bodies and runtime routines keep the
+        // precise error (no IR block labels to split at); the ISR keeps its
+        // page-0 assert in placement (it must share page 0 with `__start`).
+        let mut split_set: HashSet<String> = HashSet::new();
+        for (name, size) in &post {
+            if *size <= 0x800 {
                 continue;
             }
-            let mut g = Gen {
-                m,
-                addrs,
-                device,
-                staged: &staged,
-                pool: &pool,
-                resolved: &resolved,
-                prov: prov.clone(),
-                scratch,
-                retval_lo,
-                cur_func: &f.name,
-                bool_temps: HashSet::new(),
-                tmp: &mut tmp2,
-                page_of: None,
-                pool_log: false,
-                pool_slots: HashSet::new(),
-                split: &split_set,
-                global_addrs: &global_addrs,
-                w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
-                w_holds: None,
-                use_count: HashMap::new(),
-                deferred_store: None,
-                deferred_uses: 0,
-                z_rel: None,
-                cur_loc: None,
-                out: Vec::new(),
-                locs: Vec::new(),
+            // `post` also measures `__start`, which is placed with the ISR,
+            // never alone: only module functions split.
+            let Some(f) = order.iter().find(|f| &f.name == name) else {
+                continue;
             };
-            emit_func_body(&mut g, f);
-            let (set_lines, set_locs) = insert_goto_sets(&g.out, &g.locs);
-            a2_raw.insert(f.name.clone(), (set_lines, set_locs));
-        }
-        // Second whole-text banking with the A2 bodies swapped in, sliced
-        // per member for chunking. Entries then retarget restores on the
-        // raw text (same word count, sizes unaffected).
-        let mut measure2 = measure.clone();
-        for (i, (name, _)) in bodies.iter().enumerate() {
-            if let Some((lines, _)) = a2_raw.get(name) {
-                measure2[body_at[i]] = lines.join("\n");
-            }
-        }
-        let banked2 = banking::assign_banks(device, &measure2.join("\n"));
-        for f in &order {
-            if !split_set.contains(&f.name) {
+            // The ISR keeps its page-0 assert in placement below (it must
+            // share page 0 with `__start`, so spanning never applies to it).
+            if f.isr {
                 continue;
             }
-            let slice = slice_banked_lines(&banked2, &f.name, &func_names);
-            let block_labels: Vec<String> = f
-                .blocks
-                .iter()
-                .enumerate()
-                .map(|(i, b)| block_asm_label(&f.name, i, &b.label))
-                .collect();
-            let entries = chunk_entries(&f.name, &block_labels, &slice);
-            let (raw_lines, raw_locs) = a2_raw
-                .remove(&f.name)
-                .expect("isel: A2 body missing for split member");
-            let final_lines = rewrite_restores(&f.name, &entries, raw_lines);
-            post.insert(f.name.clone(), word_size(&slice));
-            let locs = vec![None; slice.len()];
-            plans.insert(
-                f.name.clone(),
-                SplitPlan {
-                    entries: entries.clone(),
-                    lines: slice,
-                    locs,
-                },
-            );
-            raw_final.insert(f.name.clone(), (final_lines, raw_locs));
-        }
-    }
-    // Bin-packing page assignment over every function's post-banking size,
-    // in emission order, first-fit: each function goes to the LOWEST-numbered
-    // page with room for it. The greedy next-fit only considered the current
-    // page, so a page tail was wasted whenever the next function was even
-    // slightly too large, even when a later small function could fill it;
-    // first-fit reuses those tails (a small function later in the module
-    // lands in an earlier page's tail, and the program uses fewer pages).
-    // The running word address starts after the page-0 prefix: the reset
-    // vector, the module asm, and the `__start` body plus init (counted in
-    // `page_next` below, epic-cc#207), with `__start` at the top so the
-    // reset GOTO (PCLATH = 0) always reaches it. With an ISR the vector
-    // owns word 4: the ISR is pinned there, `__start` follows it, and the
-    // ISR must fit page 0 AND leave `__start` reachable, else panics.
-    // First-fit place one page-fitting unit (a function or a split chunk),
-    // returning its (page, start). Shared so chunks pack exactly like
-    // functions: lowest fitting tail, else a new page under the device
-    // bound (docs/39 D-1, epic-cc#398).
-    fn place_unit(
-        device: &Device,
-        page_next: &mut Vec<usize>,
-        name: &str,
-        size: usize,
-    ) -> (usize, usize) {
-        for (pi, next) in page_next.iter_mut().enumerate() {
-            if *next + size <= (pi + 1) * 0x800 {
-                let start = *next;
-                *next += size;
-                return (pi, start);
-            }
-        }
-        let pi = page_next.len();
-        let num_pages = device.flash_words.div_ceil(0x800);
-        let last_page = num_pages - 1;
-        if pi as u32 >= num_pages {
-            panic!(
-                "isel: function @{name} would start at 0x{:04X}, beyond page {last_page} (device flash is {:#06x} words)",
-                pi * 0x800,
-                device.flash_words
-            );
-        }
-        let start = pi * 0x800;
-        page_next.push(start + size);
-        (pi, start)
-    }
-    let mut pages: HashMap<String, usize> = HashMap::new();
-    let mut pads: HashMap<String, usize> = HashMap::new();
-    // Split chunks live here: entry label to (page, start). Chunk 0's
-    // entry is the function label, whose page `pages` also carries for
-    // external callers.
-    let mut chunk_at: HashMap<String, (usize, usize)> = HashMap::new();
-    let init_words = start_init_words(m, addrs);
-    let mut page_next: Vec<usize> = vec![if has_isr {
-        4
-    } else {
-        5 + word_size(&modasm_lines) + init_words
-    }];
-    for (name, _) in &bodies {
-        let size = post[name];
-        if has_isr && name == isr_names[0] {
-            assert!(
-                4 + size + 4 + init_words <= 0x800,
-                "isel: isr @{name} of {size} words does not fit page 0 (0x004-0x7FF) with room for the reset __start"
-            );
-            pages.insert(name.clone(), 0);
-            pads.insert(name.clone(), 4);
-            // `size` is the ISR's post-banking body extent (label to the
-            // `__start` label); the 4-word `__start` body and its init copy
-            // loop follow it (epic-cc#207).
-            page_next[0] = 4 + size + 4 + init_words;
-        } else if let Some(plan) = plans.get(name) {
-            // Each chunk packs like a function, plus two bounded reserves.
-            // The emitted link is 3 raw words; the driver's banking may add
-            // up to a FULL BANKSEL (2 words) around its MOVWF, so 5 bounds
-            // it. A non-first entry gains the linking GOTO as a predecessor
-            // the measure lacked, unproving at most one FULL BANKSEL (2
-            // words) there. First entries keep no slack: their CALL
-            // predecessors match in both bankings.
-            let parts = plan_parts(plan);
-            for (k, (entry, lines, _)) in parts.iter().enumerate() {
-                let link = if k + 1 < parts.len() { 5 } else { 0 };
-                let slack = if k > 0 { 2 } else { 0 };
-                let size = word_size(lines) + link + slack;
-                let (page, start) = place_unit(device, &mut page_next, name, size);
-                if k == 0 {
-                    pages.insert(name.clone(), page);
-                }
-                chunk_at.insert(entry.clone(), (page, start));
-                if start & 0x7FF == 0 {
-                    pads.insert(entry.clone(), start);
-                }
-            }
-        } else {
-            if size > 0x800 {
+            if f.naked || routine_recipe(&f.name).is_some() {
                 panic!("isel: function @{name} of {size} words exceeds a 2048-word page (0x800)");
             }
-            // First-fit: the lowest page whose tail fits this function.
-            let (page, start) = place_unit(device, &mut page_next, name, size);
-            pages.insert(name.clone(), page);
-            // The anchor: a function whose start is page-aligned gets an
-            // explicit `.org` pad: both the new-page case and the
-            // exact-boundary continuation (the previous function's size
-            // hit the boundary precisely, so the strict fit check alone
-            // would emit no pad). Without it, pass B's same-page restore
-            // elision shrinks the previous function and slides this one
-            // below the boundary into a straddle: its label resolves to the
-            // LOWER page while its later words sit in the upper one, so
-            // intra-function GOTOs (PAGE(<func>) from the label) misbranch.
-            if start & 0x7FF == 0 {
-                pads.insert(name.clone(), start);
+            split_set.insert(name.clone());
+        }
+        // Repair carries forward: functions the last pass measured over a
+        // page join the split set, with their re-derived entries below.
+        split_set.extend(rep.force_split.iter().cloned());
+        split_set.extend(rep.entries.keys().cloned());
+        // Pass A2: split members are re-emitted raw with the split discipline
+        // plus goto sets, measured through a second whole-text banking, and
+        // planned there. Pass B emits the raw text, so the driver's banking is
+        // the single pass that banks it: banking twice in different contexts
+        // re-inserts BANKSELs around already-selected PCLATH sets, growing
+        // chunks past placement. Downstream deltas are elided restores
+        // (shrink-only) and links plus entry proofs, both reserved below.
+        let mut plans: HashMap<String, SplitPlan> = HashMap::new();
+        let mut raw_final: HashMap<String, (Vec<String>, Vec<Option<SrcLoc>>)> = HashMap::new();
+        if !split_set.is_empty() {
+            let mut tmp2 = 0u32;
+            let mut a2_raw: HashMap<String, (Vec<String>, Vec<Option<SrcLoc>>)> = HashMap::new();
+            for f in &order {
+                if !split_set.contains(&f.name) {
+                    continue;
+                }
+                let mut g = Gen {
+                    m,
+                    addrs,
+                    device,
+                    staged: &staged,
+                    pool: &pool,
+                    resolved: &resolved,
+                    prov: prov.clone(),
+                    scratch,
+                    retval_lo,
+                    cur_func: &f.name,
+                    bool_temps: HashSet::new(),
+                    tmp: &mut tmp2,
+                    page_of: None,
+                    pool_log: false,
+                    pool_slots: HashSet::new(),
+                    split: &split_set,
+                    global_addrs: &global_addrs,
+                    w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
+                    w_holds: None,
+                    use_count: HashMap::new(),
+                    deferred_store: None,
+                    deferred_uses: 0,
+                    z_rel: None,
+                    cur_loc: None,
+                    out: Vec::new(),
+                    locs: Vec::new(),
+                };
+                emit_func_body(&mut g, f);
+                let (set_lines, set_locs) = insert_goto_sets(&g.out, &g.locs);
+                a2_raw.insert(f.name.clone(), (set_lines, set_locs));
+            }
+            // Second whole-text banking with the A2 bodies swapped in, sliced
+            // per member for chunking. Entries then retarget restores on the
+            // raw text (same word count, sizes unaffected).
+            let mut measure2 = measure.clone();
+            for (i, (name, _)) in bodies.iter().enumerate() {
+                if let Some((lines, _)) = a2_raw.get(name) {
+                    measure2[body_at[i]] = lines.join("\n");
+                }
+            }
+            let banked2 = banking::assign_banks(device, &measure2.join("\n"));
+            for f in &order {
+                if !split_set.contains(&f.name) {
+                    continue;
+                }
+                let slice = slice_banked_lines(&banked2, &f.name, &func_names);
+                let block_labels: Vec<String> = f
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| block_asm_label(&f.name, i, &b.label))
+                    .collect();
+                // Repair overrides the planned entries with ones re-derived
+                // from real final-context block sizes; the raw lines split at
+                // the same block labels either way.
+                let entries = rep
+                    .entries
+                    .get(&f.name)
+                    .cloned()
+                    .unwrap_or_else(|| chunk_entries(&f.name, &block_labels, &slice));
+                let (raw_lines, raw_locs) = a2_raw
+                    .remove(&f.name)
+                    .expect("isel: A2 body missing for split member");
+                let final_lines = rewrite_restores(&f.name, &entries, raw_lines);
+                post.insert(f.name.clone(), word_size(&slice));
+                let locs = vec![None; slice.len()];
+                plans.insert(
+                    f.name.clone(),
+                    SplitPlan {
+                        entries: entries.clone(),
+                        lines: slice,
+                        locs,
+                    },
+                );
+                raw_final.insert(f.name.clone(), (final_lines, raw_locs));
             }
         }
-    }
-    // Const-table readers: the page PCLATH holds after each `__read_*` CALL
-    // (see `reader_pages`). The section sits right after the last function:
-    // pass B pins it to this same start, so the pages hold in the final text.
-    let mut consts: Vec<&ir::Global> = m
-        .globals
-        .iter()
-        .filter(|g| g.is_const && !addrs.contains_key(&g.name))
-        .collect();
-    // Pooled chunks table exactly like per-const tables from here on:
-    // reader pages, chunking, the collision guard, and both emission
-    // passes all reuse the per-const path (epic-cc#815).
-    let pool_globals = pool.globals();
-    consts.extend(pool_globals.iter());
-    consts.sort_by_key(|g| g.name.clone());
-    let table_start = page_next
-        .last()
-        .copied()
-        .unwrap_or(if has_isr { 4 } else { 5 });
-    // Staged routines change size under banking (BANKSELs in, redundant
-    // PCLATH sets out), and the section model must carry the post-banking
-    // lengths before pass B: its same-page elision consults the reader page
-    // map below, which is wrong when the model misses hundreds of routine
-    // words (epic-cc#844). Banking and peephole see instruction sequences,
-    // never addresses, and every routine opens with a label reset, so one
-    // banking of the pass-A text plus the nominal section measures the exact
-    // growths the final text will show.
-    let staged_len: HashMap<String, usize> = if consts.iter().any(|g| staged.contains(&g.name)) {
-        let nominal = place_consts(&consts, staged, &HashMap::new(), table_start);
-        let (sec_text, _) = emit_const_section(&consts, staged, addrs, scratch, &nominal);
-        let mut m2 = measure.clone();
-        m2.push(sec_text.join("\n"));
-        let banked = banking::assign_banks(device, &m2.join("\n"));
-        let peeped = peephole::optimize(&banked);
-        let (stage_actual, reader_actual) = measure_section_units(&peeped);
-        for (entry, words) in &reader_actual {
-            assert!(
-                *words == 6,
-                "isel: const reader {entry} is {words} words post-banking, not 6"
-            );
-        }
-        let mut lens = HashMap::new();
-        for g in &consts {
-            if staged.contains(&g.name) {
-                lens.insert(
-                    g.name.clone(),
-                    stage_actual.get(&g.name).copied().unwrap_or_else(|| {
-                        panic!(
-                            "isel: staged routine __stage_{} missing from the banked text",
-                            g.name
-                        )
-                    }),
+        // Bin-packing page assignment over post-banking sizes, in emission
+        // order, first-fit: each unit goes to the LOWEST-numbered page with
+        // room, so later small functions fill tails a greedy pass would
+        // waste. The page-0 base counts the reset vector, module asm, and
+        // `__start` plus init (epic-cc#207); with an ISR the vector owns
+        // word 4 and `__start` follows it. `place_unit` packs one unit
+        // (function or chunk) into the lowest fitting tail, else a new page
+        // under the device flash bound (docs/39 D-1, epic-cc#398).
+        fn place_unit(
+            device: &Device,
+            page_next: &mut Vec<usize>,
+            name: &str,
+            size: usize,
+        ) -> (usize, usize) {
+            for (pi, next) in page_next.iter_mut().enumerate() {
+                if *next + size <= (pi + 1) * 0x800 {
+                    let start = *next;
+                    *next += size;
+                    return (pi, start);
+                }
+            }
+            let pi = page_next.len();
+            let num_pages = device.flash_words.div_ceil(0x800);
+            let last_page = num_pages - 1;
+            if pi as u32 >= num_pages {
+                panic!(
+                    "isel: function @{name} would start at 0x{:04X}, beyond page {last_page} (device flash is {:#06x} words)",
+                    pi * 0x800,
+                    device.flash_words
                 );
             }
+            let start = pi * 0x800;
+            page_next.push(start + size);
+            (pi, start)
         }
-        lens
-    } else {
-        HashMap::new()
-    };
-    for (entry, page) in reader_pages(&consts, staged, &staged_len, table_start) {
-        pages.insert(entry, page);
-    }
-    // Pool log variant (epic-cc#817): emitted inside the callee's own
-    // extent, so it shares the callee's page and routed same-page calls
-    // elide the restore. Absent without the pool, like the variant.
-    if !pool.chunks.is_empty() {
-        if let Some(&p) = pages.get(LOG_POOL_CALLEE) {
-            pages.insert(LOG_POOL_VARIANT.to_string(), p);
+        let mut pages: HashMap<String, usize> = HashMap::new();
+        let mut pads: HashMap<String, usize> = HashMap::new();
+        // Split chunks live here: entry label to (page, start). Chunk 0's
+        // entry is the function label, whose page `pages` also carries for
+        // external callers.
+        let mut chunk_at: HashMap<String, (usize, usize)> = HashMap::new();
+        let init_words = start_init_words(m, addrs);
+        let mut page_next: Vec<usize> = vec![if has_isr {
+            4
+        } else {
+            5 + word_size(&modasm_lines) + init_words
+        }];
+        for (name, _) in &bodies {
+            let size = post[name];
+            if has_isr && name == isr_names[0] {
+                assert!(
+                    4 + size + 4 + init_words <= 0x800,
+                    "isel: isr @{name} of {size} words does not fit page 0 (0x004-0x7FF) with room for the reset __start"
+                );
+                pages.insert(name.clone(), 0);
+                pads.insert(name.clone(), 4);
+                // `size` is the ISR's post-banking body extent (label to the
+                // `__start` label); the 4-word `__start` body and its init copy
+                // loop follow it (epic-cc#207).
+                page_next[0] = 4 + size + 4 + init_words;
+            } else if let Some(plan) = plans.get(name) {
+                // Each chunk packs like a function, plus two bounded reserves.
+                // The emitted link is 3 raw words; the driver's banking may add
+                // up to a FULL BANKSEL (2 words) around its MOVWF, so 5 bounds
+                // it. A non-first entry gains the linking GOTO as a predecessor
+                // the measure lacked, unproving at most one FULL BANKSEL (2
+                // words) there. First entries keep no slack: their CALL
+                // predecessors match in both bankings.
+                let parts = plan_parts(plan);
+                for (k, (entry, lines, _)) in parts.iter().enumerate() {
+                    let link = if k + 1 < parts.len() { 5 } else { 0 };
+                    let slack = if k > 0 { 2 } else { 0 };
+                    // Repair sizes measured chunks in the final context
+                    // instead of re-estimating them from the plan.
+                    let size = rep
+                        .chunk_sizes
+                        .get(entry)
+                        .copied()
+                        .unwrap_or(word_size(lines) + link + slack);
+                    let (page, start) = place_unit(device, &mut page_next, name, size);
+                    if k == 0 {
+                        pages.insert(name.clone(), page);
+                    }
+                    chunk_at.insert(entry.clone(), (page, start));
+                    if start & 0x7FF == 0 {
+                        pads.insert(entry.clone(), start);
+                    }
+                }
+            } else {
+                if size > 0x800 {
+                    panic!(
+                        "isel: function @{name} of {size} words exceeds a 2048-word page (0x800)"
+                    );
+                }
+                // First-fit: the lowest page whose tail fits this function.
+                let (page, start) = place_unit(device, &mut page_next, name, size);
+                pages.insert(name.clone(), page);
+                // The anchor: a page-aligned start gets an explicit `.org`
+                // pad, for new pages and exact-boundary continuations alike.
+                // Without it, pass-B restore elision shrinks the previous
+                // function and slides this one across the boundary into a
+                // straddle, and its PAGE(<func>) GOTOs misbranch.
+                if start & 0x7FF == 0 {
+                    pads.insert(name.clone(), start);
+                }
+            }
         }
-    }
-    // ---- PASS B: emit the final text with every function's page known.
-    // Same-page calls (and same-page const reads) skip the restore pair; the
-    // pages are the assignment's, and the `.org` pads pin the page bases, so
-    // the elision cannot move a function off its assigned page (it only
-    // shrinks bodies, page-membership-stable).
-    //
-    // Emission is in PAGE order, not module order: bin packing can place a
-    // later function in an earlier page's tail, so module-order emission
-    // would emit a backward `.org` (a page-0 function after a page-1 one):
-    // the assembler panics on backward `.org`. Within a page, functions keep
-    // their emission order (the page's running address is monotonic).
-    // Split chunks join page order as their own units: a chunk may sit on
-    // any page, and page order (not module order) keeps `.org` monotonic.
-    enum EmitUnit<'a> {
-        Func(&'a ir::Func, &'a str),
-        Chunk(&'a str, usize),
-    }
-    let mut page_order: Vec<Vec<EmitUnit>> = Vec::new();
-    for (f, (name, _)) in order.iter().zip(&bodies) {
-        if plans.contains_key(name) {
-            for (k, entry) in plans[name].entries.iter().enumerate() {
-                let (page, _) = chunk_at[entry];
+        // Const-table readers: the page PCLATH holds after each `__read_*` CALL
+        // (see `reader_pages`). The section sits right after the last function:
+        // pass B pins it to this same start, so the pages hold in the final text.
+        let mut consts: Vec<&ir::Global> = m
+            .globals
+            .iter()
+            .filter(|g| g.is_const && !addrs.contains_key(&g.name))
+            .collect();
+        // Pooled chunks table exactly like per-const tables from here on:
+        // reader pages, chunking, the collision guard, and both emission
+        // passes all reuse the per-const path (epic-cc#815).
+        let pool_globals = pool.globals();
+        consts.extend(pool_globals.iter());
+        consts.sort_by_key(|g| g.name.clone());
+        // Repair re-lays the section at the measured code end when the pin
+        // would jump backward: the elision map is recomputed here from the
+        // same base, so it stays exact for the re-emission.
+        let table_start = rep
+            .section_base
+            .or(page_next.last().copied())
+            .unwrap_or(if has_isr { 4 } else { 5 });
+        // Staged routines change size under banking (BANKSELs in, redundant
+        // PCLATH sets out), and the section model must carry the post-banking
+        // lengths before pass B: its same-page elision consults the reader page
+        // map below, which is wrong when the model misses hundreds of routine
+        // words (epic-cc#844). Banking and peephole see instruction sequences,
+        // never addresses, and every routine opens with a label reset, so one
+        // banking of the pass-A text plus the nominal section measures the exact
+        // growths the final text will show.
+        let staged_len: HashMap<String, usize> = if consts.iter().any(|g| staged.contains(&g.name))
+        {
+            let nominal = place_consts(&consts, staged, &HashMap::new(), table_start);
+            let (sec_text, _) = emit_const_section(&consts, staged, addrs, scratch, &nominal);
+            let mut m2 = measure.clone();
+            m2.push(sec_text.join("\n"));
+            let banked = banking::assign_banks(device, &m2.join("\n"));
+            let peeped = peephole::optimize(&banked);
+            let (stage_actual, reader_actual) = measure_section_units(&peeped);
+            for (entry, words) in &reader_actual {
+                assert!(
+                    *words == 6,
+                    "isel: const reader {entry} is {words} words post-banking, not 6"
+                );
+            }
+            let mut lens = HashMap::new();
+            for g in &consts {
+                if staged.contains(&g.name) {
+                    lens.insert(
+                        g.name.clone(),
+                        stage_actual.get(&g.name).copied().unwrap_or_else(|| {
+                            panic!(
+                                "isel: staged routine __stage_{} missing from the banked text",
+                                g.name
+                            )
+                        }),
+                    );
+                }
+            }
+            lens
+        } else {
+            HashMap::new()
+        };
+        for (entry, page) in reader_pages(&consts, staged, &staged_len, table_start) {
+            pages.insert(entry, page);
+        }
+        // Pool log variant (epic-cc#817): emitted inside the callee's own
+        // extent, so it shares the callee's page and routed same-page calls
+        // elide the restore. Absent without the pool, like the variant.
+        if !pool.chunks.is_empty() {
+            if let Some(&p) = pages.get(LOG_POOL_CALLEE) {
+                pages.insert(LOG_POOL_VARIANT.to_string(), p);
+            }
+        }
+        // ---- PASS B: emit the final text with every function's page known.
+        // Same-page calls and const reads skip the restore pair; the `.org`
+        // pads pin the page bases, so elision only shrinks bodies in place.
+        // Emission is in PAGE order, not module order (a tail-placed later
+        // function would otherwise emit a backward `.org`), with split
+        // chunks as their own units.
+        enum EmitUnit<'a> {
+            Func(&'a ir::Func, &'a str),
+            Chunk(&'a str, usize),
+        }
+        let mut page_order: Vec<Vec<EmitUnit>> = Vec::new();
+        for (f, (name, _)) in order.iter().zip(&bodies) {
+            if plans.contains_key(name) {
+                for (k, entry) in plans[name].entries.iter().enumerate() {
+                    let (page, _) = chunk_at[entry];
+                    while page_order.len() <= page {
+                        page_order.push(Vec::new());
+                    }
+                    page_order[page].push(EmitUnit::Chunk(name, k));
+                }
+            } else {
+                let page = pages[name];
                 while page_order.len() <= page {
                     page_order.push(Vec::new());
                 }
-                page_order[page].push(EmitUnit::Chunk(name, k));
+                page_order[page].push(EmitUnit::Func(f, name));
             }
-        } else {
-            let page = pages[name];
-            while page_order.len() <= page {
-                page_order.push(Vec::new());
-            }
-            page_order[page].push(EmitUnit::Func(f, name));
         }
-    }
-    let section_start = {
-        let mut tmp = 0u32;
-        let mut addr_b: usize = if has_isr { 4 } else { 5 };
-        for funcs_on_page in &page_order {
-            for unit in funcs_on_page {
-                match unit {
-                    EmitUnit::Chunk(func, k) => {
-                        // Emit the raw final text (goto sets in, restores
-                        // retargeted), split at the planned entries: the
-                        // driver's whole-text banking is the single pass
-                        // that banks it. The link carries execution (and
-                        // PCLATH) to the next chunk, wherever it sits; each
-                        // non-final chunk ends with one unconditionally, so
-                        // no chunk layout can fall into the wrong page.
-                        let plan = &plans[*func];
-                        let (raw_lines, raw_locs) = &raw_final[*func];
-                        let parts = split_at_entries(&plan.entries, raw_lines, raw_locs);
-                        let (entry, lines, chunk_locs) = &parts[*k];
-                        if let Some(pad) = pads.get(entry) {
-                            out.push(format!("    org 0x{pad:04X}"));
-                            locs.push(None);
-                            addr_b = *pad;
+        let section_start = {
+            let mut tmp = 0u32;
+            let mut addr_b: usize = if has_isr { 4 } else { 5 };
+            for funcs_on_page in &page_order {
+                for unit in funcs_on_page {
+                    match unit {
+                        EmitUnit::Chunk(func, k) => {
+                            // Emit the raw final text (goto sets in, restores
+                            // retargeted), split at the planned entries: the
+                            // driver's whole-text banking is the single pass
+                            // that banks it. The link carries execution (and
+                            // PCLATH) to the next chunk, wherever it sits; each
+                            // non-final chunk ends with one unconditionally, so
+                            // no chunk layout can fall into the wrong page.
+                            let plan = &plans[*func];
+                            let (raw_lines, raw_locs) = &raw_final[*func];
+                            let parts = split_at_entries(&plan.entries, raw_lines, raw_locs);
+                            let (entry, lines, chunk_locs) = &parts[*k];
+                            if let Some(pad) = pads.get(entry) {
+                                out.push(format!("    org 0x{pad:04X}"));
+                                locs.push(None);
+                                addr_b = *pad;
+                            }
+                            addr_b += word_size(lines);
+                            out.extend(lines.iter().cloned());
+                            locs.extend(chunk_locs.iter().cloned());
+                            if *k + 1 < parts.len() {
+                                let next = &plan.entries[*k + 1];
+                                out.push(format!("    MOVLW PAGE({next})"));
+                                locs.push(None);
+                                out.push("    MOVWF PCLATH".to_string());
+                                locs.push(None);
+                                out.push(format!("    GOTO {next}"));
+                                locs.push(None);
+                                addr_b += 3;
+                            }
                         }
-                        addr_b += word_size(lines);
-                        out.extend(lines.iter().cloned());
-                        locs.extend(chunk_locs.iter().cloned());
-                        if *k + 1 < parts.len() {
-                            let next = &plan.entries[*k + 1];
-                            out.push(format!("    MOVLW PAGE({next})"));
-                            locs.push(None);
-                            out.push("    MOVWF PCLATH".to_string());
-                            locs.push(None);
-                            out.push(format!("    GOTO {next}"));
-                            locs.push(None);
-                            addr_b += 3;
-                        }
-                    }
-                    EmitUnit::Func(f, name) => {
-                        let mut g = Gen {
-                            m,
-                            addrs,
-                            device,
-                            staged: &staged,
-                            pool: &pool,
-                            resolved: &resolved,
-                            prov: prov.clone(),
-                            scratch,
-                            retval_lo,
-                            cur_func: &f.name,
-                            bool_temps: HashSet::new(),
-                            tmp: &mut tmp,
-                            page_of: Some(&pages),
-                            pool_log: false,
-                            pool_slots: HashSet::new(),
-                            split: &split_set,
-                            global_addrs: &global_addrs,
-                            w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
-                            w_holds: None,
-                            use_count: HashMap::new(),
-                            deferred_store: None,
-                            deferred_uses: 0,
-                            z_rel: None,
-                            cur_loc: None,
-                            out: Vec::new(),
-                            locs: Vec::new(),
-                        };
-                        emit_func_body(&mut g, f);
-                        if let Some(pad) = pads.get(*name) {
-                            out.push(format!("    org 0x{pad:04X}"));
-                            locs.push(None);
-                            addr_b = *pad;
-                        }
-                        addr_b += word_size(&g.out);
-                        out.extend(g.out);
-                        locs.extend(g.locs);
-                        if f.isr {
-                            // `__start` moves after the ISR (the vector owns word 4):
-                            // the reset GOTO at word 0 still reaches it, since it stays in
-                            // page 0 per the ISR fit check above.
-                            let mut init: Vec<String> = Vec::new();
-                            for g in &m.globals {
-                                if addrs.contains_key(&g.name) && g.needs_ram_init() {
-                                    let base = addrs[&g.name];
-                                    for (i, b) in g.bytes.iter().enumerate() {
-                                        // A ref byte materializes its address half
-                                        // from the alloc map for RAM targets, else
-                                        // the link-time label literal; the raw byte
-                                        // is a placeholder zero (epic-cc#454). This
-                                        // must match the measure-pass twin above, or
-                                        // word counts agree while values differ.
-                                        if let Some((_, f, a)) =
-                                            g.refs.iter().find(|(o, _, _)| *o == i)
-                                        {
+                        EmitUnit::Func(f, name) => {
+                            let mut g = Gen {
+                                m,
+                                addrs,
+                                device,
+                                staged: &staged,
+                                pool: &pool,
+                                resolved: &resolved,
+                                prov: prov.clone(),
+                                scratch,
+                                retval_lo,
+                                cur_func: &f.name,
+                                bool_temps: HashSet::new(),
+                                tmp: &mut tmp,
+                                page_of: Some(&pages),
+                                pool_log: false,
+                                pool_slots: HashSet::new(),
+                                split: &split_set,
+                                global_addrs: &global_addrs,
+                                w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
+                                w_holds: None,
+                                use_count: HashMap::new(),
+                                deferred_store: None,
+                                deferred_uses: 0,
+                                z_rel: None,
+                                cur_loc: None,
+                                out: Vec::new(),
+                                locs: Vec::new(),
+                            };
+                            emit_func_body(&mut g, f);
+                            if let Some(pad) = pads.get(*name) {
+                                out.push(format!("    org 0x{pad:04X}"));
+                                locs.push(None);
+                                addr_b = *pad;
+                            }
+                            addr_b += word_size(&g.out);
+                            out.extend(g.out);
+                            locs.extend(g.locs);
+                            if f.isr {
+                                // `__start` moves after the ISR (the vector owns word 4):
+                                // the reset GOTO at word 0 still reaches it, since it stays in
+                                // page 0 per the ISR fit check above.
+                                let mut init: Vec<String> = Vec::new();
+                                for g in &m.globals {
+                                    if addrs.contains_key(&g.name) && g.needs_ram_init() {
+                                        let base = addrs[&g.name];
+                                        for (i, b) in g.bytes.iter().enumerate() {
+                                            // A ref byte materializes its address half
+                                            // from the alloc map for RAM targets, else
+                                            // the link-time label literal; the raw byte
+                                            // is a placeholder zero (epic-cc#454). This
+                                            // must match the measure-pass twin above, or
+                                            // word counts agree while values differ.
+                                            if let Some((_, f, a)) =
+                                                g.refs.iter().find(|(o, _, _)| *o == i)
+                                            {
+                                                init.push(format!(
+                                                    "    MOVLW {}",
+                                                    ref_byte_operand(addrs, i, f, *a)
+                                                ));
+                                            } else {
+                                                init.push(format!("    MOVLW 0x{b:02X}"));
+                                            }
                                             init.push(format!(
-                                                "    MOVLW {}",
-                                                ref_byte_operand(addrs, i, f, *a)
+                                                "    MOVWF 0x{:02X}",
+                                                base + i as u16
                                             ));
-                                        } else {
-                                            init.push(format!("    MOVLW 0x{b:02X}"));
                                         }
-                                        init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
                                     }
                                 }
+                                let mut blk: Vec<String> = vec![
+                                    "__start:".to_string(),
+                                    "    MOVLW PAGE(main)".to_string(),
+                                    "    MOVWF PCLATH".to_string(),
+                                ];
+                                let init_len = init.len();
+                                blk.extend(init);
+                                blk.extend([
+                                    "    CALL main".to_string(),
+                                    "    SLEEP".to_string(),
+                                    "".to_string(),
+                                ]);
+                                let blk_len = blk.len();
+                                out.extend(blk);
+                                locs.extend(std::iter::repeat(None).take(blk_len));
+                                addr_b += 4 + init_len;
                             }
-                            let mut blk: Vec<String> = vec![
-                                "__start:".to_string(),
-                                "    MOVLW PAGE(main)".to_string(),
-                                "    MOVWF PCLATH".to_string(),
-                            ];
-                            let init_len = init.len();
-                            blk.extend(init);
-                            blk.extend([
-                                "    CALL main".to_string(),
-                                "    SLEEP".to_string(),
-                                "".to_string(),
-                            ]);
-                            let blk_len = blk.len();
-                            out.extend(blk);
-                            locs.extend(std::iter::repeat(None).take(blk_len));
-                            addr_b += 4 + init_len;
                         }
                     }
                 }
             }
-        }
-        // Pin the const-table section to its pass-A `table_start` whenever
-        // the pass-B elision would move a reader base across a page
-        // boundary. `reader_pages` maps every reader entry's page from the
-        // pass-A position, but pass B emits the tables at the post-elision
-        // position (bodies only shrink, so the section shifts earlier): a
-        // chunked table's `.align 256` can then round a base across a page
-        // boundary (a base pass A aligned to exactly k*0x800 re-aligns into
-        // page k-1 after a 2-word elision), silently invalidating the
-        // restore-skip map: a caller that skipped its restore on the mapped
-        // page is left with the reader's HIGH(<base>) page, the drifted one,
-        // and its next GOTO misbranches. The `.org` re-pins the section so
-        // the final addresses are exactly the pass-A ones and the map stays
-        // exact, but only when a base's page actually changes (the common
-        // case, a small drift that stays within the mapped page, needs no
-        // pin). It is always forward (or equal): pass-B bodies are no
-        // larger, so `addr_b <= table_start`. A module without consts has no
-        // section to pin.
-        //
-        // The window-fit accounting runs at the FINAL post-banking
-        // position: bank + peephole the emitted text exactly as the
-        // driver will and measure its end, so the fold sees the
-        // assembler's org, not an estimate. The old `addr_b + growth`
-        // estimate missed the const-reader regions (their bodies + RETLW
-        // data follow the code): without them every reader CALL left the
-        // bank UNKNOWN and banking over-inserted BANKSELs, over-estimating
-        // the end (epic-cc#151).
-        let mut start = addr_b;
-        if !consts.is_empty() {
-            // Append placeholder reader bodies (a `RETLW` exit) so the
-            // regions resolve like the real text's; the analysis keys on
-            // operand banks, never the literal addresses. The measurement
-            // stops at the first reader.
-            let mut code_text = out.join("\n");
-            for g in &consts {
-                code_text.push_str("\n__read_");
-                code_text.push_str(&g.name);
-                code_text.push_str(
-                    ":\n    MOVWF 0x70\n    MOVLW 0x00\n    MOVWF PCLATH\n    MOVF 0x70, W\n    ADDLW 0x00\n    MOVWF PCL\n    RETLW 0x00",
-                );
-            }
-            let banked = banking::assign_banks(device, &code_text);
-            let peeped = peephole::optimize(&banked);
-            start = measure_end_org(&peeped);
-            // The pin decision must compare the map against the ACTUAL
-            // emission position `start` (post-banking), not the
-            // pre-banking `addr_b`: growth can push a base across a page
-            // boundary that neither pass-A nor `addr_b` cross. Checking
-            // at `start` is conservative (start >= addr_b, and a pin
-            // re-anchors to the map-consistent `table_start`).
-            let pages_a = reader_pages(&consts, staged, &staged_len, table_start);
-            let pages_b = reader_pages(&consts, staged, &staged_len, start);
-            let drift = pages_a
-                .iter()
-                .zip(&pages_b)
-                .any(|((_, pa), (_, pb))| pa != pb);
-            if drift {
-                out.push(format!("    org 0x{table_start:04X}"));
-                locs.push(None);
-                start = table_start;
-            }
-        }
-        start
-    };
-    // Const (flash) globals become RETLW tables, emitted after the
-    // functions so the CALLs above resolve. Every `__read_<name>` reader
-    // sets PCLATH = HIGH(<name>) first: the computed `ADDLW LOW(<name>);
-    // MOVWF PCL` jump lands at PCLATH:PCL, so a table in a nonzero 256-byte
-    // window needs the window set (an earlier reader leaves PCLATH stale).
-    // A table of 256+ bytes is emitted as two 256-byte
-    // chunks: chunk 0's 256 RETLWs at the base label `<name>` (`.align 256`
-    // pads it to a 256-word boundary so LOW(<name>) == 0), then chunk 1's
-    // RETLWs at the fresh label `<name>_1` IMMEDIATELY after: `<name>` +
-    // 256 in the address space, so LOW(<name>_1) == 0 too and the true
-    // bound is 511 bytes (a table of exactly 256 bytes has an empty chunk
-    // 1, unreachable since its valid indices are 0..255), then the
-    // `__read_<name>_hi` entry AFTER the
-    // table (its computed-goto jumps into the table; the entry instructions
-    // are dead after MOVWF PCL). A `.table <name> <size>` directive is
-    // emitted immediately before every table's base label; the assembler
-    // enforces the window fit (LOW + size <= 0x100 for single-entry
-    // tables, LOW == 0 for chunked bases): a table that crosses its window
-    // or a misaligned chunk base would silently misread, so it must fail
-    // assembly, not miscompile. Tables beyond 511 bytes (three chunks)
-    // panic: out of scope.
-    // Label-collision guard: every label a table emits, its base label, its
-    // reader entry, and for chunked tables the fresh `{name}_1` chunk label
-    // and `__read_{name}_hi` entry, must be unique across all consts. A
-    // user `const t_1` (or `const __read_t_hi`) next to a chunked `const t`
-    // would emit a duplicate label the assembler's symbol insert silently
-    // overwrites (wrong reads, no error): panics instead.
-    {
-        let mut labels: HashMap<String, String> = HashMap::new();
-        for g in &consts {
-            let mut claim = |label: String, what: String| {
-                if let Some(prev) = labels.insert(label.clone(), what.clone()) {
-                    panic!(
-                        "isel: const-table label collision: `{label}` is both {prev} and {what}"
+            // Pin the section to pass-A `table_start` when elision would move
+            // a reader base across a page boundary, keeping the restore-skip
+            // map exact. The end is measured post-banking like the driver
+            // sees it (epic-cc#151), never estimated. A backward pin never
+            // assembles (epic-cc#923); in the repair loop it is fuel, relayed
+            // into the next pass's `section_base`, so only clean passes ship.
+            // A module without consts has no section to pin.
+            let mut start = addr_b;
+            if !consts.is_empty() {
+                // Append placeholder reader bodies (a `RETLW` exit) so the
+                // regions resolve like the real text's; the analysis keys on
+                // operand banks, never the literal addresses. The measurement
+                // stops at the first reader.
+                let mut code_text = out.join("\n");
+                for g in &consts {
+                    code_text.push_str("\n__read_");
+                    code_text.push_str(&g.name);
+                    code_text.push_str(
+                        ":\n    MOVWF 0x70\n    MOVLW 0x00\n    MOVWF PCLATH\n    MOVF 0x70, W\n    ADDLW 0x00\n    MOVWF PCL\n    RETLW 0x00",
                     );
                 }
-            };
-            claim(
-                format!("__read_{}", g.name),
-                format!("reader entry of const {}", g.name),
-            );
-            claim(g.name.clone(), format!("base label of const {}", g.name));
-            if staged.contains(&g.name) {
-                claim(
-                    format!("__stage_{}", g.name),
-                    format!("staging routine of const {}", g.name),
-                );
+                let banked = banking::assign_banks(device, &code_text);
+                let peeped = peephole::optimize(&banked);
+                start = measure_end_org(&peeped);
+                // The pin decision must compare the map against the ACTUAL
+                // emission position `start` (post-banking), not the
+                // pre-banking `addr_b`: growth can push a base across a page
+                // boundary that neither pass-A nor `addr_b` cross. Checking
+                // at `start` is conservative (start >= addr_b, and a pin
+                // re-anchors to the map-consistent `table_start`).
+                let pages_a = reader_pages(&consts, staged, &staged_len, table_start);
+                let pages_b = reader_pages(&consts, staged, &staged_len, start);
+                let drift = pages_a
+                    .iter()
+                    .zip(&pages_b)
+                    .any(|((_, pa), (_, pb))| pa != pb);
+                if drift {
+                    out.push(format!("    org 0x{table_start:04X}"));
+                    locs.push(None);
+                    start = table_start;
+                }
             }
-            // Chunk count matches the emitter: a 256-byte table still emits
-            // the empty chunk 1 + `_hi` reader.
-            let n_chunks = if g.bytes.len() >= 256 {
-                ((g.bytes.len() + 255) / 256).max(2)
-            } else {
-                1
-            };
-            for c in 1..n_chunks {
+            start
+        };
+        // Const globals become RETLW tables after the functions. Each reader
+        // sets PCLATH = HIGH(base) before its computed jump; the assembler
+        // enforces the window fit and fails loudly on a crossing table.
+        // Chunked tables align chunk 0 with `_1`/`_hi` right after. Every
+        // emitted label must be unique across consts, or the assembler would
+        // silently overwrite a colliding one: panics instead.
+        {
+            let mut labels: HashMap<String, String> = HashMap::new();
+            for g in &consts {
+                let mut claim = |label: String, what: String| {
+                    if let Some(prev) = labels.insert(label.clone(), what.clone()) {
+                        panic!(
+                            "isel: const-table label collision: `{label}` is both {prev} and {what}"
+                        );
+                    }
+                };
                 claim(
-                    if c == 1 {
-                        format!("{}_1", g.name)
-                    } else {
-                        format!("{}_{}", g.name, c)
-                    },
-                    format!("chunk-{c} label of const {}", g.name),
+                    format!("__read_{}", g.name),
+                    format!("reader entry of const {}", g.name),
                 );
-                claim(
-                    if c == 1 {
-                        format!("__read_{}_hi", g.name)
-                    } else {
-                        format!("__read_{}_hi{}", g.name, c)
-                    },
-                    format!("chunk-{c} reader entry of const {}", g.name),
-                );
+                claim(g.name.clone(), format!("base label of const {}", g.name));
+                if staged.contains(&g.name) {
+                    claim(
+                        format!("__stage_{}", g.name),
+                        format!("staging routine of const {}", g.name),
+                    );
+                }
+                // Chunk count matches the emitter: a 256-byte table still emits
+                // the empty chunk 1 + `_hi` reader.
+                let n_chunks = if g.bytes.len() >= 256 {
+                    ((g.bytes.len() + 255) / 256).max(2)
+                } else {
+                    1
+                };
+                for c in 1..n_chunks {
+                    claim(
+                        if c == 1 {
+                            format!("{}_1", g.name)
+                        } else {
+                            format!("{}_{}", g.name, c)
+                        },
+                        format!("chunk-{c} label of const {}", g.name),
+                    );
+                    claim(
+                        if c == 1 {
+                            format!("__read_{}_hi", g.name)
+                        } else {
+                            format!("__read_{}_hi{}", g.name, c)
+                        },
+                        format!("chunk-{c} reader entry of const {}", g.name),
+                    );
+                }
+            }
+            // Pool log variant (epic-cc#817): its entry label shares the
+            // namespace, so a user const with the same name fails here,
+            // not as a silent assembler overwrite.
+            if !pool.chunks.is_empty() && m.funcs.iter().any(|f| f.name == LOG_POOL_CALLEE) {
+                if let Some(prev) = labels.insert(
+                    LOG_POOL_VARIANT.to_string(),
+                    "pool log variant entry".to_string(),
+                ) {
+                    panic!(
+                        "isel: const-table label collision: `{}` is both {prev} and pool log variant entry",
+                        LOG_POOL_VARIANT
+                    );
+                }
             }
         }
-        // Pool log variant (epic-cc#817): its entry label shares the
-        // namespace, so a user const with the same name fails here,
-        // not as a silent assembler overwrite.
-        if !pool.chunks.is_empty() && m.funcs.iter().any(|f| f.name == LOG_POOL_CALLEE) {
-            if let Some(prev) = labels.insert(
-                LOG_POOL_VARIANT.to_string(),
-                "pool log variant entry".to_string(),
-            ) {
-                panic!(
-                    "isel: const-table label collision: `{}` is both {prev} and pool log variant entry",
-                    LOG_POOL_VARIANT
-                );
+        let places = place_consts(&consts, staged, &staged_len, section_start);
+        let (sec_out, sec_locs) = emit_const_section(&consts, staged, addrs, scratch, &places);
+        out.extend(sec_out);
+        locs.extend(sec_locs);
+        // The model is exact by construction (measured routine lengths, pinned
+        // readers, folded windows), so this re-banking must agree with it word
+        // for word; a disagreement panics here, never as a silent miscompile.
+        if !consts.is_empty() {
+            let banked = banking::assign_banks(device, &out.join("\n"));
+            let peeped = peephole::optimize(&banked);
+            verify_section_model(&places, &peeped);
+        }
+        out.push("    end".to_string());
+        locs.push(None);
+        let chunk_map: HashMap<String, Vec<String>> = plans
+            .iter()
+            .map(|(name, plan)| (name.clone(), plan.entries.clone()))
+            .collect();
+        match assess_fit(device, m, &out.join("\n"), &chunk_map, table_start, &rep) {
+            FitVerdict::Fit => {
+                let chunks: HashMap<String, Vec<String>> = plans
+                    .into_iter()
+                    .map(|(name, plan)| (name, plan.entries))
+                    .collect();
+                return (out.join("\n"), locs, chunks);
+            }
+            FitVerdict::Again(next) => {
+                rep = next;
+            }
+            FitVerdict::Broken(msg) => {
+                verify_page_fit_split(m, &post_pass(device, &out.join("\n")), &chunk_map);
+                panic!("{msg}");
+            }
+            FitVerdict::NoConverge(msg) => {
+                panic!("{msg}");
             }
         }
     }
-    let places = place_consts(&consts, staged, &staged_len, section_start);
-    let (sec_out, sec_locs) = emit_const_section(&consts, staged, addrs, scratch, &places);
-    out.extend(sec_out);
-    locs.extend(sec_locs);
-    // The model is exact by construction (measured routine lengths, pinned
-    // readers, folded windows), so this re-banking must agree with it word
-    // for word; a disagreement panics here, never as a silent miscompile.
-    if !consts.is_empty() {
-        let banked = banking::assign_banks(device, &out.join("\n"));
-        let peeped = peephole::optimize(&banked);
-        verify_section_model(&places, &peeped);
-    }
-    out.push("    end".to_string());
-    locs.push(None);
-    let chunks: HashMap<String, Vec<String>> = plans
-        .into_iter()
-        .map(|(name, plan)| (name, plan.entries))
-        .collect();
-    (out.join("\n"), locs, chunks)
+    panic!("isel: page-fit repair did not converge after {FIT_REPAIR_PASSES} passes");
 }
 
 /// `parse_map` lives in `iselcore` now: it is a plain text-format parser

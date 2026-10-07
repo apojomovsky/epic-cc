@@ -170,6 +170,10 @@ FILES = [
         "hal/pic14/16f87xa/src/core/pic16_irq_table.c",
     ),
     (
+        "hal-pic16-encoder-full/hal/pic14/16f87xa/src/mdb/pic16_harness_mdb.c",
+        "hal/pic14/16f87xa/src/mdb/pic16_harness_mdb.c",
+    ),
+    (
         "hal-pic16-encoder-full/hal/pic14/core/include/core/pic14_irq_common.h",
         "hal/pic14/core/include/core/pic14_irq_common.h",
     ),
@@ -238,6 +242,14 @@ FILES = [
         "hal/pic14/core/src/epiccc/pic16_irq_dispatch_epiccc.c",
     ),
     (
+        "hal-pic16-encoder-full/hal/pic14/core/src/epiccc/pic16_irq_dispatch_serial_tick_epiccc.c",
+        "hal/pic14/core/src/epiccc/pic16_irq_dispatch_serial_tick_epiccc.c",
+    ),
+    (
+        "hal-pic16-encoder-full/hal/pic14/core/src/epiccc/pic16_irq_dispatch_tiers_inc.h",
+        "hal/pic14/core/src/epiccc/pic16_irq_dispatch_tiers_inc.h",
+    ),
+    (
         "hal-pic16-encoder-full/hal/pic14/core/src/epiccc/pic16_isr_vector.c",
         "hal/pic14/core/src/epiccc/pic16_isr_vector.c",
     ),
@@ -264,6 +276,10 @@ FILES = [
     (
         "hal-pic16-encoder-full/lib/encoder/examples/example_encoder.c",
         "lib/encoder/examples/example_encoder.c",
+    ),
+    (
+        "hal-pic16-encoder-full/lib/encoder/tests/sim_encoder.c",
+        "lib/encoder/tests/sim_encoder.c",
     ),
     (
         "hal-pic16-encoder-full/lib/encoder/include/encoder.h",
