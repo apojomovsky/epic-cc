@@ -10,6 +10,7 @@ device = { path = "../device" }
 banking = { path = "../banking" }
 iselcore = { path = "../iselcore" }
 peephole = { path = "../peephole" }
+schedule = { path = "../schedule" }
 
 [dev-dependencies]
 alloc = { path = "../alloc" }
