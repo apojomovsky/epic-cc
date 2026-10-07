@@ -162,7 +162,7 @@ ram_bytes = 326
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 9332
+flash_words = 9311
 ram_bytes = 781
 
 [[entry]]
@@ -222,5 +222,5 @@ ram_bytes = 339
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
 profile = "O2"
-flash_words = 10914
+flash_words = 10916
 ram_bytes = 818

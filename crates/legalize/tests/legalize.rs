@@ -714,6 +714,70 @@ fn fills_memcpy_struct_copy_callback_candidates() {
     );
 }
 
+/// A callback flowing into an ISR-read global through an UNINLINED `Init(&h)`
+/// helper (epic-cc#918): the caller stores the callback into a local alloca
+/// while the callee memcpys its param into the storage, so neither the
+/// same-function alloca scan nor the handle-global scan sees the edge. Left
+/// unresolved, the tick callback missed the ISR site's candidate list and
+/// the first Timer2 tick trapped in the no-match loop. Resolving the feed
+/// one hop through the call edge duplicates the callback and scopes the
+/// site to the copy.
+#[test]
+fn fills_uninlined_init_memcpy_callback_candidates() {
+    let m = parse(
+        "global g_storage i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %h = alloca 4\n\
+             %f1 = gep %h +2\n\
+             store i16 @cb %f1\n\
+             call void @init(i16 %h)\n\
+             ret void\n\
+         fn init(void) (p=i16)\n\
+           block entry:\n\
+             memcpy @g_storage %p 4\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %p = gep @g_storage +2\n\
+             %1 = load i16 %p\n\
+             call void @1()\n\
+             ret void\n\
+         fn cb(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    assert!(
+        m2.funcs.iter().any(|f| f.name == "cb_isr"),
+        "cb_isr missing: the cross-function memcpy edge was not detected"
+    );
+    let isr = m2.funcs.iter().find(|f| f.name == "isr").unwrap();
+    let call = isr
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .expect("isr call");
+    assert_eq!(call.callees, vec!["cb_isr".to_string()]);
+    let main = m2.funcs.iter().find(|f| f.name == "main").unwrap();
+    let main_store = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Store(s) => Some(s),
+            _ => None,
+        })
+        .expect("main store");
+    assert_eq!(
+        main_store.val,
+        ir::Val::Global("cb_isr".to_string()),
+        "caller's alloca-field store must point at the _isr copy"
+    );
+}
+
 /// A callback that flows into an ISR-read global through a handle GLOBAL
 /// memcpy'd whole-object inside an Init helper (the HAL `Init(&h)` idiom
 /// with the handle as a file-scope static, epic-cc#484): main stores the

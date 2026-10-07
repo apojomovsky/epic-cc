@@ -315,6 +315,18 @@ impl<'m> Gen<'m> {
     /// decision and destroy the belief it was about to reuse.
     fn emit_w_store(&mut self, addr: u16) {
         if self.w_holds != Some(addr) {
+            // The MOVWF writes W's current byte, but resolving the operand
+            // and pushing the line both drain staged copies first, and the
+            // loop drain loads its count into W. Flush while the belief
+            // still names W's source and reload when the drain took it
+            // (epic-cc#910); straight replays leave W alone, so the check
+            // below passes and the copy run keeps coalescing.
+            if let Some(held) = self.w_holds {
+                self.flush_copies();
+                if self.w_holds != Some(held) {
+                    self.emit_w_load(held, false);
+                }
+            }
             let (a, f) = self.operand(addr);
             let bank = if a == 0 { "A" } else { "B" };
             self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
