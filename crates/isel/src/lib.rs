@@ -9519,23 +9519,14 @@ pub fn select_with_locs(
                 raw_final.insert(f.name.clone(), (final_lines, raw_locs));
             }
         }
-        // Bin-packing page assignment over every function's post-banking size,
-        // in emission order, first-fit: each function goes to the LOWEST-numbered
-        // page with room for it. The greedy next-fit only considered the current
-        // page, so a page tail was wasted whenever the next function was even
-        // slightly too large, even when a later small function could fill it;
-        // first-fit reuses those tails (a small function later in the module
-        // lands in an earlier page's tail, and the program uses fewer pages).
-        // The running word address starts after the page-0 prefix: the reset
-        // vector, the module asm, and the `__start` body plus init (counted in
-        // `page_next` below, epic-cc#207), with `__start` at the top so the
-        // reset GOTO (PCLATH = 0) always reaches it. With an ISR the vector
-        // owns word 4: the ISR is pinned there, `__start` follows it, and the
-        // ISR must fit page 0 AND leave `__start` reachable, else panics.
-        // First-fit place one page-fitting unit (a function or a split chunk),
-        // returning its (page, start). Shared so chunks pack exactly like
-        // functions: lowest fitting tail, else a new page under the device
-        // bound (docs/39 D-1, epic-cc#398).
+        // Bin-packing page assignment over post-banking sizes, in emission
+        // order, first-fit: each unit goes to the LOWEST-numbered page with
+        // room, so later small functions fill tails a greedy pass would
+        // waste. The page-0 base counts the reset vector, module asm, and
+        // `__start` plus init (epic-cc#207); with an ISR the vector owns
+        // word 4 and `__start` follows it. `place_unit` packs one unit
+        // (function or chunk) into the lowest fitting tail, else a new page
+        // under the device flash bound (docs/39 D-1, epic-cc#398).
         fn place_unit(
             device: &Device,
             page_next: &mut Vec<usize>,
@@ -9625,15 +9616,11 @@ pub fn select_with_locs(
                 // First-fit: the lowest page whose tail fits this function.
                 let (page, start) = place_unit(device, &mut page_next, name, size);
                 pages.insert(name.clone(), page);
-                // The anchor: a function whose start is page-aligned gets an
-                // explicit `.org` pad: both the new-page case and the
-                // exact-boundary continuation (the previous function's size
-                // hit the boundary precisely, so the strict fit check alone
-                // would emit no pad). Without it, pass B's same-page restore
-                // elision shrinks the previous function and slides this one
-                // below the boundary into a straddle: its label resolves to the
-                // LOWER page while its later words sit in the upper one, so
-                // intra-function GOTOs (PAGE(<func>) from the label) misbranch.
+                // The anchor: a page-aligned start gets an explicit `.org`
+                // pad, for new pages and exact-boundary continuations alike.
+                // Without it, pass-B restore elision shrinks the previous
+                // function and slides this one across the boundary into a
+                // straddle, and its PAGE(<func>) GOTOs misbranch.
                 if start & 0x7FF == 0 {
                     pads.insert(name.clone(), start);
                 }
@@ -9713,18 +9700,11 @@ pub fn select_with_locs(
             }
         }
         // ---- PASS B: emit the final text with every function's page known.
-        // Same-page calls (and same-page const reads) skip the restore pair; the
-        // pages are the assignment's, and the `.org` pads pin the page bases, so
-        // the elision cannot move a function off its assigned page (it only
-        // shrinks bodies, page-membership-stable).
-        //
-        // Emission is in PAGE order, not module order: bin packing can place a
-        // later function in an earlier page's tail, so module-order emission
-        // would emit a backward `.org` (a page-0 function after a page-1 one):
-        // the assembler panics on backward `.org`. Within a page, functions keep
-        // their emission order (the page's running address is monotonic).
-        // Split chunks join page order as their own units: a chunk may sit on
-        // any page, and page order (not module order) keeps `.org` monotonic.
+        // Same-page calls and const reads skip the restore pair; the `.org`
+        // pads pin the page bases, so elision only shrinks bodies in place.
+        // Emission is in PAGE order, not module order (a tail-placed later
+        // function would otherwise emit a backward `.org`), with split
+        // chunks as their own units.
         enum EmitUnit<'a> {
             Func(&'a ir::Func, &'a str),
             Chunk(&'a str, usize),
@@ -9875,37 +9855,13 @@ pub fn select_with_locs(
                     }
                 }
             }
-            // Pin the const-table section to its pass-A `table_start` whenever
-            // the pass-B elision would move a reader base across a page
-            // boundary. `reader_pages` maps every reader entry's page from the
-            // pass-A position, but pass B emits the tables at the post-elision
-            // position (bodies only shrink, so the section shifts earlier): a
-            // chunked table's `.align 256` can then round a base across a page
-            // boundary (a base pass A aligned to exactly k*0x800 re-aligns into
-            // page k-1 after a 2-word elision), silently invalidating the
-            // restore-skip map: a caller that skipped its restore on the mapped
-            // page is left with the reader's HIGH(<base>) page, the drifted one,
-            // and its next GOTO misbranches. The `.org` re-pins the section so
-            // the final addresses are exactly the pass-A ones and the map stays
-            // exact, but only when a base's page actually changes (the common
-            // case, a small drift that stays within the mapped page, needs no
-            // pin). When banking grows the code past `table_start`, the pin
-            // jumps backward in the final text; that never assembles (the
-            // assembler rejects backward `.org`, epic-cc#923), but inside the
-            // repair loop a backward pin is fuel, not failure: the assess
-            // step relays its position into the next pass's `section_base`
-            // and re-lays the section there, so only backward-org-free
-            // passes ever ship.
+            // Pin the section to pass-A `table_start` when elision would move
+            // a reader base across a page boundary, keeping the restore-skip
+            // map exact. The end is measured post-banking like the driver
+            // sees it (epic-cc#151), never estimated. A backward pin never
+            // assembles (epic-cc#923); in the repair loop it is fuel, relayed
+            // into the next pass's `section_base`, so only clean passes ship.
             // A module without consts has no section to pin.
-            //
-            // The window-fit accounting runs at the FINAL post-banking
-            // position: bank + peephole the emitted text exactly as the
-            // driver will and measure its end, so the fold sees the
-            // assembler's org, not an estimate. The old `addr_b + growth`
-            // estimate missed the const-reader regions (their bodies + RETLW
-            // data follow the code): without them every reader CALL left the
-            // bank UNKNOWN and banking over-inserted BANKSELs, over-estimating
-            // the end (epic-cc#151).
             let mut start = addr_b;
             if !consts.is_empty() {
                 // Append placeholder reader bodies (a `RETLW` exit) so the
@@ -9943,33 +9899,12 @@ pub fn select_with_locs(
             }
             start
         };
-        // Const (flash) globals become RETLW tables, emitted after the
-        // functions so the CALLs above resolve. Every `__read_<name>` reader
-        // sets PCLATH = HIGH(<name>) first: the computed `ADDLW LOW(<name>);
-        // MOVWF PCL` jump lands at PCLATH:PCL, so a table in a nonzero 256-byte
-        // window needs the window set (an earlier reader leaves PCLATH stale).
-        // A table of 256+ bytes is emitted as two 256-byte
-        // chunks: chunk 0's 256 RETLWs at the base label `<name>` (`.align 256`
-        // pads it to a 256-word boundary so LOW(<name>) == 0), then chunk 1's
-        // RETLWs at the fresh label `<name>_1` IMMEDIATELY after: `<name>` +
-        // 256 in the address space, so LOW(<name>_1) == 0 too and the true
-        // bound is 511 bytes (a table of exactly 256 bytes has an empty chunk
-        // 1, unreachable since its valid indices are 0..255), then the
-        // `__read_<name>_hi` entry AFTER the
-        // table (its computed-goto jumps into the table; the entry instructions
-        // are dead after MOVWF PCL). A `.table <name> <size>` directive is
-        // emitted immediately before every table's base label; the assembler
-        // enforces the window fit (LOW + size <= 0x100 for single-entry
-        // tables, LOW == 0 for chunked bases): a table that crosses its window
-        // or a misaligned chunk base would silently misread, so it must fail
-        // assembly, not miscompile. Tables beyond 511 bytes (three chunks)
-        // panic: out of scope.
-        // Label-collision guard: every label a table emits, its base label, its
-        // reader entry, and for chunked tables the fresh `{name}_1` chunk label
-        // and `__read_{name}_hi` entry, must be unique across all consts. A
-        // user `const t_1` (or `const __read_t_hi`) next to a chunked `const t`
-        // would emit a duplicate label the assembler's symbol insert silently
-        // overwrites (wrong reads, no error): panics instead.
+        // Const globals become RETLW tables after the functions. Each reader
+        // sets PCLATH = HIGH(base) before its computed jump; the assembler
+        // enforces the window fit and fails loudly on a crossing table.
+        // Chunked tables align chunk 0 with `_1`/`_hi` right after. Every
+        // emitted label must be unique across consts, or the assembler would
+        // silently overwrite a colliding one: panics instead.
         {
             let mut labels: HashMap<String, String> = HashMap::new();
             for g in &consts {
