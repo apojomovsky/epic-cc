@@ -157,24 +157,22 @@ fn both_dispatch_contexts_list_the_stored_usart_copies() {
             "{name} dispatcher's RX site must list epic_serial_on_rx_isr; got {sites:?}"
         );
     }
-    // The 0-arg sites: the TxDone and taskmgr callbacks went through the
-    // same shared-storage rewrite, plus the main-only originals.
+    // The 0-arg sites scope through their own storages (ADR-038): the USART
+    // TX, Timer0 taskmgr, and Timer2 tick callbacks each went through the
+    // shared-storage rewrite, so each context lists exactly the stored copy
+    // at each site. The Timer2 entry is the epic-cc#918 regression: the
+    // uninlined Init(&h) local-handle shape left the tick callback out of
+    // the ISR list, and the first tick trapped in the no-match loop.
     for (name, sites) in [("main", &main_sites), ("isr", &isr_sites)] {
-        assert!(
-            sites.iter().any(|c| {
-                c.contains(&"epic_serial_on_tx_isr".to_string())
-                    && c.contains(&"epic_taskmgr_on_timer0_overflow_isr".to_string())
-            }),
-            "{name} dispatcher must list the TX and taskmgr copies; got {sites:?}"
-        );
+        for want in [
+            "epic_serial_on_tx_isr",
+            "epic_taskmgr_on_timer0_overflow_isr",
+            "epic_tick_on_overflow_isr",
+        ] {
+            assert!(
+                sites.iter().any(|c| c == &[want.to_string()]),
+                "{name} dispatcher must scope a site to exactly {want}; got {sites:?}"
+            );
+        }
     }
-    // The harness no longer defines an `s_tx_cplt` stub (upstream sets a
-    // null TX callback and TXEN explicitly), so the tick overflow is the
-    // remaining main-only original.
-    assert!(
-        main_sites
-            .iter()
-            .any(|c| c.contains(&"epic_tick_on_overflow".to_string())),
-        "main dispatcher keeps the main-only original; got {main_sites:?}"
-    );
 }

@@ -2,10 +2,10 @@
 
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
-- Date (UTC): 2026-10-06
-- Commit: 615fcdd
+- Date (UTC): 2026-10-07
+- Commit: 8381c80
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
-- Menu-demo listing: 9325 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
+- Menu-demo listing: 9304 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
 ## Micro benches (flash / RAM)
 
@@ -44,7 +44,7 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | hal-pic18-blink-18f4550 | 18F4550 | 318 | 30 | = / = |
 | hal-pic14e-blink-16f1937 | 16F1937 | 100 | 6 | = / = |
 | hal-pic16-encoder-full-16f877a | 16F877A | 5460 | 326 | = / = |
-| hal-pic18-menu-demo-18f4550 | 18F4550 | 9337 | 781 | = / = |
+| hal-pic18-menu-demo-18f4550 | 18F4550 | 9316 | 781 | = / = |
 | hal-pic18-control-demo-18f4550 | 18F4550 | 9524 | 963 | = / = |
 | hal-pic18-pid-18f4550 | 18F4550 | 3259 | 500 | = / = |
 | hal-pic18-bridge-demo-18f4550 | 18F4550 | 13604 | 1312 | = / = |
@@ -59,8 +59,8 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | redraw_status | 365 |
 | EPIC_USART_Init | 327 |
 | epic_taskmgr_run +1 folded | 322 |
-| epic_dispatch_all_irqs_isr | 277 |
-| epic_dispatch_all_irqs +5 folded | 253 |
+| epic_dispatch_all_irqs_isr | 267 |
+| epic_dispatch_all_irqs +5 folded | 235 |
 | menu_demo_task_heartbeat +1 folded | 222 |
 | menu_demo_task_ui | 208 |
 | __epic_config | 196 |
@@ -69,14 +69,14 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 
 Top profiler categories on the same listing:
 
-- `data-move`: 1420 (15.2%)
+- `data-move`: 1417 (15.2%)
 - `shared-code`: 1362 (14.6%)
 - `struct-copy-movff`: 1260 (13.5%)
-- `branch`: 767 (8.2%)
-- `scalar-alu`: 533 (5.7%)
-- `cond-branch`: 530 (5.7%)
-- `literal-load`: 489 (5.2%)
-- `wide-literal-arith`: 438 (4.7%)
+- `branch`: 764 (8.2%)
+- `scalar-alu`: 530 (5.7%)
+- `cond-branch`: 524 (5.6%)
+- `literal-load`: 492 (5.3%)
+- `wide-literal-arith`: 429 (4.6%)
 
 ## Regenerating
 

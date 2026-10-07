@@ -2837,6 +2837,59 @@ fn isr_context_for(
                                         grew = true;
                                     }
                                 }
+                                // The uninlined `Init(&h)` idiom (epic-cc#918): the
+                                // call site passes a caller-local alloca, not a
+                                // global, so the handle scan above sees nothing. Any
+                                // function-valued field the caller stored into that
+                                // alloca rides this memcpy into the ISR-read storage,
+                                // so it joins like the same-function alloca case.
+                                // One hop only: deeper forwarding chains stay opaque.
+                                let callee = f.name.clone();
+                                for cf in &m.funcs {
+                                    let cbases = bases_with_alias_loads(cf, &aliases);
+                                    for cb in &cf.blocks {
+                                        for ci in &cb.insts {
+                                            let Inst::Call(c) = ci else { continue };
+                                            if c.func != callee {
+                                                continue;
+                                            }
+                                            let Some(arg) = c.args.get(pi) else { continue };
+                                            if !matches!(arg.val, Val::Reg(_)) {
+                                                continue;
+                                            }
+                                            let Some(root) =
+                                                alloca_root_map(&ptr_of_val(&arg.val), &cbases)
+                                            else {
+                                                continue;
+                                            };
+                                            let is_caller_alloca = cf
+                                                .blocks
+                                                .iter()
+                                                .flat_map(|b| &b.insts)
+                                                .any(|i| {
+                                                    matches!(i, Inst::Alloca(a) if a.dst == root)
+                                                });
+                                            if !is_caller_alloca {
+                                                continue;
+                                            }
+                                            for b2 in &cf.blocks {
+                                                for inst2 in &b2.insts {
+                                                    let Inst::Store(s2) = inst2 else { continue };
+                                                    if alloca_field(&s2.ptr, cf, &root).is_none() {
+                                                        continue;
+                                                    }
+                                                    if let Val::Global(fn_name) = &s2.val {
+                                                        if defined.contains(fn_name.as_str())
+                                                            && isr_ctx.insert(fn_name.clone())
+                                                        {
+                                                            grew = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -3188,6 +3241,33 @@ fn duplicate_isr_shared(
             }
         }
     }
+    // Callee param -> whole-object memcpy destinations (the uninlined
+    // `Init(&h)` idiom, epic-cc#918): `EPIC_TIMER2_Init` memcpys its param
+    // into `g_t2_storage` while the callback stores live in the caller's
+    // alloca, so the per-function alloca scan below resolves the feed
+    // through the call edge, one hop.
+    let mut param_memcpy_dsts: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    for sf in &funcs {
+        let sf_bases = bases_with_alias_loads(sf, &aliases);
+        for b in &sf.blocks {
+            for inst in &b.insts {
+                let Inst::Memcpy(mc) = inst else { continue };
+                let Some((g, _)) = global_field_map(&ptr_of_val(&mc.dst), &sf_bases) else {
+                    continue;
+                };
+                let Some(src_reg) = ptr_of_val(&mc.src).strip_prefix('%').map(str::to_string)
+                else {
+                    continue;
+                };
+                if let Some(pi) = sf.params.iter().position(|p| p.name == src_reg) {
+                    param_memcpy_dsts
+                        .entry(sf.name.clone())
+                        .or_default()
+                        .push((pi, g));
+                }
+            }
+        }
+    }
     for f in &mut funcs {
         // GEP bases are resolved before the mutation loop (the function is
         // borrowed mutably below), now with the alias-load entries.
@@ -3219,6 +3299,42 @@ fn duplicate_isr_shared(
                 }
                 if hi_read.iter().any(|(rg, _)| *rg == g) {
                     alloca_feeds_hi.entry(src_reg).or_default().push(g);
+                }
+            }
+        }
+        // Cross-function alloca feeds (epic-cc#918): a call passing a
+        // same-function alloca into a callee param the callee memcpys
+        // whole-object into a global feeds that global, like a same-function
+        // memcpy would. One hop only: deeper forwarding chains stay opaque.
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let Inst::Call(c) = inst else { continue };
+                let Some(dsts) = param_memcpy_dsts.get(&c.func) else {
+                    continue;
+                };
+                for (pi, g) in dsts {
+                    let Some(arg) = c.args.get(*pi) else { continue };
+                    let Val::Reg(_) = &arg.val else { continue };
+                    let Some(root) = alloca_root_map(&ptr_of_val(&arg.val), &bases) else {
+                        continue;
+                    };
+                    let is_alloca = f
+                        .blocks
+                        .iter()
+                        .flat_map(|bb| &bb.insts)
+                        .any(|i| matches!(i, Inst::Alloca(a) if a.dst == root));
+                    if !is_alloca {
+                        continue;
+                    }
+                    if lo_read.iter().any(|(rg, _)| rg == g) {
+                        alloca_feeds_lo
+                            .entry(root.clone())
+                            .or_default()
+                            .push((*g).clone());
+                    }
+                    if hi_read.iter().any(|(rg, _)| rg == g) {
+                        alloca_feeds_hi.entry(root).or_default().push((*g).clone());
+                    }
                 }
             }
         }
