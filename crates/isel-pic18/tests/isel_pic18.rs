@@ -8145,3 +8145,116 @@ fn returned_call_result_never_leaves_retval() {
         );
     }
 }
+
+#[test]
+fn inplace_same_home_i8_increment_uses_a_single_incf() {
+    // `tick += 1` through a folded store homes the operand where the
+    // result lands, so the lane accumulates in place (epic-cc#767): one
+    // `INCF` instead of `MOVLW`/`ADDWF`/`MOVWF`.
+    let m = parse(
+        "global tick i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @tick\n    %2 = add i8 %1 1\n    store i8 %2 @tick\n    ret void\n",
+    );
+    let addrs = addrs(&[("tick", 0x20), ("main::1", 0x21), ("main::2", 0x22)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main = block_section(&asm, "main");
+    assert!(main.contains("INCF 0x020,F,A"), "main:\n{main}");
+    assert!(!main.contains("MOVLW 0x01"), "no staged literal:\n{main}");
+    let words = asm::assemble_pic18(&asm);
+    let start = start_steps(&asm);
+    for (tick, want) in [(0x00u8, 0x01u8), (0x2Au8, 0x2Bu8), (0xFFu8, 0x00u8)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start);
+        p.ram_mut()[0x20] = tick;
+        p.run(200);
+        assert!(p.halted(), "program must halt (tick={tick:#04x})");
+        assert_eq!(p.ram()[0x20], want, "tick must wrap (tick={tick:#04x})");
+    }
+}
+
+#[test]
+fn phi_folded_i16_increment_reads_the_phi_home_through_a_materialized_compare() {
+    // `eq` a second carried flag observes, so the compare cannot fuse:
+    // the `Bin` computes into the phi's slot, the `Icmp` arm reads that
+    // slot (not the dead temp), and the backedge copies degrade to a
+    // skipped self-copy plus a disjoint flag copy (epic-cc#767). The
+    // branch rides the carried flag, so halting on the trip after the
+    // match proves the materialized compare, the copies, and the fold.
+    let m = parse(
+        "global limit i16\nglobal flag i8\nfn main(void) ()\n  block entry:\n    br loop\n  block loop:\n    %i = phi i16 %r loop 0 entry\n    %r = add i16 %i, 1\n    %lv = load i16 @limit\n    %c = icmp eq i16 %r, %lv\n    %f = phi i8 %c loop 0 entry\n    br i1 %f, exit, loop\n  block exit:\n    store i8 %f @flag\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("limit", 0x20),
+        ("flag", 0x22),
+        ("main::i", 0x30),
+        ("main::f", 0x32),
+        ("main::r", 0x34),
+        ("main::lv", 0x36),
+        ("main::c", 0x38),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(lp.contains("INCF 0x030,F,A"), "loop:\n{lp}");
+    assert!(lp.contains("BTFSC 0xFD8,0,A"), "loop:\n{lp}");
+    assert!(lp.contains("INCF 0x031,F,A"), "loop:\n{lp}");
+    assert!(!lp.contains("0x034"), "dead temp must go unread:\n{lp}");
+    assert!(!lp.contains("MOVWF 0x030"), "no staged low store:\n{lp}");
+    assert!(!lp.contains("MOVWF 0x031"), "no staged high store:\n{lp}");
+    assert!(
+        lp.contains("CLRF 0x038,A"),
+        "compare must materialize, not fuse:\n{lp}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let start = start_steps(&asm);
+    for limit in [1u16, 5, 300] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start);
+        p.ram_mut()[0x20] = (limit & 0xFF) as u8;
+        p.ram_mut()[0x21] = (limit >> 8) as u8;
+        p.run(500 + 200 * usize::from(limit));
+        assert!(p.halted(), "program must halt (limit={limit})");
+        let want = limit.wrapping_add(1);
+        assert_eq!(
+            p.ram()[0x30],
+            (want & 0xFF) as u8,
+            "counter lo (limit={limit})"
+        );
+        assert_eq!(
+            p.ram()[0x31],
+            (want >> 8) as u8,
+            "counter hi (limit={limit})"
+        );
+        assert_eq!(p.ram()[0x22], 1, "flag must ride the match (limit={limit})");
+    }
+}
+
+#[test]
+fn inplace_add_i16_with_zero_low_byte_skips_the_lane() {
+    // `x += 0x0100` needs no low lane and no carry seed: the low add
+    // carries nothing in, so the high lane takes the plain form
+    // (epic-cc#767), two words against the staged six.
+    let m = parse(
+        "global x i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @x\n    %2 = add i16 %1, 256\n    store i16 %2 @x\n    ret void\n",
+    );
+    let addrs = addrs(&[("x", 0x20), ("main::1", 0x22), ("main::2", 0x24)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main = block_section(&asm, "main");
+    assert!(main.contains("MOVLW 0x01"), "main:\n{main}");
+    assert!(main.contains("ADDWF 0x021,F,A"), "main:\n{main}");
+    assert!(!main.contains("ADDWF 0x020"), "low lane must go:\n{main}");
+    assert!(!main.contains("ADDWFC"), "no carry to consume:\n{main}");
+}
+
+#[test]
+fn inplace_sub_i32_literal_uses_read_modify_write_lanes() {
+    // Same-homed `y -= 0x012E` stages each literal byte but accumulates
+    // into the file register: two words per lane, no store (epic-cc#767).
+    let m = parse(
+        "global y i32\nfn main(void) ()\n  block entry:\n    %1 = load i32 @y\n    %2 = sub i32 %1, 302\n    store i32 %2 @y\n    ret void\n",
+    );
+    let addrs = addrs(&[("y", 0x20), ("main::1", 0x24), ("main::2", 0x28)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main = block_section(&asm, "main");
+    assert!(main.contains("SUBWF 0x020,F,A"), "main:\n{main}");
+    assert!(main.contains("SUBWFB 0x021,F,A"), "main:\n{main}");
+    assert!(!main.contains(",W,A"), "no staged W form:\n{main}");
+}

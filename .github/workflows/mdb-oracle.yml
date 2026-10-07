@@ -61,6 +61,16 @@ jobs:
           - bitmask-eq1-inv
           - bitmask-truthy
           - bitmask-base
+          - add16-plus1
+          - sub16-minus1
+          - add16-lit
+          - sub16-lit
+          - add16-lo0
+          - sub16-lo0
+          - add32-plus1
+          - sub32-minus1
+          - add32-lit
+          - sub32-lit
     steps:
       - uses: actions/checkout@v5
 

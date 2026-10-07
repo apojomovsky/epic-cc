@@ -306,16 +306,16 @@ ram_bytes = 58
 [[entry]]
 name = "speed-crc16-18f4550"
 device = "18F4550"
-cycles = 13640
-flash_words = 165
+cycles = 12680
+flash_words = 161
 ram_bytes = 52
 
 [[entry]]
 name = "speed-crc16-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 13640
-flash_words = 165
+cycles = 12680
+flash_words = 161
 ram_bytes = 52
 
 [[entry]]
@@ -487,14 +487,14 @@ ram_bytes = 749
 name = "speed-isr-18f4550-latency"
 device = "18F4550"
 cycles = 39
-flash_words = 110
+flash_words = 108
 ram_bytes = 29
 
 [[entry]]
 name = "speed-isr-18f4550-roundtrip"
 device = "18F4550"
-cycles = 81
-flash_words = 110
+cycles = 79
+flash_words = 108
 ram_bytes = 29
 
 [[entry]]
@@ -502,15 +502,15 @@ name = "speed-isr-18f4550-latency"
 device = "18F4550"
 profile = "O2"
 cycles = 39
-flash_words = 110
+flash_words = 108
 ram_bytes = 29
 
 [[entry]]
 name = "speed-isr-18f4550-roundtrip"
 device = "18F4550"
 profile = "O2"
-cycles = 81
-flash_words = 110
+cycles = 79
+flash_words = 108
 ram_bytes = 29
 
 [[entry]]
