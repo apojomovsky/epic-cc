@@ -3,9 +3,9 @@
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
 - Date (UTC): 2026-10-08
-- Commit: e11f83d
+- Commit: 9dcbb30
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
-- Menu-demo listing: 9186 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
+- Menu-demo listing: 9172 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
 ## Micro benches (flash / RAM)
 
@@ -45,7 +45,7 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | hal-pic18-blink-18f4550 | 18F4550 | 313 | 30 | = / = |
 | hal-pic14e-blink-16f1937 | 16F1937 | 100 | 6 | = / = |
 | hal-pic16-encoder-full-16f877a | 16F877A | 5460 | 326 | = / = |
-| hal-pic18-menu-demo-18f4550 | 18F4550 | 9199 | 781 | = / = |
+| hal-pic18-menu-demo-18f4550 | 18F4550 | 9185 | 781 | = / = |
 | hal-pic18-control-demo-18f4550 | 18F4550 | 9460 | 963 | = / = |
 | hal-pic18-pid-18f4550 | 18F4550 | 3202 | 500 | = / = |
 | hal-pic18-bridge-demo-18f4550 | 18F4550 | 13292 | 1312 | = / = |
@@ -55,11 +55,11 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | cluster | ours |
 |---|---|
 | menu_demo_init +7 folded | 1708 |
-| redraw | 473 |
+| redraw | 466 |
 | main | 367 |
 | EPIC_USART_Init | 327 |
 | epic_taskmgr_run +1 folded | 322 |
-| redraw_status | 317 |
+| redraw_status | 310 |
 | epic_dispatch_all_irqs_isr | 267 |
 | menu_demo_task_heartbeat +1 folded | 264 |
 | epic_dispatch_all_irqs +5 folded | 235 |
@@ -70,12 +70,12 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 
 Top profiler categories on the same listing:
 
-- `data-move`: 1409 (15.3%)
+- `data-move`: 1409 (15.4%)
 - `shared-code`: 1321 (14.4%)
-- `struct-copy-movff`: 1192 (13.0%)
+- `struct-copy-movff`: 1184 (12.9%)
 - `branch`: 763 (8.3%)
-- `scalar-alu`: 584 (6.4%)
-- `cond-branch`: 553 (6.0%)
+- `scalar-alu`: 588 (6.4%)
+- `cond-branch`: 555 (6.1%)
 - `literal-load`: 486 (5.3%)
 - `slot-copy`: 404 (4.4%)
 
