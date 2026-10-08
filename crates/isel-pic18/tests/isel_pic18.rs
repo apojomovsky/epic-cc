@@ -8558,3 +8558,59 @@ fn adjacent_plusw_static_parts_step_without_reseeding() {
     assert_eq!(p.ram()[0x130], 0xAB, "stepped low byte");
     assert_eq!(p.ram()[0x131], 0xCD, "stepped high byte");
 }
+
+#[test]
+fn rmw_gap_def_between_binop_and_store_stays_staged() {
+    // A live def between the producer and its store keeps the staged
+    // form: `alloc` ends the operand temp's live range at the binop,
+    // so the gap def could be colored into its slot (epic-cc#825).
+    let m = parse(
+        "global ram i16\n\
+         global idx i8\n\
+         global other i16\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +0 +1*%i\n\
+             %v = load i16 %p\n\
+             %w = add i16 %v, 7\n\
+             %g = load i16 @other\n\
+             store i16 %w %p\n\
+             store i16 %g @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x122),
+        ("other", 0x140),
+        ("out", 0x130),
+        ("main::i", 0x123),
+        ("main::v", 0x124),
+        ("main::w", 0x126),
+        ("main::g", 0x128),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("MOVWF 0x026"),
+        "result temp stays staged across the gap:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x120] = 10;
+    p.ram_mut()[0x121] = 0;
+    p.ram_mut()[0x122] = 0;
+    p.ram_mut()[0x140] = 0xBE;
+    p.ram_mut()[0x141] = 0xEF;
+    p.run(300);
+    assert!(p.halted());
+    assert_eq!(
+        p.ram()[0x120],
+        17,
+        "store reads the producer, not the gap def"
+    );
+    assert_eq!(p.ram()[0x130], 0xBE, "gap def survives");
+    assert_eq!(p.ram()[0x131], 0xEF, "gap def high byte survives");
+}
