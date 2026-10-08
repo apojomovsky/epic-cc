@@ -297,3 +297,31 @@ fn three_chunk_table_followup_base_counts_all_chunks() {
         "t[5] = 5 takes the then arm with the restore skipped:\n{asm}"
     );
 }
+
+#[test]
+#[should_panic(expected = "255-byte single-chunk staging bound")]
+fn panics_on_staged_const_over_255_bytes() {
+    // epic-cc#934: the `__stage_` routine indexes with one MOVLW byte
+    // and always CALLs the chunk-0 reader, so a staged const past 255
+    // bytes would misread. alloc never stages such consts, so the set
+    // is hand-built here; emission must fail loudly, never copy wrong.
+    let m = module_with_globals(
+        "const big i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    store i8 0 @out\n    ret void\n",
+        vec![
+            const_table_global("big", 256),
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+                refs: Vec::new(),
+            },
+        ],
+    );
+    let addrs = addrs(&[("out", 0x20), ("__const_stage", 0x30)]);
+    let mut staged = HashSet::new();
+    staged.insert("big".to_string());
+    let _ = isel_pic14e::select_with_locs(&PIC16F1937, &m, &addrs, &staged);
+}
