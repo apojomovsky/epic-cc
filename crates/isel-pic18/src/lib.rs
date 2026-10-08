@@ -212,6 +212,17 @@ struct Gen<'m> {
     /// read. The ISR prologue saves `TBLPTR`/`TABLAT`, so a walked sequence
     /// survives interrupts like the memcpy walk does (epic-cc#492).
     tblptr_holds: Option<(String, u16)>,
+    /// `(block, inst, byte)` of dynamically indexed const reads whose seed
+    /// the `find_tblptr_walks` pre-scan proved redundant (epic-cc#778): the
+    /// previous same-block run site left `TBLPTR` one past its last byte,
+    /// the table and dynamic terms match, and nothing between them writes
+    /// a term slot or touches `TBLPTR`. The emitter skips the seed and
+    /// walks `TBLRD*+`; the scan's own accounting (not this set) is what
+    /// makes each skip sound, so emission never extends a run by itself.
+    tblptr_walk: HashSet<(String, usize, u8)>,
+    /// `(block label, inst index)` of the instruction under emission. The
+    /// seed skip above keys off it; the driver sets it per instruction.
+    cur_site: (String, usize),
     /// Direct-to-direct `MOVFF` byte copies staged by `emit_copy_byte`,
     /// drained as straight MOVFFs or, once long enough, as one
     /// LFSR-seeded POSTINC copy loop (epic-cc#486). Each entry carries
@@ -1540,6 +1551,352 @@ impl<'m> Gen<'m> {
             }
         }
         (phi_fold, inplace)
+    }
+
+    /// Per-function `TBLPTR` walk pre-scan (epic-cc#778): `(block, inst,
+    /// byte)` of dynamically indexed const reads whose seed is redundant.
+    /// A run extends while each next site reads the same table with
+    /// identical terms at the offset the walk left `TBLPTR` on; later
+    /// bytes of a multi-byte site always join. Anything that could move
+    /// `TBLPTR` or rewrite a term slot ends the run, as do static reads
+    /// (the `#745` tracker owns those). All breaks are conservative:
+    /// an unrecognized shape only loses sharing, never soundness.
+    fn find_tblptr_walks(g: &Gen, f: &Func) -> HashSet<(String, usize, u8)> {
+        let unplaced = g.w_folds.unplaced();
+        let mut marks = HashSet::new();
+        for b in &f.blocks {
+            let fused: HashSet<String> = Gen::fusable_icmp(g, f, b)
+                .map(|c| {
+                    Gen::fused_chain_sources(g, f, b, c)
+                        .consumed
+                        .into_iter()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut run: Option<(String, u16, Vec<(u16, String)>, Vec<(u16, u16)>)> = None;
+            for (ii, inst) in b.insts.iter().enumerate() {
+                match inst {
+                    Inst::Phi(_) => run = None,
+                    Inst::Load(l) if fused.contains(&l.dst) => {}
+                    Inst::Load(l) => {
+                        let ptr = Self::tblptr_ptr_val(&l.ptr);
+                        match ptr.as_ref().and_then(|v| Self::tblptr_const_base(g, f, v)) {
+                            Some((table, k, terms)) if !terms.is_empty() && terms.len() <= 1 => {
+                                let mut tslots = Vec::new();
+                                let mut placed = true;
+                                for (_, reg) in &terms {
+                                    match (
+                                        g.addrs.get(&ssa_key(&f.name, reg)),
+                                        Self::tblptr_term_width(f, reg),
+                                    ) {
+                                        (Some(a), Some(w)) => tslots.push((*a, u16::from(w))),
+                                        _ => {
+                                            placed = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !placed {
+                                    run = None;
+                                    continue;
+                                }
+                                let n = u16::from(l.ty.bytes());
+                                let start = match &run {
+                                    Some((t, off, tm, _))
+                                        if *t == table && *tm == terms && *off == k =>
+                                    {
+                                        0
+                                    }
+                                    _ => 1,
+                                };
+                                for j in start..n {
+                                    marks.insert((b.label.clone(), ii, j as u8));
+                                }
+                                run = Some((table, k.wrapping_add(n), terms, tslots));
+                                if Self::tblptr_home_hits(
+                                    g,
+                                    f,
+                                    &l.dst,
+                                    n,
+                                    &unplaced,
+                                    Self::tblptr_run_terms(&run),
+                                ) {
+                                    run = None;
+                                }
+                            }
+                            Some(_) => run = None,
+                            None => {
+                                if let Some(r) = l.ptr.strip_prefix('%') {
+                                    let key = ssa_key(&f.name, r);
+                                    if g.prov.flash.contains(&key) || g.prov.mixed.contains(&key) {
+                                        run = None;
+                                        continue;
+                                    }
+                                }
+                                if Self::tblptr_home_hits(
+                                    g,
+                                    f,
+                                    &l.dst,
+                                    u16::from(l.ty.bytes()),
+                                    &unplaced,
+                                    Self::tblptr_run_terms(&run),
+                                ) {
+                                    run = None;
+                                }
+                            }
+                        }
+                    }
+                    Inst::Store(s) => {
+                        if let Val::Reg(r) = &s.val {
+                            if g.store_consumed.contains(r) {
+                                continue;
+                            }
+                        }
+                        if let Some(hex) = s.ptr.strip_prefix("0x") {
+                            match u16::from_str_radix(hex, 16) {
+                                Ok(a) => {
+                                    if Self::tblptr_range_hits(
+                                        Self::tblptr_run_terms(&run),
+                                        a,
+                                        u16::from(s.ty.bytes()),
+                                    ) {
+                                        run = None;
+                                    }
+                                }
+                                Err(_) => run = None,
+                            }
+                            continue;
+                        }
+                        match Self::static_base(g, &f.name, &s.ptr) {
+                            Some(a) => {
+                                if Self::tblptr_range_hits(
+                                    Self::tblptr_run_terms(&run),
+                                    a,
+                                    u16::from(s.ty.bytes()),
+                                ) {
+                                    run = None;
+                                }
+                            }
+                            None => run = None,
+                        }
+                    }
+                    Inst::Bin(x) => {
+                        if Self::tblptr_home_hits(
+                            g,
+                            f,
+                            &x.dst,
+                            u16::from(x.ty.bytes()),
+                            &unplaced,
+                            Self::tblptr_run_terms(&run),
+                        ) {
+                            run = None;
+                        }
+                    }
+                    Inst::Select(s) => {
+                        let emits = !s.ptr
+                            || matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_)))
+                            || g.select_is_seeded(&s.dst);
+                        if emits
+                            && Self::tblptr_home_hits(
+                                g,
+                                f,
+                                &s.dst,
+                                u16::from(s.ty.bytes()),
+                                &unplaced,
+                                Self::tblptr_run_terms(&run),
+                            )
+                        {
+                            run = None;
+                        }
+                    }
+                    Inst::Memcpy(mc) => {
+                        if !Self::tblptr_memcpy_step(g, f, mc, &b.label, ii, &mut marks, &mut run) {
+                            run = None;
+                        }
+                    }
+                    Inst::Gep(_) | Inst::Alloca(_) => {}
+                    _ => run = None,
+                }
+            }
+        }
+        marks
+    }
+
+    /// Whether `[addr, addr + n)` overlaps a term slot range. Every write
+    /// the walk scan classifies funnels through here or `tblptr_home_hits`.
+    fn tblptr_range_hits(terms: &[(u16, u16)], addr: u16, n: u16) -> bool {
+        terms.iter().any(|(s, w)| addr < s + w && *s < addr + n)
+    }
+
+    /// Term slot ranges of the current walk run, if any.
+    fn tblptr_run_terms(
+        run: &Option<(String, u16, Vec<(u16, String)>, Vec<(u16, u16)>)>,
+    ) -> &[(u16, u16)] {
+        run.as_ref().map(|(_, _, _, t)| t.as_slice()).unwrap_or(&[])
+    }
+
+    /// Whether the value `dst` of width `w` is written into a term slot.
+    /// Mirrors where the emitter puts it: a store-folded producer writes
+    /// the store's slot, a phi-folded increment the phi's slot, otherwise
+    /// its own frame slot. Slotless folded loads emit nothing. Anything
+    /// else (lanes, missing maps) ends the run rather than risk a miss.
+    fn tblptr_home_hits(
+        g: &Gen,
+        f: &Func,
+        dst: &str,
+        w: u16,
+        unplaced: &HashSet<String>,
+        terms: &[(u16, u16)],
+    ) -> bool {
+        if let Some(a) = g.store_fwd.get(dst) {
+            return Self::tblptr_range_hits(terms, *a, w);
+        }
+        if g.store_consumed.contains(dst) {
+            return true;
+        }
+        if let Some(p) = g.phi_fold.get(dst) {
+            return match g.addrs.get(&ssa_key(&f.name, p)) {
+                Some(a) => Self::tblptr_range_hits(terms, *a, w),
+                None => true,
+            };
+        }
+        if let Some(a) = g.addrs.get(&ssa_key(&f.name, dst)) {
+            return Self::tblptr_range_hits(terms, *a, w);
+        }
+        if g.bit_lanes.contains_key(dst) || g.lane_consumed.contains(dst) {
+            return true;
+        }
+        !unplaced.contains(dst)
+    }
+
+    /// `@g`/`%r` pointer operand in `Val` form. `None` for literal (`0x`)
+    /// pointers, which read RAM, and for malformed operands, which make
+    /// the emitter panic: both end any run without marking anything.
+    fn tblptr_ptr_val(ptr: &str) -> Option<Val> {
+        if let Some(name) = ptr.strip_prefix('@') {
+            Some(Val::Global(name.to_string()))
+        } else if let Some(name) = ptr.strip_prefix('%') {
+            Some(Val::Reg(name.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// `const_base_of` without the missing-resolution panic: the emitter
+    /// still panics there, so the scan only needs the `None` fallback to
+    /// end the run on the way past.
+    fn tblptr_const_base(
+        g: &Gen,
+        f: &Func,
+        ptr: &Val,
+    ) -> Option<(String, u16, Vec<(u16, String)>)> {
+        match ptr {
+            Val::Global(name) if g.global_is_const(name) => Some((name.clone(), 0, Vec::new())),
+            Val::Reg(r) => match g.resolved.get(&ssa_key(&f.name, r)) {
+                Some((Base::Global(name), k, terms)) if g.global_is_const(name) => {
+                    Some((name.clone(), *k, terms.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `reg_width` without its no-def panic: a term without a width bails
+    /// the site, and the emitter panics on the way past exactly as today.
+    fn tblptr_term_width(f: &Func, reg: &str) -> Option<u8> {
+        for p in &f.params {
+            if p.name == reg {
+                return Some(if p.sret { 2 } else { p.width });
+            }
+        }
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let d = match inst {
+                    Inst::Load(l) if l.dst == reg => Some(l.ty.bytes()),
+                    Inst::Bin(x) if x.dst == reg => Some(x.ty.bytes()),
+                    Inst::Zext(z) if z.dst == reg => Some(z.to.bytes()),
+                    Inst::Sext(s) if s.dst == reg => Some(s.to.bytes()),
+                    Inst::Trunc(t) if t.dst == reg => Some(t.to.bytes()),
+                    Inst::IntToPtr(p) if p.dst == reg => Some(p.to.bytes()),
+                    Inst::Icmp(c) if c.dst == reg => Some(1),
+                    Inst::Select(s) if s.dst == reg => Some(s.ty.bytes()),
+                    Inst::Call(c) => match (&c.dst, &c.ty) {
+                        (Some(d), Some(t)) if d == reg => Some(t.bytes()),
+                        _ => None,
+                    },
+                    Inst::Phi(p) if p.dst == reg => Some(p.ty.bytes()),
+                    Inst::Alloca(a) if a.dst == reg => Some(a.size),
+                    Inst::Freeze(x) if x.dst == reg => Some(x.ty.bytes()),
+                    Inst::VaArg(v) if v.dst == reg => Some(v.ty.bytes()),
+                    _ => None,
+                };
+                if d.is_some() {
+                    return d;
+                }
+            }
+        }
+        None
+    }
+
+    /// Fold one `Memcpy` into the walk: a const-source copy of `n` bytes
+    /// is one run member (its single seed skips when adjacent, its walk
+    /// advances the run past all `n` bytes). Returns false for anything
+    /// that ends the run instead: a clobbered term slot, a dynamic or
+    /// unknown destination, a non-const source, or a dynamic length.
+    fn tblptr_memcpy_step(
+        g: &Gen,
+        f: &Func,
+        mc: &ir::Memcpy,
+        label: &str,
+        ii: usize,
+        marks: &mut HashSet<(String, usize, u8)>,
+        run: &mut Option<(String, u16, Vec<(u16, String)>, Vec<(u16, u16)>)>,
+    ) -> bool {
+        let n = match &mc.len {
+            ir::MemLen::Const(n) => u16::from(*n),
+            ir::MemLen::Reg(_) => return false,
+        };
+        if n == 0 {
+            return true;
+        }
+        let Some((table, k, terms)) = Self::tblptr_const_base(g, f, &mc.src) else {
+            return false;
+        };
+        if terms.is_empty() || terms.len() > 1 {
+            return false;
+        }
+        let mut tslots = Vec::new();
+        for (_, reg) in &terms {
+            match (
+                g.addrs.get(&ssa_key(&f.name, reg)),
+                Self::tblptr_term_width(f, reg),
+            ) {
+                (Some(a), Some(w)) => tslots.push((*a, u16::from(w))),
+                _ => return false,
+            }
+        }
+        match &mc.dst {
+            Val::Global(name) if g.global_is_const(name) => return false,
+            Val::Global(_) => {}
+            Val::Reg(r) => {
+                let ptr = format!("%{r}");
+                match Self::static_base(g, &f.name, &ptr) {
+                    Some(a) => {
+                        if Self::tblptr_range_hits(&tslots, a, n) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            Val::Const(_) => return false,
+        }
+        if matches!(run, Some((t, off, tm, _)) if *t == table && *tm == terms && *off == k) {
+            marks.insert((label.to_string(), ii, 0));
+        }
+        *run = Some((table, k.wrapping_add(n), terms, tslots));
+        true
     }
 
     /// The backedge incoming of `preg`'s phi carrying this `Bin`'s result:
@@ -3436,11 +3793,12 @@ impl<'m> Gen<'m> {
         self.add_dynamic_to_tblptr(terms);
     }
     /// Seed `TBLPTR` for `(table, k + byte_off)` unless it already points
-    /// there from the previous const read, then the 6-word static seed is
-    /// skipped and the caller walks on with `TBLRD*+` (epic-cc#745). Only
-    /// static reads share: a dynamic term or chain seed clears the tracked
-    /// state and seeds from scratch. Records the position either way, so
-    /// the next adjacent read can share in turn.
+    /// there: either from the previous static const read (epic-cc#745), or
+    /// by a `find_tblptr_walks` mark proving the same-block run left it on
+    /// this dynamic address (epic-cc#778). A marked site records no static
+    /// position: its address carries terms the `(table, off)` tracker
+    /// cannot name, so trusting it there would miscompile. Unmarked
+    /// dynamic reads keep the old clear-and-reseed behavior.
     fn emit_tblptr_setup_shared(
         &mut self,
         table: &str,
@@ -3448,6 +3806,13 @@ impl<'m> Gen<'m> {
         terms: &[(u16, String)],
         byte_off: u8,
     ) {
+        if self
+            .tblptr_walk
+            .contains(&(self.cur_site.0.clone(), self.cur_site.1, byte_off))
+        {
+            self.tblptr_holds = None;
+            return;
+        }
         if !terms.is_empty() {
             self.emit_tblptr_setup(table, k, terms, byte_off);
             self.tblptr_holds = None;
@@ -3539,9 +3904,11 @@ impl<'m> Gen<'m> {
 
     /// One `const` (flash) byte read: `TBLPTR = table_base + k + terms +
     /// byte_off`, then `TABLAT` to `dst`. Static reads share one seed across
-    /// adjacent bytes and walk with `TBLRD*+`; dynamic reads keep the old
-    /// per-byte seed with `TBLRD*`. Multi-byte loads call this once per byte
-    /// with an increasing `byte_off`.
+    /// adjacent bytes and walk with `TBLRD*+`; dynamic reads seed per byte
+    /// unless a `find_tblptr_walks` mark proved the run already points there
+    /// (epic-cc#778), and always walk with `TBLRD*+` so the next run member
+    /// finds `TBLPTR` one past this byte. Multi-byte loads call this once
+    /// per byte with an increasing `byte_off`.
     fn emit_const_load_byte(
         &mut self,
         table: &str,
@@ -3560,7 +3927,7 @@ impl<'m> Gen<'m> {
             self.emit("    TBLRD*+".to_string());
             self.note_tblptr_walked(table, k.wrapping_add(u16::from(byte_off)));
         } else {
-            self.emit("    TBLRD*".to_string());
+            self.emit("    TBLRD*+".to_string());
         }
         self.emit_copy_byte(0xFF5, dst); // TABLAT -> dst
     }
@@ -9229,6 +9596,8 @@ pub fn select_with_opts(
                 routine_ends: Some(Vec::new()),
                 fsr0_holds: None,
                 tblptr_holds: None,
+                tblptr_walk: HashSet::new(),
+                cur_site: (String::new(), 0),
                 pending_copies: Vec::new(),
                 copy_loop: opts.copy_loop,
                 cur_func: &f.name,
@@ -9298,6 +9667,8 @@ pub fn select_with_opts(
             routine_ends: None,
             fsr0_holds: None,
             tblptr_holds: None,
+            tblptr_walk: HashSet::new(),
+            cur_site: (String::new(), 0),
             pending_copies: Vec::new(),
             copy_loop: opts.copy_loop,
             cur_func: &f.name,
@@ -9344,6 +9715,10 @@ pub fn select_with_opts(
         let (phi_fold, inplace_bins) = Gen::find_inplace_folds(&g, f);
         g.phi_fold = phi_fold;
         g.inplace_bins = inplace_bins;
+        // `TBLPTR` walk marks for this function (epic-cc#778): dynamically
+        // indexed const reads whose seed the run scan proved redundant.
+        // Runs after every other scan since dst-home checks read them.
+        g.tblptr_walk = Gen::find_tblptr_walks(&g, f);
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
         // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
@@ -9544,7 +9919,8 @@ pub fn select_with_opts(
                     fc
                 });
             let mut terminator: Option<&Inst> = None;
-            for inst in &b.insts {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                g.cur_site = (b.label.clone(), ii);
                 match inst {
                     Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
                     Inst::Br(_) | Inst::BrCond(_) | Inst::Switch(_) | Inst::Ret(..) => {
@@ -9980,6 +10356,8 @@ pub fn select_with_opts(
                 routine_ends: None,
                 fsr0_holds: None,
                 tblptr_holds: None,
+                tblptr_walk: HashSet::new(),
+                cur_site: (String::new(), 0),
                 pending_copies: Vec::new(),
                 copy_loop: opts.copy_loop,
                 cur_func: &f.name,
@@ -10326,6 +10704,8 @@ mod tests {
                 routine_ends: None,
                 fsr0_holds: None,
                 tblptr_holds: None,
+                tblptr_walk: HashSet::new(),
+                cur_site: (String::new(), 0),
                 pending_copies: Vec::new(),
                 copy_loop: true,
                 cur_func: "f",
@@ -10361,6 +10741,8 @@ mod tests {
                 routine_ends: None,
                 fsr0_holds: None,
                 tblptr_holds: None,
+                tblptr_walk: HashSet::new(),
+                cur_site: (String::new(), 0),
                 pending_copies: Vec::new(),
                 copy_loop: true,
                 cur_func: "f",
@@ -10411,6 +10793,8 @@ mod p3_gen_tests {
             routine_ends: None,
             fsr0_holds: None,
             tblptr_holds: None,
+            tblptr_walk: HashSet::new(),
+            cur_site: (String::new(), 0),
             pending_copies: Vec::new(),
             copy_loop: true,
             cur_func: "main",
