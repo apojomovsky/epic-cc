@@ -701,7 +701,7 @@ fn fold_gap_pure(inst: &Inst) -> bool {
 /// The `Store`/`Load`/call span test `isel-pic18` folds under
 /// (epic-cc#723): no memory behavior may sit between producer and
 /// consumer, since the folded access moves to the producer.
-fn fold_span_clean(insts: &[Inst]) -> bool {
+pub fn fold_span_clean(insts: &[Inst]) -> bool {
     insts.iter().all(|i| match i {
         Inst::Call(_)
         | Inst::Asm(_)
