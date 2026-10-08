@@ -1654,8 +1654,8 @@ impl<'m> Gen<'m> {
                 {
                     continue;
                 }
-                if Self::phi_backedge(f, &b.label, &qreg, r, n).is_some() {
-                    if Self::phi_tail_clean(g, f, b, qi, r, &qreg, n, &uses, &home_of) {
+                if let Some(header) = Self::phi_backedge(f, &b.label, &qreg, r, n) {
+                    if Self::phi_tail_clean(g, f, b, qi, r, &qreg, n, &header, &home_of) {
                         phi_fold.insert(r.clone(), qreg.clone());
                         inplace.insert(r.clone());
                     }
@@ -1677,10 +1677,13 @@ impl<'m> Gen<'m> {
 
     /// The backedge incoming of `preg`'s phi carrying this `Bin`'s result:
     /// some block holds `Phi dest == preg` at width `n` with exactly one
-    /// incoming of `%r` from `pred`. `None` when the result feeds no such
-    /// edge (the common case) or the shape is ambiguous.
-    fn phi_backedge(f: &Func, pred: &str, preg: &str, r: &str, n: u8) -> Option<()> {
-        let mut found = false;
+    /// The backedge incoming of `preg`'s phi carrying this `Bin`'s result:
+    /// some block holds `Phi dest == preg` at width `n` with exactly one
+    /// incoming of `%r` from `pred`. Returns that block's label, or `None`
+    /// when the result feeds no such edge (the common case) or the shape
+    /// is ambiguous.
+    fn phi_backedge(f: &Func, pred: &str, preg: &str, r: &str, n: u8) -> Option<String> {
+        let mut found: Option<String> = None;
         for h in &f.blocks {
             for inst in &h.insts {
                 let Inst::Phi(p) = inst else { continue };
@@ -1693,25 +1696,30 @@ impl<'m> Gen<'m> {
                     .filter(|(v, from)| matches!(v, Val::Reg(rr) if rr == r) && from == pred)
                     .count();
                 if hits == 1 {
-                    if found {
+                    if found.is_some() {
                         return None;
                     }
-                    found = true;
+                    found = Some(h.label.clone());
                 } else if hits > 1 {
                     return None;
                 }
             }
         }
-        found.then_some(())
+        found
     }
 
     /// Whether the tail from a folded `Bin` to its block's terminator can
     /// host the in-place update: every use of the result `%r` is an
     /// `Icmp` in this same tail (renamed to the phi reg at emission) or a
-    /// phi edge (renamed the same way), the operand `%p` is read nowhere
-    /// else, and the tail holds no call, return, switch, store-shaped
-    /// write, or address-taken read of either home. A writer between
-    /// (`Icmp`/`Load` results) must home outside the phi's lanes.
+    /// phi edge (renamed the same way). The phi operand `%p` may have
+    /// other readers: they all observe edge-synced values except reads
+    /// ordered after the folded write, which are the tail past the `Bin`
+    /// (only renamed `%r` readers may sit there), the blocks reachable
+    /// from `b` without passing the phi's block, and copies on `b`'s
+    /// outgoing edges. Each is rejected below. The tail holds no call,
+    /// return, switch, store-shaped write, or address-taken read of
+    /// either home. A writer between (`Icmp`/`Load` results) must home
+    /// outside the phi's lanes.
     #[allow(clippy::too_many_arguments)]
     fn phi_tail_clean(
         g: &Gen,
@@ -1721,10 +1729,50 @@ impl<'m> Gen<'m> {
         r: &str,
         preg: &str,
         n: u8,
-        uses: &HashMap<String, usize>,
+        header: &str,
         home_of: &dyn Fn(&str) -> Option<u16>,
     ) -> bool {
-        if uses.get(preg).copied().unwrap_or(0) != 1 {
+        let reads_preg = |inst: &Inst| ir::read_vals(inst).iter().any(|v| v.as_str() == preg);
+        // Blocks reachable from `b` without passing the phi's block:
+        // a `%p` read there would observe the folded value where the
+        // original saw the edge value. Reads in the phi's block see
+        // edge-synced values, and reads in `b` before the `Bin` run
+        // before the folded write.
+        let mut danger: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut stack: Vec<&str> = match b.insts.last() {
+            Some(Inst::Br(br)) => vec![br.target.as_str()],
+            Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+            Some(Inst::Switch(sw)) => sw
+                .cases
+                .iter()
+                .map(|(_, l)| l.as_str())
+                .chain(std::iter::once(sw.default.as_str()))
+                .collect(),
+            _ => vec![],
+        };
+        while let Some(l) = stack.pop() {
+            if l == header || !danger.insert(l) {
+                continue;
+            }
+            let Some(ob) = f.blocks.iter().find(|bb| bb.label == l) else {
+                continue;
+            };
+            match ob.insts.last() {
+                Some(Inst::Br(br)) => stack.push(br.target.as_str()),
+                Some(Inst::BrCond(bc)) => {
+                    stack.push(bc.t.as_str());
+                    stack.push(bc.f.as_str());
+                }
+                Some(Inst::Switch(sw)) => {
+                    for (_, s) in &sw.cases {
+                        stack.push(s.as_str());
+                    }
+                    stack.push(sw.default.as_str());
+                }
+                _ => {}
+            }
+        }
+        if danger.contains(b.label.as_str()) {
             return false;
         }
         let Some(sp) = g.addrs.get(&ssa_key(&f.name, preg)).copied() else {
@@ -1748,7 +1796,14 @@ impl<'m> Gen<'m> {
             if ob.label == b.label {
                 continue;
             }
+            // A `%p` read outside the phi's block is sound only when
+            // every path from the folded write reaches it through the
+            // phi's edge sync, which the danger set above excludes.
+            let preg_ok = ob.label == header || !danger.contains(ob.label.as_str());
             for inst in &ob.insts {
+                if !preg_ok && reads_preg(inst) {
+                    return false;
+                }
                 let nreads = reads_of(inst);
                 if nreads == 0 {
                     continue;
@@ -1773,17 +1828,20 @@ impl<'m> Gen<'m> {
             match inst {
                 Inst::Phi(_) => {
                     phi_reads += reads_of(inst);
+                    if reads_preg(inst) {
+                        return false;
+                    }
                 }
                 Inst::Icmp(c) => {
                     if g.lane_consumed.contains(&c.dst) || g.bit_lanes.contains_key(&c.dst) {
                         return false;
                     }
-                    if !disjoint(&c.dst) {
+                    if reads_preg(inst) || !disjoint(&c.dst) {
                         return false;
                     }
                 }
                 Inst::Load(l) => {
-                    if reads_of(inst) > 0 || !disjoint(&l.dst) {
+                    if reads_of(inst) > 0 || reads_preg(inst) || !disjoint(&l.dst) {
                         return false;
                     }
                     let overlap = match Self::static_base(g, &f.name, &l.ptr) {
@@ -1795,7 +1853,7 @@ impl<'m> Gen<'m> {
                     }
                 }
                 Inst::Br(_) | Inst::BrCond(_) => {
-                    if reads_of(inst) > 0 {
+                    if reads_of(inst) > 0 || reads_preg(inst) {
                         return false;
                     }
                 }
@@ -1805,9 +1863,10 @@ impl<'m> Gen<'m> {
         // Copies on `b`'s outgoing edges run after the folded write: any
         // of them homing inside the phi's lanes would clobber the folded
         // value before its next read. Only the folded self-copy may touch
-        // the lanes (it emits nothing). Reads need no check: `%p` has no
-        // other reader by the use count above, and renamed `%r` readers
-        // want the new value.
+        // the lanes (it emits nothing). A copy reading `%p` on these
+        // edges would observe the folded value where the original saw
+        // the edge value, so only the self-copy (carrying `%r`) may run
+        // here; renamed `%r` readers want the new value.
         let succs: Vec<&str> = match b.insts.last() {
             Some(Inst::Br(br)) => vec![br.target.as_str()],
             Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
@@ -1828,6 +1887,9 @@ impl<'m> Gen<'m> {
                 for (val, from) in &p.incoming {
                     if from != &b.label {
                         continue;
+                    }
+                    if matches!(val, Val::Reg(x) if x == preg) {
+                        return false;
                     }
                     let Some(da) = g.addrs.get(&ssa_key(&f.name, &p.dst)).copied() else {
                         return false;

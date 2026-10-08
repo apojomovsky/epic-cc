@@ -8367,3 +8367,51 @@ fn const_select_threads_each_arm_through_w_to_the_store() {
         assert_eq!(p.ram()[0x14], expect, "const select c={c}");
     }
 }
+
+#[test]
+fn loop_phi_with_header_readers_folds_the_increment_in_place() {
+    // The phi operand has readers beyond the increment (the header's
+    // exit test), but they all observe edge-synced values: the latch
+    // increment computes into the phi's slot and the backedge copy
+    // degrades to a skipped self-copy (epic-cc#825).
+    let m = parse(
+        "global out i8\nfn main(void) ()\n\
+         block entry:\n\
+           br body\n\
+         block body:\n\
+           %2 = phi i8 0 entry %3 latch\n\
+           %4 = icmp eq i8 %2, 3\n\
+           br i1 %4 exit latch\n\
+         block latch:\n\
+           %3 = add i8 %2, 1\n\
+           br body\n\
+         block exit:\n\
+           store i8 %2 @out\n\
+           ret void\n",
+    );
+    let addrs = addrs(&[
+        ("out", 0x10),
+        ("main::2", 0x11),
+        ("main::3", 0x12),
+        ("main::4", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let latch = block_section(&asm, "main_Llatch");
+    assert!(
+        latch.contains("INCF 0x011,F,A"),
+        "increment computes into the phi slot:\n{latch}"
+    );
+    assert!(
+        !latch.contains("MOVWF 0x012"),
+        "no staged result temp:\n{latch}"
+    );
+    assert!(
+        !asm.contains("MOVFF 0x012, 0x011"),
+        "no backedge copy:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.run(500);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x10], 3, "exit stores the final count");
+}
