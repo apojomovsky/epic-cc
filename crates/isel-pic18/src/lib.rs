@@ -691,11 +691,10 @@ impl<'m> Gen<'m> {
     ///   terminator. Any instruction between them would be skipped by the
     ///   fused exits, so adjacency is what makes the fusion sound rather
     ///   than merely likely;
-    /// - the compare is multi-byte, or a single-byte `eq`/`ne`. Fusing
-    ///   skips the 0/1 result byte (preclear, set, reload and test), which
-    ///   is an i8 compare's real cost: its own lane is already one word.
-    ///   Single-byte ordering compares keep the materializing path, which
-    ///   routes them to the per-lane cascade (epic-cc#625).
+    /// - any width the backends lower (`n == 1 || n == 2 || n == 4`).
+    ///   Single bytes fuse to the one-lane lowering (the same flags the
+    ///   materializing byte path reads, with the exits rebound), wider
+    ///   values to the borrow chain or sign check plus chain.
     ///
     /// A fused compare emits its exits as the branch's own targets and
     /// never writes the result slot, so the 0/1 byte, its preclear, and
@@ -710,40 +709,37 @@ impl<'m> Gen<'m> {
         if c.dst != *cond {
             return None;
         }
-        let is_eq_ne = matches!(c.pred.as_str(), "eq" | "ne");
         // The same width guard `emit_inst`'s `Inst::Icmp` arm applies
         // (`n == 1 || n == 2 || n == 4`). Fusing an i64 compare would
-        // route it to the chain and compile, while the identical compare
+        // route it to a lowering and compile, while the identical compare
         // with any other use still panics; keep the two paths consistent
         // and the unsupported width loud.
         if !matches!(c.ty.bytes(), 1 | 2 | 4) {
             return None;
         }
-        // Only the predicates with a fused lowering. Single-byte orderings
-        // have none: fusion has no single-lane ordering lowering, only the
-        // borrow chain, so single-byte unsigned orderings keep the
-        // materializing path with the signed ones below.
-        // (`emit_icmp_signed_chain` covers the multi-byte signed half.)
+        // Only the predicates with a fused lowering (all ten: single
+        // bytes take the one-lane lowering, wider values the chain or
+        // sign check plus chain).
         if !matches!(
             c.pred.as_str(),
             "eq" | "ne" | "ult" | "uge" | "ugt" | "ule" | "slt" | "sle" | "sgt" | "sge"
-        ) || (c.ty.bytes() == 1 && !is_eq_ne)
-        {
+        ) {
             return None;
         }
-        // The unsigned ordering compares lower to the borrow chain, which
-        // holds STATUS,C across lanes; a rhs lane load that writes C would
-        // corrupt it. The materializing path routes that shape to the
-        // per-lane cascade instead (see `emit_icmp_i16`), but fusion has
-        // no cascade lowering, so decline to fuse it.
+        // The unsigned multi-byte compares lower to the borrow chain,
+        // which holds STATUS,C across lanes; a rhs lane load that writes
+        // C would corrupt it. The one-lane lowering consumes its flags
+        // immediately and needs no such guard, but the gate stays uniform
+        // across widths: the declined shapes keep the correct cascade.
         if matches!(c.pred.as_str(), "ult" | "uge" | "ugt" | "ule") && g.load_w_writes_carry(&c.b) {
             return None;
         }
         // The signed chain re-reads both high bytes in its sign check, so
-        // SFR operands and address-math rhs loads keep the cascade; fusion
-        // has no cascade lowering, so decline those too. A same-block
-        // single-use load feeding the compare is fine to fuse: the lanes
-        // then read a GPR global twice, and GPR reads have no side
+        // SFR operands and address-math rhs loads keep the cascade. The
+        // one-lane lowering reads each byte once and needs no such guard,
+        // but the gate stays uniform across widths for the same reason. A
+        // same-block single-use load feeding the compare is fine to fuse:
+        // the lanes then read a GPR global twice, and GPR reads have no side
         // effects (only SFRs do, and those never fuse). The rewrite that
         // could expose an SFR global directly keeps slot reads instead
         // (see `fused_chain_sources`).
@@ -5285,7 +5281,13 @@ impl<'m> Gen<'m> {
                     "isel-pic18: only i8/i16/i32 Icmp implemented so far (n={n})"
                 );
                 if n == 1 {
-                    self.emit_icmp_byte(self.fold_reg(&c.a), self.fold_reg(&c.b), &c.pred, &c.dst);
+                    self.emit_icmp_byte(
+                        self.fold_reg(&c.a),
+                        self.fold_reg(&c.b),
+                        &c.pred,
+                        &c.dst,
+                        None,
+                    );
                 } else if n == 2 {
                     self.emit_icmp_i16(self.fold_reg(&c.a), self.fold_reg(&c.b), &c.pred, &c.dst);
                 } else {
@@ -5761,7 +5763,19 @@ impl<'m> Gen<'m> {
     /// equality directly to the predicate answer: true for `eq`/`uge`/`ule`/
     /// `sge`/`sle`, false for the strict ones. Routing equality uniformly
     /// to `l_false` inverts the non-strict predicates at equal inputs.
-    fn emit_icmp_byte(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
+    ///
+    /// `fuse` carries the two exit labels of a consuming `BrCond` in this
+    /// function, when this compare's result has no other use. With it, the
+    /// lane branches straight to the branch targets and no 0/1 byte is
+    /// materialized (see `emit_fused_branch`).
+    fn emit_icmp_byte(
+        &mut self,
+        a: Val,
+        b: Val,
+        pred: &str,
+        dst: &str,
+        fuse: Option<(String, String)>,
+    ) {
         // `val_addr` maps `Val::Const(k)` to a RAM address, not a literal:
         // a constant LHS would compare against the byte at that address
         // instead of the literal. Same hazard as the `Bin` LHS arm;
@@ -5770,20 +5784,38 @@ impl<'m> Gen<'m> {
             !matches!(a, Val::Const(_)),
             "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
         );
-        let l_true = self.fresh_label();
-        let l_false = self.fresh_label();
-        let l_done = self.fresh_label();
+        let (l_true, l_false, l_done);
+        match fuse {
+            Some((t, f)) => {
+                l_true = t;
+                l_false = f;
+                l_done = None;
+            }
+            None => {
+                l_true = self.fresh_label();
+                l_false = self.fresh_label();
+                l_done = Some(self.fresh_label());
+            }
+        }
         let l_equal = if matches!(pred, "eq" | "uge" | "ule" | "sge" | "sle") {
             l_true.clone()
         } else {
             l_false.clone()
         };
-        let pre = self.bool_result_preclear(&a, &b, dst, 1);
+        // The materializing path writes a 0/1 byte only; a fused compare
+        // leaves the slot alone entirely, so the preclear is skipped.
+        let pre = if l_done.is_some() {
+            self.bool_result_preclear(&a, &b, dst, 1)
+        } else {
+            None
+        };
         if let Some(d) = pre {
             self.emit_banked("CLRF", d, "");
         }
         self.emit_cmp_branch(&a, &b, 0, pred, &l_true, &l_false, &l_equal);
-        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst, pre);
+        if let Some(done) = l_done {
+            self.emit_materialize_bool(&l_true, &l_false, &done, dst, pre);
+        }
     }
 
     /// Computes the 16-bit predicate by comparing the high byte first with
@@ -6255,8 +6287,10 @@ impl<'m> Gen<'m> {
     /// `l_false` on a decisive mismatch, `l_equal` on equal bytes. Equality
     /// stays ambiguous by design: the caller binds `l_equal` to defer (the
     /// high-byte step) or to answer (single bytes and low-byte tie-breaks).
-    /// `eq`/`ne` skip the split: one byte decides them, so only `l_true` and
-    /// `l_false` apply.
+    /// A caller that binds `l_equal` to the trailing branch's own target
+    /// gets no middle branch: equal bytes would fall into that target
+    /// either way, so the `BZ` is dead. `eq`/`ne` skip the split: one byte
+    /// decides them, so only `l_true` and `l_false` apply.
     fn emit_cmp_branch(
         &mut self,
         a: &Val,
@@ -6280,22 +6314,30 @@ impl<'m> Gen<'m> {
             }
             "ult" => {
                 self.emit(format!("    BNC {l_true}")); // C=0: a<b, definite
-                self.emit(format!("    BZ {l_equal}"));
+                if l_equal != l_false {
+                    self.emit(format!("    BZ {l_equal}"));
+                }
                 self.emit(format!("    BRA {l_false}"));
             }
             "uge" => {
                 self.emit(format!("    BNC {l_false}")); // C=0: a<b, definite
-                self.emit(format!("    BZ {l_equal}"));
+                if l_equal != l_true {
+                    self.emit(format!("    BZ {l_equal}"));
+                }
                 self.emit(format!("    BRA {l_true}")); // C=1,Z=0: a>b, definite
             }
             "ugt" => {
                 self.emit(format!("    BNC {l_false}")); // C=0: a<b, definite
-                self.emit(format!("    BZ {l_equal}"));
+                if l_equal != l_true {
+                    self.emit(format!("    BZ {l_equal}"));
+                }
                 self.emit(format!("    BRA {l_true}")); // C=1,Z=0: a>b, definite
             }
             "ule" => {
                 self.emit(format!("    BNC {l_true}")); // C=0: a<b, definite
-                self.emit(format!("    BZ {l_equal}"));
+                if l_equal != l_false {
+                    self.emit(format!("    BZ {l_equal}"));
+                }
                 self.emit(format!("    BRA {l_false}")); // C=1,Z=0: a>b, definite
             }
             "slt" => {
@@ -9388,6 +9430,11 @@ fn emit_fused_branch<'m>(
     let fuse = Some((l_t, l_f));
     if c.pred == "eq" || c.pred == "ne" {
         g.emit_icmp_eq_ne(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
+    } else if n == 1 {
+        // Single-byte orderings never reach the borrow chain: one lane
+        // has no carry to hold, so the lane branches straight to the
+        // exits with equality bound to its final answer.
+        g.emit_icmp_byte(c.a.clone(), c.b.clone(), &c.pred, &c.dst, fuse);
     } else if matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge") {
         g.emit_icmp_signed_chain(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
     } else {

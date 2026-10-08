@@ -8094,6 +8094,199 @@ fn fused_cond_icmp_i32_chain_break_the_tie_at_the_top_lane() {
     }
 }
 
+/// Single-byte ordering compares fuse to the one-lane lowering
+/// (epic-cc#848): the same flags the materializing byte path reads, with
+/// the exits rebound to the branch targets and no 0/1 byte. The IR shape
+/// is the one `fusable_icmp` recognizes: an i8 `icmp` immediately
+/// followed by the `br i1` that is its only consumer. Both rhs shapes
+/// run: a slot (the latch) and a literal (the loop entry's `0x1F` bound).
+#[test]
+fn fused_single_byte_ordering_icmp_branches_without_a_result_byte() {
+    for (pred, reg_cases, const_cases) in [
+        (
+            "ult",
+            vec![
+                ((0x00u8, 0x01u8), 1u8),
+                ((0x01, 0x00), 0),
+                ((0x05, 0x05), 0),
+                ((0xFF, 0x00), 0),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 1u8),
+                ((0x1F, 0x1F), 0),
+                ((0x20, 0x1F), 0),
+            ],
+        ),
+        (
+            "uge",
+            vec![
+                ((0x01u8, 0x00u8), 1u8),
+                ((0x00, 0x01), 0),
+                ((0x05, 0x05), 1),
+                ((0x00, 0xFF), 0),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 0u8),
+                ((0x1F, 0x1F), 1),
+                ((0x20, 0x1F), 1),
+            ],
+        ),
+        (
+            "ugt",
+            vec![
+                ((0x01u8, 0x00u8), 1u8),
+                ((0x00, 0x01), 0),
+                ((0x05, 0x05), 0),
+                ((0xFF, 0x00), 1),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 0u8),
+                ((0x1F, 0x1F), 0),
+                ((0x20, 0x1F), 1),
+            ],
+        ),
+        (
+            "ule",
+            vec![
+                ((0x00u8, 0x01u8), 1u8),
+                ((0x01, 0x00), 0),
+                ((0x05, 0x05), 1),
+                ((0xFF, 0x00), 0),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 1u8),
+                ((0x1F, 0x1F), 1),
+                ((0x20, 0x1F), 0),
+            ],
+        ),
+        (
+            "slt",
+            vec![
+                ((0x80u8, 0x00u8), 1u8),
+                ((0x00, 0x80), 0),
+                ((0xFF, 0x00), 1),
+                ((0x7F, 0x80), 0),
+                ((0x80, 0x7F), 1),
+                ((0x05, 0x05), 0),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 1u8),
+                ((0x1F, 0x1F), 0),
+                ((0x80, 0x1F), 1),
+            ],
+        ),
+        (
+            "sge",
+            vec![
+                ((0x80u8, 0x00u8), 0u8),
+                ((0x00, 0x80), 1),
+                ((0xFF, 0x00), 0),
+                ((0x7F, 0x80), 1),
+                ((0x05, 0x05), 1),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 0u8),
+                ((0x1F, 0x1F), 1),
+                ((0x20, 0x1F), 1),
+            ],
+        ),
+        (
+            "sgt",
+            vec![
+                ((0x00u8, 0x80u8), 1u8),
+                ((0x80, 0x00), 0),
+                ((0x00, 0xFF), 1),
+                ((0x80, 0x7F), 0),
+                ((0x05, 0x05), 0),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 0u8),
+                ((0x1F, 0x1F), 0),
+                ((0x20, 0x1F), 1),
+            ],
+        ),
+        (
+            "sle",
+            vec![
+                ((0x80u8, 0x00u8), 1u8),
+                ((0x00, 0x80), 0),
+                ((0xFF, 0x00), 1),
+                ((0x7F, 0x80), 0),
+                ((0x05, 0x05), 1),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 1u8),
+                ((0x1F, 0x1F), 1),
+                ((0x20, 0x1F), 0),
+            ],
+        ),
+    ] {
+        for (rhs_ir, cases) in [
+            ("%2".to_string(), reg_cases),
+            ("31".to_string(), const_cases),
+        ] {
+            let m = parse(&format!(
+                "global a i8\nglobal b i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+                 %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp {pred} i8 %1, {rhs_ir}\n    \
+                 br i1 %3 10 20\n  block 10:\n    store i8 1 @out\n    ret void\n  \
+                 block 20:\n    store i8 0 @out\n    ret void\n",
+            ));
+            // Both shapes keep the `%2` load (unused under a literal rhs),
+            // so its slot is pinned either way.
+            let addrs = addrs(&[
+                ("a", 0x20),
+                ("b", 0x24),
+                ("out", 0x28),
+                ("main::1", 0x30),
+                ("main::2", 0x34),
+                ("main::3", 0x38),
+            ]);
+            let asm = select(&PIC18F4550, &m, &addrs, None);
+            // The fusion must have fired: no preclear, no 0/1 byte, the
+            // lane branches straight to the two block labels.
+            assert!(
+                !asm.contains("INCF 0x38") && !asm.contains("CLRF 0x38"),
+                "{pred} i8 rhs {rhs_ir} was not fused:\n{asm}"
+            );
+            let block = {
+                let rest = asm.split("\nmain:").nth(1).expect("main");
+                rest.split("\n__start:").next().unwrap()
+            };
+            assert!(
+                !block.contains("MOVWF 0x038") && !block.contains("MOVFF 0x030, 0x038"),
+                "{pred} i8 rhs {rhs_ir} still materializes its result byte:\n{asm}"
+            );
+            // `ult`/`uge` bind equality to the trailing branch's own
+            // target, so the middle `BZ` is dead and skipped; `ugt`/`ule`
+            // split equal from ordered and keep it.
+            if pred == "ult" || pred == "uge" {
+                assert!(
+                    !block.contains("BZ "),
+                    "{pred} i8 rhs {rhs_ir} keeps a dead equality branch:\n{asm}"
+                );
+            } else if pred == "ugt" || pred == "ule" {
+                assert!(
+                    block.contains("BZ "),
+                    "{pred} i8 rhs {rhs_ir} lost its equality split:\n{asm}"
+                );
+            }
+            let words = asm::assemble_pic18(&asm);
+            for &((a, b), expect) in &cases {
+                let mut p = pic14_sim::Pic18::new(words.clone());
+                step_past_start(&mut p, start_steps(&asm));
+                p.ram_mut()[0x20] = a;
+                p.ram_mut()[0x24] = b;
+                p.run(300);
+                assert_eq!(
+                    p.ram()[0x28],
+                    expect,
+                    "{pred} i8 rhs {rhs_ir} {a:#04x} vs {b:#04x}"
+                );
+            }
+        }
+    }
+}
+
 /// A fused chain whose operands are single-use global loads reads the
 /// globals in place (epic-cc#721): no MOVFF staging temp, the lane
 /// `MOVF` sources are the global addresses themselves.
