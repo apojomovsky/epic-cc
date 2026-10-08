@@ -16,14 +16,16 @@ set -uo pipefail
 
 CACHE_DIR="${HOME}/.cache/epic-cc"
 CARGO_HOME_CACHE="$CACHE_DIR/cargo-home"
-# Keyed by worktree path, not shared: every invocation mounts its
-# worktree at the identical in-container /workspace, so a shared target
-# dir lets cargo silently replay a DIFFERENT worktree's cached warnings
-# here. A hard gate on stale output is worse than a slow one.
-WARNCHECK_TARGET_CACHE="$CACHE_DIR/target-warncheck$(printf '%s' "$PWD" | tr '/' '-')"
-# Content-addressed dev image (epic-cc#736): resolve once via the single
-# script so the hook never trails the Makefile's tag.
-DEV_IMAGE="$(bash "$(git rev-parse --show-toplevel 2>/dev/null)/scripts/dev-image-tag.sh" 2>/dev/null || true)"
+# Same per-worktree target dir the Makefile builds into (#889): same
+# command, flags and profile, so the gate reuses the warm cache instead
+# of doubling it, and cargo replays cached warnings on a fresh build, so
+# the grep still fires. Serialized with the Makefile's lock, since a
+# commit during `make test` now contends for one cache dir. `make shell`
+# holds that lock for the whole session, so the probe below says so
+# instead of hanging silently when a shell or build is holding it.
+TARGET_CACHE="$CACHE_DIR/target$(printf '%s' "$PWD" | tr '/' '-')"
+TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+DEV_IMAGE="$(bash "$TOPLEVEL/scripts/dev-image-tag.sh" 2>/dev/null || true)"
 
 # Only check files that are actually staged; respect the dev container's
 # existence (skip format checks if the image isn't built yet, e.g. first
@@ -41,12 +43,15 @@ if [ -n "$staged_rs" ]; then
       exit 1
     fi
 
-    mkdir -p "$CARGO_HOME_CACHE" "$WARNCHECK_TARGET_CACHE"
-    build_out=$(docker run --rm \
+    mkdir -p "$CARGO_HOME_CACHE" "$TARGET_CACHE"
+    if command -v flock >/dev/null 2>&1 && ! flock -w 0 "$TARGET_CACHE/.build.lock" true 2>/dev/null; then
+      echo "pre-commit: waiting for the target cache lock (a build or make shell holds it)..." >&2
+    fi
+    build_out=$(bash "$TOPLEVEL/scripts/with-target-lock.sh" "$TARGET_CACHE/.build.lock" docker run --rm \
       --user "$(id -u):$(id -g)" \
       -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
       -v "$CARGO_HOME_CACHE":/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
-      -v "$WARNCHECK_TARGET_CACHE":/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
+      -v "$TARGET_CACHE":/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
       -v "$PWD":/workspace -w /workspace "$DEV_IMAGE" \
       bash -c 'cargo build --workspace --all-targets 2>&1')
     warnings=$(printf '%s\n' "$build_out" | grep '^warning:' || true)

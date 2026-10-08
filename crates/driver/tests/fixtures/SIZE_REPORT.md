@@ -3,9 +3,9 @@
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
 - Date (UTC): 2026-10-08
-- Commit: 54ac60d
+- Commit: 640bc10
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
-- Menu-demo listing: 9187 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
+- Menu-demo listing: 9179 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
 ## Micro benches (flash / RAM)
 
@@ -44,19 +44,19 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | hal-pic18-blink-18f4550 | 18F4550 | 313 | 30 | = / = |
 | hal-pic14e-blink-16f1937 | 16F1937 | 100 | 6 | = / = |
 | hal-pic16-encoder-full-16f877a | 16F877A | 5460 | 326 | = / = |
-| hal-pic18-menu-demo-18f4550 | 18F4550 | 9199 | 781 | = / = |
-| hal-pic18-control-demo-18f4550 | 18F4550 | 9371 | 963 | = / = |
+| hal-pic18-menu-demo-18f4550 | 18F4550 | 9191 | 781 | = / = |
+| hal-pic18-control-demo-18f4550 | 18F4550 | 9368 | 963 | = / = |
 | hal-pic18-pid-18f4550 | 18F4550 | 3195 | 500 | = / = |
-| hal-pic18-bridge-demo-18f4550 | 18F4550 | 13288 | 1312 | = / = |
+| hal-pic18-bridge-demo-18f4550 | 18F4550 | 13273 | 1312 | = / = |
 
 ## Menu-demo clusters (listing words)
 
 | cluster | ours |
 |---|---|
-| menu_demo_init +7 folded | 1701 |
-| redraw | 487 |
+| menu_demo_init +7 folded | 1700 |
+| redraw | 485 |
 | main | 367 |
-| redraw_status | 331 |
+| redraw_status | 329 |
 | EPIC_USART_Init | 327 |
 | epic_taskmgr_run +1 folded | 323 |
 | epic_dispatch_all_irqs_isr | 267 |
@@ -69,13 +69,13 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 
 Top profiler categories on the same listing:
 
-- `data-move`: 1419 (15.4%)
+- `data-move`: 1418 (15.4%)
 - `shared-code`: 1321 (14.4%)
 - `struct-copy-movff`: 1182 (12.9%)
 - `branch`: 763 (8.3%)
-- `scalar-alu`: 580 (6.3%)
+- `scalar-alu`: 579 (6.3%)
 - `cond-branch`: 549 (6.0%)
-- `literal-load`: 480 (5.2%)
+- `literal-load`: 479 (5.2%)
 - `slot-copy`: 396 (4.3%)
 
 ## Regenerating
