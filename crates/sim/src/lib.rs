@@ -243,7 +243,10 @@ fn cost14_masked(word: u16, pc: u16, next: u16, mask: u16, cls: u16) -> u64 {
     }
 }
 /// Instruction-cycle cost of one PIC18 step. `pc`/`next` are byte
-/// addresses (+2 per word). Fixed classes first: `SLEEP`/`RESET` cost 1,
+/// addresses (+2 per word). `jumped` marks a taken transfer (taken
+/// branch, return, computed jump): always 2, even when it lands on the
+/// next instruction, where the delta alone would read fall-through 1.
+/// Fixed classes first: `SLEEP`/`RESET` cost 1,
 /// `PUSH`/`POP` cost 2, `TBLRD*` costs 2, `GOTO`/`CALL`/`LFSR` cost 2
 /// over two words. Anything else follows the delta: fall-through 1, a
 /// one-word skip or any redirect 2, a skip over a two-word form 3.
@@ -2250,7 +2253,11 @@ impl Pic18 {
                 self.exec_goto_call_lfsr(pc, word, w2)
             }
             0x0010 | 0x0011 => self.exec_retfie(),
-            0x0012 | 0x0013 => self.pop_return(),
+            0x0012 | 0x0013 => {
+                let target = self.pop_return();
+                self.jump_target = Some(target);
+                target
+            }
             // TBLRD* / TBLRD*+ / TBLRD*- / TBLRD+*: single-word opcodes
             // that read one byte of program memory into TABLAT. Must
             // precede the literal arm below (0x0008..0x000B are numerically
@@ -2265,8 +2272,11 @@ impl Pic18 {
             }
             _ => panic!("sim(pic18): opcode {word:#06x} not yet implemented"),
         };
-        // A `MOVWF PCL` (computed jump) sets the whole PC from
-        // PCLATU:PCLATH:W; its linear next is void.
+        // A taken transfer sets the whole PC through `jump_target` (a taken
+        // `BRA`/`RCALL`/conditional, a `RETURN`/`RETFIE`/`RETLW`, or a
+        // `MOVWF PCL` computed jump); its linear next is void. `jumped`
+        // marks taken, so a branch landing on the next instruction still
+        // costs its 2 cycles instead of reading as fall-through.
         let jumped = self.jump_target.take();
         let next = jumped.unwrap_or(next);
         let delta = cost18(word, pc, next, jumped.is_some());
@@ -2603,9 +2613,12 @@ impl Pic18 {
                 self.set_zn(self.w);
             }
             0xC => {
-                // RETLW: W = k, then return
+                // RETLW: W = k, then return. A return is taken even when
+                // it lands on the next instruction, so mark it jumped.
                 self.w = k;
-                return self.pop_return();
+                let target = self.pop_return();
+                self.jump_target = Some(target);
+                return target;
             }
             0xD => {
                 // MULLW: unsigned 8x8 -> 16-bit product in PRODH:PRODL
@@ -2727,7 +2740,11 @@ impl Pic18 {
         };
         if taken {
             let next_word = (pc / 2) as i32 + 1 + n;
-            (next_word as u32) * 2
+            let target = (next_word as u32) * 2;
+            // A taken branch costs 2 even when it lands on the next
+            // instruction, where the pc-delta fallback would read 1.
+            self.jump_target = Some(target);
+            target
         } else {
             pc + 2
         }
@@ -2742,10 +2759,14 @@ impl Pic18 {
         }; // sign-extend 11 bits
         let is_call = word & 0x0800 != 0;
         let next_word = (pc / 2) as i32 + 1 + n;
+        let target = (next_word as u32) * 2;
         if is_call {
             self.push_return(pc + 2);
         }
-        (next_word as u32) * 2
+        // BRA/RCALL always take: mark even a self-adjacent target so
+        // `BRA +0` costs its 2 cycles instead of fall-through 1.
+        self.jump_target = Some(target);
+        target
     }
 
     fn exec_goto_call_lfsr(&mut self, pc: u32, word: u16, word2: u16) -> u32 {
@@ -2810,7 +2831,9 @@ impl Pic18 {
             Some(false) => self.ram[PIC18_INTCON] |= PIC18_GIEL, // low: GIEL on
             None => self.ram[PIC18_INTCON] |= PIC18_GIEH,       // unmodelled: GIE on
         }
-        self.pop_return()
+        let target = self.pop_return();
+        self.jump_target = Some(target);
+        target
     }
 
     fn status_addr(&mut self) -> usize {
