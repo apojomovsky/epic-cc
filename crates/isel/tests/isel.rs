@@ -3316,7 +3316,7 @@ fn sim_run_bytes(
 /// Every routine emits a real body — the label, recipe instructions, and a
 /// RETURN (not an empty label that would fall through into the next
 /// function). The `pats` are the load-bearing idiom strings at the contract
-/// addresses (e.g. `__mul_u8`'s `INCFSZ` carry step at t_hi = __scr+5).
+/// addresses (e.g. `__udiv_u8`'s `ADDLW` borrow fold on rem_hi).
 #[test]
 fn mul_div_rem_routines_emit_recipe_bodies() {
     // (`__mul_u8`/`__mul_u16` have no entries here: their bodies are
