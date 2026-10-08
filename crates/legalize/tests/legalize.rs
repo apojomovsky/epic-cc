@@ -2562,3 +2562,245 @@ fn shares_bench_counted_loop_on_pic18_only() {
         );
     }
 }
+
+/// A same-block `udiv`/`urem` pair on identical operands fuses into one
+/// combined divide call plus a load of its remainder spill slot
+/// (epic-cc#895): the loop runs once instead of twice.
+#[test]
+fn fuses_matching_divmod_pair() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %6 = urem i16 %1 %2\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("%3 = call i16 @__udivmod_u16(i16 %1, i16 %2)"),
+        "divide became the combined call:\n{text}"
+    );
+    assert!(
+        text.contains("%6 = load volatile i16 @__udivmod_rem_u16"),
+        "remainder became a slot load:\n{text}"
+    );
+    assert!(
+        text.contains("global __udivmod_rem_u16 i16"),
+        "spill slot injected:\n{text}"
+    );
+    assert!(
+        text.contains("fn __udivmod_u16(i16) (num=i16, den=i16)"),
+        "combined routine injected:\n{text}"
+    );
+    assert!(
+        !text.contains("fn __udiv_u16(") && !text.contains("fn __urem_u16("),
+        "pruned routines not injected:\n{text}"
+    );
+}
+
+/// The bench shape: reloaded globals (different SSA, same addresses) with
+/// a volatile store between the operations still fuses.
+#[test]
+fn fuses_reloaded_globals_across_unrelated_store() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load volatile i16 @a\n\
+             %2 = load volatile i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store volatile i16 %3 @q\n\
+             %4 = load volatile i16 @a\n\
+             %5 = load volatile i16 @b\n\
+             %6 = urem i16 %4 %5\n\
+             store volatile i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(i16 %1, i16 %2)")
+            && text.contains("%6 = load volatile i16 @__udivmod_rem_u16"),
+        "reloaded pair fused:\n{text}"
+    );
+}
+
+/// A store to an operand global between the operations blocks the fuse:
+/// the second load may read a new value.
+#[test]
+fn no_fuse_on_store_to_operand() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             store i16 %3 @a\n\
+             %4 = load i16 @a\n\
+             %6 = urem i16 %4 %2\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udiv_u16(") && text.contains("@__urem_u16("),
+        "pair kept two calls:\n{text}"
+    );
+    assert!(!text.contains("__udivmod"), "nothing fused:\n{text}");
+}
+
+/// A call between the operations blocks the fuse: it may store to the
+/// operand globals, and a second fused pair would clobber the slot.
+#[test]
+fn no_fuse_on_call_between() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn helper(i16) (x=i16)\n\
+           block entry:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             call void @helper(i16 %1)\n\
+             %6 = urem i16 %1 %2\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udiv_u16(") && text.contains("@__urem_u16("),
+        "pair kept two calls:\n{text}"
+    );
+    assert!(!text.contains("__udivmod"), "nothing fused:\n{text}");
+}
+
+/// Mismatched operands, widths, or order never fuse.
+#[test]
+fn no_fuse_on_mismatch_or_reverse_order() {
+    for (name, body) in [
+        (
+            "denominator",
+            "%3 = udiv i16 %1 %2\n             store i16 %3 @q\n             %6 = urem i16 %1 %1\n",
+        ),
+        (
+            "width",
+            "%3 = udiv i16 %1 %2\n             store i16 %3 @q\n             %8 = load i8 @qb\n             %6 = urem i8 %8 %8\n",
+        ),
+        (
+            "reverse",
+            "%6 = urem i16 %1 %2\n             store i16 %6 @m\n             %3 = udiv i16 %1 %2\n",
+        ),
+    ] {
+        let m = parse(&format!(
+            "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal qb i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i16 @a\n\
+                 %2 = load i16 @b\n\
+                 {body}             store i16 %6 @m\n\
+                 ret void\n",
+        ));
+        let text = ir::serialize(&legalize(m));
+        assert!(!text.contains("__udivmod"), "{name} fused:\n{text}");
+    }
+}
+
+/// Interrupt-context spellings keep their two calls: each context needs
+/// its own remainder slot, and fusion only provides the main one.
+#[test]
+fn no_fuse_on_isr_spellings() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = call i16 @__udiv_u16_isr(i16 %1, i16 %2)\n\
+             store i16 %3 @q\n\
+             %6 = call i16 @__urem_u16_isr(i16 %1, i16 %2)\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(!text.contains("__udivmod"), "isr pair fused:\n{text}");
+}
+
+/// A second remainder below the first fuses onto the same combined call.
+#[test]
+fn fuses_chained_remainders() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal m2 i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %6 = urem i16 %1 %2\n\
+             store i16 %6 @m\n\
+             %7 = urem i16 %1 %2\n\
+             store i16 %7 @m2\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(")
+            && text.contains("%6 = load volatile i16 @__udivmod_rem_u16")
+            && text.contains("%7 = load volatile i16 @__udivmod_rem_u16"),
+        "both remainders fused:\n{text}"
+    );
+}
+
+/// A remainder slot shadowed by a user global of another type never fuses.
+#[test]
+fn no_fuse_on_slot_collision() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal __udivmod_rem_u16 i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %6 = urem i16 %1 %2\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        !text.contains("__udivmod_u16"),
+        "collided slot fused:\n{text}"
+    );
+}
+
+/// The PIC18 entry skips fusion: its backend owns its own divide shape.
+#[test]
+fn no_fuse_on_pic18_entry() {
+    use legalize::legalize_pic18;
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %6 = urem i16 %1 %2\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize_pic18(m));
+    assert!(
+        text.contains("@__udiv_u16(") && !text.contains("__udivmod"),
+        "pic18 pair fused:\n{text}"
+    );
+}
