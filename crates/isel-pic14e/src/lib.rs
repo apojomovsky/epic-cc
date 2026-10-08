@@ -6401,6 +6401,16 @@ fn emit_const_section(
         // their table: explicit PCLATH sets, straight-line code, no
         // page-dependent elision inside, so both passes agree.
         if staged.contains(&g.name) {
+            // The routine below indexes with one MOVLW byte and always
+            // CALLs the chunk-0 reader, so a larger const would misread
+            // past byte 255. alloc never stages such consts today; fail
+            // loudly if that changes instead of emitting a wrong copy.
+            assert!(
+                g.bytes.len() <= 255,
+                "isel: staged const @{} of {} bytes exceeds the 255-byte single-chunk staging bound",
+                g.name,
+                g.bytes.len()
+            );
             let stage = *addrs
                 .get("__const_stage")
                 .expect("isel: staged const with no staging buffer in map");
