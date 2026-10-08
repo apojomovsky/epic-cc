@@ -35,14 +35,21 @@ const COPY_LOOP_MIN_PAIRS: usize = 6;
 /// long staged runs lower to the 9-word seeded loop, which runs about
 /// 3x slower per byte than straight `MOVFF`s. The speed profile turns it
 /// off, trading flash for cycles on those runs (epic-cc#883).
+/// `divmod_fold` folds the software divide/modulo loop counter into both
+/// bit paths (epic-cc#894), dropping the taken `BRA` off the success path
+/// at 2 words per helper. Speed profile only.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     pub copy_loop: bool,
+    pub divmod_fold: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { copy_loop: true }
+        Self {
+            copy_loop: true,
+            divmod_fold: false,
+        }
     }
 }
 
@@ -216,6 +223,9 @@ struct Gen<'m> {
     /// Whether long staged runs drain as the POSTINC loop. Off under the
     /// speed profile, where straight `MOVFF`s trade flash for cycles.
     copy_loop: bool,
+    /// Whether the divmod bit loop folds its counter into both paths. On
+    /// under the speed profile only.
+    divmod_fold: bool,
     /// Every RAM address a global occupies. The W cache never records or
     /// reuses one: an interrupt can write a global between the store and
     /// the reload, while the ISR epilogue restores W to its pre-interrupt
@@ -6225,6 +6235,8 @@ impl<'m> Gen<'m> {
     /// branches free the frame from any single-bank constraint. Shared by the
     /// unsigned and signed wrappers. The u8 case pairs a 2-byte remainder
     /// with a 1-byte divisor (implicit high byte 0 via `MOVLW 0` folds).
+    /// With `fold` the counter lives in both bit paths, dropping the taken
+    /// `BRA` off the success path at 2 words.
     fn emit_divmod_loop(
         &mut self,
         num: u16,
@@ -6233,10 +6245,18 @@ impl<'m> Gen<'m> {
         cnt: u16,
         den_bytes: u8,
         rem_bytes: u8,
+        fold: bool,
     ) {
+        // Mint order matches the old head so unfolded output keeps its
+        // label numbering; the fold-only label never shifts it.
         let l_loop = self.fresh_label();
         let l_restore = self.fresh_label();
         let l_next = self.fresh_label();
+        let l_done = if fold {
+            self.fresh_label()
+        } else {
+            String::new()
+        };
         for i in 0..u16::from(rem_bytes) {
             let (ra, rf) = self.operand(rem_base + i);
             self.emit(format!(
@@ -6286,15 +6306,48 @@ impl<'m> Gen<'m> {
             ));
         }
         // C after the last byte = (rem >= den): set the quotient bit or restore.
+        // Folded form counts down in both paths, dropping the taken `BRA`
+        // off the success path; the plain form keeps the old shared tail.
         self.emit(format!("    BNC {l_restore}"));
         let (na, nf) = self.operand(num);
         self.emit(format!(
             "    BSF 0x{nf:03X},0,{}",
             if na == 0 { "A" } else { "B" }
         ));
-        self.emit(format!("    BRA {l_next}"));
-        self.emit_label(&l_restore);
-        // rem += den back (ADDWF, then ADDWFC for the carries).
+        if fold {
+            let (ca, cf) = self.operand(cnt);
+            self.emit(format!(
+                "    DECFSZ 0x{cf:03X},F,{}",
+                if ca == 0 { "A" } else { "B" }
+            ));
+            self.emit(format!("    BRA {l_loop}"));
+            self.emit(format!("    BRA {l_done}"));
+            self.emit_label(&l_restore);
+            self.emit_div_restore(den, rem_base, den_bytes, rem_bytes);
+            let (ca, cf) = self.operand(cnt);
+            self.emit(format!(
+                "    DECFSZ 0x{cf:03X},F,{}",
+                if ca == 0 { "A" } else { "B" }
+            ));
+            self.emit(format!("    BRA {l_loop}"));
+            self.emit_label(&l_done);
+        } else {
+            self.emit(format!("    BRA {l_next}"));
+            self.emit_label(&l_restore);
+            self.emit_div_restore(den, rem_base, den_bytes, rem_bytes);
+            self.emit_label(&l_next);
+            let (ca, cf) = self.operand(cnt);
+            self.emit(format!(
+                "    DECFSZ 0x{cf:03X},F,{}",
+                if ca == 0 { "A" } else { "B" }
+            ));
+            self.emit(format!("    BRA {l_loop}"));
+        }
+    }
+
+    /// The restore half of one division bit: `rem += den` back after a
+    /// borrowing trial subtract (ADDWF, then ADDWFC for the carries).
+    fn emit_div_restore(&mut self, den: u16, rem_base: u16, den_bytes: u8, rem_bytes: u8) {
         for i in 0..u16::from(rem_bytes) {
             if i < u16::from(den_bytes) {
                 let (da, df) = self.operand(den + i);
@@ -6312,13 +6365,6 @@ impl<'m> Gen<'m> {
                 if ra == 0 { "A" } else { "B" }
             ));
         }
-        self.emit_label(&l_next);
-        let (ca, cf) = self.operand(cnt);
-        self.emit(format!(
-            "    DECFSZ 0x{cf:03X},F,{}",
-            if ca == 0 { "A" } else { "B" }
-        ));
-        self.emit(format!("    BRA {l_loop}"));
     }
 
     /// The restoring-division recipe for `den_bytes` = 1, 2, or 4, quotient
@@ -6336,6 +6382,7 @@ impl<'m> Gen<'m> {
             scr + u16::from(rem_bytes),
             den_bytes,
             rem_bytes,
+            self.divmod_fold,
         );
         if quotient {
             self.store_retval(num, den_bytes);
@@ -6373,8 +6420,9 @@ impl<'m> Gen<'m> {
         let l_done = self.fresh_label();
         self.emit_label(&l_digits);
         // One restoring-division pass: quotient back into `num`, remainder
-        // (the digit value, 0-9) into `rem`.
-        self.emit_divmod_loop(num, den, rem, cnt, 4, 4);
+        // (the digit value, 0-9) into `rem`. Unfolded: the digit rows pin
+        // the full-count timing and are out of scope.
+        self.emit_divmod_loop(num, den, rem, cnt, 4, 4, false);
         // digit = rem0 | 48, then POSTINC0 (0xFEE) = digit: the FSR walks
         // the buffer, one advance per digit. (0xFEB is PLUSW0, the indexed
         // form, not this.)
@@ -6415,8 +6463,8 @@ impl<'m> Gen<'m> {
         let l_digits = self.fresh_label();
         self.emit_label(&l_digits);
         // One restoring-division pass: quotient back into `num`, remainder
-        // (the binary digit, 0-9) into `rem`.
-        self.emit_divmod_loop(num, den, rem, dcnt, 2, 2);
+        // (the binary digit, 0-9) into `rem`. Unfolded like its u32 sibling.
+        self.emit_divmod_loop(num, den, rem, dcnt, 2, 2, false);
         // digit = rem0, then POSTINC0 (0xFEE) = digit.
         self.emit_banked("MOVF", rem, ",W");
         self.emit_banked("MOVWF", digit, "");
@@ -6484,6 +6532,7 @@ impl<'m> Gen<'m> {
             scr + 1 + u16::from(rem_bytes),
             den_bytes,
             rem_bytes,
+            self.divmod_fold,
         );
         if quotient {
             let (sa, sf) = self.operand(scr);
@@ -9197,6 +9246,7 @@ pub fn select_with_opts(
             tblptr_holds: None,
             pending_copies: Vec::new(),
             copy_loop: opts.copy_loop,
+            divmod_fold: opts.divmod_fold,
             cur_func: &f.name,
             global_addrs: &global_addrs,
             w_holds: None,
@@ -9878,6 +9928,7 @@ pub fn select_with_opts(
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
                 copy_loop: opts.copy_loop,
+                divmod_fold: opts.divmod_fold,
                 cur_func: &f.name,
                 global_addrs: &global_addrs,
                 w_holds: None,
@@ -10223,6 +10274,7 @@ mod tests {
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
                 copy_loop: true,
+                divmod_fold: false,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
                 w_holds: None,
@@ -10257,6 +10309,7 @@ mod tests {
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
                 copy_loop: true,
+                divmod_fold: false,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
                 w_holds: None,
@@ -10306,6 +10359,7 @@ mod p3_gen_tests {
             tblptr_holds: None,
             pending_copies: Vec::new(),
             copy_loop: true,
+            divmod_fold: false,
             cur_func: "main",
             global_addrs: empty_global_addrs(),
             w_holds: None,

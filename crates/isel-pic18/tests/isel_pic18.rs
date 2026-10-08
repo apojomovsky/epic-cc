@@ -3635,7 +3635,10 @@ fn speed_profile_drains_long_copy_runs_straight() {
              ret void\n",
     );
     let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
-    let opts = isel_pic18::Options { copy_loop: false };
+    let opts = isel_pic18::Options {
+        copy_loop: false,
+        divmod_fold: false,
+    };
     let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
     for i in 0..12u16 {
         let expect = format!("MOVFF 0x{:03X}, 0x{:03X}", 0x100 + i, 0x110 + i);

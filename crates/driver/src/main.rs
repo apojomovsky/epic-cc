@@ -569,8 +569,12 @@ fn main() {
         device::Core::Pic18 => {
             // The POSTINC copy loop trades cycles for flash, so the speed
             // profile drains staged runs as straight MOVFFs (epic-cc#883).
-            let copy_loop = !matches!(cli.opt_level, driver::cli::OptLevel::O2);
-            let opts = isel_pic18::Options { copy_loop };
+            // The divmod tail fold trades 2 words per helper the same way.
+            let is_o2 = matches!(cli.opt_level, driver::cli::OptLevel::O2);
+            let opts = isel_pic18::Options {
+                copy_loop: !is_o2,
+                divmod_fold: is_o2,
+            };
             isel_pic18::select_with_opts(
                 device,
                 &m,
