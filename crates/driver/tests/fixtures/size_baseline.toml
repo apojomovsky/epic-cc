@@ -162,13 +162,13 @@ ram_bytes = 326
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 9311
+flash_words = 9303
 ram_bytes = 781
 
 [[entry]]
 name = "hal-pic18-control-demo-18f4550"
 device = "18F4550"
-flash_words = 9519
+flash_words = 9516
 ram_bytes = 963
 
 [[entry]]
@@ -180,7 +180,7 @@ ram_bytes = 500
 [[entry]]
 name = "hal-pic18-bridge-demo-18f4550"
 device = "18F4550"
-flash_words = 13575
+flash_words = 13567
 ram_bytes = 1312
 
 [[entry]]
