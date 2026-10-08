@@ -3223,16 +3223,29 @@ fn routine_sig(name: &str) -> (&'static str, &'static [(&'static str, &'static s
         "__mul_u8" => ("i8", &[("a", "i8"), ("b", "i8")], 6),
         "__mul_u16" => ("i16", &[("a", "i16"), ("b", "i16")], 14),
         "__udiv_u8" | "__urem_u8" => ("i8", &[("num", "i8"), ("den", "i8")], 4),
+        "__udivmod_u8" => ("i8", &[("num", "i8"), ("den", "i8")], 4),
         "__udiv_u16" | "__urem_u16" => ("i16", &[("num", "i16"), ("den", "i16")], 7),
+        "__udivmod_u16" => ("i16", &[("num", "i16"), ("den", "i16")], 7),
         "__sdiv_i8" | "__srem_i8" => ("i8", &[("num", "i8"), ("den", "i8")], 5),
         "__sdiv_i16" | "__srem_i16" => ("i16", &[("num", "i16"), ("den", "i16")], 7),
         "__shl_u8" | "__lshr_u8" | "__ashr_i8" => ("i8", &[("val", "i8"), ("cnt", "i8")], 3),
         "__shl_u16" | "__lshr_u16" | "__ashr_i16" => ("i16", &[("val", "i16"), ("cnt", "i16")], 4),
         "__mul_u32" => ("i32", &[("a", "i32"), ("b", "i32")], 11),
         "__udiv_u32" | "__urem_u32" => ("i32", &[("num", "i32"), ("den", "i32")], 10),
+        "__udivmod_u32" => ("i32", &[("num", "i32"), ("den", "i32")], 10),
         "__sdiv_i32" | "__srem_i32" => ("i32", &[("num", "i32"), ("den", "i32")], 12),
         "__shl_u32" | "__lshr_u32" | "__ashr_i32" => ("i32", &[("val", "i32"), ("cnt", "i32")], 2),
         other => panic!("test: unknown routine {other}"),
+    }
+}
+/// The remainder spill slot a fused divide routine writes, mirroring
+/// legalize's injection (see `fuse_divmod_pairs`).
+fn slot_name(routine: &str) -> &'static str {
+    match routine {
+        "__udivmod_u8" => "__udivmod_rem_u8",
+        "__udivmod_u16" => "__udivmod_rem_u16",
+        "__udivmod_u32" => "__udivmod_rem_u32",
+        other => panic!("test: no spill slot for {other}"),
     }
 }
 
@@ -3249,10 +3262,16 @@ fn routine_module(name: &str) -> (String, Vec<(String, u16)>) {
         .map(|(n, t)| format!("{n}={t}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let slot = if name.starts_with("__udivmod") {
+        format!("global {} {ret}\n", slot_name(name))
+    } else {
+        String::new()
+    };
     let ir = format!(
         "global ina {ret}\n\
          global inb {ret}\n\
          global out {ret}\n\
+         {slot}\
          fn {name}({ret}) ({pstr})\n\
            block entry:\n\
              %__scr = alloca {scr}\n\
@@ -3284,6 +3303,9 @@ fn routine_module(name: &str) -> (String, Vec<(String, u16)>) {
         base += if wide { 2 } else { 1 };
     }
     map.push((format!("{name}::__scr"), base));
+    if name.starts_with("__udivmod") {
+        map.push((slot_name(name).to_string(), 0x50));
+    }
     (ir, map)
 }
 
@@ -3345,6 +3367,17 @@ fn mul_div_rem_routines_emit_recipe_bodies() {
             ],
         ),
         (
+            "__udivmod_u8",
+            &[
+                "RLF 0x30, F", // same restoring loop as the plain divide
+                "SUBWF 0x32, F",
+                "BSF 0x30, 0",
+                "DECFSZ 0x34, F",
+                "MOVWF 0x50", // remainder spill to the fusion slot
+                "MOVWF 0x71", // quotient to retval, as usual
+            ],
+        ),
+        (
             "__udiv_u16",
             &[
                 "RLF 0x40, F",    // num_lo <<= 1
@@ -3364,6 +3397,18 @@ fn mul_div_rem_routines_emit_recipe_bodies() {
                 "SUBWF 0x45, F",
                 "BSF 0x40, 0",
                 "DECFSZ 0x46, F",
+            ],
+        ),
+        (
+            "__udivmod_u16",
+            &[
+                "RLF 0x40, F", // same restoring loop as the plain divide
+                "SUBWF 0x44, F",
+                "BSF 0x40, 0",
+                "DECFSZ 0x46, F",
+                "MOVWF 0x50", // remainder spill, low byte
+                "MOVWF 0x51", // remainder spill, high byte
+                "MOVWF 0x71", // quotient to retval, as usual
             ],
         ),
         (
@@ -3502,6 +3547,77 @@ fn mul_div_rem_routines_simulate_correctly() {
         }
         let got = sim_run_bytes(&ir, &map, &seed, out, want.len());
         assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) must be {want:?}");
+    }
+}
+
+/// Fused divides return both halves: the quotient in `out`, the remainder
+/// in the fusion spill slot. Each case asserts both, so a spill to the
+/// wrong address or width fails here.
+#[test]
+fn udivmod_routines_simulate_quotient_and_remainder() {
+    // (routine, x bytes lo..hi, y bytes lo..hi, quotient bytes, remainder bytes)
+    let cases: &[(&str, &[u8], &[u8], &[u8], &[u8])] = &[
+        // 200/3 = 66 r 2; 7/200 = 0 r 7 (the restore-heavy path).
+        ("__udivmod_u8", &[200], &[3], &[66], &[2]),
+        ("__udivmod_u8", &[7], &[200], &[0], &[7]),
+        // 301/7 = 43 r 0; 7/301 = 0 r 7.
+        (
+            "__udivmod_u16",
+            &[0x2D, 0x01],
+            &[0x07, 0x00],
+            &[0x2B, 0x00],
+            &[0x00, 0x00],
+        ),
+        (
+            "__udivmod_u16",
+            &[0x07, 0x00],
+            &[0x2D, 0x01],
+            &[0x00, 0x00],
+            &[0x07, 0x00],
+        ),
+        // 0x12345678/0x100 = 0x123456 r 0x78; /0x1000 = 0x12345 r 0x678.
+        (
+            "__udivmod_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[0, 1, 0, 0],
+            &[0x56, 0x34, 0x12, 0],
+            &[0x78, 0, 0, 0],
+        ),
+        (
+            "__udivmod_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[0, 0x10, 0, 0],
+            &[0x45, 0x23, 1, 0],
+            &[0x78, 6, 0, 0],
+        ),
+    ];
+    for &(name, x, y, want_q, want_r) in cases {
+        let (ret, _, _) = routine_sig(name);
+        let (ir, map) = match ret {
+            "i32" => routine_module32(name),
+            _ => routine_module(name),
+        };
+        let (ina, inb, out) = match ret {
+            "i16" => (0x20, 0x22, 0x24),
+            "i32" => (0x20, 0x24, 0x28),
+            _ => (0x20, 0x21, 0x22),
+        };
+        let slot = map
+            .iter()
+            .find(|(k, _)| k == slot_name(name))
+            .expect("spill slot in map")
+            .1;
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((ina + i as u16, *b));
+        }
+        for (i, b) in y.iter().enumerate() {
+            seed.push((inb + i as u16, *b));
+        }
+        let got_q = sim_run_bytes(&ir, &map, &seed, out, want_q.len());
+        assert_eq!(&got_q[..], want_q, "{name}({x:?}, {y:?}) quotient");
+        let got_r = sim_run_bytes(&ir, &map, &seed, slot, want_r.len());
+        assert_eq!(&got_r[..], want_r, "{name}({x:?}, {y:?}) remainder");
     }
 }
 
@@ -6965,10 +7081,16 @@ fn routine_module32(name: &str) -> (String, Vec<(String, u16)>) {
         .map(|(n, t)| format!("{n}={t}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let slot = if name.starts_with("__udivmod") {
+        format!("global {} {ret}\n", slot_name(name))
+    } else {
+        String::new()
+    };
     let ir = format!(
         "global ina {ret}\n\
          global inb {ret}\n\
          global out {ret}\n\
+         {slot}\
          fn {name}({ret}) ({pstr})\n\
            block entry:\n\
              %__scr = alloca {scr}\n\
@@ -6994,6 +7116,9 @@ fn routine_module32(name: &str) -> (String, Vec<(String, u16)>) {
         base += 4;
     }
     map.push((format!("{name}::__scr"), base));
+    if name.starts_with("__udivmod") {
+        map.push((slot_name(name).to_string(), 0x38));
+    }
     (ir, map)
 }
 
@@ -7035,6 +7160,18 @@ fn i32_routines_emit_recipe_bodies() {
                 "SUBWF 0x4B, F",
                 "BSF 0x40, 0", // the loop computes quotient + remainder
                 "DECFSZ 0x50, F",
+            ],
+        ),
+        (
+            "__udivmod_u32",
+            &[
+                "RLF 0x40, F", // same restoring loop as the plain divide
+                "SUBWF 0x48, F",
+                "BSF 0x40, 0",
+                "DECFSZ 0x50, F",
+                "MOVWF 0x38", // remainder spill, four bytes at the slot
+                "MOVWF 0x3B",
+                "MOVWF 0x71", // quotient to retval, as usual
             ],
         ),
         (

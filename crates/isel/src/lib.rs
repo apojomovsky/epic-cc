@@ -3987,6 +3987,17 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// Spill a fused divide's remainder half to its global slot, which the
+    /// fused remainder call site loads. Plain addresses: the banking pass
+    /// inserts any BANKSELs, as for the loop body above it.
+    fn store_rem_slot(&mut self, rem: u16, bytes: u8, slot: &str) {
+        let base = self.global_addr(slot);
+        for i in 0..bytes {
+            self.emit(format!("    MOVF 0x{:02X}, W", rem + u16::from(i)));
+            self.emit(format!("    MOVWF 0x{:02X}", base + u16::from(i)));
+        }
+    }
+
     /// Two's-complement negate of a 16-bit value in place.
     fn neg16_in_place(&mut self, addr: u16) {
         self.emit(format!("    COMF 0x{addr:02X}, F"));
@@ -4240,7 +4251,7 @@ impl<'m> Gen<'m> {
             // else restore (add den back). rem is 2 bytes: the 8-bit rem
             // shift can carry. Borrow idiom: den_hi is implicitly 0, so the
             // fold is `movlw 0; btfss C; addlw 1; subwf rem_hi`.
-            "__udiv_u8" | "__urem_u8" => {
+            "__udiv_u8" | "__urem_u8" | "__udivmod_u8" => {
                 let num = self.slot_addr(name, "num").direct();
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, den, scr, scr + 3], name);
@@ -4277,16 +4288,19 @@ impl<'m> Gen<'m> {
                 self.emit(format!("{l_next}:"));
                 self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
                 self.emit(format!("    GOTO {l_loop}"));
-                if recipe == "__udiv_u8" {
-                    self.store_retval(num, 1);
-                } else {
-                    self.store_retval(rem_lo, 1);
+                match recipe {
+                    "__urem_u8" => self.store_retval(rem_lo, 1),
+                    "__udivmod_u8" => {
+                        self.store_rem_slot(rem_lo, 1, "__udivmod_rem_u8");
+                        self.store_retval(num, 1);
+                    }
+                    _ => self.store_retval(num, 1),
                 }
                 self.emit("    RETURN".to_string());
             }
             // 16/16 restoring division (16 iterations), the borrow idiom
             // `movf den_hi,w; btfss C; incfsz den_hi,w; subwf rem_hi,f`.
-            "__udiv_u16" | "__urem_u16" => {
+            "__udiv_u16" | "__urem_u16" | "__udivmod_u16" => {
                 let num = self.slot_addr(name, "num").direct();
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 1, den, den + 1, scr, scr + 6], name);
@@ -4324,10 +4338,13 @@ impl<'m> Gen<'m> {
                 self.emit(format!("{l_next}:"));
                 self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
                 self.emit(format!("    GOTO {l_loop}"));
-                if recipe == "__udiv_u16" {
-                    self.store_retval(num, 2);
-                } else {
-                    self.store_retval(rem_lo, 2);
+                match recipe {
+                    "__urem_u16" => self.store_retval(rem_lo, 2),
+                    "__udivmod_u16" => {
+                        self.store_rem_slot(rem_lo, 2, "__udivmod_rem_u16");
+                        self.store_retval(num, 2);
+                    }
+                    _ => self.store_retval(num, 2),
                 }
                 self.emit("    RETURN".to_string());
             }
@@ -4531,7 +4548,7 @@ impl<'m> Gen<'m> {
             // 2^k - 1 before the k-th shift), so the 4-byte borrow chain
             // with the INCFSZ wrap-correct folds is exact. den is copied
             // into __scr@4-7 (the divmod reads it repeatedly).
-            "__udiv_u32" | "__urem_u32" => {
+            "__udiv_u32" | "__urem_u32" | "__udivmod_u32" => {
                 let num = self.slot_addr(name, "num").direct();
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 3, den, den + 3, scr, scr + 9], name);
@@ -4540,10 +4557,13 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVWF 0x{:02X}", scr + 4 + i)); // den copy
                 }
                 self.emit_divmod32(num, scr);
-                if recipe == "__udiv_u32" {
-                    self.store_retval(num, 4);
-                } else {
-                    self.store_retval(scr, 4);
+                match recipe {
+                    "__urem_u32" => self.store_retval(scr, 4),
+                    "__udivmod_u32" => {
+                        self.store_rem_slot(scr, 4, "__udivmod_rem_u32");
+                        self.store_retval(num, 4);
+                    }
+                    _ => self.store_retval(num, 4),
                 }
                 self.emit("    RETURN".to_string());
             }
@@ -7117,13 +7137,13 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
     // into the next function.
     if let Some(recipe) = routine_recipe(&f.name) {
         match recipe {
-            "__mul_u8" | "__mul_u16" | "__mul_u32" | "__udiv_u8" | "__urem_u8" | "__udiv_u16"
-            | "__urem_u16" | "__udiv_u32" | "__urem_u32" | "__sdiv_i8" | "__srem_i8"
-            | "__sdiv_i16" | "__srem_i16" | "__sdiv_i32" | "__srem_i32" | "__shl_u8"
-            | "__lshr_u8" | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16"
-            | "__shl_u32" | "__lshr_u32" | "__ashr_i32" | "__add_f32" | "__sub_f32"
-            | "__mul_f32" | "__div_f32" | "__cmp_f32" | "__uitofp_f32" | "__sitofp_f32"
-            | "__fptoui_f32" | "__fptosi_f32" => {}
+            "__mul_u8" | "__mul_u16" | "__mul_u32" | "__udiv_u8" | "__urem_u8" | "__udivmod_u8"
+            | "__udiv_u16" | "__urem_u16" | "__udivmod_u16" | "__udiv_u32" | "__urem_u32"
+            | "__udivmod_u32" | "__sdiv_i8" | "__srem_i8" | "__sdiv_i16" | "__srem_i16"
+            | "__sdiv_i32" | "__srem_i32" | "__shl_u8" | "__lshr_u8" | "__ashr_i8"
+            | "__shl_u16" | "__lshr_u16" | "__ashr_i16" | "__shl_u32" | "__lshr_u32"
+            | "__ashr_i32" | "__add_f32" | "__sub_f32" | "__mul_f32" | "__div_f32"
+            | "__cmp_f32" | "__uitofp_f32" | "__sitofp_f32" | "__fptoui_f32" | "__fptosi_f32" => {}
             other => panic!("isel: unknown runtime routine @{other}"),
         }
         g.emit_routine();
