@@ -10,7 +10,9 @@
 //!   `__udiv_u32`, `__urem_u8`/`__urem_u16`/`__urem_u32`,
 //!   `__sdiv_i8`/`__sdiv_i16`/`__sdiv_i32`, `__srem_i8`/`__srem_i16`/
 //!   `__srem_i32`) with the dst/ty preserved and both operands copied as
-//!   typed args.
+//!   typed args. A same-block `udiv`/`urem` pair on identical operands then
+//!   fuses into one `__udivmod_uW` call plus a load of its remainder spill
+//!   slot (see `fuse_divmod_pairs`).
 //! `shl`/`lshr`/`ashr` with a const count stay as `Bin`: isel inlines
 //! the fixed RLF/RRF sequence. With a reg count they become a call to
 //! the shift routine (`__shl_u8`/`__shl_u16`/`__shl_u32`,
@@ -45,7 +47,8 @@ use std::collections::{HashMap, HashSet};
 
 use ir::{
     Alloca, Bin, BinOp, Block, Br, Call, CallArg, FBinOp, FloatConvOp, Func, Gep, GepBase, Global,
-    Icmp, Inst, IntToPtr, MemLen, Module, Param, Phi, Select, Sext, SrcLoc, Trunc, Ty, Val, Zext,
+    Icmp, Inst, IntToPtr, Load, MemLen, Module, Param, Phi, Select, Sext, SrcLoc, Trunc, Ty, Val,
+    Zext,
 };
 /// Whole-module lowering: scalar ops that need runtime support become calls
 /// to injected routine functions (see module docs).
@@ -85,7 +88,7 @@ fn legalize_inner(m: Module, pic18: bool) -> Module {
     } else {
         (m, false)
     };
-    let m = narrow_div_rem_tails(m);
+    let mut m = narrow_div_rem_tails(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
     if udec {
@@ -165,6 +168,12 @@ fn legalize_inner(m: Module, pic18: bool) -> Module {
     // without it, an ISR that preempts main inside `__mul_u8` re-enters the
     // one shared frame and clobbers main's in-flight state.
     let isr_used = split_isr_routines(&mut funcs, &used);
+    // Div/mod fusion runs after the ISR split so the call spellings already
+    // name their context: only main-context pairs fuse (see the function).
+    // Skipped on the PIC18 entry, whose backend owns its own divide shape.
+    if !pic18 {
+        fuse_divmod_pairs(&mut funcs, &mut m.globals, &mut used);
+    }
     for name in &used {
         funcs.push(routine_func(name));
     }
@@ -1490,6 +1499,231 @@ fn split_isr_routines(funcs: &mut [Func], used: &[String]) -> Vec<String> {
             .map(|u| format!("{u}_isr_high")),
     );
     out
+}
+/// The combined divide routine and remainder slot for an unsigned divide
+/// width. Matches the exact base `__udiv_uW` spelling and an already-fused
+/// `__udivmod_uW` (a second remainder below the first fuses onto the same
+/// call). Suffixed ISR spellings never match, so each context keeps its
+/// own remainder slot (see `fuse_divmod_pairs`).
+fn divmod_width(func: &str) -> Option<(Ty, &'static str, &'static str)> {
+    match func {
+        "__udiv_u8" | "__udivmod_u8" => Some((Ty::I8, "__udivmod_u8", "__udivmod_rem_u8")),
+        "__udiv_u16" | "__udivmod_u16" => Some((Ty::I16, "__udivmod_u16", "__udivmod_rem_u16")),
+        "__udiv_u32" | "__udivmod_u32" => Some((Ty::I32, "__udivmod_u32", "__udivmod_rem_u32")),
+        _ => None,
+    }
+}
+
+/// The remainder half of a fusable pair: the exact base `__urem_uW`
+/// spelling, with its width and remainder slot.
+fn divmod_rem_width(func: &str) -> Option<(Ty, &'static str)> {
+    match func {
+        "__urem_u8" => Some((Ty::I8, "__udivmod_rem_u8")),
+        "__urem_u16" => Some((Ty::I16, "__udivmod_rem_u16")),
+        "__urem_u32" => Some((Ty::I32, "__udivmod_rem_u32")),
+        _ => None,
+    }
+}
+/// Fuse a same-block `udiv`/`urem` pair on identical operands into one
+/// combined divide call (epic-cc#895). Every unsigned divide routine
+/// already computes both halves and discards one, so the fused shape runs
+/// the loop once: quotient to retval, remainder spilled to the slot the
+/// old remainder site loads. Identity is one shared SSA value or two
+/// non-volatile loads of one global (volatile reads may differ); no call,
+/// opaque write, or operand-global store may sit between the pair.
+fn fuse_divmod_pairs(funcs: &mut [Func], globals: &mut Vec<Global>, used: &mut Vec<String>) {
+    // A remainder slot shadowed by any user global never fuses: reusing it
+    // would alias the user's variable even at the same type.
+    let blocked = |slot: &str| globals.iter().any(|g| g.name == slot);
+    let mut fused: Vec<Ty> = Vec::new();
+    for f in funcs.iter_mut() {
+        for b in f.blocks.iter_mut() {
+            // Same-block loads resolving an operand to its global: reg ->
+            // (def index, global). Volatile loads never resolve: two reads
+            // of one volatile global may return different values (MMIO, or
+            // an ISR-shared flag changed between them), so only identical
+            // SSA values fuse there. Non-volatile memory changes only
+            // through visible stores and calls, which the clobber scan
+            // below excludes.
+            let mut loads: HashMap<String, (usize, String)> = HashMap::new();
+            for (idx, inst) in b.insts.iter().enumerate() {
+                if let Inst::Load(l) = inst {
+                    if !l.volatile {
+                        if let Some(g) = l.ptr.strip_prefix('@') {
+                            loads.entry(l.dst.clone()).or_insert((idx, g.to_string()));
+                        }
+                    }
+                }
+            }
+            // Operand identity: the same SSA value, constant, address, or
+            // two non-volatile loads of the same global. Returns the key
+            // plus the load def index when the value comes from a
+            // same-block non-volatile load dominating the use: the index
+            // feeds the clobber range only, never equality, since two
+            // loads of one global define different registers.
+            let key = |v: &Val, before: usize| -> (String, Option<usize>) {
+                match v {
+                    Val::Reg(r) => match loads.get(r) {
+                        Some((def, g)) if *def < before => (format!("@{g}"), Some(*def)),
+                        _ => (format!("%{r}"), None),
+                    },
+                    Val::Const(k) => (format!("#{k}"), None),
+                    Val::Global(g) => (format!("@{g}"), None),
+                }
+            };
+            let mut i = 0;
+            while i < b.insts.len() {
+                let div: Option<(String, Val, Val, Ty, String, String)> = match &b.insts[i] {
+                    Inst::Call(c) => divmod_width(&c.func).and_then(|(w, comb, slot)| {
+                        if c.args.len() != 2 || blocked(slot) {
+                            return None;
+                        }
+                        Some((
+                            c.dst.clone()?,
+                            c.args[0].val.clone(),
+                            c.args[1].val.clone(),
+                            w,
+                            comb.to_string(),
+                            slot.to_string(),
+                        ))
+                    }),
+                    _ => None,
+                };
+                let Some((_, qa, qb, w, combined, slot)) = div else {
+                    i += 1;
+                    continue;
+                };
+                let (ka, da) = key(&qa, i);
+                let (kb, db) = key(&qb, i);
+                let mut j = i + 1;
+                let hit = loop {
+                    if j >= b.insts.len() {
+                        break None;
+                    }
+                    match &b.insts[j] {
+                        Inst::Call(c) => {
+                            let matches = divmod_rem_width(&c.func).is_some_and(|(rw, rslot)| {
+                                rw == w && rslot == slot && c.args.len() == 2 && c.dst.is_some()
+                            });
+                            if !matches {
+                                break None;
+                            }
+                            let (ca, ea) = key(&c.args[0].val, j);
+                            let (cb, eb) = key(&c.args[1].val, j);
+                            if ca == ka && cb == kb {
+                                break Some((j, ea, eb));
+                            }
+                            break None;
+                        }
+                        Inst::Store(s) => {
+                            let hit_operand = match s.ptr.strip_prefix('@') {
+                                Some(g) => format!("@{g}") == ka || format!("@{g}") == kb,
+                                None => true,
+                            };
+                            if hit_operand {
+                                break None;
+                            }
+                            j += 1;
+                        }
+                        Inst::Memcpy(_) | Inst::Asm(_) => break None,
+                        Inst::Ret(_, _) | Inst::Br(_) | Inst::BrCond(_) | Inst::Switch(_) => {
+                            break None
+                        }
+                        _ => j += 1,
+                    }
+                };
+                let Some((j, ea, eb)) = hit else {
+                    i += 1;
+                    continue;
+                };
+                // The clobber scan covers every load proving operand
+                // identity on either side, so a store between any two of
+                // those loads still blocks the fuse.
+                let lo = da
+                    .into_iter()
+                    .chain(db)
+                    .chain(ea)
+                    .chain(eb)
+                    .min()
+                    .unwrap_or(i);
+                let clear = (lo..j).all(|k| k == i || !matches!(&b.insts[k], Inst::Call(_)))
+                    && (lo..j).all(|k| match &b.insts[k] {
+                        Inst::Store(s) => match s.ptr.strip_prefix('@') {
+                            Some(g) => format!("@{g}") != ka && format!("@{g}") != kb,
+                            None => false,
+                        },
+                        Inst::Memcpy(_) | Inst::Asm(_) => false,
+                        _ => true,
+                    });
+                if !clear {
+                    i += 1;
+                    continue;
+                }
+                let Inst::Call(rem) = &b.insts[j] else {
+                    unreachable!("legalize: fuse target is a remainder call")
+                };
+                let mdst = rem.dst.clone().expect("legalize: remainder call has a dst");
+                let mloc = rem.loc.clone();
+                if let Inst::Call(c) = &mut b.insts[i] {
+                    c.func = combined;
+                }
+                b.insts[j] = Inst::Load(Load {
+                    dst: mdst,
+                    ty: w,
+                    ptr: format!("@{slot}"),
+                    ptr_ty: false,
+                    volatile: true,
+                    loc: mloc,
+                });
+                if !fused.contains(&w) {
+                    fused.push(w);
+                }
+                // Rescan from the same divide: a second remainder below
+                // the first fuses onto the same call. Each fuse removes a
+                // call, so the loop still terminates.
+            }
+        }
+    }
+    for w in &fused {
+        let (_, combined, slot) = divmod_width(match w {
+            Ty::I8 => "__udiv_u8",
+            Ty::I16 => "__udiv_u16",
+            _ => "__udiv_u32",
+        })
+        .expect("legalize: fused width has a combined routine");
+        if !globals.iter().any(|g| g.name == slot) {
+            globals.push(Global {
+                name: slot.to_string(),
+                ty: *w,
+                is_const: false,
+                size: w.bytes() as u16,
+                bytes: vec![0u8; w.bytes() as usize],
+                refs: Vec::new(),
+                addr: None,
+            });
+        }
+        if !used.iter().any(|u| u == combined) {
+            used.push(combined.to_string());
+        }
+    }
+    if !fused.is_empty() {
+        let mut called: HashSet<String> = HashSet::new();
+        for f in funcs.iter() {
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    if let Inst::Call(c) = inst {
+                        let base = c
+                            .func
+                            .strip_suffix("_isr_high")
+                            .or_else(|| c.func.strip_suffix("_isr"))
+                            .unwrap_or(&c.func);
+                        called.insert(base.to_string());
+                    }
+                }
+            }
+        }
+        used.retain(|u| called.contains(u));
+    }
 }
 
 /// Fresh SSA name supply for the fcmp materialization trees. Starts from
@@ -4346,8 +4580,8 @@ fn param(name: &str, width: u8) -> Param {
 ///
 /// | routine | `__scr` size | offsets |
 /// |---|---|---|
-/// | `__mul_u8` | 6 | `bk`@0 (multiplier backup, shifted to test bits), `cnt`@1 (loop counter, 8), `r_lo`@2 / `r_hi`@3 (16-bit running product), `t_lo`@4 / `t_hi`@5 (shifted multiplicand) |
-/// | `__mul_u16` | 14 | `bk_lo`@0 / `bk_hi`@1 (multiplier backup), `cnt`@2 (loop counter, 16), `r`@3-6 (32-bit running product), `t`@7-10 (shifted multiplicand), `spare`@11-13 (recipe scratch) |
+/// | `__mul_u8` | 6 | `r`@0 (8-bit running product: the i8 result keeps the low byte, so the loop accumulates mod 256 in the param slots and exits once the multiplier shifts out; the rest is unused) |
+/// | `__mul_u16` | 14 | `r`@0-1 (16-bit running product: the i16 result keeps the low half, so the loop accumulates mod 65536 in the param slots and exits once the multiplier shifts out; the rest is unused) |
 /// | `__udiv_u8`, `__urem_u8` | 4 | `rem_lo`@0 / `rem_hi`@1 (partial remainder: 2 bytes, since the 8-bit rem shift can carry), `cnt`@2 (loop counter, 8), `restore`@3 (restore-step scratch) |
 /// | `__udiv_u16`, `__urem_u16` | 7 | `rem`@0-1 (partial remainder), `cnt`@2 (loop counter, 16), `spare`@3 (recipe scratch), `restore`@4-6 (restore-step scratch) |
 /// | `__sdiv_i8`, `__srem_i8` | 5 | `flags`@0 (sign state: bit0 = negate quotient, bit1 = negate remainder; `\|num\|`/`\|den\|` live in the param slots), `rem_lo`@1 / `rem_hi`@2, `cnt`@3, `restore`@4 |
@@ -4382,8 +4616,11 @@ fn routine_func(name: &str) -> Func {
         "__mul_u16" => (Ty::I16, vec![param("a", 2), param("b", 2)], 14),
         "__mul_u32" => (Ty::I32, vec![param("a", 4), param("b", 4)], 11),
         "__udiv_u8" | "__urem_u8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 4),
+        "__udivmod_u8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 4),
         "__udiv_u16" | "__urem_u16" => (Ty::I16, vec![param("num", 2), param("den", 2)], 7),
+        "__udivmod_u16" => (Ty::I16, vec![param("num", 2), param("den", 2)], 7),
         "__udiv_u32" | "__urem_u32" => (Ty::I32, vec![param("num", 4), param("den", 4)], 10),
+        "__udivmod_u32" => (Ty::I32, vec![param("num", 4), param("den", 4)], 10),
         // The decimal digit loop: value in, digit count out, digits to the
         // caller buffer. `den`@0-3 holds the baked divisor 10, `rem`@4-7
         // the divmod remainder, `cnt`@8 the bit counter, `digit`@9 the

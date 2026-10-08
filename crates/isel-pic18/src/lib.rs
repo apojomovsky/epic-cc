@@ -194,6 +194,11 @@ struct Gen<'m> {
     /// only after the map proved it from the code as actually emitted;
     /// absent or `None` entries clear the tracked bank exactly as master.
     exit_banks: &'m HashMap<String, Option<u8>>,
+    /// RETURN-site banks recorded while emitting a runtime recipe
+    /// (`Some` only on the recipe pre-pass). Recipes have no terminator
+    /// lowering, so this records the tracked bank as-is: `bsr_dirty`
+    /// never resets there and every select rides one linear flow.
+    routine_ends: Option<Vec<Option<u8>>>,
     /// What FSR0 currently addresses, if known: `Some((origin, offset))`
     /// where `offset` is the `k + byte_off` most recently set up on top of
     /// `origin`. Lets a later access through the *same* base skip
@@ -301,6 +306,12 @@ impl<'m> Gen<'m> {
         // survive it (epic-cc#502).
         self.w_holds = None;
         let line = s.into();
+        if self.routine_ends.is_some() && line.trim() == "RETURN" {
+            let bank = self.bsr;
+            if let Some(ends) = self.routine_ends.as_mut() {
+                ends.push(bank);
+            }
+        }
         if let Some(t) = Self::fwd_target(&line) {
             // A user function literally named `tmp` plus digits would
             // collide with fresh labels; tail calls to one must not
@@ -8850,9 +8861,10 @@ fn block_dominators(f: &Func) -> HashMap<String, HashSet<String>> {
 }
 
 /// Direct and indirect call edges between module functions, for the
-/// emission ordering. Recipes and naked bodies have no `Gen` run, so
-/// they are neither sources nor targets: they never enter the exit-bank
-/// map, and a caller must treat them as unknown exits.
+/// emission ordering. Recipes and naked bodies make no calls and take
+/// no `Gen` run in pass A, so they are neither sources nor targets
+/// here. Recipes still enter the exit-bank map (pre-seeded from their
+/// fixed bodies); only naked bodies read as unknown exits.
 fn call_edges<'a>(funcs: &[&'a Func]) -> HashMap<&'a str, Vec<&'a str>> {
     let known: std::collections::HashSet<&str> = funcs
         .iter()
@@ -9203,6 +9215,59 @@ pub fn select_with_opts(
     let order = emission_order(&funcs, &edges);
     let mut bodies: HashMap<&str, (Vec<String>, Vec<Option<SrcLoc>>)> = HashMap::new();
     let mut exits: HashMap<String, Option<u8>> = HashMap::new();
+    // Recipes skip pass A's `Gen` run, so callers read them as unknown
+    // exits. Their bodies are fixed: run each once through a throwaway
+    // `Gen` on its own label counter (the shared one stays untouched,
+    // so real output numbering never shifts) and seed the map with the
+    // join over its `RETURN` sites. Same emitter, same inputs, so the
+    // recorded exit matches the body pass B streams.
+    let mut recipe_tmp = 0u32;
+    for f in &funcs {
+        if !ir::is_runtime_routine(&f.name) {
+            continue;
+        }
+        let ends = {
+            let mut g = Gen {
+                m,
+                addrs,
+                resolved: &resolved,
+                prov: prov.clone(),
+                retval_lo: common_lo,
+                access_bank_hi,
+                bsr: None,
+                fwd_join: HashMap::new(),
+                bsr_dirty: false,
+                exit_banks: &exits,
+                routine_ends: Some(Vec::new()),
+                fsr0_holds: None,
+                tblptr_holds: None,
+                pending_copies: Vec::new(),
+                copy_loop: opts.copy_loop,
+                divmod_fold: opts.divmod_fold,
+                cur_func: &f.name,
+                global_addrs: &global_addrs,
+                w_holds: None,
+                isr: f.isr,
+                tmp: &mut recipe_tmp,
+                cur_loc: None,
+                bit_lanes: HashMap::new(),
+                lane_consumed: HashSet::new(),
+                store_fwd: HashMap::new(),
+                phi_fold: HashMap::new(),
+                inplace_bins: HashSet::new(),
+                store_consumed: HashSet::new(),
+                w_folds: iselcore::ValueFolds::default(),
+                out: Vec::new(),
+                locs: Vec::new(),
+            };
+            g.emit_routine();
+            g.flush_copies();
+            g.routine_ends
+                .take()
+                .expect("recipe pre-pass records RETURN sites")
+        };
+        exits.insert(f.name.clone(), exit_bank(&ends));
+    }
     // Priority-mode vectors are GOTO stubs: the two bodies cannot both sit
     // at fixed vector addresses (either body overflows the 16-byte vector
     // gap), so the stubs dispatch to the floating bodies below. The lone
@@ -9225,11 +9290,12 @@ pub fn select_with_opts(
         locs.push(None);
     }
     // Pass A buffers each ordinary function's body, walking emission
-    // order; pass B streams the output in module order. Recipes and
-    // naked bodies have no `Gen` run and no buffered body.
+    // order; pass B streams the output in module order. Recipes skip
+    // this loop (their exits were pre-seeded above) and naked bodies
+    // have no `Gen` run at all, so neither buffers a body here.
     for f in &order {
         if ir::is_runtime_routine(&f.name) || f.naked {
-            continue; // streamed by pass B, no Gen run, no map entry
+            continue; // streamed by pass B; recipe exits pre-seeded above
         }
         let mut g = Gen {
             m,
@@ -9242,6 +9308,7 @@ pub fn select_with_opts(
             fwd_join: HashMap::new(),
             bsr_dirty: false,
             exit_banks: &exits,
+            routine_ends: None,
             fsr0_holds: None,
             tblptr_holds: None,
             pending_copies: Vec::new(),
@@ -9924,6 +9991,7 @@ pub fn select_with_opts(
                 fwd_join: HashMap::new(),
                 bsr_dirty: false,
                 exit_banks: &exits,
+                routine_ends: None,
                 fsr0_holds: None,
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
@@ -10270,6 +10338,7 @@ mod tests {
                 fwd_join: HashMap::new(),
                 bsr_dirty: false,
                 exit_banks: &exits,
+                routine_ends: None,
                 fsr0_holds: None,
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
@@ -10305,6 +10374,7 @@ mod tests {
                 fwd_join: HashMap::new(),
                 bsr_dirty: false,
                 exit_banks: &exits,
+                routine_ends: None,
                 fsr0_holds: None,
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
@@ -10355,6 +10425,7 @@ mod p3_gen_tests {
             fwd_join: HashMap::new(),
             bsr_dirty: false,
             exit_banks: exits,
+            routine_ends: None,
             fsr0_holds: None,
             tblptr_holds: None,
             pending_copies: Vec::new(),
