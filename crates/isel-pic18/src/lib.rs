@@ -1548,16 +1548,12 @@ impl<'m> Gen<'m> {
 
     /// Per-function `TBLPTR` walk pre-scan (epic-cc#778): `(block, inst,
     /// byte)` of dynamically indexed const reads whose seed is redundant.
-    /// A run starts at an unmarked dynamic read (which seeds) and extends
-    /// while each next site reads the same table with identical dynamic
-    /// terms at exactly the offset the walk left `TBLPTR` on. Every byte
-    /// of a multi-byte site joins: byte 0 continues (or starts) the run,
-    /// later bytes always do. Anything that could move `TBLPTR` or rewrite
-    /// a term slot ends the run: calls, any `TBLPTR` use, labels (runs are
-    /// intra-block), and any value write into a term slot. Static reads
-    /// end it too: they carry no terms to match, and the `#745` tracker
-    /// already owns them. All breaks are conservative: an unrecognized
-    /// shape only loses sharing, never soundness.
+    /// A run extends while each next site reads the same table with
+    /// identical terms at the offset the walk left `TBLPTR` on; later
+    /// bytes of a multi-byte site always join. Anything that could move
+    /// `TBLPTR` or rewrite a term slot ends the run, as do static reads
+    /// (the `#745` tracker owns those). All breaks are conservative:
+    /// an unrecognized shape only loses sharing, never soundness.
     fn find_tblptr_walks(g: &Gen, f: &Func) -> HashSet<(String, usize, u8)> {
         let unplaced = g.w_folds.unplaced();
         let mut marks = HashSet::new();

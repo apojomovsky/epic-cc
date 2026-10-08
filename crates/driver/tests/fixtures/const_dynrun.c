@@ -1,12 +1,9 @@
-//! epic-cc#778 acceptance: a run of same-table dynamically indexed const
-//! reads sharing one TBLPTR seed.
-//!
-//! Four consecutive bytes of one const struct at a runtime index
-//! (`SCRIPT[i].tick` + `SCRIPT[i].event`): the index term is identical for
-//! all four sites and the static offsets step 0-3, so the backend seeds
-//! once and walks `TBLRD*+` instead of reseeding per site. `g_idx` is
-//! written by the test harness, never by the program, so every index
-//! stays dynamic exactly like the menu-demo stimulus shape.
+/* epic-cc#778 acceptance: four consecutive bytes of one const struct at
+ * a runtime index (`SCRIPT[i].tick` + `SCRIPT[i].event`) share one
+ * `TBLPTR` seed and walk `TBLRD*+`: the index term is identical for all
+ * four sites and the static offsets step 0-3. `g_idx` is harness
+ * owned, never program written, so every index stays dynamic like the
+ * menu-demo stimulus shape. */
 typedef struct {
     unsigned int tick;
     unsigned int event;

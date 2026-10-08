@@ -5254,6 +5254,14 @@ fn dynamic_const_reads_with_different_indices_seed_each() {
         2,
         "different indices reseed:\n{asm}"
     );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 1;
+    p.ram_mut()[0x11] = 2;
+    p.run(1000);
+    assert_eq!(p.ram()[0x110], 20, "first byte must be t[1]:\n{asm}");
+    assert_eq!(p.ram()[0x111], 30, "second byte must be t[2]:\n{asm}");
 }
 
 #[test]
@@ -5298,6 +5306,13 @@ fn dynamic_const_run_broken_by_call_seeds_each() {
         2,
         "a call ends the run:\n{asm}"
     );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 1;
+    p.run(1000);
+    assert_eq!(p.ram()[0x110], 20, "first byte must be t[1]:\n{asm}");
+    assert_eq!(p.ram()[0x111], 30, "second byte must be t[2]:\n{asm}");
 }
 
 #[test]
@@ -5340,6 +5355,13 @@ fn dynamic_const_run_broken_by_label_seeds_each() {
         2,
         "a label ends the run:\n{asm}"
     );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 1;
+    p.run(1000);
+    assert_eq!(p.ram()[0x110], 20, "first byte must be t[1]:\n{asm}");
+    assert_eq!(p.ram()[0x111], 30, "second byte must be t[2]:\n{asm}");
 }
 
 #[test]

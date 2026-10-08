@@ -45,8 +45,11 @@ fn asm_for() -> String {
     asm
 }
 
-/// `__start`'s zero-loop take: `LFSR 0, _` then `MOVLW take`.
-fn start_take(asm: &str) -> usize {
+/// Steps from `__start` to main's entry: the zero-loop take plus the
+/// `call main`. Asserts the whole window shape (not just the take), so a
+/// future nonzero init or allocator change fails here naming this helper
+/// instead of landing the poke mid-init.
+fn start_steps_to_main(asm: &str) -> usize {
     let window = asm.split("__start:").nth(1).expect("__start label");
     let mut lines = window.lines().map(str::trim).filter(|l| !l.is_empty());
     assert!(
@@ -57,7 +60,23 @@ fn start_take(asm: &str) -> usize {
         .next()
         .and_then(|l| l.strip_prefix("MOVLW 0x"))
         .expect("clear take");
-    usize::from(u8::from_str_radix(take, 16).expect("hex take"))
+    let take = usize::from(u8::from_str_radix(take, 16).expect("hex take"));
+    assert!(
+        lines.next().is_some_and(|l| l.ends_with(':')),
+        "loop label:\n{asm}"
+    );
+    assert_eq!(lines.next(), Some("CLRF 0xFEE,A"), "clear body:\n{asm}");
+    assert_eq!(
+        lines.next(),
+        Some("DECFSZ 0xFE8,F,A"),
+        "clear count:\n{asm}"
+    );
+    assert!(
+        lines.next().is_some_and(|l| l.starts_with("BRA ")),
+        "loop back:\n{asm}"
+    );
+    assert_eq!(lines.next(), Some("call main"), "entry call:\n{asm}");
+    3 * take + 2
 }
 
 #[test]
@@ -95,12 +114,11 @@ fn dynamic_const_run_reads_correct_bytes() {
     let tick = map_addr(&map, "g_tick");
     let event = map_addr(&map, "g_event");
 
-    // Past the clear loop (`LFSR`/`MOVLW` plus 3 steps per taken pass
-    // and 2 for the skipping one) and the `call main`: the poke must
-    // land after `__start` zeroed the globals but before main reads in.
-    let take = start_take(&asm);
+    // The poke must land after `__start` zeroed the globals but before
+    // main reads the index in.
+    let steps = start_steps_to_main(&asm);
     let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
-    for _ in 0..3 * take + 2 {
+    for _ in 0..steps {
         p.step();
     }
     p.ram_mut()[idx] = 3;
