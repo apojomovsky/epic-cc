@@ -8082,6 +8082,20 @@ fn fused_single_byte_ordering_icmp_branches_without_a_result_byte() {
                 !block.contains("MOVWF 0x038") && !block.contains("MOVFF 0x030, 0x038"),
                 "{pred} i8 rhs {rhs_ir} still materializes its result byte:\n{asm}"
             );
+            // `ult`/`uge` bind equality to the trailing branch's own
+            // target, so the middle `BZ` is dead and skipped; `ugt`/`ule`
+            // split equal from ordered and keep it.
+            if pred == "ult" || pred == "uge" {
+                assert!(
+                    !block.contains("BZ "),
+                    "{pred} i8 rhs {rhs_ir} keeps a dead equality branch:\n{asm}"
+                );
+            } else if pred == "ugt" || pred == "ule" {
+                assert!(
+                    block.contains("BZ "),
+                    "{pred} i8 rhs {rhs_ir} lost its equality split:\n{asm}"
+                );
+            }
             let words = asm::assemble_pic18(&asm);
             for &((a, b), expect) in &cases {
                 let mut p = pic14_sim::Pic18::new(words.clone());

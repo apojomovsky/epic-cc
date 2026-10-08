@@ -6011,8 +6011,10 @@ impl<'m> Gen<'m> {
     /// `l_false` on a decisive mismatch, `l_equal` on equal bytes. Equality
     /// stays ambiguous by design: the caller binds `l_equal` to defer (the
     /// high-byte step) or to answer (single bytes and low-byte tie-breaks).
-    /// `eq`/`ne` skip the split: one byte decides them, so only `l_true` and
-    /// `l_false` apply.
+    /// A caller that binds `l_equal` to the trailing branch's own target
+    /// gets no middle branch: equal bytes would fall into that target
+    /// either way, so the `BZ` is dead. `eq`/`ne` skip the split: one byte
+    /// decides them, so only `l_true` and `l_false` apply.
     fn emit_cmp_branch(
         &mut self,
         a: &Val,
@@ -6036,22 +6038,30 @@ impl<'m> Gen<'m> {
             }
             "ult" => {
                 self.emit(format!("    BNC {l_true}")); // C=0: a<b, definite
-                self.emit(format!("    BZ {l_equal}"));
+                if l_equal != l_false {
+                    self.emit(format!("    BZ {l_equal}"));
+                }
                 self.emit(format!("    BRA {l_false}"));
             }
             "uge" => {
                 self.emit(format!("    BNC {l_false}")); // C=0: a<b, definite
-                self.emit(format!("    BZ {l_equal}"));
+                if l_equal != l_true {
+                    self.emit(format!("    BZ {l_equal}"));
+                }
                 self.emit(format!("    BRA {l_true}")); // C=1,Z=0: a>b, definite
             }
             "ugt" => {
                 self.emit(format!("    BNC {l_false}")); // C=0: a<b, definite
-                self.emit(format!("    BZ {l_equal}"));
+                if l_equal != l_true {
+                    self.emit(format!("    BZ {l_equal}"));
+                }
                 self.emit(format!("    BRA {l_true}")); // C=1,Z=0: a>b, definite
             }
             "ule" => {
                 self.emit(format!("    BNC {l_true}")); // C=0: a<b, definite
-                self.emit(format!("    BZ {l_equal}"));
+                if l_equal != l_false {
+                    self.emit(format!("    BZ {l_equal}"));
+                }
                 self.emit(format!("    BRA {l_false}")); // C=1,Z=0: a>b, definite
             }
             "slt" => {
