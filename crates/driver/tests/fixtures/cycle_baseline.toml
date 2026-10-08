@@ -306,16 +306,16 @@ ram_bytes = 58
 [[entry]]
 name = "speed-crc16-18f4550"
 device = "18F4550"
-cycles = 12492
-flash_words = 155
+cycles = 12272
+flash_words = 148
 ram_bytes = 52
 
 [[entry]]
 name = "speed-crc16-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 12492
-flash_words = 155
+cycles = 12272
+flash_words = 148
 ram_bytes = 52
 
 [[entry]]
@@ -472,7 +472,7 @@ ram_bytes = 131
 name = "scen-control-pass-18f4550"
 device = "18F4550"
 cycles = 812
-flash_words = 4006
+flash_words = 4000
 ram_bytes = 653
 
 [[entry]]
