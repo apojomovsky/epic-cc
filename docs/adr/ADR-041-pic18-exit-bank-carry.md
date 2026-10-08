@@ -39,9 +39,9 @@ keep that bank live across the call.
   clearing; the indirect done label restores the candidate meet directly,
   because its linear fall-through comes from the trap block, whose bank is
   unknown.
-- **Unknown clears.** An absent map entry (runtime recipe, naked body,
-  ISR body, forward reference outside the graph) or an unknown exit
-  clears the tracked bank exactly as master did. ISR bodies record no
+- **Unknown clears.** An absent map entry (naked body, ISR body,
+  forward reference outside the graph) or an unknown exit clears the
+  tracked bank exactly as master did. ISR bodies record no
   entry because their epilogue restores the interrupted context's BSR
   in hardware, a state the tracked model never sees.
 
@@ -63,9 +63,9 @@ Measured on the menu-demo fixture (whole-program, 18F4550): function-body
 `MOVLB`s drop 236 to 184, and the size ladder improves with no row growing
 (bench-switch 94 to 64 words, pic16 encoder 7071 to 6984, menu-demo 12137
 to 11974). The simulator is the oracle for every elided select in the unit
-tests, which pin carry across direct and indirect calls, conservatism on
-poisoned and disagreeing exits, forward-defined callees, and the recipe
-fallback.
+  tests, which pin carry across direct and indirect calls, conservatism on
+  poisoned and disagreeing exits, and forward-defined callees; epic-cc#609
+  replaced the recipe fallback with carry tests over recorded recipe exits.
 
 ## Consequences
 
