@@ -569,8 +569,14 @@ fn main() {
         device::Core::Pic18 => {
             // The POSTINC copy loop trades cycles for flash, so the speed
             // profile drains staged runs as straight MOVFFs (epic-cc#883).
+            // The u16 inline multiply likewise spends flash per site for
+            // cycles, so it rides the same profile (epic-cc#892).
             let copy_loop = !matches!(cli.opt_level, driver::cli::OptLevel::O2);
-            let opts = isel_pic18::Options { copy_loop };
+            let inline_mul16 = matches!(cli.opt_level, driver::cli::OptLevel::O2);
+            let opts = isel_pic18::Options {
+                copy_loop,
+                inline_mul16,
+            };
             isel_pic18::select_with_opts(
                 device,
                 &m,
