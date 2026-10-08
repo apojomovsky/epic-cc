@@ -1490,6 +1490,21 @@ impl<'m> Gen<'m> {
             }
             g.addrs.get(&ssa_key(&f.name, r)).copied()
         };
+        let mut succs: HashMap<String, Vec<String>> = HashMap::new();
+        for b in &f.blocks {
+            let targets: Vec<String> = match b.insts.last() {
+                Some(Inst::Br(br)) => vec![br.target.clone()],
+                Some(Inst::BrCond(bc)) => vec![bc.t.clone(), bc.f.clone()],
+                Some(Inst::Switch(sw)) => sw
+                    .cases
+                    .iter()
+                    .map(|(_, l)| l.clone())
+                    .chain(std::iter::once(sw.default.clone()))
+                    .collect(),
+                _ => vec![],
+            };
+            succs.insert(b.label.clone(), targets);
+        }
         let mut phi_fold: HashMap<String, String> = HashMap::new();
         let mut inplace: HashSet<String> = HashSet::new();
         for b in &f.blocks {
@@ -1514,8 +1529,12 @@ impl<'m> Gen<'m> {
                 {
                     continue;
                 }
-                if Self::phi_backedge(f, &b.label, &qreg, r, n).is_some() {
-                    if Self::phi_tail_clean(g, f, b, qi, r, &qreg, n, &uses, &home_of) {
+                if let Some((header, latch)) =
+                    Self::phi_fold_shape(f, &succs, &b.label, &qreg, r, n)
+                {
+                    if Self::phi_region_clean(
+                        g, f, &succs, b, qi, r, &qreg, n, &header, &latch, &home_of,
+                    ) {
                         phi_fold.insert(r.clone(), qreg.clone());
                         inplace.insert(r.clone());
                     }
@@ -1535,165 +1554,221 @@ impl<'m> Gen<'m> {
         (phi_fold, inplace)
     }
 
-    /// The backedge incoming of `preg`'s phi carrying this `Bin`'s result:
-    /// some block holds `Phi dest == preg` at width `n` with exactly one
-    /// incoming of `%r` from `pred`. `None` when the result feeds no such
-    /// edge (the common case) or the shape is ambiguous.
-    fn phi_backedge(f: &Func, pred: &str, preg: &str, r: &str, n: u8) -> Option<()> {
-        let mut found = false;
+    /// The latch shape behind a phi-carried increment (epic-cc#937): some
+    /// block holds `Phi dest == preg` at width `n` with exactly one
+    /// incoming of `%r`, from the `Bin` block itself or from a latch
+    /// continuation the `Bin` block reaches that still returns to the
+    /// phi's block. Returns the phi's block and the incoming's source.
+    /// `None` when the result feeds no such edge or the shape repeats.
+    fn phi_fold_shape(
+        f: &Func,
+        succs: &HashMap<String, Vec<String>>,
+        pred: &str,
+        preg: &str,
+        r: &str,
+        n: u8,
+    ) -> Option<(String, String)> {
+        let mut found: Option<(String, String)> = None;
         for h in &f.blocks {
             for inst in &h.insts {
                 let Inst::Phi(p) = inst else { continue };
                 if p.dst != preg || p.ty.bytes() != n {
                     continue;
                 }
-                let hits = p
-                    .incoming
-                    .iter()
-                    .filter(|(v, from)| matches!(v, Val::Reg(rr) if rr == r) && from == pred)
-                    .count();
-                if hits == 1 {
-                    if found {
+                for (v, from) in &p.incoming {
+                    if !matches!(v, Val::Reg(rr) if rr == r) {
+                        continue;
+                    }
+                    if found.is_some() {
                         return None;
                     }
-                    found = true;
-                } else if hits > 1 {
-                    return None;
+                    found = Some((h.label.clone(), from.clone()));
                 }
             }
         }
-        found.then_some(())
+        let (header, from) = found?;
+        if from == pred {
+            return Some((header, from));
+        }
+        let via_pred = succs
+            .get(pred)
+            .is_some_and(|ts| ts.iter().any(|t| t == &from));
+        let back_to_header = succs
+            .get(&from)
+            .is_some_and(|ts| ts.iter().any(|t| t == &header));
+        (via_pred && back_to_header).then_some((header, from))
     }
 
-    /// Whether the tail from a folded `Bin` to its block's terminator can
-    /// host the in-place update: every use of the result `%r` is an
-    /// `Icmp` in this same tail (renamed to the phi reg at emission) or a
-    /// phi edge (renamed the same way), the operand `%p` is read nowhere
-    /// else, and the tail holds no call, return, switch, store-shaped
-    /// write, or address-taken read of either home. A writer between
-    /// (`Icmp`/`Load` results) must home outside the phi's lanes.
+    /// Whether the latch region from a folded `Bin` through the phi's
+    /// block can host the in-place update (epic-cc#937): the `Bin` block
+    /// suffix plus the latch continuation when the backedge leaves from
+    /// there. Reads of `%r` stay confined to `Icmp`s (renamed at
+    /// emission) and the one backedge incoming; reads of `%preg` before
+    /// the `Bin` still see the old value, every later one must read the
+    /// new value or not exist. Writers between must home outside the
+    /// phi's lanes, and no exit path may observe the old slot.
     #[allow(clippy::too_many_arguments)]
-    fn phi_tail_clean(
+    fn phi_region_clean(
         g: &Gen,
         f: &Func,
+        succs: &HashMap<String, Vec<String>>,
         b: &Block,
         qi: usize,
         r: &str,
         preg: &str,
         n: u8,
-        uses: &HashMap<String, usize>,
+        header: &str,
+        latch: &str,
         home_of: &dyn Fn(&str) -> Option<u16>,
     ) -> bool {
-        if uses.get(preg).copied().unwrap_or(0) != 1 {
-            return false;
-        }
         let Some(sp) = g.addrs.get(&ssa_key(&f.name, preg)).copied() else {
             return false;
         };
         let lanes = sp..sp + u16::from(n);
-        let disjoint = |dst: &str| -> bool {
-            match home_of(dst) {
+        let reads = |inst: &Inst, reg: &str| ir::read_vals(inst).iter().any(|v| v == reg);
+        let disjoint = |addr: u16, w: u8| addr + u16::from(w) <= lanes.start || addr >= lanes.end;
+        let overlap = |ptr: &str, bytes: u8| -> bool {
+            match Self::static_base(g, &f.name, ptr) {
                 None => true,
-                Some(a) => a + 1 <= lanes.start || a >= lanes.end,
+                Some(a) => !disjoint(a, bytes),
             }
         };
-        let reads_of = |inst: &Inst| {
-            ir::read_vals(inst)
-                .iter()
-                .filter(|v| v.as_str() == r)
-                .count()
-        };
-        let mut phi_reads = 0usize;
+        // A phi carrying the operand itself would read the folded home
+        // on a path this check never reconciles, so it stays staged.
         for ob in &f.blocks {
-            if ob.label == b.label {
-                continue;
-            }
             for inst in &ob.insts {
-                let nreads = reads_of(inst);
-                if nreads == 0 {
-                    continue;
+                let Inst::Phi(p) = inst else { continue };
+                for (val, _) in &p.incoming {
+                    if matches!(val, Val::Reg(x) if x == preg) {
+                        return false;
+                    }
                 }
-                if !matches!(inst, Inst::Phi(_)) {
-                    return false;
-                }
-                phi_reads += nreads;
             }
         }
-        for (ti, inst) in b.insts.iter().enumerate() {
-            if ti <= qi {
-                if let Inst::Phi(_) = inst {
-                    phi_reads += reads_of(inst);
-                    continue;
-                }
-                if reads_of(inst) > 0 {
+        let mut phi_reads = 0usize;
+        for inst in b.insts.iter().take(qi) {
+            if matches!(inst, Inst::Phi(_)) {
+                phi_reads += usize::from(reads(inst, r));
+                if reads(inst, preg) {
                     return false;
                 }
                 continue;
+            }
+            if reads(inst, r) {
+                return false;
             }
             match inst {
-                Inst::Phi(_) => {
-                    phi_reads += reads_of(inst);
+                Inst::Load(l) if l.ptr.strip_prefix('%').is_some_and(|p| p == preg) => {
+                    return false
                 }
-                Inst::Icmp(c) => {
-                    if g.lane_consumed.contains(&c.dst) || g.bit_lanes.contains_key(&c.dst) {
-                        return false;
-                    }
-                    if !disjoint(&c.dst) {
-                        return false;
-                    }
+                Inst::Store(s) if s.ptr.strip_prefix('%').is_some_and(|p| p == preg) => {
+                    return false
                 }
-                Inst::Load(l) => {
-                    if reads_of(inst) > 0 || !disjoint(&l.dst) {
-                        return false;
-                    }
-                    let overlap = match Self::static_base(g, &f.name, &l.ptr) {
-                        None => true,
-                        Some(a) => a < lanes.end && a + u16::from(l.ty.bytes()) > lanes.start,
-                    };
-                    if overlap {
-                        return false;
-                    }
-                }
-                Inst::Br(_) | Inst::BrCond(_) => {
-                    if reads_of(inst) > 0 {
-                        return false;
-                    }
-                }
-                _ => return false,
+                _ => {}
             }
         }
-        // Copies on `b`'s outgoing edges run after the folded write: any
-        // of them homing inside the phi's lanes would clobber the folded
-        // value before its next read. Only the folded self-copy may touch
-        // the lanes (it emits nothing). Reads need no check: `%p` has no
-        // other reader by the use count above, and renamed `%r` readers
-        // want the new value.
-        let succs: Vec<&str> = match b.insts.last() {
-            Some(Inst::Br(br)) => vec![br.target.as_str()],
-            Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
-            Some(Inst::Switch(sw)) => sw
-                .cases
-                .iter()
-                .map(|(_, l)| l.as_str())
-                .chain(std::iter::once(sw.default.as_str()))
-                .collect(),
-            _ => vec![],
-        };
-        for s in succs {
-            let Some(succ) = f.blocks.iter().find(|bb| bb.label == s) else {
+        let mut region: Vec<(&Block, usize)> = vec![(b, qi + 1)];
+        if latch != b.label {
+            let Some(lb) = f.blocks.iter().find(|bb| bb.label == latch) else {
+                return false;
+            };
+            region.push((lb, 0));
+        }
+        for (blk, start) in &region {
+            for inst in blk.insts.iter().skip(*start) {
+                match inst {
+                    Inst::Phi(_) => {
+                        phi_reads += usize::from(reads(inst, r));
+                        if reads(inst, preg) {
+                            return false;
+                        }
+                    }
+                    Inst::Icmp(c) => {
+                        if g.lane_consumed.contains(&c.dst) || g.bit_lanes.contains_key(&c.dst) {
+                            return false;
+                        }
+                        if reads(inst, preg) {
+                            return false;
+                        }
+                        if let Some(a) = home_of(&c.dst) {
+                            if !disjoint(a, 1) {
+                                return false;
+                            }
+                        }
+                    }
+                    Inst::Load(l) => {
+                        if reads(inst, r) || reads(inst, preg) {
+                            return false;
+                        }
+                        if overlap(&l.ptr, l.ty.bytes()) {
+                            return false;
+                        }
+                    }
+                    Inst::Store(s) => {
+                        if reads(inst, r) || reads(inst, preg) {
+                            return false;
+                        }
+                        if overlap(&s.ptr, s.ty.bytes()) {
+                            return false;
+                        }
+                    }
+                    Inst::Bin(q2) => {
+                        if reads(inst, r) || reads(inst, preg) {
+                            return false;
+                        }
+                        let home = g
+                            .store_fwd
+                            .get(&q2.dst)
+                            .copied()
+                            .or_else(|| home_of(&q2.dst));
+                        if let Some(a) = home {
+                            if !disjoint(a, q2.ty.bytes()) {
+                                return false;
+                            }
+                        }
+                    }
+                    Inst::Gep(_) => {
+                        if reads(inst, r) || reads(inst, preg) {
+                            return false;
+                        }
+                    }
+                    Inst::Br(_) | Inst::BrCond(_) => {
+                        if reads(inst, r) || reads(inst, preg) {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        // Copies on the region's outgoing edges run after the folded
+        // write: any of them homing inside the phi's lanes would clobber
+        // the folded value before its next read. Only the folded
+        // self-copy may touch the lanes (it emits nothing).
+        let mut edges: Vec<&String> = Vec::new();
+        if let Some(ts) = succs.get(&b.label) {
+            edges.extend(ts);
+        }
+        if latch != b.label {
+            if let Some(ts) = succs.get(latch) {
+                edges.extend(ts);
+            }
+        }
+        for s in &edges {
+            let Some(succ) = f.blocks.iter().find(|bb| &bb.label == *s) else {
                 continue;
             };
             for inst in &succ.insts {
                 let Inst::Phi(p) = inst else { continue };
                 for (val, from) in &p.incoming {
-                    if from != &b.label {
+                    if from != &b.label && from.as_str() != latch {
                         continue;
                     }
                     let Some(da) = g.addrs.get(&ssa_key(&f.name, &p.dst)).copied() else {
                         return false;
                     };
-                    let w = u16::from(p.ty.bytes());
-                    if da + w <= lanes.start || da >= lanes.end {
+                    let w = p.ty.bytes();
+                    if disjoint(da, w) {
                         continue;
                     }
                     let renamed = match val {
@@ -1705,6 +1780,54 @@ impl<'m> Gen<'m> {
                         return false;
                     }
                 }
+            }
+        }
+        // Every path out of the region except back to the phi's block
+        // must never observe the operand's old slot: the fold overwrites
+        // it with the new value, and only the header's phi reconciles
+        // re-entry. Reaching the region itself means an irreducible
+        // entry whose earlier readers would diverge, so that fails too.
+        let in_region = |s: &str| s == header || s == b.label.as_str() || s == latch;
+        let mut stack: Vec<&str> = edges
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|s| !in_region(s))
+            .collect();
+        let mut seen: HashSet<&str> = HashSet::from([header, b.label.as_str(), latch]);
+        while let Some(lbl) = stack.pop() {
+            if !seen.insert(lbl) {
+                continue;
+            }
+            let Some(blk) = f.blocks.iter().find(|bb| bb.label == lbl) else {
+                continue;
+            };
+            for inst in &blk.insts {
+                if reads(inst, r) || reads(inst, preg) {
+                    return false;
+                }
+                match inst {
+                    Inst::Load(l) => {
+                        // A load through a statically known base that
+                        // overlaps the lanes would observe the folded
+                        // home. Anything else cannot name the operand's
+                        // slot: pointers derive from allocas and globals,
+                        // never from a promoted counter, and an overlaid
+                        // object is either disjoint (same value both
+                        // ways) or uninitialized on both paths.
+                        if let Some(a) = Self::static_base(g, &f.name, &l.ptr) {
+                            if !disjoint(a, l.ty.bytes()) {
+                                return false;
+                            }
+                        }
+                    }
+                    Inst::Memcpy(_) | Inst::Asm(_) | Inst::VaStart(_) | Inst::VaArg(_) => {
+                        return false
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(ts) = succs.get(lbl) {
+                stack.extend(ts.iter().map(|s| s.as_str()).filter(|s| !seen.contains(s)));
             }
         }
         // Exactly the backedge incoming: any second phi reader would

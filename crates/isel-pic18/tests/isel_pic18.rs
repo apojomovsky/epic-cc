@@ -8252,6 +8252,64 @@ fn phi_folded_i16_increment_reads_the_phi_home_through_a_materialized_compare() 
 }
 
 #[test]
+fn phi_folded_i16_increment_with_earlier_index_uses_folds_in_place() {
+    // A counted copy loop reads its index for both ends before bumping
+    // it, so the phi has three uses and the single-use gate of
+    // epic-cc#767 stays shut. The two index reads sit before the `Bin`
+    // in the latch block and nothing on the exit path observes the
+    // slot, so the increment still computes into the phi's home
+    // (epic-cc#937): the backedge copies degrade to skipped self-copies
+    // exactly like the single-use shape.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %g1 = gep @src +0 +1*%i\n\
+             %v = load i8 %g1\n\
+             %g2 = gep @dst +0 +1*%i\n\
+             store i8 %v %g2\n\
+             %r = add i16 %i, 1\n\
+             %c = icmp eq i16 %r, 11\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x020),
+        ("dst", 0x030),
+        ("main::i", 0x040),
+        ("main::v", 0x042),
+        ("main::r", 0x044),
+        ("main::c", 0x046),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(lp.contains("INCF 0x040,F,A"), "loop:\n{lp}");
+    assert!(lp.contains("BTFSC 0xFD8,0,A"), "loop:\n{lp}");
+    assert!(lp.contains("INCF 0x041,F,A"), "loop:\n{lp}");
+    assert!(!lp.contains("0x044"), "dead temp must go unread:\n{lp}");
+    assert!(!lp.contains("MOVWF 0x040"), "no staged low store:\n{lp}");
+    assert!(!lp.contains("MOVWF 0x041"), "no staged high store:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for k in 0..11u8 {
+        p.ram_mut()[0x20 + usize::from(k)] = 0x50 + k;
+    }
+    p.run(4000);
+    assert!(p.halted(), "program must halt");
+    for k in 0..11u8 {
+        assert_eq!(p.ram()[0x30 + usize::from(k)], 0x50 + k, "copied byte {k}");
+    }
+    assert_eq!(p.ram()[0x40], 11, "counter lo must hold the bound");
+    assert_eq!(p.ram()[0x41], 0, "counter hi must hold the bound");
+}
+
+#[test]
 fn inplace_add_i16_with_zero_low_byte_skips_the_lane() {
     // `x += 0x0100` needs no low lane and no carry seed: the low add
     // carries nothing in, so the high lane takes the plain form
