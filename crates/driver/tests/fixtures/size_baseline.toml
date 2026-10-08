@@ -215,7 +215,7 @@ ram_bytes = 104
 name = "hal-pic16-encoder-full-16f877a"
 device = "16F877A"
 profile = "O2"
-flash_words = 5360
+flash_words = 5535
 ram_bytes = 339
 
 [[entry]]
