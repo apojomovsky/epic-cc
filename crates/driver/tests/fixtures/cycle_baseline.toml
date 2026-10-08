@@ -21,16 +21,16 @@ ram_bytes = 16
 [[entry]]
 name = "speed-mul-u8-16f877a"
 device = "16F877A"
-cycles = 128
-flash_words = 51
+cycles = 85
+flash_words = 38
 ram_bytes = 16
 
 [[entry]]
 name = "speed-mul-u8-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 128
-flash_words = 51
+cycles = 85
+flash_words = 38
 ram_bytes = 16
 
 [[entry]]
@@ -51,16 +51,16 @@ ram_bytes = 33
 [[entry]]
 name = "speed-mul-u16-16f877a"
 device = "16F877A"
-cycles = 332
-flash_words = 84
+cycles = 144
+flash_words = 78
 ram_bytes = 33
 
 [[entry]]
 name = "speed-mul-u16-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 332
-flash_words = 84
+cycles = 144
+flash_words = 78
 ram_bytes = 33
 
 [[entry]]
@@ -411,16 +411,16 @@ ram_bytes = 23
 [[entry]]
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
-cycles = 2808
-flash_words = 149
+cycles = 2643
+flash_words = 136
 ram_bytes = 33
 
 [[entry]]
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 2808
-flash_words = 149
+cycles = 2643
+flash_words = 136
 ram_bytes = 33
 
 [[entry]]
