@@ -2342,3 +2342,25 @@ define dso_local void @main() {
         other => panic!("expected the store, got {other:?}"),
     }
 }
+
+/// Bare `external` declarations name a symbol no TU defined (what llvm-link
+/// leaves behind). They carry no bytes, so they are not definitions: the
+/// parser skips them and wholeprog reports any use as an undefined symbol
+/// (epic-cc#909). The unsized-array shape is clang's spelling of
+/// `extern const irq_desc_t irq_table[];` with no definition.
+#[test]
+fn skips_external_declarations() {
+    let m = parse_ll(
+        r#"
+%struct.irq_desc_t = type { i8, i8 }
+@irq_table = external dso_local local_unnamed_addr constant [0 x %struct.irq_desc_t], align 1
+@missing_scalar = external dso_local global i16, align 2
+@defined = dso_local global i8 7, align 1
+define dso_local i16 @main() {
+  ret i16 0
+}
+"#,
+    );
+    assert_eq!(m.globals.len(), 1);
+    assert_eq!(m.globals[0].name, "defined");
+}

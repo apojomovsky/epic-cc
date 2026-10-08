@@ -2693,6 +2693,13 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                 continue;
             }
             let after = line[eq + 1..].trim();
+            // A bare `external` declaration names a symbol no TU defined
+            // (llvm-link leaves it in place). It carries no bytes, so it
+            // is not a definition: skip it and let wholeprog report any
+            // use of it as an undefined symbol (epic-cc#909).
+            if after.starts_with("external ") {
+                continue;
+            }
             let (is_const, rest) = if let Some(i) = after.find("global ") {
                 (false, &after[i + "global ".len()..])
             } else if let Some(i) = after.find("constant ") {
