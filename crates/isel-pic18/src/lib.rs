@@ -8940,6 +8940,754 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
     }
 }
 
+/// Narrowed ISR context save (epic-cc#783). The compat prologue parks 18
+/// registers whether the handler touches them or not, while the dispatch it
+/// wraps rarely multiplies, table-reads, or switches, so PROD, TBLPTR,
+/// TABLAT, PCLAT, FSR1, and retval bytes shuttle dead state. The scan below
+/// proves which classes the ISR's reachable bodies can write; the filter
+/// then drops only those exact save lines, so the kept set stays complete
+/// by construction instead of by review (the epic-cc#641 failure shape).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct IsrNeeds {
+    w: bool,
+    status: bool,
+    bsr: bool,
+    fsr0: bool,
+    fsr1: bool,
+    prod: bool,
+    tablat: bool,
+    tblptr: bool,
+    pclat: bool,
+    retval: bool,
+}
+
+impl IsrNeeds {
+    fn all() -> Self {
+        Self {
+            w: true,
+            status: true,
+            bsr: true,
+            fsr0: true,
+            fsr1: true,
+            prod: true,
+            tablat: true,
+            tblptr: true,
+            pclat: true,
+            retval: true,
+        }
+    }
+}
+
+/// One save-line class. `BsrPost` covers both low BSR restores, which share
+/// one spelling: the group restore runs before the epilogue's own `MOVLB`
+/// and the second runs after, so either must stay while a bank select
+/// stays (W saved) even if the body never selects a bank. Keeping both on
+/// that condition can hold one redundant restore when only BSR is live,
+/// which stays correct.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IsrSlot {
+    W,
+    Status,
+    Bsr,
+    BsrPost,
+    Fsr0,
+    Fsr1,
+    Prod,
+    Tablat,
+    Tblptr,
+    Pclat,
+    Retval,
+}
+
+/// The save class a full SFR address belongs to, if any. `retval_lo` is the
+/// device's fixed return region; anything else (GPRs, `INDF`/`PLUSW`
+/// windows, `WREG`, `INTCON`) needs no ISR slot. Post/pre addresses map to
+/// their pointer even though only a write moves it: the caller checks reads
+/// separately, since an `INDF` read leaves the pointer alone.
+fn isr_slot_for_addr(addr: u16, retval_lo: u16) -> Option<IsrSlot> {
+    match addr {
+        0xFD8 => Some(IsrSlot::Status),
+        0xFE0 => Some(IsrSlot::Bsr),
+        0xFE9 | 0xFEA | 0xFEC | 0xFED | 0xFEE => Some(IsrSlot::Fsr0),
+        0xFE1 | 0xFE2 | 0xFE4 | 0xFE5 | 0xFE6 => Some(IsrSlot::Fsr1),
+        0xFF3 | 0xFF4 => Some(IsrSlot::Prod),
+        0xFF5 => Some(IsrSlot::Tablat),
+        0xFF6 | 0xFF7 | 0xFF8 => Some(IsrSlot::Tblptr),
+        0xFFA | 0xFFB => Some(IsrSlot::Pclat),
+        a if (retval_lo..retval_lo + 4).contains(&a) => Some(IsrSlot::Retval),
+        _ => None,
+    }
+}
+
+/// Same resolution as `operand()`'s access arm: bytes past the access
+/// window name SFRs, banked bytes name RAM (`operand()` never addresses an
+/// SFR banked, so a `B` operand cannot alias the save set). `None` is a
+/// banked operand, never a save class.
+fn isr_access_full(byte: u16, abit: &str, access_bank_hi: u16) -> Option<u16> {
+    match abit {
+        "A" => Some(if byte <= access_bank_hi {
+            byte
+        } else {
+            0xF00 | byte
+        }),
+        "B" => None,
+        _ => None,
+    }
+}
+
+fn isr_hex_tok(tok: &str) -> Option<u16> {
+    tok.strip_prefix("0x")
+        .or_else(|| tok.strip_prefix("0X"))
+        .and_then(|h| u16::from_str_radix(h, 16).ok())
+}
+
+/// Fold one save class into the need set.
+fn isr_need_addr(needs: &mut IsrNeeds, addr: u16, retval_lo: u16) {
+    match isr_slot_for_addr(addr, retval_lo) {
+        Some(IsrSlot::Status) => needs.status = true,
+        Some(IsrSlot::Bsr) | Some(IsrSlot::BsrPost) => needs.bsr = true,
+        Some(IsrSlot::Fsr0) => needs.fsr0 = true,
+        Some(IsrSlot::Fsr1) => needs.fsr1 = true,
+        Some(IsrSlot::Prod) => needs.prod = true,
+        Some(IsrSlot::Tablat) => needs.tablat = true,
+        Some(IsrSlot::Tblptr) => needs.tblptr = true,
+        Some(IsrSlot::Pclat) => needs.pclat = true,
+        Some(IsrSlot::Retval) => needs.retval = true,
+        Some(IsrSlot::W) | None => {}
+    }
+}
+
+/// Accumulate what one reachable-body line can write. Returns false for an
+/// unrecognized line; the caller then keeps the full save set, so an
+/// unknown instruction can never shrink a save below what is proven. Reads
+/// never count except through `POSTINC`/`PREINC`/`POSTDEC`, which move the
+/// pointer as a side effect of the access itself.
+fn scan_isr_line(
+    line: &str,
+    access_bank_hi: u16,
+    retval_lo: u16,
+    calls: &mut Vec<String>,
+    jumps: &mut Vec<String>,
+    needs: &mut IsrNeeds,
+) -> bool {
+    let t = line.trim();
+    let t = match t.find(';') {
+        Some(i) => t[..i].trim(),
+        None => t,
+    };
+    if t.is_empty() || t.ends_with(':') {
+        return true;
+    }
+    let (mnem_raw, ops_str) = match t.find(char::is_whitespace) {
+        Some(i) => (&t[..i], t[i..].trim()),
+        None => (t, ""),
+    };
+    let mnem = mnem_raw.to_ascii_uppercase();
+    // Assembler directives and markers (`.pcltbl`, `org`, `db`, `g equ`)
+    // emit no code, so they clobber nothing. Anything else unknown keeps
+    // the full set in the arms below.
+    let second = ops_str
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_ascii_uppercase());
+    if mnem.starts_with('.')
+        || second.as_deref() == Some("EQU")
+        || matches!(
+            mnem.as_str(),
+            "ORG"
+                | "LIST"
+                | "RADIX"
+                | "EQU"
+                | "DB"
+                | "DW"
+                | "DT"
+                | "DE"
+                | "RES"
+                | "CODE"
+                | "UDATA"
+                | "IDATA"
+                | "CBLOCK"
+                | "ENDC"
+                | "ERROR"
+                | "MESSG"
+        )
+    {
+        return true;
+    }
+    let ops: Vec<&str> = if ops_str.is_empty() {
+        Vec::new()
+    } else {
+        ops_str.split(',').map(str::trim).collect()
+    };
+    // A `[file, bank]` or `[file, dest-or-bit, bank]` operand tail: the
+    // file byte resolves through the access window, the bank suffix must
+    // be explicit (a suffixless naked store has no static address).
+    let file_tail = |ops: &[&str]| -> Option<(u16, &str)> {
+        let (file_tok, bank_tok) = match ops {
+            [f, b] => (*f, *b),
+            [f, _, b] => (*f, *b),
+            _ => return None,
+        };
+        let abit = if bank_tok.eq_ignore_ascii_case("a") {
+            "A"
+        } else if bank_tok.eq_ignore_ascii_case("b") {
+            "B"
+        } else {
+            return None;
+        };
+        let byte = isr_hex_tok(file_tok)?;
+        Some((byte, abit))
+    };
+    // A `[file, dest, bank]` ALU tail: `W` writes W, `F` writes the file.
+    let alu_tail = |ops: &[&str]| -> Option<(u16, &str, bool)> {
+        let (f, d, b) = match ops {
+            [f, d, b] => (*f, *d, *b),
+            _ => return None,
+        };
+        let to_w = if d.eq_ignore_ascii_case("w") {
+            true
+        } else if d.eq_ignore_ascii_case("f") {
+            false
+        } else {
+            return None;
+        };
+        let abit = if b.eq_ignore_ascii_case("a") {
+            "A"
+        } else if b.eq_ignore_ascii_case("b") {
+            "B"
+        } else {
+            return None;
+        };
+        Some((isr_hex_tok(f)?, abit, to_w))
+    };
+    match mnem.as_str() {
+        "BRA" | "GOTO" | "RCALL" => {
+            if let Some(tgt) = ops.first() {
+                jumps.push(tgt.to_string());
+                true
+            } else {
+                false
+            }
+        }
+        "CALL" => match ops.first() {
+            Some(tgt) => {
+                calls.push(tgt.to_string());
+                true
+            }
+            None => false,
+        },
+        "RETURN" | "RETFIE" | "NOP" | "SLEEP" | "CLRWDT" | "RESET" | "PUSH" | "POP" => true,
+        "BZ" | "BNZ" | "BC" | "BNC" | "BN" | "BNN" | "BOV" | "BNOV" | "BTFSC" | "BTFSS"
+        | "CPFSEQ" | "CPFSGT" | "CPFSLT" | "TSTFSZ" => true,
+        "MOVLB" => {
+            needs.bsr = true;
+            true
+        }
+        "LFSR" => match ops.as_slice() {
+            [n, k] if isr_hex_tok(k).is_some() => match *n {
+                "0" => {
+                    needs.fsr0 = true;
+                    true
+                }
+                "1" => {
+                    needs.fsr1 = true;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        },
+        "MULWF" => {
+            needs.prod = true;
+            true
+        }
+        "TBLRD*" => {
+            needs.tablat = true;
+            true
+        }
+        "TBLRD*+" => {
+            needs.tablat = true;
+            needs.tblptr = true;
+            true
+        }
+        "TBLWT*" => true,
+        "TBLWT*+" => {
+            needs.tblptr = true;
+            true
+        }
+        "MOVLW" => {
+            needs.w = true;
+            true
+        }
+        "ADDLW" | "SUBLW" | "ANDLW" | "IORLW" | "XORLW" => {
+            needs.w = true;
+            needs.status = true;
+            true
+        }
+        "MOVFF" => match ops.as_slice() {
+            [s, d] => {
+                let (src, dst) = match (isr_hex_tok(s), isr_hex_tok(d)) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return false,
+                };
+                isr_need_addr(needs, dst, retval_lo);
+                if matches!(src, 0xFEC | 0xFED | 0xFEE) {
+                    needs.fsr0 = true;
+                }
+                if matches!(src, 0xFE4 | 0xFE5 | 0xFE6) {
+                    needs.fsr1 = true;
+                }
+                if matches!(dst, 0xFEC | 0xFED | 0xFEE) {
+                    needs.fsr0 = true;
+                }
+                if matches!(dst, 0xFE4 | 0xFE5 | 0xFE6) {
+                    needs.fsr1 = true;
+                }
+                true
+            }
+            _ => false,
+        },
+        "MOVWF" | "SETF" => match file_tail(&ops) {
+            Some((byte, abit)) => {
+                if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
+                    isr_need_addr(needs, full, retval_lo);
+                }
+                true
+            }
+            None => false,
+        },
+        "CLRF" => match file_tail(&ops) {
+            Some((byte, abit)) => {
+                if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
+                    isr_need_addr(needs, full, retval_lo);
+                }
+                needs.status = true;
+                true
+            }
+            None => false,
+        },
+        "BCF" | "BSF" => match file_tail(&ops) {
+            Some((byte, abit)) => {
+                if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
+                    isr_need_addr(needs, full, retval_lo);
+                }
+                true
+            }
+            None => false,
+        },
+        "MOVF" => match alu_tail(&ops) {
+            Some((byte, abit, to_w)) => {
+                if to_w {
+                    needs.w = true;
+                } else if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
+                    isr_need_addr(needs, full, retval_lo);
+                }
+                needs.status = true;
+                true
+            }
+            None => false,
+        },
+        "ADDWF" | "ADDWFC" | "SUBWF" | "SUBWFB" | "ANDWF" | "IORWF" | "XORWF" | "COMF" | "NEGF"
+        | "INCF" | "DECF" | "RLCF" | "RRCF" => match alu_tail(&ops) {
+            Some((byte, abit, to_w)) => {
+                if to_w {
+                    needs.w = true;
+                } else if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
+                    isr_need_addr(needs, full, retval_lo);
+                }
+                needs.status = true;
+                true
+            }
+            None => false,
+        },
+        "SWAPF" | "RRNCF" => match alu_tail(&ops) {
+            Some((byte, abit, to_w)) => {
+                if to_w {
+                    needs.w = true;
+                } else if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
+                    isr_need_addr(needs, full, retval_lo);
+                }
+                true
+            }
+            None => false,
+        },
+        "INCFSZ" | "DECFSZ" | "DCFSNZ" | "INFSNZ" => match alu_tail(&ops) {
+            Some((byte, abit, to_w)) => {
+                if to_w {
+                    needs.w = true;
+                } else if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
+                    isr_need_addr(needs, full, retval_lo);
+                }
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// The save-line layout one ISR uses: the fixed retval block plus a spill
+/// area (`prod` in compat/high mode, the low area `s` in priority mode).
+struct IsrSaveLayout {
+    common_lo: u16,
+    spill: u16,
+    low: bool,
+}
+
+fn isr_movff(src: u16, dst: u16) -> String {
+    format!("    MOVFF 0x{src:03X}, 0x{dst:03X}")
+}
+
+/// Every save/restore line one ISR emits, tagged with its class, split
+/// into prologue (once per body) and epilogue (once per `ret` site: each
+/// switch case returns through its own epilogue). Mirrors the
+/// prologue/epilogue emission below line for line: the filter drops a
+/// subset of exactly these strings, and any emission drift shows up as a
+/// loud count mismatch instead of a silent under-save.
+fn isr_save_table(layout: &IsrSaveLayout) -> (Vec<(IsrSlot, String)>, Vec<(IsrSlot, String)>) {
+    let lo = layout.common_lo;
+    let sp = layout.spill;
+    let mut pre = Vec::new();
+    let mut post = Vec::new();
+    if layout.low {
+        for (src, dst, slot) in [
+            (lo, sp + 8, IsrSlot::Retval),
+            (lo + 1, sp + 9, IsrSlot::Retval),
+            (lo + 2, sp + 10, IsrSlot::Retval),
+            (lo + 3, sp + 11, IsrSlot::Retval),
+            (0xFD8, sp + 1, IsrSlot::Status),
+            (0xFE0, sp + 2, IsrSlot::Bsr),
+            (0xFE9, sp + 3, IsrSlot::Fsr0),
+            (0xFEA, sp + 4, IsrSlot::Fsr0),
+            (0xFE1, sp + 12, IsrSlot::Fsr1),
+            (0xFE2, sp + 13, IsrSlot::Fsr1),
+            (0xFF3, sp + 14, IsrSlot::Prod),
+            (0xFF4, sp + 15, IsrSlot::Prod),
+            (0xFF5, sp + 16, IsrSlot::Tablat),
+            (0xFFA, sp + 17, IsrSlot::Pclat),
+            (0xFFB, sp + 18, IsrSlot::Pclat),
+            (0xFF6, sp + 5, IsrSlot::Tblptr),
+            (0xFF7, sp + 6, IsrSlot::Tblptr),
+            (0xFF8, sp + 7, IsrSlot::Tblptr),
+        ] {
+            pre.push((slot, isr_movff(src, dst)));
+        }
+        let bank = (sp >> 8) as u8;
+        pre.push((IsrSlot::W, format!("    MOVLB 0x{bank:X}")));
+        pre.push((IsrSlot::W, format!("    MOVWF 0x{sp:03X},B")));
+        for (src, dst, slot) in [
+            (sp + 11, lo + 3, IsrSlot::Retval),
+            (sp + 10, lo + 2, IsrSlot::Retval),
+            (sp + 9, lo + 1, IsrSlot::Retval),
+            (sp + 8, lo, IsrSlot::Retval),
+            (sp + 7, 0xFF8, IsrSlot::Tblptr),
+            (sp + 6, 0xFF7, IsrSlot::Tblptr),
+            (sp + 5, 0xFF6, IsrSlot::Tblptr),
+            (sp + 4, 0xFEA, IsrSlot::Fsr0),
+            (sp + 3, 0xFE9, IsrSlot::Fsr0),
+            (sp + 2, 0xFE0, IsrSlot::BsrPost),
+            (sp + 12, 0xFE1, IsrSlot::Fsr1),
+            (sp + 13, 0xFE2, IsrSlot::Fsr1),
+            (sp + 14, 0xFF3, IsrSlot::Prod),
+            (sp + 15, 0xFF4, IsrSlot::Prod),
+            (sp + 16, 0xFF5, IsrSlot::Tablat),
+            (sp + 17, 0xFFA, IsrSlot::Pclat),
+            (sp + 18, 0xFFB, IsrSlot::Pclat),
+        ] {
+            post.push((slot, isr_movff(src, dst)));
+        }
+        post.push((IsrSlot::W, format!("    MOVLB 0x{bank:X}")));
+        post.push((IsrSlot::W, format!("    MOVF 0x{sp:03X}, W, B")));
+        post.push((
+            IsrSlot::Status,
+            format!("    MOVFF 0x{:03X}, 0xFD8", sp + 1),
+        ));
+        post.push((
+            IsrSlot::BsrPost,
+            format!("    MOVFF 0x{:03X}, 0xFE0", sp + 2),
+        ));
+    } else {
+        for (src, dst, slot) in [
+            (0xFF6, lo + 5, IsrSlot::Tblptr),
+            (0xFF7, lo + 6, IsrSlot::Tblptr),
+            (0xFF8, lo + 7, IsrSlot::Tblptr),
+            (0xFEA, lo + 4, IsrSlot::Fsr0),
+            (0xFD8, lo + 9, IsrSlot::Status),
+            (0xFE0, lo + 10, IsrSlot::Bsr),
+            (0xFE9, lo + 11, IsrSlot::Fsr0),
+            (0xFE1, sp, IsrSlot::Fsr1),
+            (0xFE2, sp + 1, IsrSlot::Fsr1),
+            (0xFF3, sp + 2, IsrSlot::Prod),
+            (0xFF4, sp + 3, IsrSlot::Prod),
+            (0xFF5, sp + 4, IsrSlot::Tablat),
+            (0xFFA, sp + 5, IsrSlot::Pclat),
+            (0xFFB, sp + 6, IsrSlot::Pclat),
+            (lo, lo + 12, IsrSlot::Retval),
+            (lo + 1, lo + 13, IsrSlot::Retval),
+            (lo + 2, lo + 14, IsrSlot::Retval),
+            (lo + 3, lo + 15, IsrSlot::Retval),
+        ] {
+            pre.push((slot, isr_movff(src, dst)));
+        }
+        pre.push((IsrSlot::W, format!("    MOVWF 0x{:03X},A", lo + 8)));
+        for (src, dst, slot) in [
+            (lo + 7, 0xFF8, IsrSlot::Tblptr),
+            (lo + 6, 0xFF7, IsrSlot::Tblptr),
+            (lo + 5, 0xFF6, IsrSlot::Tblptr),
+            (lo + 4, 0xFEA, IsrSlot::Fsr0),
+            (lo + 11, 0xFE9, IsrSlot::Fsr0),
+            (lo + 10, 0xFE0, IsrSlot::Bsr),
+            (lo + 15, lo + 3, IsrSlot::Retval),
+            (lo + 14, lo + 2, IsrSlot::Retval),
+            (lo + 13, lo + 1, IsrSlot::Retval),
+            (lo + 12, lo, IsrSlot::Retval),
+            (sp, 0xFE1, IsrSlot::Fsr1),
+            (sp + 1, 0xFE2, IsrSlot::Fsr1),
+            (sp + 2, 0xFF3, IsrSlot::Prod),
+            (sp + 3, 0xFF4, IsrSlot::Prod),
+            (sp + 4, 0xFF5, IsrSlot::Tablat),
+            (sp + 5, 0xFFA, IsrSlot::Pclat),
+            (sp + 6, 0xFFB, IsrSlot::Pclat),
+        ] {
+            post.push((slot, isr_movff(src, dst)));
+        }
+        post.push((IsrSlot::W, format!("    MOVF 0x{:03X}, W, A", lo + 8)));
+        post.push((
+            IsrSlot::Status,
+            format!("    MOVFF 0x{:03X}, 0xFD8", lo + 9),
+        ));
+    }
+    (pre, post)
+}
+
+/// Prove which save classes one ISR's reachable bodies can write, following
+/// `CALL` edges through buffered, routine, and naked bodies plus module
+/// asm. Anything unrecognized (an unknown call target, a mnemonic outside
+/// the model, a suffixless naked store) keeps the full set: the scan only
+/// ever removes what the emitted text proves untouched.
+#[allow(clippy::too_many_arguments)]
+fn isr_save_needs(
+    isr: &str,
+    ordinary: &HashMap<&str, (Vec<String>, Vec<Option<SrcLoc>>)>,
+    routines: &HashMap<&str, &Vec<String>>,
+    naked: &HashMap<&str, &Vec<String>>,
+    module_asm: &[String],
+    access_bank_hi: u16,
+    retval_lo: u16,
+    save_lines: &HashSet<String>,
+) -> IsrNeeds {
+    let lookup = |name: &str| -> Option<&Vec<String>> {
+        ordinary
+            .get(name)
+            .map(|(lines, _)| lines)
+            .or_else(|| routines.get(name).copied())
+            .or_else(|| naked.get(name).copied())
+    };
+    let mut needs = IsrNeeds::default();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut stack = vec![isr.to_string()];
+    // Module asm is not attributable to one body, so it scans up front
+    // and its calls join the same worklist: a helper defined there and
+    // reached from the handler counts like any callee.
+    {
+        let mut calls = Vec::new();
+        let mut jumps = Vec::new();
+        for line in module_asm {
+            if save_lines.contains(line) {
+                continue;
+            }
+            if !scan_isr_line(
+                line,
+                access_bank_hi,
+                retval_lo,
+                &mut calls,
+                &mut jumps,
+                &mut needs,
+            ) {
+                return IsrNeeds::all();
+            }
+        }
+        for target in calls {
+            if lookup(&target).is_none() {
+                return IsrNeeds::all();
+            }
+            stack.push(target);
+        }
+        for target in jumps {
+            if lookup(&target).is_some() {
+                stack.push(target);
+            }
+        }
+    }
+    while let Some(name) = stack.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let lines = lookup(&name).expect("isel-pic18: ISR body missing from buffered bodies");
+        let mut calls = Vec::new();
+        let mut jumps = Vec::new();
+        for line in lines {
+            if save_lines.contains(line) {
+                continue;
+            }
+            if !scan_isr_line(
+                line,
+                access_bank_hi,
+                retval_lo,
+                &mut calls,
+                &mut jumps,
+                &mut needs,
+            ) {
+                return IsrNeeds::all();
+            }
+        }
+        for target in calls {
+            if lookup(&target).is_none() {
+                return IsrNeeds::all();
+            }
+            stack.push(target);
+        }
+        for target in jumps {
+            if lookup(&target).is_some() {
+                stack.push(target);
+            }
+        }
+    }
+    needs
+}
+
+/// Render one naked function's verbatim body. Shared by the pre-pass
+/// buffer (which the ISR narrowing scans) and pass B (which streams it):
+/// one source, so the scanned text and the emitted text cannot drift.
+fn render_naked_lines(
+    f: &Func,
+    addrs: &HashMap<String, u16>,
+    resolved: &PtrResolution,
+) -> (Vec<String>, Vec<Option<SrcLoc>>) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut ls: Vec<Option<SrcLoc>> = Vec::new();
+    lines.push(format!("{}:", f.name));
+    ls.push(None);
+    lines.push("; --- asm start ---".to_string());
+    ls.push(None);
+    for b in &f.blocks {
+        for inst in &b.insts {
+            match inst {
+                Inst::Asm(a) => {
+                    // Substitute $0/%0 for rung 4 memory operands
+                    let mut substituted = a.template.clone();
+                    if !a.operands.is_empty() {
+                        for op in &a.operands {
+                            if let Some(reg) = op.ptr.strip_prefix('%') {
+                                if let Some((_, k, terms)) = resolved.get(&ssa_key(&f.name, reg)) {
+                                    if *k != 0 || !terms.is_empty() {
+                                        panic!("asm: GEP-derived pointers are not supported; operand {} is derived via getelementptr (only direct locals and globals are allowed)", op.ptr);
+                                    }
+                                }
+                            }
+                        }
+                        let mut res = String::with_capacity(substituted.len() + a.operands.len() * 6);
+                        let mut chars = substituted.chars().peekable();
+                        while let Some(c) = chars.next() {
+                            if c == '$' || c == '%' {
+                                if let Some(&n) = chars.peek() {
+                                    if n == '%' || n == '$' { chars.next(); res.push(n); continue; }
+                                    if n.is_ascii_digit() {
+                                        let mut idx_str = String::new();
+                                        while let Some(&d) = chars.peek() { if d.is_ascii_digit() { idx_str.push(d); chars.next(); } else { break; } }
+                                        let idx: usize = idx_str.parse().unwrap();
+                                        if idx >= a.operands.len() { panic!("asm: placeholder ${idx} out of range for {} operands in template {:?}", a.operands.len(), a.template); }
+                                        let ptr = &a.operands[idx].ptr;
+                                        let addr = if let Some(g) = ptr.strip_prefix('@') { *addrs.get(g).unwrap_or_else(|| panic!("isel-pic18: no address for @{g}")) } else if let Some(r) = ptr.strip_prefix('%') { *addrs.get(&ssa_key(&f.name, r)).unwrap_or_else(|| panic!("isel-pic18: no slot for {}::{}", f.name, r)) } else { panic!("asm: malformed operand ptr {ptr:?}") };
+                                        res.push_str(&format!("0x{addr:02X}"));
+                                        continue;
+                                    }
+                                }
+                                res.push(c);
+                            } else { res.push(c); }
+                        }
+                        substituted = res;
+                    }
+                    for line in substituted.split('\n') {
+                        lines.push(line.to_string());
+                        ls.push(None);
+                    }
+                }
+                _ => panic!(
+                    "isel-pic18: naked function '{}' contains non-asm instruction; naked bodies must be pure assembly",
+                    f.name
+                ),
+            }
+        }
+    }
+    lines.push("; --- asm end ---".to_string());
+    ls.push(None);
+    lines.push("".to_string());
+    ls.push(None);
+    (lines, ls)
+}
+
+/// Drop one ISR's provably untouched save lines. Every prologue line must
+/// occur once and every epilogue line once per `ret` site; the table
+/// mirrors the emission above, so a count mismatch means the emission
+/// drifted and narrowing must refuse rather than guess. `locs` filters in
+/// lockstep with `lines`.
+fn narrow_isr_body(
+    lines: &mut Vec<String>,
+    locs: &mut Vec<Option<SrcLoc>>,
+    layout: &IsrSaveLayout,
+    needs: &IsrNeeds,
+    rets: usize,
+) {
+    let (pre, post) = isr_save_table(layout);
+    let keep = |slot: IsrSlot| -> bool {
+        match slot {
+            IsrSlot::W => needs.w,
+            IsrSlot::Status => needs.status,
+            IsrSlot::Bsr => needs.bsr,
+            IsrSlot::BsrPost => needs.bsr || (layout.low && needs.w),
+            IsrSlot::Fsr0 => needs.fsr0,
+            IsrSlot::Fsr1 => needs.fsr1,
+            IsrSlot::Prod => needs.prod,
+            IsrSlot::Tablat => needs.tablat,
+            IsrSlot::Tblptr => needs.tblptr,
+            IsrSlot::Pclat => needs.pclat,
+            IsrSlot::Retval => needs.retval,
+        }
+    };
+    let mut expected: HashMap<&str, (usize, usize)> = HashMap::new();
+    for (_, text) in &pre {
+        expected.entry(text.as_str()).or_default().0 += 1;
+    }
+    for (_, text) in &post {
+        expected.entry(text.as_str()).or_default().1 += 1;
+    }
+    for (text, (n_pre, n_post)) in &expected {
+        let found = lines.iter().filter(|l| l.as_str() == *text).count();
+        assert!(
+            found == *n_pre + *n_post * rets,
+            "isel-pic18: ISR save shape drifted, expected {n_pre} prologue and {n_post} per-epilogue of `{text}` over {rets} rets (found {found})"
+        );
+    }
+    let drop: HashSet<&str> = pre
+        .iter()
+        .chain(post.iter())
+        .filter(|(slot, _)| !keep(*slot))
+        .map(|(_, s)| s.as_str())
+        .collect();
+    let mut kept_lines = Vec::with_capacity(lines.len());
+    let mut kept_locs = Vec::with_capacity(locs.len());
+    for (line, loc) in lines.drain(..).zip(locs.drain(..)) {
+        if expected.contains_key(line.as_str()) && drop.contains(line.as_str()) {
+            continue;
+        }
+        kept_lines.push(line);
+        kept_locs.push(loc);
+    }
+    *lines = kept_lines;
+    *locs = kept_locs;
+}
+
 /// The low-priority ISR's context-save area base (`Some` only in priority
 /// mode: the module holds both a high- and a low-priority ISR). `None`
 /// in compatibility mode, where the single handler uses the device's fixed
@@ -9853,113 +10601,138 @@ pub fn select_with_opts(
             if f.isr { None } else { exit_bank(&ret_ends) },
         );
     }
+    // Routines and naked bodies buffer here rather than streaming inside
+    // pass B: the ISR narrowing below scans every reachable body, and a
+    // routine defined after the handler in module order would otherwise
+    // go unscanned. Emission order stays module order, so the shared
+    // `tmp` counter hands out identical label names.
+    let mut routine_bodies: HashMap<String, (Vec<String>, Vec<Option<SrcLoc>>)> = HashMap::new();
+    for f in &funcs {
+        if !ir::is_runtime_routine(&f.name) {
+            continue;
+        }
+        let mut g = Gen {
+            m,
+            addrs,
+            resolved: &resolved,
+            prov: prov.clone(),
+            retval_lo: common_lo,
+            access_bank_hi,
+            bsr: None,
+            fwd_join: HashMap::new(),
+            bsr_dirty: false,
+            exit_banks: &exits,
+            fsr0_holds: None,
+            tblptr_holds: None,
+            pending_copies: Vec::new(),
+            copy_loop: opts.copy_loop,
+            cur_func: &f.name,
+            global_addrs: &global_addrs,
+            w_holds: None,
+            isr: f.isr,
+            tmp: &mut tmp,
+            cur_loc: None,
+            bit_lanes: HashMap::new(),
+            lane_consumed: HashSet::new(),
+            store_fwd: HashMap::new(),
+            phi_fold: HashMap::new(),
+            inplace_bins: HashSet::new(),
+            store_consumed: HashSet::new(),
+            w_folds: iselcore::ValueFolds::default(),
+            out: Vec::new(),
+            locs: Vec::new(),
+        };
+        g.emit_routine();
+        g.flush_copies();
+        routine_bodies.insert(f.name.clone(), (g.out, g.locs));
+    }
+    let mut naked_bodies: HashMap<&str, (Vec<String>, Vec<Option<SrcLoc>>)> = HashMap::new();
+    for f in &funcs {
+        if !f.naked {
+            continue;
+        }
+        naked_bodies.insert(f.name.as_str(), render_naked_lines(f, addrs, &resolved));
+    }
+    // Narrow each ISR's buffered save/restore to the registers its
+    // reachable bodies can write. Unrecognized reachable code keeps the
+    // full set; see `isr_save_needs`.
+    let routine_lines: HashMap<&str, &Vec<String>> = routine_bodies
+        .iter()
+        .map(|(name, (lines, _))| (name.as_str(), lines))
+        .collect();
+    let naked_lines: HashMap<&str, &Vec<String>> = naked_bodies
+        .iter()
+        .map(|(name, (lines, _))| (*name, lines))
+        .collect();
+    for f in &funcs {
+        if !f.isr || f.naked || ir::is_runtime_routine(&f.name) {
+            continue;
+        }
+        let low_save = priority_mode && f.irq_priority != 1;
+        let spill = if low_save {
+            isr_low_save.expect("isel-pic18: low ISR without a low save area")
+        } else {
+            prod_save()
+        };
+        let layout = IsrSaveLayout {
+            common_lo,
+            spill,
+            low: low_save,
+        };
+        let (pre, post) = isr_save_table(&layout);
+        let save_lines: HashSet<String> = pre
+            .iter()
+            .chain(post.iter())
+            .map(|(_, s)| s.clone())
+            .collect();
+        let needs = isr_save_needs(
+            &f.name,
+            &bodies,
+            &routine_lines,
+            &naked_lines,
+            &m.module_asm,
+            access_bank_hi,
+            common_lo,
+            &save_lines,
+        );
+        // Every `ret` site carries its own epilogue; a value-return in an
+        // ISR panics during emission above, so each one here is bare.
+        let rets = f
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.insts.last(), Some(Inst::Ret(..))))
+            .count();
+        let (lines, ls) = bodies
+            .get_mut(f.name.as_str())
+            .expect("isel-pic18: ISR without a buffered body");
+        narrow_isr_body(lines, ls, &layout, &needs, rets);
+    }
     // Pass B streams in module order: the recipe and naked arms keep
     // their verbatim bodies, the ISR vector line keeps its position,
     // and each remaining function pulls its buffered body.
     for f in funcs {
-        // the runtime routines: a runtime routine (or its `_isr` copy) emits its recipe body
-        // directly: its entry block holds only the `__scr` alloca, which
-        // the generic block emitter would render as an empty label
-        // (silently falling through into the next function). Every other
-        // function takes the ordinary path.
+        // A runtime routine (or its `_isr` copy) holds only the `__scr`
+        // alloca in its entry block, which the generic block emitter would
+        // render as an empty label (silently falling through into the next
+        // function). The pre-pass above emitted the recipe body instead.
+        // Runtime routines stream from the pre-pass buffer: their text is
+        // identical, and the buffer is what the ISR narrowing scanned.
         if ir::is_runtime_routine(&f.name) {
-            let mut g = Gen {
-                m,
-                addrs,
-                resolved: &resolved,
-                prov: prov.clone(),
-                retval_lo: common_lo,
-                access_bank_hi,
-                bsr: None,
-                fwd_join: HashMap::new(),
-                bsr_dirty: false,
-                exit_banks: &exits,
-                fsr0_holds: None,
-                tblptr_holds: None,
-                pending_copies: Vec::new(),
-                copy_loop: opts.copy_loop,
-                cur_func: &f.name,
-                global_addrs: &global_addrs,
-                w_holds: None,
-                isr: f.isr,
-                tmp: &mut tmp,
-                cur_loc: None,
-                bit_lanes: HashMap::new(),
-                lane_consumed: HashSet::new(),
-                store_fwd: HashMap::new(),
-                phi_fold: HashMap::new(),
-                inplace_bins: HashSet::new(),
-                store_consumed: HashSet::new(),
-                w_folds: iselcore::ValueFolds::default(),
-                out: Vec::new(),
-                locs: Vec::new(),
-            };
-            g.emit_routine();
-            g.flush_copies();
-            out.extend(g.out);
-            locs.extend(g.locs);
+            let (rlines, rlocs) = routine_bodies
+                .remove(f.name.as_str())
+                .expect("every runtime routine has a buffered body");
+            out.extend(rlines);
+            locs.extend(rlocs);
             continue;
         }
-        // Naked: verbatim, no prologue, panic on non-Asm, barrier markers.
+        // Naked bodies stream from the pre-pass buffer: identical text,
+        // and the buffer is what the ISR narrowing scanned.
         if f.naked {
-            out.push(format!("{}:", f.name));
-            locs.push(None);
-            out.push("; --- asm start ---".to_string());
-            locs.push(None);
-            for b in &f.blocks {
-                for inst in &b.insts {
-                    match inst {
-                        Inst::Asm(a) => {
-                            // Substitute $0/%0 for rung 4 memory operands
-                            let mut substituted = a.template.clone();
-                            if !a.operands.is_empty() {
-                                for op in &a.operands {
-                                    if let Some(reg) = op.ptr.strip_prefix('%') {
-                                        if let Some((_, k, terms)) = resolved.get(&ssa_key(&f.name, reg)) {
-                                            if *k != 0 || !terms.is_empty() {
-                                                panic!("asm: GEP-derived pointers are not supported; operand {} is derived via getelementptr (only direct locals and globals are allowed)", op.ptr);
-                                            }
-                                        }
-                                    }
-                                }
-                                let mut res = String::with_capacity(substituted.len() + a.operands.len() * 6);
-                                let mut chars = substituted.chars().peekable();
-                                while let Some(c) = chars.next() {
-                                    if c == '$' || c == '%' {
-                                        if let Some(&n) = chars.peek() {
-                                            if n == '%' || n == '$' { chars.next(); res.push(n); continue; }
-                                            if n.is_ascii_digit() {
-                                                let mut idx_str = String::new();
-                                                while let Some(&d) = chars.peek() { if d.is_ascii_digit() { idx_str.push(d); chars.next(); } else { break; } }
-                                                let idx: usize = idx_str.parse().unwrap();
-                                                if idx >= a.operands.len() { panic!("asm: placeholder ${idx} out of range for {} operands in template {:?}", a.operands.len(), a.template); }
-                                                let ptr = &a.operands[idx].ptr;
-                                                let addr = if let Some(g) = ptr.strip_prefix('@') { *addrs.get(g).unwrap_or_else(|| panic!("isel-pic18: no address for @{g}")) } else if let Some(r) = ptr.strip_prefix('%') { *addrs.get(&ssa_key(&f.name, r)).unwrap_or_else(|| panic!("isel-pic18: no slot for {}::{}", f.name, r)) } else { panic!("asm: malformed operand ptr {ptr:?}") };
-                                                res.push_str(&format!("0x{addr:02X}"));
-                                                continue;
-                                            }
-                                        }
-                                        res.push(c);
-                                    } else { res.push(c); }
-                                }
-                                substituted = res;
-                            }
-                            for line in substituted.split('\n') {
-                                out.push(line.to_string());
-                                locs.push(None);
-                            }
-                        }
-                        _ => panic!(
-                            "isel-pic18: naked function '{}' contains non-asm instruction; naked bodies must be pure assembly",
-                            f.name
-                        ),
-                    }
-                }
-            }
-            out.push("; --- asm end ---".to_string());
-            locs.push(None);
-            out.push("".to_string());
-            locs.push(None);
+            let (nlines, nlocs) = naked_bodies
+                .remove(f.name.as_str())
+                .expect("every naked function has a buffered body");
+            out.extend(nlines);
+            locs.extend(nlocs);
             continue;
         }
         if f.isr && !priority_mode {
@@ -10439,5 +11212,216 @@ mod p3_gen_tests {
         assert_eq!(exit_bank(&[Some(1), Some(2)]), None);
         assert_eq!(exit_bank(&[None]), None);
         assert_eq!(exit_bank(&[]), None);
+    }
+    /// One scanned line plus its call/jump targets into a fresh need set.
+    fn scan_one(line: &str) -> (IsrNeeds, Vec<String>, Vec<String>, bool) {
+        let mut needs = IsrNeeds::default();
+        let mut calls = Vec::new();
+        let mut jumps = Vec::new();
+        let ok = scan_isr_line(line, 0x5F, 0x000, &mut calls, &mut jumps, &mut needs);
+        (needs, calls, jumps, ok)
+    }
+
+    #[test]
+    fn isr_scan_models_clobbers_per_mnemonic() {
+        // `MOVLW` takes W but sets no flags; ALU literals take both.
+        let (n, _, _, ok) = scan_one("    MOVLW 0x02");
+        assert!(ok && n.w && !n.status, "MOVLW is flag-neutral");
+        let (n, _, _, ok) = scan_one("    ADDLW 0x01");
+        assert!(ok && n.w && n.status, "ADDLW sets flags");
+        // `SWAPF`/`RRNCF` rotate without touching flags (unlike `RLCF`).
+        let (n, _, _, ok) = scan_one("    SWAPF 0x020,F,A");
+        assert!(ok && !n.status && !n.w, "SWAPF is flag-neutral");
+        let (n, _, _, ok) = scan_one("    RLCF 0x020,F,A");
+        assert!(ok && n.status, "RLCF sets flags");
+        // Skip-test instructions write back without flags.
+        let (n, _, _, ok) = scan_one("    DECFSZ 0xFE8,F,A");
+        assert!(ok && !n.status && !n.w, "DECFSZ is flag-neutral");
+        // `MULWF` takes PROD only; `MOVLB` takes BSR.
+        let (n, _, _, ok) = scan_one("    MULWF 0x041,A");
+        assert!(ok && n.prod && !n.status && !n.w, "MULWF takes PROD");
+        let (n, _, _, ok) = scan_one("    MOVLB 0x2");
+        assert!(ok && n.bsr, "MOVLB selects the bank");
+        // Table reads take TABLAT, and the post-increment form the pointer.
+        let (n, _, _, ok) = scan_one("    TBLRD*");
+        assert!(ok && n.tablat && !n.tblptr, "TBLRD takes TABLAT");
+        let (n, _, _, ok) = scan_one("    TBLRD*+");
+        assert!(ok && n.tablat && n.tblptr, "TBLRD*+ moves TBLPTR");
+        // `LFSR` takes its pointer; a third pointer is outside the model.
+        let (n, _, _, ok) = scan_one("    LFSR 1, 0x100");
+        assert!(ok && n.fsr1 && !n.fsr0, "LFSR 1 takes FSR1");
+        let (_, _, _, ok) = scan_one("    LFSR 2, 0x100");
+        assert!(!ok, "FSR2 keeps the full set");
+    }
+
+    #[test]
+    fn isr_scan_maps_access_bytes_like_operand() {
+        // `CLRF 0x0E9,A` clears FSR0L through the access window, the same
+        // resolution `operand()` uses; the banked twin names RAM instead.
+        let (n, _, _, ok) = scan_one("    CLRF 0x0E9,A");
+        assert!(ok && n.fsr0, "access byte past the window is FSR0L");
+        let (n, _, _, ok) = scan_one("    CLRF 0x0E9,B");
+        assert!(ok && !n.fsr0, "banked bytes never alias SFRs");
+        // A PCLATH store through W is the epic-cc#641 dispatch shape.
+        let (n, _, _, ok) = scan_one("    MOVWF 0xFFA,A");
+        assert!(ok && n.pclat, "PCLATH store takes PCLAT");
+        // A `POSTINC0` source moves FSR0 as a side effect of the read.
+        let (n, _, _, ok) = scan_one("    MOVFF 0xFEE, 0xFE6");
+        assert!(ok && n.fsr0 && n.fsr1, "copy loop moves both pointers");
+        // The retval window maps by address, one past it does not.
+        let (n, _, _, ok) = scan_one("    MOVWF 0x003,A");
+        assert!(ok && n.retval, "retval homing takes RETVAL");
+    }
+
+    #[test]
+    fn isr_scan_routes_calls_and_rejects_unknowns() {
+        let (_, calls, _, ok) = scan_one("    CALL epic_dispatch_all_irqs_isr");
+        assert!(
+            ok && calls == ["epic_dispatch_all_irqs_isr"],
+            "calls followed"
+        );
+        let (_, _, jumps, ok) = scan_one("    BRA tmp12");
+        assert!(
+            ok && jumps == ["tmp12"],
+            "local branches ignored downstream"
+        );
+        // Labels, comments, markers, and directives never clobber.
+        for line in [
+            "isr:",
+            "; --- asm start ---",
+            "",
+            "    .pcltbl l_tbl",
+            "g equ 0x020",
+        ] {
+            let (n, _, _, ok) = scan_one(line);
+            assert!(ok && n == IsrNeeds::default(), "no clobber in {line:?}");
+        }
+        // Anything outside the model keeps the full set downstream.
+        for line in ["    DAW", "    MOVWF 0x020", "    FOO 0x020,A"] {
+            let (_, _, _, ok) = scan_one(line);
+            assert!(!ok, "unrecognized line keeps everything: {line:?}");
+        }
+    }
+
+    #[test]
+    fn isr_needs_follows_transitive_calls() {
+        let leaf = vec!["    MULWF 0x041,A".to_string(), "    RETURN".to_string()];
+        let mid = vec!["    CALL leaf".to_string(), "    RETURN".to_string()];
+        let top = vec!["isr:".to_string(), "    CALL mid".to_string()];
+        let ordinary: HashMap<&str, (Vec<String>, Vec<Option<SrcLoc>>)> = [
+            ("isr", (top, Vec::new())),
+            ("mid", (mid, Vec::new())),
+            ("leaf", (leaf, Vec::new())),
+        ]
+        .into_iter()
+        .collect();
+        let routines: HashMap<&str, &Vec<String>> = HashMap::new();
+        let naked: HashMap<&str, &Vec<String>> = HashMap::new();
+        let needs = isr_save_needs(
+            "isr",
+            &ordinary,
+            &routines,
+            &naked,
+            &[],
+            0x5F,
+            0x000,
+            &HashSet::new(),
+        );
+        assert!(
+            needs.prod && !needs.w,
+            "transitive MULWF takes PROD, RETURN is free"
+        );
+        assert!(
+            !needs.tblptr && !needs.retval,
+            "untouched classes stay clear"
+        );
+    }
+
+    #[test]
+    fn isr_needs_unknown_call_keeps_everything() {
+        let top = vec!["    CALL nowhere".to_string()];
+        let ordinary: HashMap<&str, (Vec<String>, Vec<Option<SrcLoc>>)> =
+            [("isr", (top, Vec::new()))].into_iter().collect();
+        let routines: HashMap<&str, &Vec<String>> = HashMap::new();
+        let naked: HashMap<&str, &Vec<String>> = HashMap::new();
+        let needs = isr_save_needs(
+            "isr",
+            &ordinary,
+            &routines,
+            &naked,
+            &[],
+            0x5F,
+            0x000,
+            &HashSet::new(),
+        );
+        assert_eq!(needs, IsrNeeds::all(), "unknown callees keep everything");
+    }
+
+    #[test]
+    fn isr_table_counts_match_emission() {
+        // Compat: 18 prologue MOVFFs plus W, 17 epilogue MOVFFs plus W
+        // and STATUS. Low: the same 18 plus two bank selects around W,
+        // and the epilogue restores BSR twice under one spelling.
+        let (pre, post) = isr_save_table(&IsrSaveLayout {
+            common_lo: 0,
+            spill: 0x40,
+            low: false,
+        });
+        assert_eq!(pre.len(), 19, "compat prologue lines");
+        assert_eq!(post.len(), 19, "compat epilogue lines");
+        let (pre, post) = isr_save_table(&IsrSaveLayout {
+            common_lo: 0,
+            spill: 0x120,
+            low: true,
+        });
+        assert_eq!(pre.len(), 20, "low prologue lines");
+        assert_eq!(post.len(), 21, "low epilogue lines");
+    }
+
+    #[test]
+    fn narrow_isr_body_drops_one_class_in_lockstep() {
+        let layout = IsrSaveLayout {
+            common_lo: 0,
+            spill: 0x40,
+            low: false,
+        };
+        let (pre, post) = isr_save_table(&layout);
+        let mut lines: Vec<String> = pre.iter().map(|(_, s)| s.clone()).collect();
+        lines.push("isr:".to_string());
+        lines.push("    CALL helper".to_string());
+        lines.extend(post.iter().map(|(_, s)| s.clone()));
+        lines.push("    RETFIE".to_string());
+        let mut locs: Vec<Option<SrcLoc>> = vec![None; lines.len()];
+        let mut needs = IsrNeeds::all();
+        needs.prod = false;
+        narrow_isr_body(&mut lines, &mut locs, &layout, &needs, 1);
+        assert_eq!(lines.len(), locs.len(), "locs filter with lines");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("0xFF3") || l.contains("0xFF4")),
+            "PROD saves narrow away:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines.iter().any(|l| l == "    MOVFF 0xFF6, 0x005"),
+            "kept classes stay:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "save shape drifted")]
+    fn narrow_isr_body_refuses_a_drifted_epilogue() {
+        let layout = IsrSaveLayout {
+            common_lo: 0,
+            spill: 0x40,
+            low: false,
+        };
+        let (pre, _) = isr_save_table(&layout);
+        let mut lines: Vec<String> = pre.iter().map(|(_, s)| s.clone()).collect();
+        lines.push("    RETFIE".to_string());
+        let mut locs: Vec<Option<SrcLoc>> = vec![None; lines.len()];
+        narrow_isr_body(&mut lines, &mut locs, &layout, &IsrNeeds::all(), 1);
     }
 }
