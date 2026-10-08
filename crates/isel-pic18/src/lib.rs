@@ -1710,6 +1710,13 @@ impl<'m> Gen<'m> {
                         if reads(inst, r) || reads(inst, preg) {
                             return false;
                         }
+                        // A writer homing inside the lanes would clobber
+                        // the folded value before the backedge reads it.
+                        if let Some(a) = home_of(&l.dst) {
+                            if !disjoint(a, l.ty.bytes()) {
+                                return false;
+                            }
+                        }
                         if overlap(&l.ptr, l.ty.bytes()) {
                             return false;
                         }
@@ -1737,9 +1744,14 @@ impl<'m> Gen<'m> {
                             }
                         }
                     }
-                    Inst::Gep(_) => {
+                    Inst::Gep(p) => {
                         if reads(inst, r) || reads(inst, preg) {
                             return false;
+                        }
+                        if let Some(a) = home_of(&p.dst) {
+                            if !disjoint(a, 2) {
+                                return false;
+                            }
                         }
                     }
                     Inst::Br(_) | Inst::BrCond(_) => {

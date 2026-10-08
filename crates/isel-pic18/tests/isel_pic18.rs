@@ -8398,11 +8398,13 @@ fn phi_folded_i16_increment_with_carried_pointer_folds() {
         ("buf", 0x020),
         ("flag", 0x022),
         ("main::b", 0x024),
-        // The pointer homes deliberately overlap the folded index lanes:
-        // homes alone would reject the edge, only the resolution skip
-        // accepts it, so the pin discriminates the skip (epic-cc#937).
+        // The pointer phi home deliberately overlaps the folded index
+        // lanes: homes alone would reject the edge, only the resolution
+        // skip accepts it, so the pin discriminates the skip. The GEP
+        // dst stays disjoint: a region writer homing in the lanes must
+        // still keep the fold staged (epic-cc#937).
         ("main::p", 0x030),
-        ("main::q", 0x031),
+        ("main::q", 0x028),
         ("main::i", 0x030),
         ("main::v", 0x032),
         ("main::r", 0x034),
