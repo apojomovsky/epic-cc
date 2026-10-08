@@ -1077,12 +1077,13 @@ fn mul_u8_recipe_uses_hardware_mulwf() {
     // shift-add loop.
     let m = parse(
         "fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
-         fn main(void) ()\n  block entry:\n    ret void\n",
+         fn main(void) ()\n  block entry:\n    %1 = call i8 @__mul_u8(i8 3, i8 5)\n    ret void\n",
     );
     let addrs = addrs(&[
         ("__mul_u8::a", 0x20),
         ("__mul_u8::b", 0x21),
         ("__mul_u8::__scr", 0x30),
+        ("main::1", 0x40),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
@@ -1096,12 +1097,13 @@ fn mul_u8_recipe_uses_hardware_mulwf() {
 fn runtime_u16_mul_uses_schoolbook_partials() {
     let m = parse(
         "fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14\n    ret i16 0\n\
-         fn main(void) ()\n  block entry:\n    ret void\n",
+         fn main(void) ()\n  block entry:\n    %1 = call i16 @__mul_u16(i16 3, i16 5)\n    ret void\n",
     );
     let addrs = addrs(&[
         ("__mul_u16::a", 0x20),
         ("__mul_u16::b", 0x22),
         ("__mul_u16::__scr", 0x30),
+        ("main::1", 0x40),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     // P00 (shift 0), P01 + P10 (shift 8) contribute to the low 16 bits;
@@ -1113,16 +1115,185 @@ fn runtime_u16_mul_uses_schoolbook_partials() {
     );
 }
 
+/// Inline narrow multiply (epic-cc#892): a u8 call site lowers to one
+/// MULWF straight into the caller's dst. No `CALL` runs and the orphaned
+/// routine body is dropped, so outline has no second site to factor the
+/// inline back into a call.
+#[test]
+fn inline_u8_call_emits_one_mulwf_and_drops_the_routine() {
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal r i8\n\
+         fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n\
+           %3 = call i8 @__mul_u8(i8 %1, i8 %2)\n    store i8 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("r", 0x22),
+        ("__mul_u8::a", 0x30),
+        ("__mul_u8::b", 0x31),
+        ("__mul_u8::__scr", 0x32),
+        ("main::1", 0x40),
+        ("main::2", 0x41),
+        ("main::3", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("CALL __mul_u8"),
+        "no call on the inline path:\n{asm}"
+    );
+    assert!(
+        !asm.lines().any(|l| l.trim() == "__mul_u8:"),
+        "orphaned routine body is dropped:\n{asm}"
+    );
+    assert_eq!(asm.matches("MULWF").count(), 1, "one partial:\n{asm}");
+    assert!(
+        asm.contains("MOVFF 0xFF3"),
+        "result comes out of PRODL:\n{asm}"
+    );
+}
+
+/// The narrowing pass feeds the u8 multiply a constant operand; it rides
+/// W into MULWF while the RAM side stays the memory operand.
+#[test]
+fn inline_u8_const_operand_stages_through_w() {
+    let m = parse(
+        "global a i8\nglobal r i8\n\
+         fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @a\n\
+           %3 = call i8 @__mul_u8(i8 %1, i8 5)\n    store i8 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("r", 0x22),
+        ("__mul_u8::a", 0x30),
+        ("__mul_u8::b", 0x31),
+        ("__mul_u8::__scr", 0x32),
+        ("main::1", 0x40),
+        ("main::3", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("CALL __mul_u8"),
+        "no call on the inline path:\n{asm}"
+    );
+    assert!(asm.contains("MOVLW 0x05"), "const stages into W:\n{asm}");
+    assert_eq!(asm.matches("MULWF").count(), 1, "one partial:\n{asm}");
+}
+
+/// The u16 inline costs flash per site, so the default profile keeps the
+/// call: three MULWF partials in the routine, one `CALL` at the site.
+#[test]
+fn u16_call_stays_a_call_on_the_default_profile() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal r i16\n\
+         fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n\
+           %3 = call i16 @__mul_u16(i16 %1, i16 %2)\n    store i16 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x22),
+        ("r", 0x24),
+        ("__mul_u16::a", 0x30),
+        ("__mul_u16::b", 0x32),
+        ("__mul_u16::__scr", 0x34),
+        ("main::1", 0x40),
+        ("main::2", 0x42),
+        ("main::3", 0x44),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("CALL __mul_u16"), "call kept:\n{asm}");
+    assert!(
+        asm.lines().any(|l| l.trim() == "__mul_u16:"),
+        "called routine body is kept:\n{asm}"
+    );
+}
+
+/// Under the speed profile the u16 site inlines all three partials and
+/// the orphaned routine body goes with the call.
+#[test]
+fn inline_u16_call_emits_three_partials_under_the_speed_profile() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal r i16\n\
+         fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n\
+           %3 = call i16 @__mul_u16(i16 %1, i16 %2)\n    store i16 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x22),
+        ("r", 0x24),
+        ("__mul_u16::a", 0x30),
+        ("__mul_u16::b", 0x32),
+        ("__mul_u16::__scr", 0x34),
+        ("main::1", 0x40),
+        ("main::2", 0x42),
+        ("main::3", 0x44),
+    ]);
+    let opts = isel_pic18::Options {
+        copy_loop: true,
+        inline_mul16: true,
+    };
+    let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+    assert!(
+        !asm.contains("CALL __mul_u16"),
+        "no call on the inline path:\n{asm}"
+    );
+    assert!(
+        !asm.lines().any(|l| l.trim() == "__mul_u16:"),
+        "orphaned routine body is dropped:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MULWF").count(),
+        3,
+        "schoolbook partials, P11 dropped:\n{asm}"
+    );
+}
+
+/// A banked operand needs a MOVLB mid-sequence, which costs the words
+/// the inline saves: the site keeps its call even under the profile.
+#[test]
+fn inline_u16_with_a_banked_operand_keeps_the_call() {
+    let m = parse(
+        "global b i16\nglobal r i16\n\
+         fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @b\n    %2 = load i16 @b\n\
+           %3 = call i16 @__mul_u16(i16 %1, i16 %2)\n    store i16 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("b", 0x100),
+        ("r", 0x24),
+        ("__mul_u16::a", 0x30),
+        ("__mul_u16::b", 0x32),
+        ("__mul_u16::__scr", 0x34),
+        ("main::1", 0x110),
+        ("main::2", 0x112),
+        ("main::3", 0x44),
+    ]);
+    let opts = isel_pic18::Options {
+        copy_loop: true,
+        inline_mul16: true,
+    };
+    let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+    assert!(
+        asm.contains("CALL __mul_u16"),
+        "banked site keeps the call:\n{asm}"
+    );
+}
+
 #[test]
 fn udiv_u16_recipe_emits_restoring_loop() {
     let m = parse(
         "fn __udiv_u16(i16) (num=i16, den=i16)\n  block entry:\n    %__scr = alloca 7\n    ret i16 0\n\
-         fn main(void) ()\n  block entry:\n    ret void\n",
+         fn main(void) ()\n  block entry:\n    %1 = call i16 @__udiv_u16(i16 7, i16 3)\n    ret void\n",
     );
     let addrs = addrs(&[
         ("__udiv_u16::num", 0x20),
         ("__udiv_u16::den", 0x22),
         ("__udiv_u16::__scr", 0x30),
+        ("main::1", 0x40),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert_eq!(
@@ -3635,7 +3806,10 @@ fn speed_profile_drains_long_copy_runs_straight() {
              ret void\n",
     );
     let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
-    let opts = isel_pic18::Options { copy_loop: false };
+    let opts = isel_pic18::Options {
+        copy_loop: false,
+        inline_mul16: false,
+    };
     let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
     for i in 0..12u16 {
         let expect = format!("MOVFF 0x{:03X}, 0x{:03X}", 0x100 + i, 0x110 + i);
@@ -8692,12 +8866,13 @@ fn udiv_u32_recipe_subtracts_with_subwfb_borrow_chain() {
     // whose borrow crosses a byte boundary.
     let m = parse(
         "fn __udiv_u32(i16) (num=i32, den=i32)\n  block entry:\n    %__scr = alloca 7\n    ret i16 0\n\
-         fn main(void) ()\n  block entry:\n    ret void\n",
+         fn main(void) ()\n  block entry:\n    %1 = call i16 @__udiv_u32(i32 7, i32 3)\n    ret void\n",
     );
     let addrs = addrs(&[
         ("__udiv_u32::num", 0x20),
         ("__udiv_u32::den", 0x24),
         ("__udiv_u32::__scr", 0x30),
+        ("main::1", 0x40),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(asm.contains("SUBWF "), "lane 0 plain subtract:\n{asm}");

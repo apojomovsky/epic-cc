@@ -35,14 +35,23 @@ const COPY_LOOP_MIN_PAIRS: usize = 6;
 /// long staged runs lower to the 9-word seeded loop, which runs about
 /// 3x slower per byte than straight `MOVFF`s. The speed profile turns it
 /// off, trading flash for cycles on those runs (epic-cc#883).
+/// `inline_mul16` inlines the u16 widening multiply at the call site
+/// instead of calling `__mul_u16`. The inline form parks both operand
+/// bytes in the retval region, so it costs flash per site; the speed
+/// profile pays it for cycles (epic-cc#892). The u8 multiply always
+/// inlines: one MULWF is shorter than the call either way.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     pub copy_loop: bool,
+    pub inline_mul16: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { copy_loop: true }
+        Self {
+            copy_loop: true,
+            inline_mul16: false,
+        }
     }
 }
 
@@ -54,6 +63,32 @@ impl Default for Options {
 enum Addr {
     Direct(u16),
     Indirect,
+}
+/// One inline-multiply operand byte: RAM contents, or a literal the
+/// u8 form stages into W with MOVLW. A literal cannot ride MULWF
+/// directly, so the u16 form takes RAM operands only.
+#[derive(Clone, Copy)]
+enum MulOp {
+    Ram(u16),
+    Lit(u8),
+}
+
+/// An inlineable narrow-multiply call, resolved but not emitted.
+/// `dst` is `None` for a dead result: the reads still run (a
+/// volatile operand is observable), only the store is skipped.
+enum InlineMul {
+    U8 {
+        a: MulOp,
+        b: MulOp,
+        dst: Option<u16>,
+    },
+    U16 {
+        a0: u16,
+        a1: u16,
+        b0: u16,
+        b1: u16,
+        dst: Option<(u16, u16)>,
+    },
 }
 
 /// Which scaled-term form won: the hardware multiplier, or the
@@ -232,6 +267,8 @@ struct Gen<'m> {
     /// Whether long staged runs drain as the POSTINC loop. Off under the
     /// speed profile, where straight `MOVFF`s trade flash for cycles.
     copy_loop: bool,
+    /// Whether `__mul_u16` calls inline at the site (epic-cc#892).
+    inline_mul16: bool,
     /// Every RAM address a global occupies. The W cache never records or
     /// reuses one: an interrupt can write a global between the store and
     /// the reload, while the ISR epilogue restores W to its pre-interrupt
@@ -261,6 +298,9 @@ struct Gen<'m> {
     /// Shares one module-scoped label counter across functions so `tmp{n}:`
     /// labels stay unique in the single output. Mirrors the `isel` counter.
     tmp: &'m mut u32,
+    /// Records each callee a real `CALL` line emitted, `None` outside
+    /// pass A. Pass B drops runtime routines absent from the set.
+    emitted_calls: Option<&'m mut HashSet<String>>,
     /// The source location of the instruction currently being emitted, or
     /// `None` for compiler-generated glue (prologue, `__start`, const
     /// tables, runtime routines). `emit` records it on the line it pushes,
@@ -4312,6 +4352,231 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// The narrow-multiply width of a runtime routine name, with the ISR
+    /// suffixes stripped the way `emit_routine` strips them. `__mul_u32`
+    /// stays a call: its widening form is already fast (epic-cc#892).
+    fn inline_mul_width(func: &str) -> Option<u8> {
+        let base = func
+            .strip_suffix("_isr_high")
+            .or_else(|| func.strip_suffix("_isr"))
+            .unwrap_or(func);
+        match base {
+            "__mul_u8" => Some(1),
+            "__mul_u16" => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Resolve `v` to `width` operand bytes, or `None` when the call path
+    /// must handle it. A reg behind pointer resolution holds an address,
+    /// not a value; a data global in value position is its address
+    /// literal (the `emit_move_val_to_slot` contract), which only the u8
+    /// form stages into W.
+    fn inline_mul_operand(&self, v: &Val, width: u8) -> Option<Vec<MulOp>> {
+        match v {
+            Val::Const(k) => {
+                if width != 1 {
+                    return None;
+                }
+                Some(vec![MulOp::Lit((*k & 0xFF) as u8)])
+            }
+            Val::Reg(r) => {
+                if self
+                    .resolved
+                    .contains_key(&iselcore::ssa_key(self.cur_func, r))
+                {
+                    return None;
+                }
+                let base = match self.w_folds.loads.get(r) {
+                    Some(iselcore::LoadFold::Direct(g)) => *self.addrs.get(g)?,
+                    _ => *self.addrs.get(&iselcore::ssa_key(self.cur_func, r))?,
+                };
+                Some(
+                    (0..width)
+                        .map(|i| MulOp::Ram(base + u16::from(i)))
+                        .collect(),
+                )
+            }
+            Val::Global(g) => {
+                if width != 1 || self.is_function(g) || self.global_is_const(g) {
+                    return None;
+                }
+                Some(vec![MulOp::Lit((self.addrs.get(g)? & 0xFF) as u8)])
+            }
+        }
+    }
+
+    /// The inline form of a narrow-multiply call, or `None` for the
+    /// ordinary call path. Pure: resolves addresses and checks shapes,
+    /// never emits. Every RAM byte touched must sit in the access bank
+    /// (a MOVLB mid-sequence costs the words the inline saves), and no
+    /// u16 operand byte may alias the retval temps (a retval-homed call
+    /// result parks there, epic-cc#738).
+    fn inline_mul_plan(&self, c: &ir::Call) -> Option<InlineMul> {
+        let width = Self::inline_mul_width(&c.func)?;
+        if !c.callees.is_empty() || c.args.len() != 2 {
+            return None;
+        }
+        let want = match width {
+            1 => Ty::I8,
+            2 => Ty::I16,
+            _ => return None,
+        };
+        if c.ty != Some(want) {
+            return None;
+        }
+        for arg in &c.args {
+            if arg.ty != Some(want) || arg.byval.is_some() || arg.sret {
+                return None;
+            }
+        }
+        if width == 2 && !self.inline_mul16 {
+            return None;
+        }
+        let a = self.inline_mul_operand(&c.args[0].val, width)?;
+        let b = self.inline_mul_operand(&c.args[1].val, width)?;
+        let dst = match &c.dst {
+            None => None,
+            Some(d) => Some(*self.addrs.get(&iselcore::ssa_key(self.cur_func, d))?),
+        };
+        if width == 1 {
+            if matches!((a[0], b[0]), (MulOp::Lit(_), MulOp::Lit(_))) {
+                return None;
+            }
+            let mut ram = Vec::new();
+            for op in a.iter().chain(b.iter()) {
+                if let MulOp::Ram(addr) = op {
+                    ram.push(*addr);
+                }
+            }
+            if let Some(d) = dst {
+                ram.push(d);
+            }
+            if ram.iter().any(|x| self.lane_bank(*x).is_some()) {
+                return None;
+            }
+            return Some(InlineMul::U8 {
+                a: a[0],
+                b: b[0],
+                dst,
+            });
+        }
+        let ([MulOp::Ram(a0), MulOp::Ram(a1)], [MulOp::Ram(b0), MulOp::Ram(b1)]) =
+            (a.as_slice(), b.as_slice())
+        else {
+            return None;
+        };
+        let (a0, a1, b0, b1) = (*a0, *a1, *b0, *b1);
+        let mut ram = vec![a0, a1, b0, b1];
+        let dst16 = match dst {
+            None => None,
+            Some(d) => {
+                ram.push(d);
+                ram.push(d + 1);
+                Some((d, d + 1))
+            }
+        };
+        if ram.iter().any(|x| self.lane_bank(*x).is_some()) {
+            return None;
+        }
+        for x in [a0, a1, b0, b1] {
+            if (self.retval_lo..self.retval_lo + 4).contains(&x) {
+                return None;
+            }
+        }
+        Some(InlineMul::U16 {
+            a0,
+            a1,
+            b0,
+            b1,
+            dst: dst16,
+        })
+    }
+
+    /// Emit an inline narrow multiply, `true` when a plan resolved. Each
+    /// operand byte is read exactly once (a second read would observe a
+    /// volatile twice), so the u16 form parks both low bytes in retval
+    /// temps across the three partials. The ISR prologue snapshots the
+    /// retval region and PROD, so an interrupt mid-sequence restores
+    /// both. Staged copies drain first: a parked retval copy must land
+    /// before the temps are reused (the `emit_delay` rule).
+    fn try_emit_inline_mul(&mut self, c: &ir::Call) -> bool {
+        let Some(plan) = self.inline_mul_plan(c) else {
+            return false;
+        };
+        self.flush_copies();
+        match plan {
+            InlineMul::U8 { a, b, dst } => {
+                if let Some(d) = dst {
+                    self.invalidate_fsr0_if_slot_written(d, 1);
+                }
+                match (a, b) {
+                    (MulOp::Ram(aa), MulOp::Ram(bb)) => {
+                        self.emit(format!("    MOVF 0x{aa:03X},W,A"));
+                        self.emit(format!("    MULWF 0x{bb:03X},A"));
+                    }
+                    (MulOp::Lit(k), MulOp::Ram(bb)) => {
+                        self.emit(format!("    MOVLW 0x{k:02X}"));
+                        self.emit(format!("    MULWF 0x{bb:03X},A"));
+                    }
+                    (MulOp::Ram(aa), MulOp::Lit(k)) => {
+                        self.emit(format!("    MOVLW 0x{k:02X}"));
+                        self.emit(format!("    MULWF 0x{aa:03X},A"));
+                    }
+                    (MulOp::Lit(_), MulOp::Lit(_)) => {
+                        unreachable!("isel-pic18: inline u8 plan rejects const/const")
+                    }
+                }
+                if let Some(d) = dst {
+                    self.emit(format!("    MOVFF 0xFF3, 0x{d:03X}"));
+                }
+            }
+            InlineMul::U16 {
+                a0,
+                a1,
+                b0,
+                b1,
+                dst,
+            } => {
+                assert!(
+                    self.retval_lo + 3 <= self.access_bank_hi,
+                    "isel-pic18: inline u16 multiply needs 4 retval bytes in the access bank"
+                );
+                let (t0, t1, t2) = (self.retval_lo, self.retval_lo + 1, self.retval_lo + 2);
+                let (d0, d1) = dst.unwrap_or((self.retval_lo + 3, self.retval_lo + 3));
+                if let Some((x0, _)) = dst {
+                    self.invalidate_fsr0_if_slot_written(x0, 2);
+                }
+                self.invalidate_fsr0_if_slot_written(t0, 4);
+                // P10 first while both low bytes park in t0/t1, then
+                // P01, then P00 with the high accumulator in t2. d0
+                // lands after the last operand read, so any dst/operand
+                // overlay is already consumed.
+                self.emit(format!("    MOVF 0x{b0:03X},W,A"));
+                self.emit(format!("    MOVWF 0x{t0:03X},A"));
+                self.emit(format!("    MOVF 0x{a0:03X},W,A"));
+                self.emit(format!("    MOVWF 0x{t1:03X},A"));
+                self.emit(format!("    MOVF 0x{a1:03X},W,A"));
+                self.emit(format!("    MULWF 0x{t0:03X},A"));
+                self.emit("    MOVF 0xFF3,W,A".to_string());
+                self.emit(format!("    MOVWF 0x{t2:03X},A"));
+                self.emit(format!("    MOVF 0x{t1:03X},W,A"));
+                self.emit(format!("    MULWF 0x{b1:03X},A"));
+                self.emit("    MOVF 0xFF3,W,A".to_string());
+                self.emit(format!("    ADDWF 0x{t2:03X},F,A"));
+                self.emit(format!("    MOVF 0x{t1:03X},W,A"));
+                self.emit(format!("    MULWF 0x{t0:03X},A"));
+                self.emit("    MOVF 0xFF3,W,A".to_string());
+                self.emit(format!("    MOVWF 0x{d0:03X},A"));
+                self.emit("    MOVF 0xFF4,W,A".to_string());
+                self.emit(format!("    ADDWF 0x{t2:03X},F,A"));
+                self.emit(format!("    MOVF 0x{t2:03X},W,A"));
+                self.emit(format!("    MOVWF 0x{d1:03X},A"));
+            }
+        }
+        true
+    }
+
     fn emit_inst(&mut self, i: &Inst) {
         self.cur_loc = i.loc().cloned();
         match i {
@@ -5292,6 +5557,9 @@ impl<'m> Gen<'m> {
             }
             Inst::Call(c) => {
                 if !c.callees.is_empty() {
+                    if let Some(set) = self.emitted_calls.as_mut() {
+                        set.extend(c.callees.iter().cloned());
+                    }
                     self.emit_indirect_call(&c.dst, c.ty, &c.func, &c.args, &c.callees);
                 } else if !self.is_function(&c.func) {
                     // An indirect call site (numeric `func`, the SSA
@@ -5304,7 +5572,15 @@ impl<'m> Gen<'m> {
                     let l_trap = self.fresh_label();
                     self.emit_label(&l_trap);
                     self.emit(format!("    BRA {l_trap}"));
+                } else if self.try_emit_inline_mul(&c) {
+                    // Narrow multiply inlined as MULWF partials: no call
+                    // ran, so BSR, FSR0 and TBLPTR carry through untouched.
                 } else {
+                    // A real `CALL` line leaves: record the callee so pass
+                    // B keeps its body. Inlined multiplies record nothing.
+                    if let Some(set) = self.emitted_calls.as_mut() {
+                        set.insert(c.func.clone());
+                    }
                     self.emit_call_args(&c.func, &c.args);
                     self.emit(format!("    CALL {}", c.func));
                     // A `CALL` return joins like a label: the callee ran its
@@ -9511,6 +9787,9 @@ pub fn select_with_opts(
     // Shared across every `Gen` below so `fresh_label` never repeats a
     // `tmp{n}:` label across two different functions in the same output.
     let mut tmp = 0u32;
+    // Every callee a `CALL` line actually emitted, filled by the pass-A
+    // `Gen` runs. Pass B drops uncalled runtime routines (epic-cc#892).
+    let mut emitted_calls: HashSet<String> = HashSet::new();
     // Every pointer reg in the module, folded once up front; later tasks'
     // pointer emitters consume it via `Gen::resolved_for`.
     let resolved = resolve_pointers(m);
@@ -9610,11 +9889,13 @@ pub fn select_with_opts(
                 cur_site: (String::new(), 0),
                 pending_copies: Vec::new(),
                 copy_loop: opts.copy_loop,
+                inline_mul16: opts.inline_mul16,
                 cur_func: &f.name,
                 global_addrs: &global_addrs,
                 w_holds: None,
                 isr: f.isr,
                 tmp: &mut recipe_tmp,
+                emitted_calls: None,
                 cur_loc: None,
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
@@ -9681,11 +9962,13 @@ pub fn select_with_opts(
             cur_site: (String::new(), 0),
             pending_copies: Vec::new(),
             copy_loop: opts.copy_loop,
+            inline_mul16: opts.inline_mul16,
             cur_func: &f.name,
             global_addrs: &global_addrs,
             w_holds: None,
             isr: f.isr,
             tmp: &mut tmp,
+            emitted_calls: Some(&mut emitted_calls),
             cur_loc: None,
             bit_lanes: HashMap::new(),
             lane_consumed: HashSet::new(),
@@ -10342,6 +10625,12 @@ pub fn select_with_opts(
             if f.isr { None } else { exit_bank(&ret_ends) },
         );
     }
+    // Routines no emitted `CALL` reaches are dropped: the
+    // narrow-multiply inline orphans `__mul_u8`/`__mul_u16` once every
+    // site inlines, and emitting the dead body would hand outline a
+    // second site to factor the inline back into a call. Runtime
+    // routines are compiler-owned (no C name can take their address),
+    // so the pass-A emitted set covers every caller (epic-cc#892).
     // Pass B streams in module order: the recipe and naked arms keep
     // their verbatim bodies, the ISR vector line keeps its position,
     // and each remaining function pulls its buffered body.
@@ -10351,6 +10640,9 @@ pub fn select_with_opts(
         // the generic block emitter would render as an empty label
         // (silently falling through into the next function). Every other
         // function takes the ordinary path.
+        if ir::is_runtime_routine(&f.name) && !emitted_calls.contains(f.name.as_str()) {
+            continue;
+        }
         if ir::is_runtime_routine(&f.name) {
             let mut g = Gen {
                 m,
@@ -10370,11 +10662,13 @@ pub fn select_with_opts(
                 cur_site: (String::new(), 0),
                 pending_copies: Vec::new(),
                 copy_loop: opts.copy_loop,
+                inline_mul16: opts.inline_mul16,
                 cur_func: &f.name,
                 global_addrs: &global_addrs,
                 w_holds: None,
                 isr: f.isr,
                 tmp: &mut tmp,
+                emitted_calls: None,
                 cur_loc: None,
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
@@ -10718,11 +11012,13 @@ mod tests {
                 cur_site: (String::new(), 0),
                 pending_copies: Vec::new(),
                 copy_loop: true,
+                inline_mul16: false,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
                 w_holds: None,
                 isr: false,
                 tmp: &mut tmp,
+                emitted_calls: None,
                 cur_loc: None,
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
@@ -10755,11 +11051,13 @@ mod tests {
                 cur_site: (String::new(), 0),
                 pending_copies: Vec::new(),
                 copy_loop: true,
+                inline_mul16: false,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
                 w_holds: None,
                 isr: false,
                 tmp: &mut tmp,
+                emitted_calls: None,
                 cur_loc: None,
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
@@ -10807,11 +11105,13 @@ mod p3_gen_tests {
             cur_site: (String::new(), 0),
             pending_copies: Vec::new(),
             copy_loop: true,
+            inline_mul16: false,
             cur_func: "main",
             global_addrs: empty_global_addrs(),
             w_holds: None,
             isr: false,
             tmp,
+            emitted_calls: None,
             cur_loc: None,
             bit_lanes: HashMap::new(),
             lane_consumed: HashSet::new(),
