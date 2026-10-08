@@ -273,6 +273,13 @@ fn cases() -> Vec<Case> {
             inputs: vec![fixture("size-bench/bench-struct-copy.c")],
         },
         Case {
+            name: "bench-counted-copy-18f4550",
+            device: "18F4550",
+            includes: vec![],
+            defines: vec![],
+            inputs: vec![fixture("size-bench/bench-counted-copy.c")],
+        },
+        Case {
             name: "bench-switch-18f4550",
             device: "18F4550",
             includes: vec![],
