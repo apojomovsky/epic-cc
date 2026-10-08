@@ -162,7 +162,7 @@ ram_bytes = 6
 [[entry]]
 name = "hal-pic16-encoder-full-16f877a"
 device = "16F877A"
-flash_words = 5460
+flash_words = 5372
 ram_bytes = 326
 
 [[entry]]
