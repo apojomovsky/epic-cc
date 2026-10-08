@@ -1,4 +1,4 @@
-# ADR-047 -- PIC18 ISR context save narrows to the reachable clobber set
+# ADR-048 -- PIC18 ISR context save narrows to the reachable clobber set
 
 **Status:** Accepted 2026-10-08<br>
 **Decides:** `epic-cc#783`<br>
