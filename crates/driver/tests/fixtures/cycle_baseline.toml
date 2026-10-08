@@ -6,16 +6,16 @@
 [[entry]]
 name = "speed-mul-u8-18f4550"
 device = "18F4550"
-cycles = 16
-flash_words = 34
+cycles = 6
+flash_words = 25
 ram_bytes = 16
 
 [[entry]]
 name = "speed-mul-u8-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 16
-flash_words = 34
+cycles = 6
+flash_words = 25
 ram_bytes = 16
 
 [[entry]]
@@ -36,16 +36,16 @@ ram_bytes = 16
 [[entry]]
 name = "speed-mul-u16-18f4550"
 device = "18F4550"
-cycles = 36
-flash_words = 58
+cycles = 24
+flash_words = 47
 ram_bytes = 33
 
 [[entry]]
 name = "speed-mul-u16-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 36
-flash_words = 58
+cycles = 24
+flash_words = 47
 ram_bytes = 33
 
 [[entry]]
