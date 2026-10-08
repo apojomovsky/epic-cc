@@ -2116,6 +2116,19 @@ impl<'m> Gen<'m> {
             self.emit(format!("    MOVWF {}", self.fop(d)));
         }
     }
+    /// Spill a fused divide's remainder half to its global slot, which the
+    /// fused remainder call site loads. Bank-selected per byte like the
+    /// retval copy, since this core has no banking pass (D-2).
+    fn store_rem_slot(&mut self, rem: u16, bytes: u8, slot: &str) {
+        let base = self.global_addr(slot);
+        for i in 0..bytes {
+            let (s, d) = (rem + u16::from(i), base + u16::from(i));
+            self.emit_bank_select(s);
+            self.emit(format!("    MOVF {}, W", self.fop(s)));
+            self.emit_bank_select(d);
+            self.emit(format!("    MOVWF {}", self.fop(d)));
+        }
+    }
 
     /// Shared AN526/divmod loop helpers for the routine recipes below.
     /// One 16-iteration AN526 shift-add chunk over 4-byte r/t: test the
@@ -2429,7 +2442,7 @@ impl<'m> Gen<'m> {
             // bit else restore (add den back). rem is 2 bytes: the 8-bit
             // rem shift can carry. Borrow/carry folds use the D-6
             // carry helpers (skip-safe units) instead of ADDLW.
-            "__udiv_u8" | "__urem_u8" => {
+            "__udiv_u8" | "__urem_u8" | "__udivmod_u8" => {
                 let num = self.slot_addr(&name, "num").direct();
                 let den = self.slot_addr(&name, "den").direct();
                 let (rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2);
@@ -2477,10 +2490,13 @@ impl<'m> Gen<'m> {
                 self.emit_bank_select(cnt);
                 self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
                 self.emit(format!("    GOTO {l_loop}"));
-                if recipe == "__udiv_u8" {
-                    self.store_retval(num, 1);
-                } else {
-                    self.store_retval(rem_lo, 1);
+                match recipe {
+                    "__urem_u8" => self.store_retval(rem_lo, 1),
+                    "__udivmod_u8" => {
+                        self.store_rem_slot(rem_lo, 1, "__udivmod_rem_u8");
+                        self.store_retval(num, 1);
+                    }
+                    _ => self.store_retval(num, 1),
                 }
                 self.emit("    RETLW 0x00".to_string());
             }
@@ -2613,7 +2629,7 @@ impl<'m> Gen<'m> {
             // 32/32 restoring division (32 iterations): den copied into
             // __scr, the shared loop runs, udiv keeps num (quotient),
             // urem keeps rem.
-            "__udiv_u32" | "__urem_u32" => {
+            "__udiv_u32" | "__urem_u32" | "__udivmod_u32" => {
                 let num = self.slot_addr(&name, "num").direct();
                 let den = self.slot_addr(&name, "den").direct();
                 for i in 0..4 {
@@ -2623,17 +2639,20 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVWF {}", self.fop(scr + 4 + i as u16))); // den copy
                 }
                 self.emit_divmod32(num, scr);
-                if recipe == "__udiv_u32" {
-                    self.store_retval(num, 4);
-                } else {
-                    self.store_retval(scr, 4);
+                match recipe {
+                    "__urem_u32" => self.store_retval(scr, 4),
+                    "__udivmod_u32" => {
+                        self.store_rem_slot(scr, 4, "__udivmod_rem_u32");
+                        self.store_retval(num, 4);
+                    }
+                    _ => self.store_retval(num, 4),
                 }
                 self.emit("    RETLW 0x00".to_string());
             }
             // 16/16 restoring division (16 iterations) with the
             // register-direct borrow idiom (no ADDLW): udiv keeps num,
             // urem keeps rem.
-            "__udiv_u16" | "__urem_u16" => {
+            "__udiv_u16" | "__urem_u16" | "__udivmod_u16" => {
                 let num = self.slot_addr(&name, "num").direct();
                 let den = self.slot_addr(&name, "den").direct();
                 let (rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2);
@@ -2701,10 +2720,13 @@ impl<'m> Gen<'m> {
                 self.emit_bank_select(cnt);
                 self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
                 self.emit(format!("    GOTO {l_loop}"));
-                if recipe == "__udiv_u16" {
-                    self.store_retval(num, 2);
-                } else {
-                    self.store_retval(rem_lo, 2);
+                match recipe {
+                    "__urem_u16" => self.store_retval(rem_lo, 2),
+                    "__udivmod_u16" => {
+                        self.store_rem_slot(rem_lo, 2, "__udivmod_rem_u16");
+                        self.store_retval(num, 2);
+                    }
+                    _ => self.store_retval(num, 2),
                 }
                 self.emit("    RETLW 0x00".to_string());
             }
