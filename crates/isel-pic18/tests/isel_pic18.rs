@@ -8614,3 +8614,37 @@ fn rmw_gap_def_between_binop_and_store_stays_staged() {
     assert_eq!(p.ram()[0x130], 0xBE, "gap def survives");
     assert_eq!(p.ram()[0x131], 0xEF, "gap def high byte survives");
 }
+
+#[test]
+fn w_operand_const_left_sub_consumes_w_with_sublw() {
+    // `255 - g` with a banked source: the load leaves its byte in W
+    // and the const-left `sub` consumes it with `SUBLW` (epic-cc#825).
+    let m = parse(
+        "global g i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @g\n    %2 = sub i8 -1, %1\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("g", 0x120),
+        ("out", 0x130),
+        ("main::1", 0x132),
+        ("main::2", 0x133),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("SUBLW 0xFF"),
+        "const-left sub consumes W:\n{main_asm}"
+    );
+    assert!(
+        !main_asm.contains("0x032"),
+        "load temp never staged:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (g, expect) in [(10u8, 245u8), (0, 255), (255, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x120] = g;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x130], expect, "255 - g for g={g}");
+    }
+}
