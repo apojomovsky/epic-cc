@@ -5884,6 +5884,12 @@ fn priority_pair_emits_both_vectors_and_save_areas() {
         asm.contains("MOVF 0x120, W, B"),
         "low ISR restores W banked:\n{asm}"
     );
+    // Both handlers only write W, and W restores through flag-setting
+    // `MOVF`, so STATUS stays with W for flag transparency (epic-cc#604).
+    assert!(
+        asm.contains("MOVFF 0xFD8, 0x009") && asm.contains("MOVFF 0xFD8, 0x121"),
+        "STATUS stays wherever W stays:\n{asm}"
+    );
     assert!(
         !asm.contains("MOVFF 0xFF3,"),
         "neither handler multiplies, so no PROD saves:\n{asm}"

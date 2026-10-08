@@ -9655,11 +9655,13 @@ fn render_naked_lines(
     (lines, ls)
 }
 
-/// Drop one ISR's provably untouched save lines. Every prologue line must
-/// occur once and every epilogue line once per `ret` site; the table
-/// mirrors the emission above, so a count mismatch means the emission
-/// drifted and narrowing must refuse rather than guess. `locs` filters in
-/// lockstep with `lines`.
+/// Drop one ISR's provably untouched save lines. Drops apply only inside
+/// the prologue window (the lines right after the entry label) and one
+/// epilogue window per `RETFIE` (the lines right before it): a body
+/// instruction that merely spells like a save line is never touched. Each
+/// window must match its table exactly, in order, so emission drift is a
+/// loud failure instead of a silent under-save. `locs` filters in lockstep
+/// with `lines`.
 fn narrow_isr_body(
     lines: &mut Vec<String>,
     locs: &mut Vec<Option<SrcLoc>>,
@@ -9671,7 +9673,10 @@ fn narrow_isr_body(
     let keep = |slot: IsrSlot| -> bool {
         match slot {
             IsrSlot::W => needs.w,
-            IsrSlot::Status => needs.status,
+            // The epilogue restores W with `MOVF`, which sets Z/N: keeping
+            // W without STATUS would resume main on the handler's flags
+            // (epic-cc#604 makes flag transparency load-bearing).
+            IsrSlot::Status => needs.status || needs.w,
             IsrSlot::Bsr => needs.bsr,
             IsrSlot::BsrPost => needs.bsr || (layout.low && needs.w),
             IsrSlot::Fsr0 => needs.fsr0,
@@ -9683,30 +9688,64 @@ fn narrow_isr_body(
             IsrSlot::Retval => needs.retval,
         }
     };
-    let mut expected: HashMap<&str, (usize, usize)> = HashMap::new();
-    for (_, text) in &pre {
-        expected.entry(text.as_str()).or_default().0 += 1;
-    }
-    for (_, text) in &post {
-        expected.entry(text.as_str()).or_default().1 += 1;
-    }
-    for (text, (n_pre, n_post)) in &expected {
-        let found = lines.iter().filter(|l| l.as_str() == *text).count();
+    let pre_text: Vec<&str> = pre.iter().map(|(_, s)| s.as_str()).collect();
+    let post_text: Vec<&str> = post.iter().map(|(_, s)| s.as_str()).collect();
+    assert!(
+        lines.first().is_some_and(|l| l.ends_with(':')),
+        "isel-pic18: ISR body must start with its entry label"
+    );
+    assert!(
+        lines.len() >= 1 + pre_text.len(),
+        "isel-pic18: ISR save shape drifted, body shorter than its prologue"
+    );
+    assert!(
+        lines[1..1 + pre_text.len()]
+            .iter()
+            .zip(pre_text.iter())
+            .all(|(l, t)| l.as_str() == *t),
+        "isel-pic18: ISR save shape drifted, prologue window mismatch"
+    );
+    let ends: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.as_str() == "    RETFIE")
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        ends.len() == rets,
+        "isel-pic18: ISR save shape drifted, expected {rets} epilogues (found {})",
+        ends.len()
+    );
+    for end in &ends {
         assert!(
-            found == *n_pre + *n_post * rets,
-            "isel-pic18: ISR save shape drifted, expected {n_pre} prologue and {n_post} per-epilogue of `{text}` over {rets} rets (found {found})"
+            end >= &post_text.len(),
+            "isel-pic18: ISR save shape drifted, body shorter than an epilogue"
+        );
+        assert!(
+            lines[end - post_text.len()..*end]
+                .iter()
+                .zip(post_text.iter())
+                .all(|(l, t)| l.as_str() == *t),
+            "isel-pic18: ISR save shape drifted, epilogue window mismatch"
         );
     }
-    let drop: HashSet<&str> = pre
-        .iter()
-        .chain(post.iter())
-        .filter(|(slot, _)| !keep(*slot))
-        .map(|(_, s)| s.as_str())
-        .collect();
+    let mut drop_idx: HashSet<usize> = HashSet::new();
+    for (k, (slot, _)) in pre.iter().enumerate() {
+        if !keep(*slot) {
+            drop_idx.insert(1 + k);
+        }
+    }
+    for end in &ends {
+        for (k, (slot, _)) in post.iter().enumerate() {
+            if !keep(*slot) {
+                drop_idx.insert(end - post_text.len() + k);
+            }
+        }
+    }
     let mut kept_lines = Vec::with_capacity(lines.len());
     let mut kept_locs = Vec::with_capacity(locs.len());
-    for (line, loc) in lines.drain(..).zip(locs.drain(..)) {
-        if expected.contains_key(line.as_str()) && drop.contains(line.as_str()) {
+    for ((i, line), loc) in lines.drain(..).enumerate().zip(locs.drain(..)) {
+        if drop_idx.contains(&i) {
             continue;
         }
         kept_lines.push(line);
@@ -11422,9 +11461,13 @@ mod p3_gen_tests {
             low: false,
         };
         let (pre, post) = isr_save_table(&layout);
-        let mut lines: Vec<String> = pre.iter().map(|(_, s)| s.clone()).collect();
-        lines.push("isr:".to_string());
+        let mut lines: Vec<String> = vec!["isr:".to_string()];
+        lines.extend(pre.iter().map(|(_, s)| s.clone()));
         lines.push("    CALL helper".to_string());
+        // A body instruction spelling like a dropped save line must
+        // survive: drops apply only inside the save windows, never to
+        // body text.
+        lines.push("    MOVFF 0xFF3, 0x042".to_string());
         lines.extend(post.iter().map(|(_, s)| s.clone()));
         lines.push("    RETFIE".to_string());
         let mut locs: Vec<Option<SrcLoc>> = vec![None; lines.len()];
@@ -11432,10 +11475,17 @@ mod p3_gen_tests {
         needs.prod = false;
         narrow_isr_body(&mut lines, &mut locs, &layout, &needs, 1);
         assert_eq!(lines.len(), locs.len(), "locs filter with lines");
-        assert!(
-            !lines
+        assert_eq!(
+            lines
                 .iter()
-                .any(|l| l.contains("0xFF3") || l.contains("0xFF4")),
+                .filter(|l| l.as_str() == "    MOVFF 0xFF3, 0x042")
+                .count(),
+            1,
+            "the body twin of a dropped save survives:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("0xFF4")),
             "PROD saves narrow away:\n{}",
             lines.join("\n")
         );
@@ -11455,14 +11505,15 @@ mod p3_gen_tests {
             low: false,
         };
         let (pre, _) = isr_save_table(&layout);
-        let mut lines: Vec<String> = pre.iter().map(|(_, s)| s.clone()).collect();
+        let mut lines: Vec<String> = vec!["isr:".to_string()];
+        lines.extend(pre.iter().map(|(_, s)| s.clone()));
         lines.push("    RETFIE".to_string());
         let mut locs: Vec<Option<SrcLoc>> = vec![None; lines.len()];
         narrow_isr_body(&mut lines, &mut locs, &layout, &IsrNeeds::all(), 1);
     }
 
     #[test]
-    fn narrow_low_keeps_bsr_save_with_w_but_no_bsr() {
+    fn narrow_low_keeps_bsr_and_status_with_w_but_no_bsr() {
         // A low handler that writes W but never selects a bank still runs
         // the prologue and epilogue `MOVLB`s, so the BSR save and both
         // restores must stay together: restoring from a dropped save
@@ -11473,8 +11524,8 @@ mod p3_gen_tests {
             low: true,
         };
         let (pre, post) = isr_save_table(&layout);
-        let mut lines: Vec<String> = pre.iter().map(|(_, s)| s.clone()).collect();
-        lines.push("lo:".to_string());
+        let mut lines: Vec<String> = vec!["lo:".to_string()];
+        lines.extend(pre.iter().map(|(_, s)| s.clone()));
         lines.push("    MOVLW 0x02".to_string());
         lines.extend(post.iter().map(|(_, s)| s.clone()));
         lines.push("    RETFIE".to_string());
@@ -11489,10 +11540,14 @@ mod p3_gen_tests {
             "    MOVFF 0x122, 0xFE0",
             "    MOVLB 0x1",
             "    MOVWF 0x120,B",
+            // W restores through `MOVF`, which sets Z/N, so STATUS stays
+            // with W for flag transparency (epic-cc#604).
+            "    MOVFF 0xFD8, 0x121",
+            "    MOVFF 0x121, 0xFD8",
         ] {
             assert!(
                 lines.iter().any(|l| l == kept),
-                "BSR save/restore stay with W ({kept}):\n{}",
+                "W-kept saves stay ({kept}):\n{}",
                 lines.join("\n")
             );
         }

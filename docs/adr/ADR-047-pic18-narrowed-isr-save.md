@@ -29,12 +29,17 @@ stay complete by construction, never by review.
   PCLATH/PCLATU, retval) the reachable instructions can write. Scanning
   the final text keeps the model honest: a lowering the scan does not
   understand keeps the full set instead of miscompiling.
-- **Drop only exact save lines.** The filter removes lines identical to
-  the prologue/epilogue emission for unneeded classes and refuses loudly
-  on any count mismatch (prologue once per body, epilogue once per
-  `ret`), so emission drift is a compile error, not an under-save.
+- **Drop only exact save lines, only inside save windows.** The filter
+  removes lines identical to the prologue/epilogue emission for unneeded
+  classes, bounded to the prologue window (after the entry label) and one
+  epilogue window per `ret` (before each `RETFIE`), so a body instruction
+  that merely spells like a save line is never touched. Each window must
+  match exactly, so emission drift is a compile error, not an under-save.
   Unknown call targets, unrecognized mnemonics, and suffixless naked
   stores all keep the full set.
+  STATUS stays whenever W stays: the epilogue restores W with flag-setting
+  `MOVF`, so dropping STATUS under a kept W would resume main on the
+  handler's flags.
 - **Shared save stub rejected.** One save subroutine would still need
   per-entry W handling and only pays off with several handlers; every
   program in the ladder has one ISR, so the shared stub saves nothing
