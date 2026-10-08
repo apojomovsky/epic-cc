@@ -8978,11 +8978,12 @@ impl IsrNeeds {
     }
 }
 
-/// One save-line class. `BsrPost` covers both low BSR restores, which share
-/// one spelling: the group restore runs before the epilogue's own `MOVLB`
-/// and the second runs after, so either must stay while a bank select
-/// stays (W saved) even if the body never selects a bank. Keeping both on
-/// that condition can hold one redundant restore when only BSR is live,
+/// One save-line class. `BsrPost` covers the low BSR save and both low
+/// BSR restores, which share one spelling per site: the save and the group
+/// restore run around the prologue's own `MOVLB`, and the second restore
+/// runs after the epilogue's, so all three must stay while a bank select
+/// stays (W saved) even if the body never selects a bank. Keeping them on
+/// that condition can hold redundant restores when only BSR is live,
 /// which stays correct.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum IsrSlot {
@@ -8998,16 +8999,17 @@ enum IsrSlot {
     Pclat,
     Retval,
 }
-
 /// The save class a full SFR address belongs to, if any. `retval_lo` is the
 /// device's fixed return region; anything else (GPRs, `INDF`/`PLUSW`
-/// windows, `WREG`, `INTCON`) needs no ISR slot. Post/pre addresses map to
-/// their pointer even though only a write moves it: the caller checks reads
-/// separately, since an `INDF` read leaves the pointer alone.
+/// windows, `INTCON`) needs no ISR slot. `WREG` is W itself, so a file
+/// write there takes the W class. Post/pre addresses map to their pointer
+/// even though only a write moves it: the caller checks reads separately,
+/// since an `INDF` read leaves the pointer alone.
 fn isr_slot_for_addr(addr: u16, retval_lo: u16) -> Option<IsrSlot> {
     match addr {
         0xFD8 => Some(IsrSlot::Status),
         0xFE0 => Some(IsrSlot::Bsr),
+        0xFE8 => Some(IsrSlot::W),
         0xFE9 | 0xFEA | 0xFEC | 0xFED | 0xFEE => Some(IsrSlot::Fsr0),
         0xFE1 | 0xFE2 | 0xFE4 | 0xFE5 | 0xFE6 => Some(IsrSlot::Fsr1),
         0xFF3 | 0xFF4 => Some(IsrSlot::Prod),
@@ -9044,6 +9046,7 @@ fn isr_hex_tok(tok: &str) -> Option<u16> {
 /// Fold one save class into the need set.
 fn isr_need_addr(needs: &mut IsrNeeds, addr: u16, retval_lo: u16) {
     match isr_slot_for_addr(addr, retval_lo) {
+        Some(IsrSlot::W) => needs.w = true,
         Some(IsrSlot::Status) => needs.status = true,
         Some(IsrSlot::Bsr) | Some(IsrSlot::BsrPost) => needs.bsr = true,
         Some(IsrSlot::Fsr0) => needs.fsr0 = true,
@@ -9053,7 +9056,20 @@ fn isr_need_addr(needs: &mut IsrNeeds, addr: u16, retval_lo: u16) {
         Some(IsrSlot::Tblptr) => needs.tblptr = true,
         Some(IsrSlot::Pclat) => needs.pclat = true,
         Some(IsrSlot::Retval) => needs.retval = true,
-        Some(IsrSlot::W) | None => {}
+        None => {}
+    }
+}
+
+/// Fold pointer motion from a read side effect into the need set. A
+/// `POSTINC`/`PREINC`/`POSTDEC` source moves its pointer as the access
+/// itself, so even a pure read (a `MOVF` into W, an ALU lane into W)
+/// needs the FSR class. Plain `INDF`/`PLUSW` reads leave the pointer.
+fn isr_mark_post_read(needs: &mut IsrNeeds, addr: u16) {
+    if matches!(addr, 0xFEC | 0xFED | 0xFEE) {
+        needs.fsr0 = true;
+    }
+    if matches!(addr, 0xFE4 | 0xFE5 | 0xFE6) {
+        needs.fsr1 = true;
     }
 }
 
@@ -9279,6 +9295,9 @@ fn scan_isr_line(
             Some((byte, abit, to_w)) => {
                 if to_w {
                     needs.w = true;
+                    if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
+                        isr_mark_post_read(needs, full);
+                    }
                 } else if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
                     isr_need_addr(needs, full, retval_lo);
                 }
@@ -9292,6 +9311,9 @@ fn scan_isr_line(
             Some((byte, abit, to_w)) => {
                 if to_w {
                     needs.w = true;
+                    if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
+                        isr_mark_post_read(needs, full);
+                    }
                 } else if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
                     isr_need_addr(needs, full, retval_lo);
                 }
@@ -9304,6 +9326,9 @@ fn scan_isr_line(
             Some((byte, abit, to_w)) => {
                 if to_w {
                     needs.w = true;
+                    if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
+                        isr_mark_post_read(needs, full);
+                    }
                 } else if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
                     isr_need_addr(needs, full, retval_lo);
                 }
@@ -9315,6 +9340,9 @@ fn scan_isr_line(
             Some((byte, abit, to_w)) => {
                 if to_w {
                     needs.w = true;
+                    if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
+                        isr_mark_post_read(needs, full);
+                    }
                 } else if let Some(full) = isr_access_full(byte, abit, access_bank_hi) {
                     isr_need_addr(needs, full, retval_lo);
                 }
@@ -9356,7 +9384,7 @@ fn isr_save_table(layout: &IsrSaveLayout) -> (Vec<(IsrSlot, String)>, Vec<(IsrSl
             (lo + 2, sp + 10, IsrSlot::Retval),
             (lo + 3, sp + 11, IsrSlot::Retval),
             (0xFD8, sp + 1, IsrSlot::Status),
-            (0xFE0, sp + 2, IsrSlot::Bsr),
+            (0xFE0, sp + 2, IsrSlot::BsrPost),
             (0xFE9, sp + 3, IsrSlot::Fsr0),
             (0xFEA, sp + 4, IsrSlot::Fsr0),
             (0xFE1, sp + 12, IsrSlot::Fsr1),
@@ -11234,9 +11262,17 @@ mod p3_gen_tests {
         assert!(ok && !n.status && !n.w, "SWAPF is flag-neutral");
         let (n, _, _, ok) = scan_one("    RLCF 0x020,F,A");
         assert!(ok && n.status, "RLCF sets flags");
-        // Skip-test instructions write back without flags.
+        // Skip-test instructions write back without flags; a `WREG`
+        // destination still takes W, since `WREG` is W itself.
         let (n, _, _, ok) = scan_one("    DECFSZ 0xFE8,F,A");
-        assert!(ok && !n.status && !n.w, "DECFSZ is flag-neutral");
+        assert!(ok && !n.status && n.w, "DECFSZ writes WREG back");
+        let (n, _, _, ok) = scan_one("    CLRF 0xFE8,A");
+        assert!(ok && n.w, "a WREG file write takes W");
+        // A `POSTINC` source moves its pointer even on a pure read.
+        let (n, _, _, ok) = scan_one("    MOVF 0xFEE,W,A");
+        assert!(ok && n.w && n.fsr0, "POSTINC0 read moves FSR0");
+        let (n, _, _, ok) = scan_one("    ADDWF 0xFE6,W,A");
+        assert!(ok && n.w && n.fsr1, "POSTINC1 read moves FSR1");
         // `MULWF` takes PROD only; `MOVLB` takes BSR.
         let (n, _, _, ok) = scan_one("    MULWF 0x041,A");
         assert!(ok && n.prod && !n.status && !n.w, "MULWF takes PROD");
@@ -11423,5 +11459,42 @@ mod p3_gen_tests {
         lines.push("    RETFIE".to_string());
         let mut locs: Vec<Option<SrcLoc>> = vec![None; lines.len()];
         narrow_isr_body(&mut lines, &mut locs, &layout, &IsrNeeds::all(), 1);
+    }
+
+    #[test]
+    fn narrow_low_keeps_bsr_save_with_w_but_no_bsr() {
+        // A low handler that writes W but never selects a bank still runs
+        // the prologue and epilogue `MOVLB`s, so the BSR save and both
+        // restores must stay together: restoring from a dropped save
+        // would resume main on a stale bank.
+        let layout = IsrSaveLayout {
+            common_lo: 0,
+            spill: 0x120,
+            low: true,
+        };
+        let (pre, post) = isr_save_table(&layout);
+        let mut lines: Vec<String> = pre.iter().map(|(_, s)| s.clone()).collect();
+        lines.push("lo:".to_string());
+        lines.push("    MOVLW 0x02".to_string());
+        lines.extend(post.iter().map(|(_, s)| s.clone()));
+        lines.push("    RETFIE".to_string());
+        let mut locs: Vec<Option<SrcLoc>> = vec![None; lines.len()];
+        let needs = IsrNeeds {
+            w: true,
+            ..IsrNeeds::default()
+        };
+        narrow_isr_body(&mut lines, &mut locs, &layout, &needs, 1);
+        for kept in [
+            "    MOVFF 0xFE0, 0x122",
+            "    MOVFF 0x122, 0xFE0",
+            "    MOVLB 0x1",
+            "    MOVWF 0x120,B",
+        ] {
+            assert!(
+                lines.iter().any(|l| l == kept),
+                "BSR save/restore stay with W ({kept}):\n{}",
+                lines.join("\n")
+            );
+        }
     }
 }
