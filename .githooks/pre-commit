@@ -20,7 +20,9 @@ CARGO_HOME_CACHE="$CACHE_DIR/cargo-home"
 # command, flags and profile, so the gate reuses the warm cache instead
 # of doubling it, and cargo replays cached warnings on a fresh build, so
 # the grep still fires. Serialized with the Makefile's lock, since a
-# commit during `make test` now contends for one cache dir.
+# commit during `make test` now contends for one cache dir. `make shell`
+# holds that lock for the whole session, so the probe below says so
+# instead of hanging silently when a shell or build is holding it.
 TARGET_CACHE="$CACHE_DIR/target$(printf '%s' "$PWD" | tr '/' '-')"
 TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 DEV_IMAGE="$(bash "$TOPLEVEL/scripts/dev-image-tag.sh" 2>/dev/null || true)"
@@ -42,6 +44,9 @@ if [ -n "$staged_rs" ]; then
     fi
 
     mkdir -p "$CARGO_HOME_CACHE" "$TARGET_CACHE"
+    if command -v flock >/dev/null 2>&1 && ! flock -w 0 "$TARGET_CACHE/.build.lock" true 2>/dev/null; then
+      echo "pre-commit: waiting for the target cache lock (a build or make shell holds it)..." >&2
+    fi
     build_out=$(bash "$TOPLEVEL/scripts/with-target-lock.sh" "$TARGET_CACHE/.build.lock" docker run --rm \
       --user "$(id -u):$(id -g)" \
       -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
