@@ -10591,6 +10591,126 @@ mod p3_gen_tests {
     }
 
     #[test]
+    fn long_zero_run_splits_at_255() {
+        // The count is one `MOVLW` literal: 300 staged bytes drain as a
+        // 255-loop plus a 45-loop, with the second seed continuing where
+        // the first walk ends.
+        let m = Module {
+            globals: Vec::new(),
+            funcs: Vec::new(),
+            module_asm: Vec::new(),
+        };
+        let addrs = HashMap::new();
+        let resolved: PtrResolution = HashMap::new();
+        let mut tmp = 0u32;
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
+        for a in 0x100..0x100 + 300u16 {
+            g.stage_zero(a);
+        }
+        g.emit("    NOP".to_string());
+        let text = g.out.join("\n");
+        for line in [
+            "LFSR 0, 0x100",
+            "MOVLW 0xFF",
+            "LFSR 0, 0x1FF",
+            "MOVLW 0x2D",
+            "CLRF 0xFEE,A",
+        ] {
+            assert!(text.contains(line), "{line} missing:\n{text}");
+        }
+        assert_eq!(
+            text.matches("DECFSZ 0xFE8,F,A").count(),
+            2,
+            "one counted tail per chunk:\n{text}"
+        );
+    }
+
+    #[test]
+    fn zero_run_replays_straight_with_copy_loop_off() {
+        // The speed profile turns the loop off: even long runs replay as
+        // straight `CLRF`s, the pre-loop form.
+        let m = Module {
+            globals: Vec::new(),
+            funcs: Vec::new(),
+            module_asm: Vec::new(),
+        };
+        let addrs = HashMap::new();
+        let resolved: PtrResolution = HashMap::new();
+        let mut tmp = 0u32;
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
+        g.copy_loop = false;
+        for a in 0x120..0x128u16 {
+            g.stage_zero(a);
+        }
+        g.emit("    NOP".to_string());
+        let text = g.out.join("\n");
+        assert!(
+            !text.contains("LFSR 0, 0x120"),
+            "no loop seed with copy_loop off:\n{text}"
+        );
+        for a in 0x20..0x28u16 {
+            let direct = format!("CLRF 0x{a:03X},B");
+            assert!(text.contains(&direct), "{direct} missing:\n{text}");
+        }
+    }
+
+    #[test]
+    fn bank_spanning_zero_replay_selects_once() {
+        // A straight replay through `operand` must not duplicate the
+        // `MOVLB` the outer decision already covers: draining inside the
+        // select re-checks the tracked bank instead of emitting blindly.
+        let m = Module {
+            globals: Vec::new(),
+            funcs: Vec::new(),
+            module_asm: Vec::new(),
+        };
+        let addrs = HashMap::new();
+        let resolved: PtrResolution = HashMap::new();
+        let mut tmp = 0u32;
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
+        g.stage_zero(0x120);
+        g.stage_zero(0x121);
+        let (a, f) = g.operand(0x122);
+        assert_eq!((a, f), (1, 0x22));
+        let movlbs = g.out.iter().filter(|l| l.contains("MOVLB")).count();
+        assert_eq!(movlbs, 1, "one bank select for the run: {:?}", g.out);
+        assert_eq!(g.bsr, Some(1));
+    }
+
+    #[test]
+    fn staged_zeros_hold_off_branch_reload_folding() {
+        // The reload audit reads the last two emitted lines: staged zeros
+        // drain between those lines and the branch, so the fold must not
+        // fire while anything is staged.
+        let m = Module {
+            globals: Vec::new(),
+            funcs: Vec::new(),
+            module_asm: Vec::new(),
+        };
+        let mut addrs = HashMap::new();
+        addrs.insert("main::1".to_string(), 0x31);
+        let resolved: PtrResolution = HashMap::new();
+        let mut tmp = 0u32;
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let cond = Val::Reg("1".to_string());
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
+        g.emit("    ADDWF 0x030,W,A".to_string());
+        g.emit("    MOVWF 0x031,A".to_string());
+        assert!(
+            g.branch_reload_redundant(&cond),
+            "the fold fires on the bare pair"
+        );
+        g.stage_zero(0x120);
+        assert!(
+            !g.branch_reload_redundant(&cond),
+            "staged zeros must hold the fold off"
+        );
+    }
+
+    #[test]
     fn forward_join_restores_agreement() {
         // Two recorded edges and the fall-through all hold bank 2: the
         // label restores it instead of resetting. Guards the meet
