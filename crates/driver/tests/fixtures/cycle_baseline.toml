@@ -336,16 +336,16 @@ ram_bytes = 54
 [[entry]]
 name = "speed-switch16-18f4550"
 device = "18F4550"
-cycles = 98
-flash_words = 91
+cycles = 58
+flash_words = 80
 ram_bytes = 10
 
 [[entry]]
 name = "speed-switch16-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 74
-flash_words = 107
+cycles = 50
+flash_words = 83
 ram_bytes = 10
 
 [[entry]]
