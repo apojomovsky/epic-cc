@@ -1744,14 +1744,12 @@ impl<'m> Gen<'m> {
                             }
                         }
                     }
-                    Inst::Gep(p) => {
+                    Inst::Gep(_) => {
+                        // Virtual: folded away by `resolve_pointers`
+                        // before codegen runs, so it never writes a home.
+                        // Only value reads can disturb the fold.
                         if reads(inst, r) || reads(inst, preg) {
                             return false;
-                        }
-                        if let Some(a) = home_of(&p.dst) {
-                            if !disjoint(a, 2) {
-                                return false;
-                            }
                         }
                     }
                     Inst::Br(_) | Inst::BrCond(_) => {
