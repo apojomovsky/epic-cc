@@ -409,6 +409,42 @@ fn rcall_and_bra_and_conditional_branches_execute() {
 }
 
 #[test]
+fn taken_bra_to_next_costs_two() {
+    // Hardware charges 2 for any taken branch, even onto the next
+    // instruction, where the pc delta alone reads fall-through (epic-cc#890).
+    let words = asm::assemble_pic18("    BRA next\nnext:\n    NOP\n");
+    assert_eq!(words[0], 0xD000, "BRA +0 encodes as 0xD000");
+    let mut p = Pic18::new(words);
+    p.run(1);
+    assert_eq!(p.pc(), 2, "taken BRA lands on the next word");
+    assert_eq!(p.cycles(), 2, "taken BRA to next costs 2");
+}
+
+#[test]
+fn taken_conditional_to_next_costs_two_not_taken_costs_one() {
+    // SUBLW sets Z, so BZ takes onto the next word: 1 + 1 + 2.
+    let words = asm::assemble_pic18("    MOVLW 0\n    SUBLW 0\n    BZ next\nnext:\n    NOP\n");
+    let mut p = Pic18::new(words);
+    p.run(3);
+    assert_eq!(p.cycles(), 4, "taken BZ to next costs 2");
+    // SUBLW leaves W nonzero, Z clear, so BZ falls through at 1.
+    let words = asm::assemble_pic18("    MOVLW 1\n    SUBLW 0\n    BZ next\nnext:\n    NOP\n");
+    let mut p = Pic18::new(words);
+    p.run(3);
+    assert_eq!(p.cycles(), 3, "not-taken BZ costs 1");
+}
+
+#[test]
+fn rcall_to_next_costs_two_with_return() {
+    // RCALL always takes (2), even calling the next word; the RETURN
+    // there pops back at 2. Two steps, four cycles.
+    let words = asm::assemble_pic18("    RCALL sub\nsub:\n    RETURN\n");
+    let mut p = Pic18::new(words);
+    p.run(2);
+    assert_eq!(p.cycles(), 4, "RCALL to next plus RETURN cost 2 each");
+}
+
+#[test]
 fn retlw_returns_and_loads_w() {
     // `sub:` sits right after the main flow with no separating halt, so
     // this only runs exactly the two real steps (CALL, then RETLW) rather
