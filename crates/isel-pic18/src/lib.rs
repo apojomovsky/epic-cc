@@ -35,14 +35,23 @@ const COPY_LOOP_MIN_PAIRS: usize = 6;
 /// long staged runs lower to the 9-word seeded loop, which runs about
 /// 3x slower per byte than straight `MOVFF`s. The speed profile turns it
 /// off, trading flash for cycles on those runs (epic-cc#883).
+/// `inline_mul16` inlines the u16 widening multiply at the call site
+/// instead of calling `__mul_u16`. The inline form parks both operand
+/// bytes in the retval region, so it costs flash per site; the speed
+/// profile pays it for cycles (epic-cc#892). The u8 multiply always
+/// inlines: one MULWF is shorter than the call either way.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     pub copy_loop: bool,
+    pub inline_mul16: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { copy_loop: true }
+        Self {
+            copy_loop: true,
+            inline_mul16: false,
+        }
     }
 }
 
@@ -242,6 +251,8 @@ struct Gen<'m> {
     /// Whether long staged runs drain as the POSTINC loop. Off under the
     /// speed profile, where straight `MOVFF`s trade flash for cycles.
     copy_loop: bool,
+    /// Whether `__mul_u16` calls inline at the site (epic-cc#892).
+    inline_mul16: bool,
     /// Every RAM address a global occupies. The W cache never records or
     /// reuses one: an interrupt can write a global between the store and
     /// the reload, while the ISR epilogue restores W to its pre-interrupt
@@ -306,16 +317,6 @@ struct Gen<'m> {
     /// loads whose byte never stages to a slot. `alloc` drops those
     /// slots; the load arm skips them and consumers read the source.
     w_folds: iselcore::ValueFolds,
-    /// Single-use loads feeding inlined multiply args, folded to read
-    /// the source global directly (epic-cc#892): reg to global base
-    /// address plus load position. The slot stays allocated; only
-    /// emission skips it.
-    mul_load_fold: HashMap<String, (u16, usize)>,
-    /// Single-use multiply results feeding a direct-global store,
-    /// computed into the store address (epic-cc#892): reg to global
-    /// base address. Only recorded when the inline plan resolves, so
-    /// the fallback call path always finds its slot.
-    mul_store_fwd: HashMap<String, u16>,
     out: Vec<String>,
     /// One source location per emitted line, index-aligned with `out`.
     /// `None` marks a compiler-generated line (no source instruction).
@@ -1485,206 +1486,6 @@ impl<'m> Gen<'m> {
             }
         }
         (fwd, consumed)
-    }
-    /// A gap instruction a folded multiply load may move past: a pure
-    /// lane copy with no memory behavior, mirroring
-    /// `iselcore::fold_gap_pure`, plus sibling loads folding into the
-    /// same call (handled by the caller, which knows the sibling set).
-    fn mul_gap_pure(inst: &Inst) -> bool {
-        matches!(
-            inst,
-            Inst::Zext(_)
-                | Inst::Sext(_)
-                | Inst::Trunc(_)
-                | Inst::Freeze(_)
-                | Inst::Select(_)
-                | Inst::Gep(_)
-                | Inst::IntToPtr(_)
-                | Inst::Alloca(_)
-                | Inst::Phi(_)
-        )
-    }
-
-    /// Multiply folds for one function (epic-cc#892): single-use loads
-    /// feeding inlined multiply args read the source global, and
-    /// single-use results feeding a direct store compute into it. A
-    /// load folds only when the call inlines, and a store fuses only
-    /// when the plan resolves with the fused address, so the fallback
-    /// call path always finds its slots. Folded reads keep IR order.
-    fn find_mul_folds(g: &Gen, f: &Func) -> (HashMap<String, (u16, usize)>, HashMap<String, u16>) {
-        let mut uses: HashMap<String, usize> = HashMap::new();
-        for b in &f.blocks {
-            for inst in &b.insts {
-                for r in ir::read_vals(inst) {
-                    if r.is_empty() {
-                        continue;
-                    }
-                    *uses.entry(r).or_insert(0) += 1;
-                }
-            }
-        }
-        // An access-bank RAM global's address, or `None` (flash consts
-        // read through TBLRD and banked sources would trade a bankless
-        // `MOVFF` for a `MOVLB` word, so neither folds).
-        let ram_global = |ptr: &str| -> Option<u16> {
-            let name = ptr.strip_prefix('@')?;
-            let known = g.m.globals.iter().find(|x| x.name == name)?;
-            if known.is_const {
-                return None;
-            }
-            let addr = *g.addrs.get(name)?;
-            if g.lane_bank(addr).is_some() {
-                return None;
-            }
-            Some(addr)
-        };
-        let mut load_fold: HashMap<String, (u16, usize)> = HashMap::new();
-        let mut store_fwd: HashMap<String, u16> = HashMap::new();
-        for b in &f.blocks {
-            for (ci, inst) in b.insts.iter().enumerate() {
-                let Inst::Call(c) = inst else { continue };
-                let Some(width) = Self::inline_mul_width(&c.func) else {
-                    continue;
-                };
-                let want = match width {
-                    1 => Ty::I8,
-                    2 => Ty::I16,
-                    _ => continue,
-                };
-                if c.ty != Some(want) || c.args.len() != 2 {
-                    continue;
-                }
-                if c.args
-                    .iter()
-                    .any(|a| a.ty != Some(want) || a.byval.is_some() || a.sret)
-                {
-                    continue;
-                }
-                // Load candidates, one per register arg: a same-block
-                // single-use load of matching width off an access-bank
-                // RAM global, never a resolved pointer value. Each
-                // carries its arg index for the order check below.
-                let mut cands: Vec<(usize, String, u16, usize)> = Vec::new();
-                for (ai, arg) in c.args.iter().enumerate() {
-                    let Val::Reg(r) = &arg.val else { continue };
-                    if uses.get(r).copied().unwrap_or(0) != 1 {
-                        continue;
-                    }
-                    if g.resolved.contains_key(&ssa_key(&f.name, r)) {
-                        continue;
-                    }
-                    let Some((pi, l)) = b.insts[..ci]
-                        .iter()
-                        .rposition(|i| match i {
-                            Inst::Load(l) => &l.dst == r,
-                            _ => false,
-                        })
-                        .and_then(|pi| match &b.insts[pi] {
-                            Inst::Load(l) => Some((pi, l)),
-                            _ => None,
-                        })
-                    else {
-                        continue;
-                    };
-                    if l.ty.bytes() != width || l.ptr_ty {
-                        continue;
-                    }
-                    if matches!(b.insts.get(pi + 1), Some(Inst::Icmp(_))) {
-                        continue;
-                    }
-                    let Some(addr) = ram_global(&l.ptr) else {
-                        continue;
-                    };
-                    cands.push((ai, r.clone(), addr, pi));
-                }
-                // Sibling loads fold together: a candidate survives when
-                // its gap to the call holds only pure ops and sibling
-                // loads. Fixpoint: dropping one can strand another.
-                let mut kept = vec![true; cands.len()];
-                loop {
-                    let mut changed = false;
-                    for (i, (_, _, _, lp)) in cands.iter().enumerate() {
-                        if !kept[i] {
-                            continue;
-                        }
-                        let mut ok = true;
-                        for inst in &b.insts[lp + 1..ci] {
-                            if Self::mul_gap_pure(inst) {
-                                continue;
-                            }
-                            if let Inst::Load(l2) = inst {
-                                if cands
-                                    .iter()
-                                    .enumerate()
-                                    .any(|(j, c)| kept[j] && c.1 == l2.dst)
-                                {
-                                    continue;
-                                }
-                            }
-                            ok = false;
-                            break;
-                        }
-                        if !ok {
-                            kept[i] = false;
-                            changed = true;
-                        }
-                    }
-                    if !changed {
-                        break;
-                    }
-                }
-                // Emission reads sides in load order (swapping the
-                // commuting operands when inverted), so kept loads
-                // carry their positions for the ordering.
-                let mut trial: HashMap<String, (u16, usize)> = HashMap::new();
-                for (i, (_, r, addr, lp)) in cands.iter().enumerate() {
-                    if kept[i] {
-                        trial.insert(r.clone(), (*addr, *lp));
-                    }
-                }
-                let slot_dst = match &c.dst {
-                    None => None,
-                    Some(d) => match g.addrs.get(&ssa_key(&f.name, d)) {
-                        Some(a) => Some(*a),
-                        None => continue,
-                    },
-                };
-                if Self::inline_mul_plan_for(g, &trial, c, slot_dst).is_none() {
-                    continue;
-                }
-                load_fold.extend(trial);
-                // Store fusion: the single-use result feeds a
-                // direct-global store of matching width with a clean
-                // span, and the plan resolves with the fused address.
-                let Some(dst_reg) = &c.dst else { continue };
-                if uses.get(dst_reg).copied().unwrap_or(0) != 1 {
-                    continue;
-                }
-                if g.lane_consumed.contains(dst_reg) || g.bit_lanes.contains_key(dst_reg) {
-                    continue;
-                }
-                for sinst in b.insts.iter().skip(ci + 1) {
-                    match sinst {
-                        Inst::Store(s)
-                            if matches!(&s.val, Val::Reg(r) if r == dst_reg)
-                                && s.ty.bytes() == width
-                                && !s.ptr.starts_with("0x") =>
-                        {
-                            if let Some(addr) = ram_global(&s.ptr) {
-                                if Self::inline_mul_plan_for(g, &load_fold, c, Some(addr)).is_some()
-                                {
-                                    store_fwd.insert(dst_reg.clone(), addr);
-                                }
-                            }
-                            break;
-                        }
-                        other if iselcore::fold_span_clean(std::slice::from_ref(other)) => {}
-                        _ => break,
-                    }
-                }
-            }
-        }
-        (load_fold, store_fwd)
     }
     /// The register side of an `Add`/`Sub` against a constant: the value
     /// operand plus the literal. `Add` commutes, so a constant on either
@@ -4193,17 +3994,11 @@ impl<'m> Gen<'m> {
     }
 
     /// Resolve `v` to `width` operand bytes, or `None` when the call path
-    /// must handle it. A folded load reads its source global directly;
-    /// a reg behind pointer resolution holds an address, not a value; a
-    /// data global in value position is its address literal (the
-    /// `emit_move_val_to_slot` contract), which only the u8 form stages
-    /// into W.
-    fn inline_mul_operand(
-        g: &Gen,
-        load_fold: &HashMap<String, (u16, usize)>,
-        v: &Val,
-        width: u8,
-    ) -> Option<Vec<MulOp>> {
+    /// must handle it. A reg behind pointer resolution holds an address,
+    /// not a value; a data global in value position is its address
+    /// literal (the `emit_move_val_to_slot` contract), which only the u8
+    /// form stages into W.
+    fn inline_mul_operand(&self, v: &Val, width: u8) -> Option<Vec<MulOp>> {
         match v {
             Val::Const(k) => {
                 if width != 1 {
@@ -4212,19 +4007,15 @@ impl<'m> Gen<'m> {
                 Some(vec![MulOp::Lit((*k & 0xFF) as u8)])
             }
             Val::Reg(r) => {
-                if let Some((base, _)) = load_fold.get(r) {
-                    return Some(
-                        (0..width)
-                            .map(|i| MulOp::Ram(*base + u16::from(i)))
-                            .collect(),
-                    );
-                }
-                if g.resolved.contains_key(&iselcore::ssa_key(g.cur_func, r)) {
+                if self
+                    .resolved
+                    .contains_key(&iselcore::ssa_key(self.cur_func, r))
+                {
                     return None;
                 }
-                let base = match g.w_folds.loads.get(r) {
-                    Some(iselcore::LoadFold::Direct(gb)) => *g.addrs.get(gb)?,
-                    _ => *g.addrs.get(&iselcore::ssa_key(g.cur_func, r))?,
+                let base = match self.w_folds.loads.get(r) {
+                    Some(iselcore::LoadFold::Direct(g)) => *self.addrs.get(g)?,
+                    _ => *self.addrs.get(&iselcore::ssa_key(self.cur_func, r))?,
                 };
                 Some(
                     (0..width)
@@ -4232,64 +4023,22 @@ impl<'m> Gen<'m> {
                         .collect(),
                 )
             }
-            Val::Global(gb) => {
-                if width != 1 || g.is_function(gb) || g.global_is_const(gb) {
+            Val::Global(g) => {
+                if width != 1 || self.is_function(g) || self.global_is_const(g) {
                     return None;
                 }
-                Some(vec![MulOp::Lit((g.addrs.get(gb)? & 0xFF) as u8)])
+                Some(vec![MulOp::Lit((self.addrs.get(g)? & 0xFF) as u8)])
             }
         }
     }
 
     /// The inline form of a narrow-multiply call, or `None` for the
-    /// ordinary call path. The destination prefers a fused store
-    /// target; otherwise it is the result slot.
+    /// ordinary call path. Pure: resolves addresses and checks shapes,
+    /// never emits. Every RAM byte touched must sit in the access bank
+    /// (a MOVLB mid-sequence costs the words the inline saves), and no
+    /// u16 operand byte may alias the retval temps (a retval-homed call
+    /// result parks there, epic-cc#738).
     fn inline_mul_plan(&self, c: &ir::Call) -> Option<InlineMul> {
-        let dst = match &c.dst {
-            None => None,
-            Some(d) => {
-                if let Some(addr) = self.mul_store_fwd.get(d) {
-                    Some(*addr)
-                } else {
-                    Some(*self.addrs.get(&iselcore::ssa_key(self.cur_func, d))?)
-                }
-            }
-        };
-        Self::inline_mul_plan_for(self, &self.mul_load_fold, c, dst)
-    }
-
-    /// The call's operand sides in the order emission reads them.
-    /// Folded volatile reads must follow IR load order, so an
-    /// inverted pair swaps sides (the product commutes); anything
-    /// else keeps call-arg order.
-    fn mul_operands_ordered<'v>(
-        load_fold: &HashMap<String, (u16, usize)>,
-        a: &'v Val,
-        b: &'v Val,
-    ) -> (&'v Val, &'v Val) {
-        match (a, b) {
-            (Val::Reg(r0), Val::Reg(r1)) => match (load_fold.get(r0), load_fold.get(r1)) {
-                (Some((_, p0)), Some((_, p1))) if p0 > p1 => (b, a),
-                _ => (a, b),
-            },
-            _ => (a, b),
-        }
-    }
-
-    /// The plan core over explicit maps, so the pre-scan can gate
-    /// store fusion on the same predicate emission uses. Pure:
-    /// resolves addresses and checks shapes, never emits. Every RAM
-    /// byte touched must sit in the access bank (a MOVLB mid-sequence
-    /// costs the words the inline saves), and no u16 operand byte may
-    /// alias the retval temps (a retval-homed call result parks there,
-    /// epic-cc#738).
-
-    fn inline_mul_plan_for(
-        g: &Gen,
-        load_fold: &HashMap<String, (u16, usize)>,
-        c: &ir::Call,
-        dst: Option<u16>,
-    ) -> Option<InlineMul> {
         let width = Self::inline_mul_width(&c.func)?;
         if !c.callees.is_empty() || c.args.len() != 2 {
             return None;
@@ -4307,9 +4056,15 @@ impl<'m> Gen<'m> {
                 return None;
             }
         }
-        let (av, bv) = Self::mul_operands_ordered(load_fold, &c.args[0].val, &c.args[1].val);
-        let a = Self::inline_mul_operand(g, load_fold, av, width)?;
-        let b = Self::inline_mul_operand(g, load_fold, bv, width)?;
+        if width == 2 && !self.inline_mul16 {
+            return None;
+        }
+        let a = self.inline_mul_operand(&c.args[0].val, width)?;
+        let b = self.inline_mul_operand(&c.args[1].val, width)?;
+        let dst = match &c.dst {
+            None => None,
+            Some(d) => Some(*self.addrs.get(&iselcore::ssa_key(self.cur_func, d))?),
+        };
         if width == 1 {
             if matches!((a[0], b[0]), (MulOp::Lit(_), MulOp::Lit(_))) {
                 return None;
@@ -4323,7 +4078,7 @@ impl<'m> Gen<'m> {
             if let Some(d) = dst {
                 ram.push(d);
             }
-            if ram.iter().any(|x| g.lane_bank(*x).is_some()) {
+            if ram.iter().any(|x| self.lane_bank(*x).is_some()) {
                 return None;
             }
             return Some(InlineMul::U8 {
@@ -4347,11 +4102,11 @@ impl<'m> Gen<'m> {
                 Some((d, d + 1))
             }
         };
-        if ram.iter().any(|x| g.lane_bank(*x).is_some()) {
+        if ram.iter().any(|x| self.lane_bank(*x).is_some()) {
             return None;
         }
         for x in [a0, a1, b0, b1] {
-            if (g.retval_lo..g.retval_lo + 4).contains(&x) {
+            if (self.retval_lo..self.retval_lo + 4).contains(&x) {
                 return None;
             }
         }
@@ -4365,12 +4120,12 @@ impl<'m> Gen<'m> {
     }
 
     /// Emit an inline narrow multiply, `true` when a plan resolved. Each
-    /// operand byte is read exactly once in IR order (a second read
-    /// would observe a volatile twice), so the u16 form parks three
-    /// bytes in retval temps across the three partials. The ISR
-    /// prologue snapshots the retval region and PROD, so an interrupt
-    /// mid-sequence restores both. Staged copies drain first: a parked
-    /// retval copy must land before the temps are reused.
+    /// operand byte is read exactly once (a second read would observe a
+    /// volatile twice), so the u16 form parks both low bytes in retval
+    /// temps across the three partials. The ISR prologue snapshots the
+    /// retval region and PROD, so an interrupt mid-sequence restores
+    /// both. Staged copies drain first: a parked retval copy must land
+    /// before the temps are reused (the `emit_delay` rule).
     fn try_emit_inline_mul(&mut self, c: &ir::Call) -> bool {
         let Some(plan) = self.inline_mul_plan(c) else {
             return false;
@@ -4413,40 +4168,30 @@ impl<'m> Gen<'m> {
                     self.retval_lo + 3 <= self.access_bank_hi,
                     "isel-pic18: inline u16 multiply needs 4 retval bytes in the access bank"
                 );
-                let (t0, t1, t2, t3) = (
-                    self.retval_lo,
-                    self.retval_lo + 1,
-                    self.retval_lo + 2,
-                    self.retval_lo + 3,
-                );
-                let (d0, d1) = dst.unwrap_or((t0, t1));
+                let (t0, t1, t2) = (self.retval_lo, self.retval_lo + 1, self.retval_lo + 2);
+                let (d0, d1) = dst.unwrap_or((self.retval_lo + 3, self.retval_lo + 3));
                 if let Some((x0, _)) = dst {
                     self.invalidate_fsr0_if_slot_written(x0, 2);
                 }
                 self.invalidate_fsr0_if_slot_written(t0, 4);
-                // Operands read in IR order (a0, a1, b0, b1), so folded
-                // volatile reads keep their order; each parks in a
-                // retval temp (a0 in t0, a1 in t1, b0 in t3) while b1
-                // rides W into P01. P10 and P00 follow, the high
-                // accumulator rides t2 into d1, and d0 lands after the
-                // last park read, so any dst/operand overlay is
-                // already consumed.
-                self.emit(format!("    MOVF 0x{a0:03X},W,A"));
-                self.emit(format!("    MOVWF 0x{t0:03X},A"));
-                self.emit(format!("    MOVF 0x{a1:03X},W,A"));
-                self.emit(format!("    MOVWF 0x{t1:03X},A"));
+                // P10 first while both low bytes park in t0/t1, then
+                // P01, then P00 with the high accumulator in t2. d0
+                // lands after the last operand read, so any dst/operand
+                // overlay is already consumed.
                 self.emit(format!("    MOVF 0x{b0:03X},W,A"));
-                self.emit(format!("    MOVWF 0x{t3:03X},A"));
-                self.emit(format!("    MOVF 0x{b1:03X},W,A"));
+                self.emit(format!("    MOVWF 0x{t0:03X},A"));
+                self.emit(format!("    MOVF 0x{a0:03X},W,A"));
+                self.emit(format!("    MOVWF 0x{t1:03X},A"));
+                self.emit(format!("    MOVF 0x{a1:03X},W,A"));
                 self.emit(format!("    MULWF 0x{t0:03X},A"));
                 self.emit("    MOVF 0xFF3,W,A".to_string());
                 self.emit(format!("    MOVWF 0x{t2:03X},A"));
-                self.emit(format!("    MOVF 0x{t3:03X},W,A"));
-                self.emit(format!("    MULWF 0x{t1:03X},A"));
+                self.emit(format!("    MOVF 0x{t1:03X},W,A"));
+                self.emit(format!("    MULWF 0x{b1:03X},A"));
                 self.emit("    MOVF 0xFF3,W,A".to_string());
                 self.emit(format!("    ADDWF 0x{t2:03X},F,A"));
-                self.emit(format!("    MOVF 0x{t0:03X},W,A"));
-                self.emit(format!("    MULWF 0x{t3:03X},A"));
+                self.emit(format!("    MOVF 0x{t1:03X},W,A"));
+                self.emit(format!("    MULWF 0x{t0:03X},A"));
                 self.emit("    MOVF 0xFF3,W,A".to_string());
                 self.emit(format!("    MOVWF 0x{d0:03X},A"));
                 self.emit("    MOVF 0xFF4,W,A".to_string());
@@ -4477,12 +4222,6 @@ impl<'m> Gen<'m> {
                             return;
                         }
                     }
-                }
-                // A load folded into an inlined multiply arg never
-                // stages: the sequence reads the source global
-                // directly (epic-cc#892).
-                if self.mul_load_fold.contains_key(&l.dst) {
-                    return;
                 }
                 // An i1 global is real: clang's own -O1 GlobalOpt narrows an
                 // internal flag only ever written 0/1 down to `global i1`
@@ -4590,7 +4329,7 @@ impl<'m> Gen<'m> {
                 // A folded store already emitted at its producer
                 // (epic-cc#723): the value sits in place, skip the copy.
                 if let Val::Reg(r) = &s.val {
-                    if self.store_consumed.contains(r) || self.mul_store_fwd.contains_key(r) {
+                    if self.store_consumed.contains(r) {
                         return;
                     }
                 }
@@ -9737,6 +9476,7 @@ pub fn select_with_opts(
             tblptr_holds: None,
             pending_copies: Vec::new(),
             copy_loop: opts.copy_loop,
+            inline_mul16: opts.inline_mul16,
             cur_func: &f.name,
             global_addrs: &global_addrs,
             w_holds: None,
@@ -9751,8 +9491,6 @@ pub fn select_with_opts(
             inplace_bins: HashSet::new(),
             store_consumed: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
-            mul_load_fold: HashMap::new(),
-            mul_store_fwd: HashMap::new(),
             out: Vec::new(),
             locs: Vec::new(),
         };
@@ -9767,13 +9505,6 @@ pub fn select_with_opts(
         let (store_fwd, store_consumed) = Gen::find_store_forwards(&g, f);
         g.store_fwd = store_fwd;
         g.store_consumed = store_consumed;
-        // Multiply folds for this function (epic-cc#892): single-use
-        // loads feeding inlined multiply args read the source global,
-        // and single-use results feeding a direct store compute into
-        // it. Only emission reroutes; every slot stays allocated.
-        let (mul_load_fold, mul_store_fwd) = Gen::find_mul_folds(&g, f);
-        g.mul_load_fold = mul_load_fold;
-        g.mul_store_fwd = mul_store_fwd;
         // Value folds for this function (epic-cc#863): loads whose byte
         // never stages. Same predicate `alloc` places by, over the same
         // bank test on the final map, so a skipped load reads an
@@ -10437,6 +10168,7 @@ pub fn select_with_opts(
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
                 copy_loop: opts.copy_loop,
+                inline_mul16: opts.inline_mul16,
                 cur_func: &f.name,
                 global_addrs: &global_addrs,
                 w_holds: None,
@@ -10451,8 +10183,6 @@ pub fn select_with_opts(
                 inplace_bins: HashSet::new(),
                 store_consumed: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
-                mul_load_fold: HashMap::new(),
-                mul_store_fwd: HashMap::new(),
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -10785,6 +10515,7 @@ mod tests {
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
                 copy_loop: true,
+                inline_mul16: false,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
                 w_holds: None,
@@ -10799,8 +10530,6 @@ mod tests {
                 inplace_bins: HashSet::new(),
                 store_consumed: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
-                mul_load_fold: HashMap::new(),
-                mul_store_fwd: HashMap::new(),
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -10822,6 +10551,7 @@ mod tests {
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
                 copy_loop: true,
+                inline_mul16: false,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
                 w_holds: None,
@@ -10836,8 +10566,6 @@ mod tests {
                 inplace_bins: HashSet::new(),
                 store_consumed: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
-                mul_load_fold: HashMap::new(),
-                mul_store_fwd: HashMap::new(),
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -10874,6 +10602,7 @@ mod p3_gen_tests {
             tblptr_holds: None,
             pending_copies: Vec::new(),
             copy_loop: true,
+            inline_mul16: false,
             cur_func: "main",
             global_addrs: empty_global_addrs(),
             w_holds: None,
@@ -10888,8 +10617,6 @@ mod p3_gen_tests {
             inplace_bins: HashSet::new(),
             store_consumed: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
-            mul_load_fold: HashMap::new(),
-            mul_store_fwd: HashMap::new(),
             out: Vec::new(),
             locs: Vec::new(),
         }
