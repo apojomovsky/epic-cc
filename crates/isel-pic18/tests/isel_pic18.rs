@@ -8310,6 +8310,49 @@ fn phi_folded_i16_increment_with_earlier_index_uses_folds_in_place() {
 }
 
 #[test]
+fn phi_folded_i16_increment_with_split_header_and_latch_folds() {
+    // The increment may sit in a latch block apart from the header
+    // holding the phi. The backedge phi reads the result, so the same
+    // in-place fold applies (epic-cc#937): the header phi is the one
+    // reader the region check counts.
+    let m = parse(
+        "global limit i16\nfn main(void) ()\n  block entry:\n    br header\n  block header:\n    %i = phi i16 %r latch 0 entry\n    br latch\n  block latch:\n    %r = add i16 %i, 1\n    %lv = load i16 @limit\n    %c = icmp eq i16 %r, %lv\n    br i1 %c, exit, header\n  block exit:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("limit", 0x20),
+        ("main::i", 0x30),
+        ("main::r", 0x34),
+        ("main::lv", 0x36),
+        ("main::c", 0x38),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Llatch");
+    assert!(lp.contains("INCF 0x030,F,A"), "latch:\n{lp}");
+    assert!(lp.contains("BTFSC 0xFD8,0,A"), "latch:\n{lp}");
+    assert!(lp.contains("INCF 0x031,F,A"), "latch:\n{lp}");
+    assert!(!lp.contains("0x034"), "dead temp must go unread:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    for limit in [1u16, 5, 300] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20] = (limit & 0xFF) as u8;
+        p.ram_mut()[0x21] = (limit >> 8) as u8;
+        p.run(500 + 200 * usize::from(limit));
+        assert!(p.halted(), "program must halt (limit={limit})");
+        assert_eq!(
+            p.ram()[0x30],
+            (limit & 0xFF) as u8,
+            "counter lo (limit={limit})"
+        );
+        assert_eq!(
+            p.ram()[0x31],
+            (limit >> 8) as u8,
+            "counter hi (limit={limit})"
+        );
+    }
+}
+
+#[test]
 fn inplace_add_i16_with_zero_low_byte_skips_the_lane() {
     // `x += 0x0100` needs no low lane and no carry seed: the low add
     // carries nothing in, so the high lane takes the plain form

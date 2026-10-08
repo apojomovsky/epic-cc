@@ -1646,6 +1646,28 @@ impl<'m> Gen<'m> {
             }
         }
         let mut phi_reads = 0usize;
+        // The backedge phi lives in the header, which the region scan
+        // below skips when the increment sits in a separate latch block:
+        // count its result reads here so split loops fold like single
+        // block ones. Any other header read of the result cannot be
+        // dominated by the latch increment, so it fails instead.
+        if header != b.label && header != latch {
+            let Some(hb) = f.blocks.iter().find(|bb| bb.label == header) else {
+                return false;
+            };
+            for inst in &hb.insts {
+                if matches!(inst, Inst::Phi(_)) {
+                    phi_reads += usize::from(reads(inst, r));
+                    if reads(inst, preg) {
+                        return false;
+                    }
+                    continue;
+                }
+                if reads(inst, r) {
+                    return false;
+                }
+            }
+        }
         for inst in b.insts.iter().take(qi) {
             if matches!(inst, Inst::Phi(_)) {
                 phi_reads += usize::from(reads(inst, r));
@@ -1784,19 +1806,22 @@ impl<'m> Gen<'m> {
         }
         // Every path out of the region except back to the phi's block
         // must never observe the operand's old slot: the fold overwrites
-        // it with the new value, and only the header's phi reconciles
-        // re-entry. Reaching the region itself means an irreducible
-        // entry whose earlier readers would diverge, so that fails too.
-        let in_region = |s: &str| s == header || s == b.label.as_str() || s == latch;
+        // it with the new value. Re-entry through the header is fine
+        // without walking it: its phi reconciles every incoming edge in
+        // both forms. Re-entry into the region itself has no such phi,
+        // so it fails instead of silently accepting divergent readers.
         let mut stack: Vec<&str> = edges
             .iter()
             .map(|s| s.as_str())
-            .filter(|s| !in_region(s))
+            .filter(|s| *s != header)
             .collect();
-        let mut seen: HashSet<&str> = HashSet::from([header, b.label.as_str(), latch]);
+        let mut seen: HashSet<&str> = HashSet::from([header]);
         while let Some(lbl) = stack.pop() {
             if !seen.insert(lbl) {
                 continue;
+            }
+            if lbl != header && (lbl == b.label.as_str() || lbl == latch) {
+                return false;
             }
             let Some(blk) = f.blocks.iter().find(|bb| bb.label == lbl) else {
                 continue;
