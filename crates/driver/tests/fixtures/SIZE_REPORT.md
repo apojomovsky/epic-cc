@@ -3,7 +3,7 @@
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
 - Date (UTC): 2026-10-08
-- Commit: 8c17605
+- Commit: 6f4a58e
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
 - Menu-demo listing: 9164 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
@@ -44,7 +44,7 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | hal-pic16-blink-16f877a | 16F877A | 462 | 44 | = / = |
 | hal-pic18-blink-18f4550 | 18F4550 | 313 | 30 | = / = |
 | hal-pic14e-blink-16f1937 | 16F1937 | 100 | 6 | = / = |
-| hal-pic16-encoder-full-16f877a | 16F877A | 5460 | 326 | = / = |
+| hal-pic16-encoder-full-16f877a | 16F877A | 5372 | 326 | = / = |
 | hal-pic18-menu-demo-18f4550 | 18F4550 | 9177 | 781 | = / = |
 | hal-pic18-control-demo-18f4550 | 18F4550 | 9463 | 963 | = / = |
 | hal-pic18-pid-18f4550 | 18F4550 | 3202 | 500 | = / = |
