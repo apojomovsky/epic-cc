@@ -3223,16 +3223,29 @@ fn routine_sig(name: &str) -> (&'static str, &'static [(&'static str, &'static s
         "__mul_u8" => ("i8", &[("a", "i8"), ("b", "i8")], 6),
         "__mul_u16" => ("i16", &[("a", "i16"), ("b", "i16")], 14),
         "__udiv_u8" | "__urem_u8" => ("i8", &[("num", "i8"), ("den", "i8")], 4),
+        "__udivmod_u8" => ("i8", &[("num", "i8"), ("den", "i8")], 4),
         "__udiv_u16" | "__urem_u16" => ("i16", &[("num", "i16"), ("den", "i16")], 7),
+        "__udivmod_u16" => ("i16", &[("num", "i16"), ("den", "i16")], 7),
         "__sdiv_i8" | "__srem_i8" => ("i8", &[("num", "i8"), ("den", "i8")], 5),
         "__sdiv_i16" | "__srem_i16" => ("i16", &[("num", "i16"), ("den", "i16")], 7),
         "__shl_u8" | "__lshr_u8" | "__ashr_i8" => ("i8", &[("val", "i8"), ("cnt", "i8")], 3),
         "__shl_u16" | "__lshr_u16" | "__ashr_i16" => ("i16", &[("val", "i16"), ("cnt", "i16")], 4),
         "__mul_u32" => ("i32", &[("a", "i32"), ("b", "i32")], 11),
         "__udiv_u32" | "__urem_u32" => ("i32", &[("num", "i32"), ("den", "i32")], 10),
+        "__udivmod_u32" => ("i32", &[("num", "i32"), ("den", "i32")], 10),
         "__sdiv_i32" | "__srem_i32" => ("i32", &[("num", "i32"), ("den", "i32")], 12),
         "__shl_u32" | "__lshr_u32" | "__ashr_i32" => ("i32", &[("val", "i32"), ("cnt", "i32")], 2),
         other => panic!("test: unknown routine {other}"),
+    }
+}
+/// The remainder spill slot a fused divide routine writes, mirroring
+/// legalize's injection (see `fuse_divmod_pairs`).
+fn slot_name(routine: &str) -> &'static str {
+    match routine {
+        "__udivmod_u8" => "__udivmod_rem_u8",
+        "__udivmod_u16" => "__udivmod_rem_u16",
+        "__udivmod_u32" => "__udivmod_rem_u32",
+        other => panic!("test: no spill slot for {other}"),
     }
 }
 
@@ -3249,10 +3262,16 @@ fn routine_module(name: &str) -> (String, Vec<(String, u16)>) {
         .map(|(n, t)| format!("{n}={t}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let slot = if name.starts_with("__udivmod") {
+        format!("global {} {ret}\n", slot_name(name))
+    } else {
+        String::new()
+    };
     let ir = format!(
         "global ina {ret}\n\
          global inb {ret}\n\
          global out {ret}\n\
+         {slot}\
          fn {name}({ret}) ({pstr})\n\
            block entry:\n\
              %__scr = alloca {scr}\n\
@@ -3284,6 +3303,9 @@ fn routine_module(name: &str) -> (String, Vec<(String, u16)>) {
         base += if wide { 2 } else { 1 };
     }
     map.push((format!("{name}::__scr"), base));
+    if name.starts_with("__udivmod") {
+        map.push((slot_name(name).to_string(), 0x50));
+    }
     (ir, map)
 }
 
@@ -3316,33 +3338,12 @@ fn sim_run_bytes(
 /// Every routine emits a real body — the label, recipe instructions, and a
 /// RETURN (not an empty label that would fall through into the next
 /// function). The `pats` are the load-bearing idiom strings at the contract
-/// addresses (e.g. `__mul_u8`'s `INCFSZ` carry step at t_hi = __scr+5).
+/// addresses (e.g. `__udiv_u8`'s `ADDLW` borrow fold on rem_hi).
 #[test]
 fn mul_div_rem_routines_emit_recipe_bodies() {
+    // (`__mul_u8`/`__mul_u16` have no entries here: their bodies are
+    // pinned by the simulation tests below, not by asm text.)
     let cases: &[(&str, &[&str])] = &[
-        (
-            "__mul_u8",
-            &[
-                "BTFSS 0x32, 0",  // bk = __scr+0, multiplier bit test
-                "ADDWF 0x34, F",  // r_lo = __scr+2
-                "INCFSZ 0x37, W", // t_hi = __scr+5: the carry idiom
-                "ADDWF 0x35, F",  // r_hi = __scr+3
-                "RLF 0x36, F",    // t_lo = __scr+4, tmp <<= 1
-                "RRF 0x32, F",    // bk >>= 1
-                "DECFSZ 0x33, F", // cnt = __scr+1, 8 iterations
-            ],
-        ),
-        (
-            "__mul_u16",
-            &[
-                "BTFSS 0x44, 0",  // bk_lo = __scr+0
-                "INCFSZ 0x4E, W", // t3 = __scr+10: 32-bit carry idiom
-                "ADDWF 0x4A, F",  // r3 = __scr+6
-                "RLF 0x4B, F",    // t0 = __scr+7
-                "RRF 0x45, F",    // bk_hi = __scr+1
-                "DECFSZ 0x46, F", // cnt = __scr+2, 16 iterations
-            ],
-        ),
         (
             "__udiv_u8",
             &[
@@ -3366,6 +3367,17 @@ fn mul_div_rem_routines_emit_recipe_bodies() {
             ],
         ),
         (
+            "__udivmod_u8",
+            &[
+                "RLF 0x30, F", // same restoring loop as the plain divide
+                "SUBWF 0x32, F",
+                "BSF 0x30, 0",
+                "DECFSZ 0x34, F",
+                "MOVWF 0x50", // remainder spill to the fusion slot
+                "MOVWF 0x71", // quotient to retval, as usual
+            ],
+        ),
+        (
             "__udiv_u16",
             &[
                 "RLF 0x40, F",    // num_lo <<= 1
@@ -3385,6 +3397,18 @@ fn mul_div_rem_routines_emit_recipe_bodies() {
                 "SUBWF 0x45, F",
                 "BSF 0x40, 0",
                 "DECFSZ 0x46, F",
+            ],
+        ),
+        (
+            "__udivmod_u16",
+            &[
+                "RLF 0x40, F", // same restoring loop as the plain divide
+                "SUBWF 0x44, F",
+                "BSF 0x40, 0",
+                "DECFSZ 0x46, F",
+                "MOVWF 0x50", // remainder spill, low byte
+                "MOVWF 0x51", // remainder spill, high byte
+                "MOVWF 0x71", // quotient to retval, as usual
             ],
         ),
         (
@@ -3467,9 +3491,22 @@ fn mul_div_rem_routines_simulate_correctly() {
         // unsigned mul: 35*7 = 245; 200*200 lo byte = 0x40 (16-bit product 0x9C40).
         ("__mul_u8", &[35], &[7], &[245]),
         ("__mul_u8", &[200], &[200], &[0x40]),
+        // Zero multiplier exits after one pass; 255*255 = 0xFE01 keeps
+        // the low byte; 0x80*2 = 0x100 keeps nothing (mod-256 shift).
+        ("__mul_u8", &[0], &[123], &[0]),
+        ("__mul_u8", &[255], &[255], &[0x01]),
+        ("__mul_u8", &[0x80], &[2], &[0]),
         // 16-bit mul: 300*7 = 2100 = 0x0834; 0x0105*7 = 0x0723.
         ("__mul_u16", &[0x2C, 0x01], &[0x07, 0x00], &[0x34, 0x08]),
         ("__mul_u16", &[0x05, 0x01], &[0x07, 0x00], &[0x23, 0x07]),
+        // Zero exits after one pass; 0xFFFF^2 = 0xFFFE0001 keeps the low
+        // half; 0x8000*2 = 0x10000 keeps nothing (mod-65536 shift).
+        ("__mul_u16", &[0x00, 0x00], &[0x34, 0x12], &[0x00, 0x00]),
+        ("__mul_u16", &[0xFF, 0xFF], &[0xFF, 0xFF], &[0x01, 0x00]),
+        ("__mul_u16", &[0x00, 0x80], &[0x02, 0x00], &[0x00, 0x00]),
+        ("__mul_u16", &[0xFF, 0x00], &[0x01, 0x01], &[0xFF, 0xFF]),
+        // Short operand first takes the swap path: 7*0x0105 = 0x0723.
+        ("__mul_u16", &[0x07, 0x00], &[0x05, 0x01], &[0x23, 0x07]),
         // unsigned divmod: 200/3 = 66 r 2; 301/7 = 43 r 0.
         ("__udiv_u8", &[200], &[3], &[66]),
         ("__urem_u8", &[200], &[3], &[2]),
@@ -3510,6 +3547,77 @@ fn mul_div_rem_routines_simulate_correctly() {
         }
         let got = sim_run_bytes(&ir, &map, &seed, out, want.len());
         assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) must be {want:?}");
+    }
+}
+
+/// Fused divides return both halves: the quotient in `out`, the remainder
+/// in the fusion spill slot. Each case asserts both, so a spill to the
+/// wrong address or width fails here.
+#[test]
+fn udivmod_routines_simulate_quotient_and_remainder() {
+    // (routine, x bytes lo..hi, y bytes lo..hi, quotient bytes, remainder bytes)
+    let cases: &[(&str, &[u8], &[u8], &[u8], &[u8])] = &[
+        // 200/3 = 66 r 2; 7/200 = 0 r 7 (the restore-heavy path).
+        ("__udivmod_u8", &[200], &[3], &[66], &[2]),
+        ("__udivmod_u8", &[7], &[200], &[0], &[7]),
+        // 301/7 = 43 r 0; 7/301 = 0 r 7.
+        (
+            "__udivmod_u16",
+            &[0x2D, 0x01],
+            &[0x07, 0x00],
+            &[0x2B, 0x00],
+            &[0x00, 0x00],
+        ),
+        (
+            "__udivmod_u16",
+            &[0x07, 0x00],
+            &[0x2D, 0x01],
+            &[0x00, 0x00],
+            &[0x07, 0x00],
+        ),
+        // 0x12345678/0x100 = 0x123456 r 0x78; /0x1000 = 0x12345 r 0x678.
+        (
+            "__udivmod_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[0, 1, 0, 0],
+            &[0x56, 0x34, 0x12, 0],
+            &[0x78, 0, 0, 0],
+        ),
+        (
+            "__udivmod_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[0, 0x10, 0, 0],
+            &[0x45, 0x23, 1, 0],
+            &[0x78, 6, 0, 0],
+        ),
+    ];
+    for &(name, x, y, want_q, want_r) in cases {
+        let (ret, _, _) = routine_sig(name);
+        let (ir, map) = match ret {
+            "i32" => routine_module32(name),
+            _ => routine_module(name),
+        };
+        let (ina, inb, out) = match ret {
+            "i16" => (0x20, 0x22, 0x24),
+            "i32" => (0x20, 0x24, 0x28),
+            _ => (0x20, 0x21, 0x22),
+        };
+        let slot = map
+            .iter()
+            .find(|(k, _)| k == slot_name(name))
+            .expect("spill slot in map")
+            .1;
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((ina + i as u16, *b));
+        }
+        for (i, b) in y.iter().enumerate() {
+            seed.push((inb + i as u16, *b));
+        }
+        let got_q = sim_run_bytes(&ir, &map, &seed, out, want_q.len());
+        assert_eq!(&got_q[..], want_q, "{name}({x:?}, {y:?}) quotient");
+        let got_r = sim_run_bytes(&ir, &map, &seed, slot, want_r.len());
+        assert_eq!(&got_r[..], want_r, "{name}({x:?}, {y:?}) remainder");
     }
 }
 
@@ -6973,10 +7081,16 @@ fn routine_module32(name: &str) -> (String, Vec<(String, u16)>) {
         .map(|(n, t)| format!("{n}={t}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let slot = if name.starts_with("__udivmod") {
+        format!("global {} {ret}\n", slot_name(name))
+    } else {
+        String::new()
+    };
     let ir = format!(
         "global ina {ret}\n\
          global inb {ret}\n\
          global out {ret}\n\
+         {slot}\
          fn {name}({ret}) ({pstr})\n\
            block entry:\n\
              %__scr = alloca {scr}\n\
@@ -7002,6 +7116,9 @@ fn routine_module32(name: &str) -> (String, Vec<(String, u16)>) {
         base += 4;
     }
     map.push((format!("{name}::__scr"), base));
+    if name.starts_with("__udivmod") {
+        map.push((slot_name(name).to_string(), 0x38));
+    }
     (ir, map)
 }
 
@@ -7043,6 +7160,18 @@ fn i32_routines_emit_recipe_bodies() {
                 "SUBWF 0x4B, F",
                 "BSF 0x40, 0", // the loop computes quotient + remainder
                 "DECFSZ 0x50, F",
+            ],
+        ),
+        (
+            "__udivmod_u32",
+            &[
+                "RLF 0x40, F", // same restoring loop as the plain divide
+                "SUBWF 0x48, F",
+                "BSF 0x40, 0",
+                "DECFSZ 0x50, F",
+                "MOVWF 0x38", // remainder spill, four bytes at the slot
+                "MOVWF 0x3B",
+                "MOVWF 0x71", // quotient to retval, as usual
             ],
         ),
         (
@@ -7391,6 +7520,30 @@ fn runtime_ptr_select_materializes_arm_then_derefs_indirect() {
     assert!(
         !asm.contains("BANKSEL"),
         "no BANKSEL for an indirect SFR access:\n{asm}"
+    );
+}
+
+#[test]
+fn ptr_select_with_offset_gep_arm_materializes_base_plus_k() {
+    // epic-cc#781: `%g = gep @b +1` and `@a` share no base, so the
+    // select seeds as an indirect slot; the offset arm materializes as
+    // base plus k (0x21+1), the bare arm as its base (0x20).
+    let m = parse("global a i8\nglobal b i8\nglobal c i8\nfn main(void) ()\n  block entry:\n    %l = load i8 @c\n    %g = gep @b +1\n    %s = select i1 %l, ptr %g, ptr @a\n    ret void\n");
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("c", 0x22),
+        ("main::l", 0x25),
+        ("main::s", 0x26),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        asm.contains("MOVLW 0x22"),
+        "offset arm materializes base+k:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x20"),
+        "bare arm materializes its base:\n{asm}"
     );
 }
 
@@ -9567,6 +9720,30 @@ fn staged_const_call_args_deliver_table_bytes_in_sim() {
         &[67, 68, 0],
         "callee must observe the staged table bytes"
     );
+}
+
+#[test]
+#[should_panic(expected = "255-byte single-chunk staging bound")]
+fn panics_on_staged_const_over_255_bytes() {
+    // epic-cc#934: the `__stage_` routine indexes with one MOVLW byte
+    // and always CALLs the chunk-0 reader, so a staged const past 255
+    // bytes would misread. alloc never stages such consts, so the set
+    // is hand-built here; emission must fail loudly, never copy wrong.
+    let mut m = parse(
+        "const big i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i8 0 @out\n\
+             ret void\n",
+    );
+    m.globals[0].size = 256;
+    m.globals[0].bytes = vec![0; 256];
+    m.globals[1].size = 1;
+    m.globals[1].bytes = vec![0];
+    let addrs = addrs(&[("out", 0x20), ("__const_stage", 0x30)]);
+    let staged: HashSet<String> = ["big".to_string()].into_iter().collect();
+    let _ = isel::select_with_locs(&PIC16F877A, &m, &addrs, &staged, &isel::ConstPool::empty());
 }
 
 #[test]

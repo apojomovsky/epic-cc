@@ -37,11 +37,12 @@ TOOLCHAIN_CACHE := --cache-from type=registry,ref=ghcr.io/apojomovsky/epic-cc-to
 # path (/workspace), so a shared target dir lets cargo silently replay a
 # DIFFERENT worktree's cached artifacts here: fingerprints key on the
 # absolute path, which is constant across worktrees. One target dir per
-# worktree (WT_KEY) restores the distinction. check-warnings used to be the
-# only target isolated this way; now every target is.
+# worktree (WT_KEY) restores the distinction. check-warnings shares it:
+# same command, flags and profile as every other build, so there is no
+# separate cache to poison, and cargo replays cached warnings on a fresh
+# build, so the grep still fires when the units are already compiled (#889).
 WT_KEY := $(subst /,-,$(CURDIR))
 TARGET_CACHE := $(CACHE_DIR)/target$(WT_KEY)
-WARNCHECK_TARGET_CACHE := $(CACHE_DIR)/target-warncheck$(WT_KEY)
 FILE        ?= crates/driver/tests/fixtures/add.c
 TARGET      ?= p16f877a
 
@@ -56,15 +57,15 @@ EPIC_CC_GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null)
 # Shared container invocation, so every docker entry point on the dev image
 # (exec, test, compile, shell, check-warnings) carries the same mounts and the
 # EPIC_CC_GIT_SHA stamp. Each bespoke copy was a place to forget one: `shell`
-# lost the sha (#543), and `check-warnings` lost it too. The target-cache mount
-# is the one thing a caller may override, since check-warnings builds into its
-# own dir so a warnings probe cannot poison the normal build cache.
+# lost the sha (#543), and `check-warnings` lost it too. TARGET_CACHE_MOUNT
+# stays overridable for one-off probes, but no recipe overrides it: every
+# entry point shares the worktree target dir.
 TARGET_CACHE_MOUNT ?= $(TARGET_CACHE)
 
-# Recursively expanded (=), not immediate, so a target-specific
-# TARGET_CACHE_MOUNT override is still in effect when a recipe expands
-# DOCKER_RUN. With := the value is baked in at parse time and check-warnings
-# would silently build into the shared target dir instead of its own.
+# Recursively expanded (=), not immediate, so a TARGET_CACHE_MOUNT override
+# passed on the command line is still in effect when a recipe expands
+# DOCKER_RUN. With := the value is baked in at parse time and the override
+# would silently build into the default target dir instead.
 # One lock per target cache dir: two builds from the same CURDIR (the
 # main clone under concurrent agents) share one cache dir, and cargo
 # does not serialize across containers, so the second build used to
@@ -201,7 +202,6 @@ lint: guard-main-clone image ## Clippy, advisory (never fails the build)
 fuzz: guard-main-clone ## Lane B (#286): coverage-guided fuzz of irparse's parser (needs nightly + cargo-fuzz)
 	@$(DOCKER_RUN) bash -c 'cargo install cargo-fuzz --version 0.12.0 2>&1 | tail -1 && cargo fuzz run irparse_parse_ll -- -max_total_time=60'
 
-check-warnings: TARGET_CACHE_MOUNT := $(WARNCHECK_TARGET_CACHE)
 check-warnings: guard-main-clone image ## Fail if cargo build --workspace --all-targets emits any warnings
 	@$(DOCKER_RUN) bash -c '\
 		out=$$(cargo build --workspace --all-targets 2>&1); \
