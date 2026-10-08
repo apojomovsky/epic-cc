@@ -119,13 +119,20 @@ replaced by ->`, so each worktree builds into its own cache. This is
 load-bearing: every docker invocation mounts its worktree at the identical
 in-container path (`/workspace`), and cargo fingerprints compilation units
 partly by absolute path, so a shared target dir lets cargo silently replay a
-different worktree's artifacts. `check-warnings` uses its own
-`target-warncheck-<same key>` dir for the same reason.
+different worktree's artifacts. `make check-warnings` and the pre-commit
+warnings gate build into this same dir: they run the identical command,
+flags and profile as every other build, so there is no separate cache to
+poison, and cargo replays cached warnings on a fresh build, so the gate
+still fires when the units are already compiled (#889). Both serialize
+through the same `.build.lock`; a commit during `make test` queues instead
+of racing it.
 
 Caches are never pruned automatically, and removing a worktree does not
 remove its cache (the caches live outside the repo). To reclaim the space of
 a removed worktree, delete the matching dirs under `~/.cache/epic-cc/`, whose
-names carry the worktree path with slashes replaced by dashes. Correctness
+names carry the worktree path with slashes replaced by dashes. The legacy
+`target-warncheck-*` dirs left over from before #889 are dead and safe to
+delete outright. Correctness
 first, disk second: a cold per-worktree build is the price of never replaying
 a sibling branch's bytes.
 
