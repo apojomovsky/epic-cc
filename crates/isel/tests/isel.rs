@@ -9594,6 +9594,30 @@ fn staged_const_call_args_deliver_table_bytes_in_sim() {
 }
 
 #[test]
+#[should_panic(expected = "255-byte single-chunk staging bound")]
+fn panics_on_staged_const_over_255_bytes() {
+    // epic-cc#934: the `__stage_` routine indexes with one MOVLW byte
+    // and always CALLs the chunk-0 reader, so a staged const past 255
+    // bytes would misread. alloc never stages such consts, so the set
+    // is hand-built here; emission must fail loudly, never copy wrong.
+    let mut m = parse(
+        "const big i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i8 0 @out\n\
+             ret void\n",
+    );
+    m.globals[0].size = 256;
+    m.globals[0].bytes = vec![0; 256];
+    m.globals[1].size = 1;
+    m.globals[1].bytes = vec![0];
+    let addrs = addrs(&[("out", 0x20), ("__const_stage", 0x30)]);
+    let staged: HashSet<String> = ["big".to_string()].into_iter().collect();
+    let _ = isel::select_with_locs(&PIC16F877A, &m, &addrs, &staged, &isel::ConstPool::empty());
+}
+
+#[test]
 fn fanout_load_threads_w_through_both_stores() {
     // `%1 = load @in; store %1 @slot; store %1 @out`: one volatile read
     // into W, then a MOVWF per store (epic-cc#875). `%1` needs no entry:
