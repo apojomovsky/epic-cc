@@ -42,7 +42,7 @@ ram_bytes = 45
 [[entry]]
 name = "bench-switch-18f4550"
 device = "18F4550"
-flash_words = 66
+flash_words = 58
 ram_bytes = 5
 
 [[entry]]
@@ -102,7 +102,7 @@ ram_bytes = 21
 [[entry]]
 name = "bench-struct-scan-18f4550"
 device = "18F4550"
-flash_words = 109
+flash_words = 92
 ram_bytes = 95
 
 [[entry]]
@@ -120,7 +120,7 @@ ram_bytes = 23
 [[entry]]
 name = "bench-branch-computed-18f4550"
 device = "18F4550"
-flash_words = 38
+flash_words = 35
 ram_bytes = 5
 
 [[entry]]
@@ -201,7 +201,7 @@ ram_bytes = 2
 name = "bench-struct-scan-18f4550"
 device = "18F4550"
 profile = "O2"
-flash_words = 131
+flash_words = 105
 ram_bytes = 95
 
 [[entry]]
