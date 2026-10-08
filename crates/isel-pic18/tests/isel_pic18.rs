@@ -7174,6 +7174,55 @@ fn a_loop_recipe_callee_exit_bank_carries_across_the_call() {
     );
 }
 
+#[test]
+fn an_access_bank_recipe_callee_keeps_the_post_call_movlb() {
+    // A recipe whose frame sits wholly in the access bank never
+    // selects, so its recorded exit is unknown and main still
+    // re-selects after the call. The conservatism pin for the two
+    // carry tests above: only a known exit carries.
+    let m = parse(
+        "global a i16\nglobal g i8\n\
+         fn __mul_u16(i16) (a=i16, b=i16)\n\
+           block entry:\n\
+             %__scr = alloca 14\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = call i16 @__mul_u16(i16 %1, i16 %1)\n\
+             store i8 7 @g\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("g", 0x090), // bank 0: main must re-select it after the call
+        ("main::1", 0x30),
+        ("main::2", 0x32),
+        ("__mul_u16::a", 0x40),
+        ("__mul_u16::b", 0x42),
+        ("__mul_u16::__scr", 0x50),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        block_section(&asm, "main").matches("MOVLB").count(),
+        1,
+        "the unknown recipe exit re-selects bank 0 exactly once:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x20] = 3;
+    p.ram_mut()[0x21] = 0; // a = 3
+    p.run(500);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x32], 9, "3 * 3 lands in the call result slot");
+    assert_eq!(p.ram()[0x33], 0);
+    assert_eq!(
+        p.ram()[0x090],
+        7,
+        "post-call store landed after re-selecting"
+    );
+}
+
 /// Every predicate the fused compare handles, simulating the emitted asm
 /// with the branch targets as the compare's exits. The IR shape is the one
 /// `fusable_icmp` recognizes: a multi-byte `icmp` immediately followed by
