@@ -38,3 +38,10 @@ Vendored layout keeps the pre-reorg epic-cc names (`epic-*`,
 `pic18fxx5x-hal`); upstream renamed them in epic-hal#316
 (`lib/*`, `common/*`, `hal/pic18/18fxx5x/*`, `demos/*`). The drift
 script maps each file to its upstream path.
+
+Deliberate deltas from the pin (each with an upstream port issue, else
+the weekly drift gate stays red until re-vendor absorbs them):
+
+- `epic-bus/src/epic_bus.c`: the I2C/SPI default tables are `static
+  const` here (epic-cc#900, port: epic-hal#368); upstream still
+  populates mutable tables at init. Re-vendor drops this note.
