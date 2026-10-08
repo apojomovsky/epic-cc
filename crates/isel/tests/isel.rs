@@ -3319,30 +3319,9 @@ fn sim_run_bytes(
 /// addresses (e.g. `__mul_u8`'s `INCFSZ` carry step at t_hi = __scr+5).
 #[test]
 fn mul_div_rem_routines_emit_recipe_bodies() {
+    // (`__mul_u8`/`__mul_u16` have no entries here: their bodies are
+    // pinned by the simulation tests below, not by asm text.)
     let cases: &[(&str, &[&str])] = &[
-        (
-            "__mul_u8",
-            &[
-                "BTFSS 0x32, 0",  // bk = __scr+0, multiplier bit test
-                "ADDWF 0x34, F",  // r_lo = __scr+2
-                "INCFSZ 0x37, W", // t_hi = __scr+5: the carry idiom
-                "ADDWF 0x35, F",  // r_hi = __scr+3
-                "RLF 0x36, F",    // t_lo = __scr+4, tmp <<= 1
-                "RRF 0x32, F",    // bk >>= 1
-                "DECFSZ 0x33, F", // cnt = __scr+1, 8 iterations
-            ],
-        ),
-        (
-            "__mul_u16",
-            &[
-                "BTFSS 0x44, 0",  // bk_lo = __scr+0
-                "INCFSZ 0x4E, W", // t3 = __scr+10: 32-bit carry idiom
-                "ADDWF 0x4A, F",  // r3 = __scr+6
-                "RLF 0x4B, F",    // t0 = __scr+7
-                "RRF 0x45, F",    // bk_hi = __scr+1
-                "DECFSZ 0x46, F", // cnt = __scr+2, 16 iterations
-            ],
-        ),
         (
             "__udiv_u8",
             &[
@@ -3467,9 +3446,22 @@ fn mul_div_rem_routines_simulate_correctly() {
         // unsigned mul: 35*7 = 245; 200*200 lo byte = 0x40 (16-bit product 0x9C40).
         ("__mul_u8", &[35], &[7], &[245]),
         ("__mul_u8", &[200], &[200], &[0x40]),
+        // Zero multiplier exits after one pass; 255*255 = 0xFE01 keeps
+        // the low byte; 0x80*2 = 0x100 keeps nothing (mod-256 shift).
+        ("__mul_u8", &[0], &[123], &[0]),
+        ("__mul_u8", &[255], &[255], &[0x01]),
+        ("__mul_u8", &[0x80], &[2], &[0]),
         // 16-bit mul: 300*7 = 2100 = 0x0834; 0x0105*7 = 0x0723.
         ("__mul_u16", &[0x2C, 0x01], &[0x07, 0x00], &[0x34, 0x08]),
         ("__mul_u16", &[0x05, 0x01], &[0x07, 0x00], &[0x23, 0x07]),
+        // Zero exits after one pass; 0xFFFF^2 = 0xFFFE0001 keeps the low
+        // half; 0x8000*2 = 0x10000 keeps nothing (mod-65536 shift).
+        ("__mul_u16", &[0x00, 0x00], &[0x34, 0x12], &[0x00, 0x00]),
+        ("__mul_u16", &[0xFF, 0xFF], &[0xFF, 0xFF], &[0x01, 0x00]),
+        ("__mul_u16", &[0x00, 0x80], &[0x02, 0x00], &[0x00, 0x00]),
+        ("__mul_u16", &[0xFF, 0x00], &[0x01, 0x01], &[0xFF, 0xFF]),
+        // Short operand first takes the swap path: 7*0x0105 = 0x0723.
+        ("__mul_u16", &[0x07, 0x00], &[0x05, 0x01], &[0x23, 0x07]),
         // unsigned divmod: 200/3 = 66 r 2; 301/7 = 43 r 0.
         ("__udiv_u8", &[200], &[3], &[66]),
         ("__urem_u8", &[200], &[3], &[2]),
