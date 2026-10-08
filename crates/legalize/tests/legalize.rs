@@ -2603,10 +2603,11 @@ fn fuses_matching_divmod_pair() {
     );
 }
 
-/// The bench shape: reloaded globals (different SSA, same addresses) with
-/// a volatile store between the operations still fuses.
+/// Reloaded volatile globals never fuse: two reads of one volatile global
+/// may return different values (MMIO, or an ISR-shared flag changed
+/// between them), so the second pair is not provably the first.
 #[test]
-fn fuses_reloaded_globals_across_unrelated_store() {
+fn no_fuse_on_volatile_reloads() {
     let m = parse(
         "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
          fn main(void) ()\n\
@@ -2623,9 +2624,59 @@ fn fuses_reloaded_globals_across_unrelated_store() {
     );
     let text = ir::serialize(&legalize(m));
     assert!(
+        text.contains("@__udiv_u16(") && text.contains("@__urem_u16("),
+        "volatile pair kept two calls:\n{text}"
+    );
+    assert!(!text.contains("__udivmod"), "volatile pair fused:\n{text}");
+}
+
+/// Reloaded non-volatile globals fuse across an unrelated store: plain
+/// memory changes only through visible stores and calls.
+#[test]
+fn fuses_nonvolatile_reloads_across_unrelated_store() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %4 = load i16 @a\n\
+             %5 = load i16 @b\n\
+             %6 = urem i16 %4 %5\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
         text.contains("@__udivmod_u16(i16 %1, i16 %2)")
             && text.contains("%6 = load volatile i16 @__udivmod_rem_u16"),
         "reloaded pair fused:\n{text}"
+    );
+}
+
+/// One volatile load pair shared by both operations fuses: a single read
+/// has one value, however it was obtained.
+#[test]
+fn fuses_volatile_shared_operands() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load volatile i16 @a\n\
+             %2 = load volatile i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store volatile i16 %3 @q\n\
+             %6 = urem i16 %1 %2\n\
+             store volatile i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(i16 %1, i16 %2)")
+            && text.contains("%6 = load volatile i16 @__udivmod_rem_u16"),
+        "shared-operand pair fused:\n{text}"
     );
 }
 

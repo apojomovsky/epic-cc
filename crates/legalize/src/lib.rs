@@ -1527,11 +1527,10 @@ fn divmod_rem_width(func: &str) -> Option<(Ty, &'static str)> {
 /// Fuse a same-block `udiv`/`urem` pair on identical operands into one
 /// combined divide call (epic-cc#895). Every unsigned divide routine
 /// already computes both halves and discards one, so the fused shape runs
-/// the loop once: quotient to the retval slots, remainder spilled to
-/// `@__udivmod_rem_uW` for the old remainder site to load. Fuses only with
-/// provable operand identity and no call, unknown-pointer write, or
-/// operand-global store in between. Reverse order and cross-block pairs
-/// do not fuse.
+/// the loop once: quotient to retval, remainder spilled to the slot the
+/// old remainder site loads. Identity is one shared SSA value or two
+/// non-volatile loads of one global (volatile reads may differ); no call,
+/// opaque write, or operand-global store may sit between the pair.
 fn fuse_divmod_pairs(funcs: &mut [Func], globals: &mut Vec<Global>, used: &mut Vec<String>) {
     // A remainder slot shadowed by any user global never fuses: reusing it
     // would alias the user's variable even at the same type.
@@ -1539,18 +1538,28 @@ fn fuse_divmod_pairs(funcs: &mut [Func], globals: &mut Vec<Global>, used: &mut V
     let mut fused: Vec<Ty> = Vec::new();
     for f in funcs.iter_mut() {
         for b in f.blocks.iter_mut() {
+            // Same-block loads resolving an operand to its global: reg ->
+            // (def index, global). Volatile loads never resolve: two reads
+            // of one volatile global may return different values (MMIO, or
+            // an ISR-shared flag changed between them), so only identical
+            // SSA values fuse there. Non-volatile memory changes only
+            // through visible stores and calls, which the clobber scan
+            // below excludes.
             let mut loads: HashMap<String, (usize, String)> = HashMap::new();
             for (idx, inst) in b.insts.iter().enumerate() {
                 if let Inst::Load(l) = inst {
-                    if let Some(g) = l.ptr.strip_prefix('@') {
-                        loads.entry(l.dst.clone()).or_insert((idx, g.to_string()));
+                    if !l.volatile {
+                        if let Some(g) = l.ptr.strip_prefix('@') {
+                            loads.entry(l.dst.clone()).or_insert((idx, g.to_string()));
+                        }
                     }
                 }
             }
-            // Operand identity: the same SSA value, or two loads of the same
-            // global. Returns the key plus the load def index when the value
-            // comes from a same-block global load dominating the use: the
-            // index feeds the clobber range only, never equality, since two
+            // Operand identity: the same SSA value, constant, address, or
+            // two non-volatile loads of the same global. Returns the key
+            // plus the load def index when the value comes from a
+            // same-block non-volatile load dominating the use: the index
+            // feeds the clobber range only, never equality, since two
             // loads of one global define different registers.
             let key = |v: &Val, before: usize| -> (String, Option<usize>) {
                 match v {
