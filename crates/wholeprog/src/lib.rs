@@ -2,7 +2,7 @@
 //! lets through on the merged module. Expects N translation units already
 //! merged into one `.ll` by `llvm-link` (docs/31 §7); this stage does not link.
 
-use ir::{collect_global_vals, GepBase, Inst, Module, SrcLoc};
+use ir::{collect_global_vals, GepBase, Inst, Module, SrcLoc, Val};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Validates the merged module and hands it on.
@@ -115,6 +115,9 @@ fn check_globals_resolved(m: &Module) {
                 let mut vals = HashSet::new();
                 collect_global_vals(inst, &mut vals);
                 used.extend(vals.into_iter());
+                // `collect_global_vals` skips these shapes (it is shared
+                // with legalize, whose view must not change); the Val and
+                // pointer-string operands are read here instead.
                 match inst {
                     Inst::Load(l) => {
                         if let Some(n) = l.ptr.strip_prefix('@') {
@@ -129,6 +132,28 @@ fn check_globals_resolved(m: &Module) {
                     Inst::Gep(g) => {
                         if let GepBase::Global(n) = &g.base {
                             used.insert(n.clone());
+                        }
+                    }
+                    Inst::BrCond(b) => {
+                        if let Val::Global(n) = &b.cond {
+                            used.insert(n.clone());
+                        }
+                    }
+                    Inst::Switch(s) => {
+                        if let Val::Global(n) = &s.val {
+                            used.insert(n.clone());
+                        }
+                    }
+                    Inst::Asm(a) => {
+                        for o in &a.operands {
+                            if let Some(n) = o.ptr.strip_prefix('@') {
+                                used.insert(n.to_string());
+                            }
+                        }
+                    }
+                    Inst::VaArg(v) => {
+                        if let Some(n) = v.ptr.strip_prefix('@') {
+                            used.insert(n.to_string());
                         }
                     }
                     _ => {}

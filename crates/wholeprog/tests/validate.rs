@@ -168,3 +168,21 @@ fn main(void) ()
     ));
     assert_eq!(out.funcs.len(), 2);
 }
+
+/// Branch and switch discriminants read globals too; an undefined one
+/// there reports the same way.
+#[test]
+#[should_panic(expected = "undefined symbols: flag, sel")]
+fn rejects_branch_and_switch_on_undefined_globals() {
+    merge(parse(
+        "\
+fn main(void) ()
+  block 0:
+    br i1 @flag, %1, %2
+  block 1:
+    switch i16 @sel, default %2, cases 0 %2
+  block 2:
+    ret void
+",
+    ));
+}
