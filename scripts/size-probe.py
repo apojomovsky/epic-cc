@@ -22,11 +22,11 @@ triage counting notes that motivated them:
 Fixtures are verbatim excerpts of the 826e77c demo listings the
 triage measured, cut to windows around the sites. Counts verified
 equal between each fixture and its full listing. Two rules print
-numbers the ticket body does not carry: w-sfr-pairs finds 43 (the
-issue body's own figure; the ticket quotes the triage recount, 45)
-and inc-carry finds 19 (likewise the issue body's figure; triage
-priced a subset of 7). The probes encode the reproducible rule;
-the ticket conflict is tracked on #827, not papered over here.
+numbers below the ticket's first figures, ratified on #827 as
+triage miscounts: w-sfr-pairs finds 43 (the #674 issue body's own
+figure, against the recount's 45) and inc-carry finds 19 (the #767
+body's own exact-form figure, against the priced subset of 7).
+The probes encode the reproducible rule and its evidence.
 
 Usage: python3 scripts/size-probe.py <probe> <listing> [--json]
 Probes only; density fixes live in the backend, never here.

@@ -2,12 +2,13 @@
 
 epic-cc#827. Each fixture is a verbatim window excerpt of the 826e77c
 demo listing its triage comment measured, cut around the sites; the
-extraction check asserts probe counts equal the full listing's. Two
-rules print numbers the ticket body does not carry, and the tests pin
-the reproducible ones: w-sfr-pairs finds 43 (the #674 issue body's
-own figure; the ticket quotes the triage recount, 45) and inc-carry
-finds 19 (likewise #767's body figure; triage priced a subset of 7).
-The conflict is tracked on #827, not adjusted to fit here.
+counts were verified equal to the full listings at extraction time
+(the listings themselves are not checked in). Two rules print
+numbers below the ticket's first figures, ratified on #827 as
+triage miscounts: w-sfr-pairs finds 43 (the #674 issue body's own
+figure, against the recount's 45) and inc-carry finds 19 (the #767
+body's own exact-form figure, against the priced subset of 7).
+The tests pin the reproducible counts and their evidence.
 """
 
 import importlib.util
