@@ -1427,6 +1427,44 @@ fn inline_u8_multiuse_load_keeps_its_slot() {
     );
 }
 
+/// Loads in the opposite order of the call args fold neither: the
+/// sequence reads args in order, so folding the pair would swap two
+/// observable reads. Both stage, and the inline reads the slots.
+#[test]
+fn inline_u8_inverted_load_order_folds_neither() {
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal r i8\n\
+         fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @b\n    %2 = load i8 @a\n\
+           %3 = call i8 @__mul_u8(i8 %2, i8 %1)\n    store i8 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("r", 0x22),
+        ("__mul_u8::a", 0x30),
+        ("__mul_u8::b", 0x31),
+        ("__mul_u8::__scr", 0x32),
+        ("main::1", 0x40),
+        ("main::2", 0x41),
+        ("main::3", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("CALL __mul_u8"),
+        "no call on the inline path:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0x020") && asm.contains("MOVFF 0x021"),
+        "both loads stage in IR order:\n{asm}"
+    );
+    assert_eq!(asm.matches("MULWF").count(), 1, "one partial:\n{asm}");
+    assert!(
+        asm.contains("MOVFF 0xFF3, 0x022"),
+        "PRODL lands straight in r:\n{asm}"
+    );
+}
+
 #[test]
 fn udiv_u16_recipe_emits_restoring_loop() {
     let m = parse(

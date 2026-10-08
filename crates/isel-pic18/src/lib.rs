@@ -1561,9 +1561,10 @@ impl<'m> Gen<'m> {
                 }
                 // Load candidates, one per register arg: a same-block
                 // single-use load of matching width off an access-bank
-                // RAM global, never a resolved pointer value.
-                let mut cands: Vec<(String, u16, usize)> = Vec::new();
-                for arg in &c.args {
+                // RAM global, never a resolved pointer value. Each
+                // carries its arg index for the order check below.
+                let mut cands: Vec<(usize, String, u16, usize)> = Vec::new();
+                for (ai, arg) in c.args.iter().enumerate() {
                     let Val::Reg(r) = &arg.val else { continue };
                     if uses.get(r).copied().unwrap_or(0) != 1 {
                         continue;
@@ -1593,16 +1594,15 @@ impl<'m> Gen<'m> {
                     let Some(addr) = ram_global(&l.ptr) else {
                         continue;
                     };
-                    cands.push((r.clone(), addr, pi));
+                    cands.push((ai, r.clone(), addr, pi));
                 }
                 // Sibling loads fold together: a candidate survives when
                 // its gap to the call holds only pure ops and sibling
-                // loads, so every folded read keeps IR order at the
-                // sequence. Fixpoint: dropping one can strand another.
+                // loads. Fixpoint: dropping one can strand another.
                 let mut kept = vec![true; cands.len()];
                 loop {
                     let mut changed = false;
-                    for (i, (_, _, lp)) in cands.iter().enumerate() {
+                    for (i, (_, _, _, lp)) in cands.iter().enumerate() {
                         if !kept[i] {
                             continue;
                         }
@@ -1615,7 +1615,7 @@ impl<'m> Gen<'m> {
                                 if cands
                                     .iter()
                                     .enumerate()
-                                    .any(|(j, c)| kept[j] && c.0 == l2.dst)
+                                    .any(|(j, c)| kept[j] && c.1 == l2.dst)
                                 {
                                     continue;
                                 }
@@ -1632,8 +1632,23 @@ impl<'m> Gen<'m> {
                         break;
                     }
                 }
+                // Emission reads args in order, so kept loads must sit
+                // in arg order too; an inverted pair folds neither,
+                // leaving both reads at their IR positions.
+                {
+                    let mut order: Vec<(usize, usize)> = cands
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| kept[*i])
+                        .map(|(_, c)| (c.3, c.0))
+                        .collect();
+                    order.sort();
+                    if order.windows(2).any(|w| w[0].1 >= w[1].1) {
+                        kept.fill(false);
+                    }
+                }
                 let mut trial: HashMap<String, u16> = HashMap::new();
-                for (i, (r, addr, _)) in cands.iter().enumerate() {
+                for (i, (_, r, addr, _)) in cands.iter().enumerate() {
                     if kept[i] {
                         trial.insert(r.clone(), *addr);
                     }
