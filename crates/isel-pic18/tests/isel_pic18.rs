@@ -7061,11 +7061,12 @@ fn a_forward_defined_callee_with_provable_exit_still_carries() {
 }
 
 #[test]
-fn a_recipe_callee_keeps_the_post_call_movlb() {
-    // __mul_u16 has no Gen run: its body streams from the recipe in the
-    // concat loop and its exit never enters the map, so main must
-    // re-select after the call. The stub's alloca-only entry block must
-    // not leak into the output as an empty label either.
+fn a_recipe_callee_exit_bank_carries_across_the_call() {
+    // __mul_u16 streams from its fixed recipe body, but the pre-pass
+    // records its exit bank (bank 2 here), so main's post-call store
+    // to the same bank re-selects nothing: main's section holds no
+    // MOVLB at all (the argument fill copies via MOVFF). The stub's
+    // alloca-only entry block must not leak into the output either.
     let m = parse(
         "global a i16\nglobal g i8\n\
          fn __mul_u16(i16) (a=i16, b=i16)\n\
@@ -7080,18 +7081,18 @@ fn a_recipe_callee_keeps_the_post_call_movlb() {
     );
     let addrs = addrs(&[
         ("a", 0x20),
-        ("g", 0x090),
+        ("g", 0x290), // bank 2: the post-call store under test
         ("main::1", 0x30),
         ("main::2", 0x32),
-        ("__mul_u16::a", 0x40),
-        ("__mul_u16::b", 0x42),
-        ("__mul_u16::__scr", 0x50),
+        ("__mul_u16::a", 0x240),     // bank 2
+        ("__mul_u16::b", 0x242),     // bank 2
+        ("__mul_u16::__scr", 0x250), // bank 2: the recipe exits here
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(asm.contains("    CALL __mul_u16"), "recipe call:\n{asm}");
     assert!(
-        block_section(&asm, "main").contains("MOVLB 0x0"),
-        "main must re-select after the recipe call:\n{asm}"
+        !block_section(&asm, "main").contains("MOVLB"),
+        "main must carry the recipe's bank-2 exit, not re-select:\n{asm}"
     );
     let lines: Vec<&str> = asm.lines().collect();
     let i = lines
@@ -7102,6 +7103,74 @@ fn a_recipe_callee_keeps_the_post_call_movlb() {
     assert!(
         !next.trim().is_empty() && !next.trim_end().ends_with(':'),
         "stub entry block leaked as an empty label:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x20] = 3;
+    p.ram_mut()[0x21] = 0; // a = 3
+    p.run(500);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x32], 9, "3 * 3 lands in the call result slot");
+    assert_eq!(p.ram()[0x33], 0);
+    assert_eq!(
+        p.ram()[0x290],
+        7,
+        "post-call store landed without re-selecting"
+    );
+}
+
+#[test]
+fn a_loop_recipe_callee_exit_bank_carries_across_the_call() {
+    // __udiv_u16's restoring-division loop branches through internal
+    // labels, but every path converges on its frame bank (bank 1
+    // here), so the recorded exit is unanimous and main's post-call
+    // store carries it with no MOVLB.
+    let m = parse(
+        "global n i16\nglobal d i16\nglobal g i8\n\
+         fn __udiv_u16(i16) (num=i16, den=i16)\n\
+           block entry:\n\
+             %__scr = alloca 7\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @n\n\
+             %2 = load i16 @d\n\
+             %3 = call i16 @__udiv_u16(i16 %1, i16 %2)\n\
+             store i8 7 @g\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("n", 0x20),
+        ("d", 0x22),
+        ("g", 0x190), // bank 1: the post-call store under test
+        ("main::1", 0x30),
+        ("main::2", 0x32),
+        ("main::3", 0x34),
+        ("__udiv_u16::num", 0x140),   // bank 1
+        ("__udiv_u16::den", 0x142),   // bank 1
+        ("__udiv_u16::__scr", 0x144), // bank 1: the recipe exits here
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("    CALL __udiv_u16"), "recipe call:\n{asm}");
+    assert!(
+        !block_section(&asm, "main").contains("MOVLB"),
+        "main must carry the recipe's bank-1 exit, not re-select:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x20] = 13;
+    p.ram_mut()[0x21] = 0; // n = 13
+    p.ram_mut()[0x22] = 4;
+    p.ram_mut()[0x23] = 0; // d = 4
+    p.run(2000);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x34], 3, "13 / 4 lands in the call result slot");
+    assert_eq!(p.ram()[0x35], 0);
+    assert_eq!(
+        p.ram()[0x190],
+        7,
+        "post-call store landed without re-selecting"
     );
 }
 

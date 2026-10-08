@@ -69,10 +69,9 @@ fallback.
 
 ## Consequences
 
-- Calls to runtime recipes keep the post-call `MOVLB`: recipes have no
-  `Gen` run and no map entry. The residual provable-exit sites in the
-  post-change listing are exactly the `__mul_u32`/`__mul_u16` callers.
-  Giving recipes recorded exit banks is deferred, not decided here.
+- Calls to runtime recipes kept the post-call `MOVLB` until epic-cc#609:
+  recipes now pre-seed the map from a throwaway `Gen` run over their
+  fixed bodies, so recipe callers carry the exit like any other callee.
 - A banked select inside the terminator lowering (per-edge phi copies,
   banked retval routing) sets `bsr_dirty`, which poisons the block's
   end state and leaves the callee's exit unknown. Expected and
