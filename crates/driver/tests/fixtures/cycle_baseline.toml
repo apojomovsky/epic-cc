@@ -149,8 +149,8 @@ ram_bytes = 28
 name = "speed-divmod-u16-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 752
-flash_words = 116
+cycles = 634
+flash_words = 360
 ram_bytes = 28
 
 [[entry]]
@@ -179,8 +179,8 @@ ram_bytes = 51
 name = "speed-divmod-u32-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 2676
-flash_words = 224
+cycles = 1260
+flash_words = 576
 ram_bytes = 51
 
 [[entry]]
@@ -419,8 +419,8 @@ ram_bytes = 33
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 2643
-flash_words = 136
+cycles = 2130
+flash_words = 258
 ram_bytes = 33
 
 [[entry]]
