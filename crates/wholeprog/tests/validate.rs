@@ -117,3 +117,72 @@ fn main(void) ()
     ));
     assert_eq!(out.funcs.len(), 1);
 }
+
+/// A load from a global no TU defined is an undefined symbol naming it
+/// (epic-cc#909): irparse skips the bare `external` declaration, so the
+/// use reaches this check instead of crashing the decoder.
+#[test]
+#[should_panic(expected = "undefined symbols: irq_table")]
+fn rejects_a_load_from_an_undefined_global() {
+    merge(parse(
+        "\
+fn main(void) ()
+  block 0:
+    %1 = load i8 @irq_table
+    ret void
+",
+    ));
+}
+
+/// Store and GEP uses report the same way, sorted like call targets.
+#[test]
+#[should_panic(expected = "undefined symbols: alpha, zeta")]
+fn rejects_store_and_gep_to_undefined_globals() {
+    merge(parse(
+        "\
+fn main(void) ()
+  block 0:
+    store i8 3 @zeta
+    %p = gep @alpha +0
+    ret void
+",
+    ));
+}
+
+/// A use of a defined global, and of a function label as data
+/// (`ptr @handler`), clears the check.
+#[test]
+fn accepts_defined_globals_and_function_labels() {
+    let out = merge(parse(
+        "\
+global table i8
+fn handler(i8) (0=i8)
+  block 0:
+    ret i8 %0
+fn main(void) ()
+  block 0:
+    %1 = load i8 @table
+    store i8 @handler @table
+    ret void
+",
+    ));
+    assert_eq!(out.funcs.len(), 2);
+}
+
+/// Branch and switch discriminants read globals too; an undefined one
+/// there reports the same way.
+#[test]
+#[should_panic(expected = "undefined symbols: flag, sel")]
+fn rejects_branch_and_switch_on_undefined_globals() {
+    merge(parse(
+        "\
+fn main(void) ()
+  block 0:
+    br i1 @flag, %1, %2
+  block 1:
+    switch i16 @sel, default %2, cases 0 %2
+  block 2:
+    ret void
+",
+    ));
+}
