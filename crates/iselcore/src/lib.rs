@@ -485,14 +485,14 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
             // same base with matching term sets. The cond reg becomes a
             // scale-1 term, so `select c, base+kA, base+kB` (kA < kB) is
             // `base + kA + (kB-kA)×c`: c = 0 picks kA, c = 1 adds the
-            // difference. A select whose arms are runtime address
-            // VALUES that do not fold (distinct globals, a global vs a
-            // runtime slot, two runtime slots) is itself a runtime address
-            // VALUE: seed the dst as an indirect slot, whose bytes isel
-            // materializes as a 2-byte value select. Only an arm that is
-            // neither foldable nor a materializable runtime value (a
-            // folded GEP reg, whose address is a link-time constant with no
-            // slot bytes) stays pending and panics below.
+            // difference. A select whose arms are runtime address VALUES
+            // that do not fold (distinct globals, a global vs a runtime
+            // slot, two runtime slots, a nonzero-offset GEP arm) is itself
+            // a runtime address VALUE: seed the dst as an indirect slot,
+            // whose bytes isel materializes as a 2-byte value select. Only
+            // an arm that is neither foldable nor a materializable runtime
+            // value (a dynamic GEP reg or an offset over a runtime slot)
+            // stays pending and panics below.
             let mut rest_selects = Vec::new();
             for (key, s) in pending_selects {
                 // A select whose arms are both runtime address CONSTANTS was
@@ -615,17 +615,16 @@ fn fold_select(
 /// Whether a pointer-select arm is a runtime address VALUE whose two bytes
 /// isel can materialize into the dst slot: a `Const` literal, a `Global`
 /// (its address is a link-time literal), or a reg resolving to a
-/// runtime-address slot (`Base::Slot(_, true)`, whose bytes ARE the
-/// address) or a plain global base (a link-time literal). A reg with a
-/// constant offset or dynamic terms is a computed address with no single
-/// materializable value and is not a runtime value.
+/// runtime-address slot (`Base::Slot(_, true)` with no offset, whose bytes
+/// ARE the address) or a global base (a link-time literal plus the constant
+/// offset, epic-cc#781). A reg with dynamic terms, or an offset over a
+/// slot, is a computed address with no single materializable value.
 fn select_arm_is_runtime_value(v: &ir::Val, resolved: &PtrResolution, fname: &str) -> bool {
     match v {
         ir::Val::Const(_) | ir::Val::Global(_) => true,
         ir::Val::Reg(r) => match resolved.get(&ssa_key(fname, r)) {
-            Some((Base::Slot(_, true), 0, t)) | Some((Base::Global(_), 0, t)) if t.is_empty() => {
-                true
-            }
+            Some((Base::Slot(_, true), 0, t)) if t.is_empty() => true,
+            Some((Base::Global(_), _, t)) if t.is_empty() => true,
             _ => false,
         },
     }

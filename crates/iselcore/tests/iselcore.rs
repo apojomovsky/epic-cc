@@ -179,6 +179,29 @@ fn seeds_a_pointer_select_with_a_global_and_a_runtime_slot() {
 }
 
 #[test]
+fn seeds_a_pointer_select_with_a_nonzero_offset_gep_arm() {
+    // epic-cc#781: one arm is a one-hop GEP over a global (`@str+1`),
+    // the other a bare global. The arms share no base so they cannot
+    // fold, but the offset arm is still a link-time literal (base plus
+    // k), so the dst seeds as an indirect slot like the zero-offset
+    // cross-base shape.
+    let m = parse(
+        "global buf i8\n\
+         global str i8\n\
+         fn main() ()\n\
+           block entry:\n\
+             %g = gep @str +1\n\
+             %s = select i1 %c, ptr %g, ptr @buf\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("main::s").expect("pointer select must resolve");
+    assert!(matches!(base, Base::Slot(n, true) if n == "s"));
+    assert_eq!(*k, 0);
+    assert!(terms.is_empty());
+}
+
+#[test]
 fn seeds_a_ptr_phi_over_a_ptr_param_and_self_gep() {
     // The sd-card crc walk: `%7 = phi ptr [...]` whose incomings are a
     // ptr param and a GEP over the phi's own dst (the loop increment).

@@ -1,10 +1,8 @@
-//! Issue #147: a pointer select between two distinct global addresses (the
-//! `ok_flag ? "PASS\n" : "FAIL\n"` shape) must compile and read the
-//! selected global's first byte on both cores.
-//!
-//! Hand-computed expectations (sim sets `ok_flag` before run):
-//!   - ok_flag = 1: out = 'P' (0x50)
-//!   - ok_flag = 0: out = 'F' (0x46)
+//! Pointer selects across distinct global addresses must compile and read
+//! the selected arm's byte on both cores: two globals (epic-cc#147), one
+//! const arm against RAM (epic-cc#147), and a nonzero-offset GEP arm
+//! (epic-cc#781). Each fixture carries its own expectations; the harness
+//! below compiles with `-D OK_FLAG=n` and checks `out` in the sim.
 use std::process::Command;
 
 /// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
@@ -110,6 +108,18 @@ fn run_select_globals_one_const(device_name: &str, device: &'static device::Devi
     );
 }
 
+fn run_select_gep_offset(device_name: &str, device: &'static device::Device) {
+    // epic-cc#781: one arm is a nonzero-offset GEP over a const, the
+    // other a RAM global. The arms share no base, so the select seeds
+    // as an indirect slot and each backend materializes base plus k.
+    run_fixture(
+        device_name,
+        device,
+        "tests/fixtures/select_gep_offset.c",
+        &[(1, b'b'), (0, b'R')],
+    );
+}
+
 #[test]
 fn select_globals_runs_on_p16() {
     run_select_globals("p16f877a", &device::PIC16F877A);
@@ -128,4 +138,14 @@ fn select_globals_one_const_arm_runs_on_p16() {
 #[test]
 fn select_globals_one_const_arm_runs_on_p18() {
     run_select_globals_one_const("p18f4550", &device::PIC18F4550);
+}
+
+#[test]
+fn select_gep_offset_runs_on_p16() {
+    run_select_gep_offset("p16f877a", &device::PIC16F877A);
+}
+
+#[test]
+fn select_gep_offset_runs_on_p18() {
+    run_select_gep_offset("p18f4550", &device::PIC18F4550);
 }
