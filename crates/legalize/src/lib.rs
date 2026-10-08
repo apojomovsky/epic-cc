@@ -1533,9 +1533,9 @@ fn divmod_rem_width(func: &str) -> Option<(Ty, &'static str)> {
 /// operand-global store in between. Reverse order and cross-block pairs
 /// do not fuse.
 fn fuse_divmod_pairs(funcs: &mut [Func], globals: &mut Vec<Global>, used: &mut Vec<String>) {
-    // A remainder slot shadowed by a user global of another type never
-    // fuses: the spill would alias it.
-    let blocked = |slot: &str, w: Ty| globals.iter().any(|g| g.name == slot && g.ty != w);
+    // A remainder slot shadowed by any user global never fuses: reusing it
+    // would alias the user's variable even at the same type.
+    let blocked = |slot: &str| globals.iter().any(|g| g.name == slot);
     let mut fused: Vec<Ty> = Vec::new();
     for f in funcs.iter_mut() {
         for b in f.blocks.iter_mut() {
@@ -1566,7 +1566,7 @@ fn fuse_divmod_pairs(funcs: &mut [Func], globals: &mut Vec<Global>, used: &mut V
             while i < b.insts.len() {
                 let div: Option<(String, Val, Val, Ty, String, String)> = match &b.insts[i] {
                     Inst::Call(c) => divmod_width(&c.func).and_then(|(w, comb, slot)| {
-                        if c.args.len() != 2 || blocked(slot, w) {
+                        if c.args.len() != 2 || blocked(slot) {
                             return None;
                         }
                         Some((

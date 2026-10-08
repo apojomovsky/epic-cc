@@ -2760,25 +2760,99 @@ fn fuses_chained_remainders() {
     );
 }
 
-/// A remainder slot shadowed by a user global of another type never fuses.
+/// A remainder slot shadowed by any user global never fuses, whatever its
+/// type: reusing the name would alias the user's variable.
 #[test]
 fn no_fuse_on_slot_collision() {
+    for ty in ["i8", "i16"] {
+        let m = parse(&format!(
+            "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal __udivmod_rem_u16 {ty}\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i16 @a\n\
+                 %2 = load i16 @b\n\
+                 %3 = udiv i16 %1 %2\n\
+                 store i16 %3 @q\n\
+                 %6 = urem i16 %1 %2\n\
+                 store i16 %6 @m\n\
+                 ret void\n",
+        ));
+        let text = ir::serialize(&legalize(m));
+        assert!(
+            !text.contains("__udivmod_u16"),
+            "{ty}-typed collision fused:\n{text}"
+        );
+    }
+}
+
+/// A store to an operand global between the two proving loads blocks the
+/// fuse even though the calls themselves are adjacent.
+#[test]
+fn no_fuse_on_store_between_loads() {
     let m = parse(
-        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal __udivmod_rem_u16 i8\n\
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             store i16 %1 @a\n\
+             %4 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %6 = urem i16 %4 %2\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(!text.contains("__udivmod"), "stale load fused:\n{text}");
+}
+
+/// An indirect store or a memcpy between the operations blocks the fuse:
+/// either may write an operand global through an untracked address.
+#[test]
+fn no_fuse_on_opaque_writes_between() {
+    for (name, middle) in [
+        ("indirect store", "store i16 %2 %p\n"),
+        ("memcpy", "memcpy @m %1 2\n"),
+    ] {
+        let m = parse(&format!(
+            "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i16 @a\n\
+                 %2 = load i16 @b\n\
+                 %3 = udiv i16 %1 %2\n\
+                 store i16 %3 @q\n\
+                 {middle}             %6 = urem i16 %1 %2\n\
+                 store i16 %6 @m\n\
+                 ret void\n",
+        ));
+        let text = ir::serialize(&legalize(m));
+        assert!(!text.contains("__udivmod"), "{name} fused:\n{text}");
+    }
+}
+
+/// A pair split across blocks never fuses: matching is same-block only.
+#[test]
+fn no_fuse_across_blocks() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
          fn main(void) ()\n\
            block entry:\n\
              %1 = load i16 @a\n\
              %2 = load i16 @b\n\
              %3 = udiv i16 %1 %2\n\
              store i16 %3 @q\n\
+             br next\n\
+           block next:\n\
              %6 = urem i16 %1 %2\n\
              store i16 %6 @m\n\
              ret void\n",
     );
     let text = ir::serialize(&legalize(m));
     assert!(
-        !text.contains("__udivmod_u16"),
-        "collided slot fused:\n{text}"
+        !text.contains("__udivmod"),
+        "cross-block pair fused:\n{text}"
     );
 }
 
