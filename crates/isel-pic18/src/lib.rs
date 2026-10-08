@@ -1633,18 +1633,6 @@ impl<'m> Gen<'m> {
                 Some(a) => !disjoint(a, bytes),
             }
         };
-        // A phi carrying the operand itself would read the folded home
-        // on a path this check never reconciles, so it stays staged.
-        for ob in &f.blocks {
-            for inst in &ob.insts {
-                let Inst::Phi(p) = inst else { continue };
-                for (val, _) in &p.incoming {
-                    if matches!(val, Val::Reg(x) if x == preg) {
-                        return false;
-                    }
-                }
-            }
-        }
         let mut phi_reads = 0usize;
         // The backedge phi lives in the header, which the region scan
         // below skips when the increment sits in a separate latch block:
@@ -1786,6 +1774,12 @@ impl<'m> Gen<'m> {
                     if from != &b.label && from.as_str() != latch {
                         continue;
                     }
+                    // A pointer-carried phi has no RAM home: its edge
+                    // values materialize address state, never a home
+                    // copy into the lanes, so there is nothing to check.
+                    if g.resolved.contains_key(&ssa_key(&f.name, &p.dst)) {
+                        continue;
+                    }
                     let Some(da) = g.addrs.get(&ssa_key(&f.name, &p.dst)).copied() else {
                         return false;
                     };
@@ -1806,14 +1800,14 @@ impl<'m> Gen<'m> {
         }
         // Every path out of the region except back to the phi's block
         // must never observe the operand's old slot: the fold overwrites
-        // it with the new value. Re-entry through the header is fine
-        // without walking it: its phi reconciles every incoming edge in
-        // both forms. Re-entry into the region itself has no such phi,
-        // so it fails instead of silently accepting divergent readers.
+        // it with the new value. Re-entry through the header needs no
+        // walk (its phi reconciles every edge in both forms); re-entry
+        // into the region itself fails. The seeds skip the region's own
+        // blocks so the internal latch edge is not mistaken for re-entry.
         let mut stack: Vec<&str> = edges
             .iter()
             .map(|s| s.as_str())
-            .filter(|s| *s != header)
+            .filter(|s| *s != header && *s != b.label.as_str() && *s != latch)
             .collect();
         let mut seen: HashSet<&str> = HashSet::from([header]);
         while let Some(lbl) = stack.pop() {
@@ -1853,6 +1847,27 @@ impl<'m> Gen<'m> {
             }
             if let Some(ts) = succs.get(lbl) {
                 stack.extend(ts.iter().map(|s| s.as_str()).filter(|s| !seen.contains(s)));
+            }
+        }
+        // A phi carrying the operand itself is sound only off paths
+        // that observe the folded home: the latch region (which writes
+        // it) and the exit-reachable blocks the walk above visited
+        // (which run after the write). Carries from anywhere else read
+        // the same phi value in both forms, including the header.
+        for ob in &f.blocks {
+            for inst in &ob.insts {
+                let Inst::Phi(p) = inst else { continue };
+                for (val, from) in &p.incoming {
+                    if !matches!(val, Val::Reg(x) if x == preg) {
+                        continue;
+                    }
+                    if from == &b.label || from.as_str() == latch {
+                        return false;
+                    }
+                    if from.as_str() != header && seen.contains(from.as_str()) {
+                        return false;
+                    }
+                }
             }
         }
         // Exactly the backedge incoming: any second phi reader would
