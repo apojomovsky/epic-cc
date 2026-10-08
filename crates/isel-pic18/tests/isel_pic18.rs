@@ -5096,6 +5096,297 @@ fn const_reads_from_different_tables_seed_each() {
 }
 
 #[test]
+fn dynamic_const_run_shares_one_seed_and_walks() {
+    // Two dynamically indexed reads from one table at consecutive offsets
+    // with the same index seed once and walk `TBLRD*+` (epic-cc#778), and
+    // the sim proves each byte lands in its own slot.
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in i8\n\
+             global a i8\n\
+             global b i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in\n\
+                 %p = gep @t +0 +1*%1\n\
+                 %2 = load i8 %p\n\
+                 %q = gep @t +1 +1*%1\n\
+                 %3 = load i8 %q\n\
+                 store i8 %2 @a\n\
+                 store i8 %3 @b\n\
+                 ret void\n",
+        ),
+        "t",
+        &[10, 20, 30, 40],
+    );
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("a", 0x110),
+        ("b", 0x111),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("main::3", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        1,
+        "one run seeds once:\n{asm}"
+    );
+    assert_eq!(asm.matches("TBLRD*+").count(), 2, "both reads walk:\n{asm}");
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 1;
+    p.run(1000);
+    assert_eq!(p.ram()[0x110], 20, "first byte must be t[1]:\n{asm}");
+    assert_eq!(p.ram()[0x111], 30, "second byte must be t[2]:\n{asm}");
+}
+
+#[test]
+fn dynamic_const_run_with_stride_shares_one_seed() {
+    // The menu-demo shape (epic-cc#778): a 4-byte struct read at a dynamic
+    // index is four consecutive offsets off one scaled term, so one seed
+    // serves all four walks.
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in i8\n\
+             global a i8\n\
+             global b i8\n\
+             global c i8\n\
+             global d i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in\n\
+                 %p = gep @t +0 +4*%1\n\
+                 %2 = load i8 %p\n\
+                 %q = gep @t +1 +4*%1\n\
+                 %3 = load i8 %q\n\
+                 %r = gep @t +2 +4*%1\n\
+                 %4 = load i8 %r\n\
+                 %s = gep @t +3 +4*%1\n\
+                 %5 = load i8 %s\n\
+                 store i8 %2 @a\n\
+                 store i8 %3 @b\n\
+                 store i8 %4 @c\n\
+                 store i8 %5 @d\n\
+                 ret void\n",
+        ),
+        "t",
+        &[0, 1, 2, 3, 4, 5, 6, 7],
+    );
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("a", 0x110),
+        ("b", 0x111),
+        ("c", 0x112),
+        ("d", 0x113),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("main::3", 0x13),
+        ("main::4", 0x14),
+        ("main::5", 0x15),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        1,
+        "one run seeds once:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("TBLRD*+").count(),
+        4,
+        "all four reads walk:\n{asm}"
+    );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 1;
+    p.run(1000);
+    assert_eq!(p.ram()[0x110], 4, "must read t[4]:\n{asm}");
+    assert_eq!(p.ram()[0x111], 5, "must read t[5]:\n{asm}");
+    assert_eq!(p.ram()[0x112], 6, "must read t[6]:\n{asm}");
+    assert_eq!(p.ram()[0x113], 7, "must read t[7]:\n{asm}");
+}
+
+#[test]
+fn dynamic_const_reads_with_different_indices_seed_each() {
+    // A varying index reads non-consecutive addresses: two reads off
+    // different index regs must reseed even at adjacent static offsets,
+    // or the second read walks the wrong address (epic-cc#778).
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in1 i8\n\
+             global in2 i8\n\
+             global a i8\n\
+             global b i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in1\n\
+                 %2 = load i8 @in2\n\
+                 %p = gep @t +0 +1*%1\n\
+                 %3 = load i8 %p\n\
+                 %q = gep @t +0 +1*%2\n\
+                 %4 = load i8 %q\n\
+                 store i8 %3 @a\n\
+                 store i8 %4 @b\n\
+                 ret void\n",
+        ),
+        "t",
+        &[10, 20, 30, 40],
+    );
+    let addrs = addrs(&[
+        ("in1", 0x10),
+        ("in2", 0x11),
+        ("a", 0x110),
+        ("b", 0x111),
+        ("main::1", 0x12),
+        ("main::2", 0x13),
+        ("main::3", 0x14),
+        ("main::4", 0x15),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        2,
+        "different indices reseed:\n{asm}"
+    );
+}
+
+#[test]
+fn dynamic_const_run_broken_by_call_seeds_each() {
+    // A call clobbers `TBLPTR`, so reads on either side seed afresh even
+    // with identical terms and consecutive offsets (epic-cc#778).
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in i8\n\
+             global a i8\n\
+             global b i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in\n\
+                 %p = gep @t +0 +1*%1\n\
+                 %2 = load i8 %p\n\
+                 call void @f()\n\
+                 %q = gep @t +1 +1*%1\n\
+                 %3 = load i8 %q\n\
+                 store i8 %2 @a\n\
+                 store i8 %3 @b\n\
+                 ret void\n\
+             fn f(void) ()\n\
+               block entry:\n\
+                 ret void\n",
+        ),
+        "t",
+        &[10, 20, 30, 40],
+    );
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("a", 0x110),
+        ("b", 0x111),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("main::3", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        2,
+        "a call ends the run:\n{asm}"
+    );
+}
+
+#[test]
+fn dynamic_const_run_broken_by_label_seeds_each() {
+    // Runs are intra-block: a label joins paths the scan cannot see, so
+    // the read past it reseeds (epic-cc#778).
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in i8\n\
+             global a i8\n\
+             global b i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in\n\
+                 %p = gep @t +0 +1*%1\n\
+                 %2 = load i8 %p\n\
+                 br label %next\n\
+               block next:\n\
+                 %q = gep @t +1 +1*%1\n\
+                 %3 = load i8 %q\n\
+                 store i8 %2 @a\n\
+                 store i8 %3 @b\n\
+                 ret void\n",
+        ),
+        "t",
+        &[10, 20, 30, 40],
+    );
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("a", 0x110),
+        ("b", 0x111),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("main::3", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        2,
+        "a label ends the run:\n{asm}"
+    );
+}
+
+#[test]
+fn dynamic_const_run_survives_unrelated_store() {
+    // A store into a slot no term reads leaves the run intact: only one
+    // seed for both reads (epic-cc#778).
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in i8\n\
+             global tmp i8\n\
+             global a i8\n\
+             global b i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in\n\
+                 %p = gep @t +0 +1*%1\n\
+                 %2 = load i8 %p\n\
+                 store i8 %2 @tmp\n\
+                 %q = gep @t +1 +1*%1\n\
+                 %3 = load i8 %q\n\
+                 store i8 %2 @a\n\
+                 store i8 %3 @b\n\
+                 ret void\n",
+        ),
+        "t",
+        &[10, 20, 30, 40],
+    );
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("tmp", 0x114),
+        ("a", 0x110),
+        ("b", 0x111),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("main::3", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        1,
+        "an unrelated store keeps the run:\n{asm}"
+    );
+    assert_eq!(asm.matches("TBLRD*+").count(), 2, "both reads walk:\n{asm}");
+}
+
+#[test]
 #[should_panic(expected = "ROM is not writable")]
 fn const_store_panics() {
     let m =
