@@ -1524,22 +1524,14 @@ fn divmod_rem_width(func: &str) -> Option<(Ty, &'static str)> {
         _ => None,
     }
 }
-
 /// Fuse a same-block `udiv`/`urem` pair on identical operands into one
 /// combined divide call (epic-cc#895). Every unsigned divide routine
 /// already computes both halves and discards one, so the fused shape runs
-/// the restoring loop once: `q = call __udivmod_uW(a, b)` carries the
-/// quotient in the retval slots like the plain divide, and the routine
-/// spills the remainder to `@__udivmod_rem_uW`, which the old remainder
-/// call site loads instead. Roughly half the cycles and one routine body
-/// instead of two on each fused pair.
-///
-/// A pair fuses only when the operand identity resolves (same SSA value,
-/// or loads of the same global) and nothing from the earliest operand
-/// load to the remainder call can change either value: no call (which may
-/// store anywhere, including the remainder slot once an earlier pair
-/// fused), no store or memcpy through an unknown pointer, and no store to
-/// an operand global. Reverse order and cross-block pairs do not fuse.
+/// the loop once: quotient to the retval slots, remainder spilled to
+/// `@__udivmod_rem_uW` for the old remainder site to load. Fuses only with
+/// provable operand identity and no call, unknown-pointer write, or
+/// operand-global store in between. Reverse order and cross-block pairs
+/// do not fuse.
 fn fuse_divmod_pairs(funcs: &mut [Func], globals: &mut Vec<Global>, used: &mut Vec<String>) {
     // A remainder slot shadowed by a user global of another type never
     // fuses: the spill would alias it.
