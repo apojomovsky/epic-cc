@@ -8282,3 +8282,88 @@ fn inplace_sub_i32_literal_uses_read_modify_write_lanes() {
     assert!(main.contains("SUBWFB 0x021,F,A"), "main:\n{main}");
     assert!(!main.contains(",W,A"), "no staged W form:\n{main}");
 }
+
+#[test]
+fn const_phi_threads_each_arm_through_w_to_the_store() {
+    // All-constant i8 phi feeding one direct-global store: each edge
+    // leaves its byte in W (`MOVLW` only) and the store writes it
+    // (`MOVWF`), so the temp slot is never touched (epic-cc#825).
+    let m = parse(
+        "global c i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @c\n    br i1 %1 a b\n  block a:\n    br j\n  block b:\n    br j\n  block j:\n    %2 = phi i8 10 a 20 b\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("c", 0x10),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("out", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let a_section = block_section(&asm, "main_La");
+    let j_section = block_section(&asm, "main_Lj");
+    assert!(a_section.contains("MOVLW 0x0A"), "arm a:\n{a_section}");
+    assert!(
+        !a_section.contains("MOVWF 0x012"),
+        "arm a keeps no slot:\n{a_section}"
+    );
+    assert!(
+        j_section.contains("MOVWF 0x013,A"),
+        "merge stores W to out:\n{j_section}"
+    );
+    assert!(
+        !asm.contains("MOVWF 0x012"),
+        "dead temp slot never written:\n{asm}"
+    );
+    assert!(!asm.contains("MOVFF 0x012"), "no final temp copy:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (c, expect) in [(0u8, 20u8), (1, 10)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x10] = c;
+        p.run(200);
+        assert_eq!(p.ram()[0x13], expect, "const phi arm c={c}");
+    }
+}
+
+#[test]
+fn const_select_threads_each_arm_through_w_to_the_store() {
+    // `select` over two constants feeding one direct-global store:
+    // both arms `MOVLW`, the store `MOVWF` (epic-cc#825).
+    let m = parse(
+        "global c i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @c\n    %2 = icmp eq i8 %1, 0\n    %3 = select i1 %2 i8 2 i8 1\n    store i8 %3 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("c", 0x10),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("main::3", 0x13),
+        ("out", 0x14),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    // `block_section` stops at the select's own tmp labels, so scope
+    // to everything from `main:` up to the next function instead.
+    let main = asm
+        .split("main:")
+        .nth(1)
+        .expect("main label")
+        .split("__start:")
+        .next()
+        .expect("main precedes __start");
+    assert!(main.contains("MOVLW 0x02"), "taken arm:\n{main}");
+    assert!(main.contains("MOVLW 0x01"), "else arm:\n{main}");
+    assert!(
+        main.contains("MOVWF 0x014,A"),
+        "store writes W to out:\n{main}"
+    );
+    assert!(
+        !main.contains("MOVWF 0x013"),
+        "dead temp slot never written:\n{main}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (c, expect) in [(0u8, 2u8), (7, 1)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x10] = c;
+        p.run(200);
+        assert_eq!(p.ram()[0x14], expect, "const select c={c}");
+    }
+}

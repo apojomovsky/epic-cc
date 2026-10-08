@@ -273,6 +273,11 @@ struct Gen<'m> {
     /// read-modify-write into its own home, phi-folded or same-homed.
     phi_fold: HashMap<String, String>,
     inplace_bins: HashSet<String>,
+    /// Const-phis threaded through W (epic-cc#825). Holds a phi dst
+    /// whose block has no other phi, every incoming is a one-byte
+    /// constant, and the only use is a direct-global store right after
+    /// the phis: each edge emits just `MOVLW`, the store one `MOVWF`.
+    const_w_phis: HashSet<String>,
     /// Value folds from the shared per-function pre-scan (epic-cc#863):
     /// loads whose byte never stages to a slot. `alloc` drops those
     /// slots; the load arm skips them and consumers read the source.
@@ -1446,6 +1451,141 @@ impl<'m> Gen<'m> {
             }
         }
         (fwd, consumed)
+    }
+    /// Const-producer pre-scan (epic-cc#825): a block with exactly one
+    /// phi, one byte wide, every incoming a constant, consumed only by
+    /// a direct-global store that follows the phis; or a `select` over
+    /// two constants consumed by the next instruction, a direct-global
+    /// store. Edges and arms leave the byte in W (`MOVLW` only) and the
+    /// store writes it (`MOVWF`), saving the per-arm slot write plus
+    /// the final copy. W survives the edge (copies, then a branch) and
+    /// the ISR preserves it, so the single-phi block keeps the threaded
+    /// copy last by construction.
+    fn find_const_w_phis(g: &Gen, f: &Func) -> HashSet<String> {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+        for b in &f.blocks {
+            let mut targets: Vec<&str> = Vec::new();
+            match b.insts.last() {
+                Some(Inst::Br(br)) => targets.push(&br.target),
+                Some(Inst::BrCond(bc)) => {
+                    targets.push(&bc.t);
+                    targets.push(&bc.f);
+                }
+                Some(Inst::Switch(sw)) => {
+                    for (_, l) in &sw.cases {
+                        targets.push(l);
+                    }
+                    targets.push(&sw.default);
+                }
+                _ => {}
+            }
+            for t in targets {
+                preds.entry(t).or_default().push(b.label.as_str());
+            }
+        }
+        let mut out = HashSet::new();
+        for b in &f.blocks {
+            let mut phis = b.insts.iter().filter_map(|i| match i {
+                Inst::Phi(p) => Some(p),
+                _ => None,
+            });
+            let Some(p) = phis.next() else { continue };
+            if phis.next().is_some() || p.ptr || p.ty.bytes() != 1 {
+                continue;
+            }
+            if p.incoming.is_empty() || p.incoming.iter().any(|(v, _)| !matches!(v, Val::Const(_)))
+            {
+                continue;
+            }
+            if uses.get(&p.dst).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            if g.lane_consumed.contains(&p.dst) || g.bit_lanes.contains_key(&p.dst) {
+                continue;
+            }
+            if g.resolved.contains_key(&ssa_key(&f.name, &p.dst)) {
+                continue;
+            }
+            // Every CFG predecessor must supply the constant, or W
+            // would be garbage on the uncovered edge.
+            let mut froms: Vec<&str> = p.incoming.iter().map(|(_, fr)| fr.as_str()).collect();
+            froms.sort_unstable();
+            let mut ps: Vec<&str> = preds.get(b.label.as_str()).cloned().unwrap_or_default();
+            ps.sort_unstable();
+            ps.dedup();
+            if froms != ps {
+                continue;
+            }
+            let mut rest = b.insts.iter().filter(|i| !matches!(i, Inst::Phi(_)));
+            let Some(Inst::Store(s)) = rest.next() else {
+                continue;
+            };
+            if !matches!(&s.val, Val::Reg(r) if r == &p.dst) || s.ty.bytes() != 1 {
+                continue;
+            }
+            let Some(dg) = s.ptr.strip_prefix('@') else {
+                continue;
+            };
+            let Some(known) = g.m.globals.iter().find(|x| x.name == dg) else {
+                continue;
+            };
+            if known.is_const {
+                continue;
+            }
+            out.insert(p.dst.clone());
+        }
+        // A `select` over two constants feeding a direct-global store
+        // threads the same way: both arms `MOVLW`, the store `MOVWF`.
+        // Straight-line, so the store must be the next instruction;
+        // anything between could clobber W.
+        for b in &f.blocks {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                let Inst::Select(s) = inst else { continue };
+                if s.ptr || s.ty.bytes() != 1 || matches!(s.cond, Val::Const(_)) {
+                    continue;
+                }
+                if !matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_))) {
+                    continue;
+                }
+                if uses.get(&s.dst).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                if g.lane_consumed.contains(&s.dst) || g.bit_lanes.contains_key(&s.dst) {
+                    continue;
+                }
+                if g.resolved.contains_key(&ssa_key(&f.name, &s.dst)) {
+                    continue;
+                }
+                let Some(Inst::Store(st)) = b.insts.get(ii + 1) else {
+                    continue;
+                };
+                if !matches!(&st.val, Val::Reg(r) if r == &s.dst) || st.ty.bytes() != 1 {
+                    continue;
+                }
+                let Some(dg) = st.ptr.strip_prefix('@') else {
+                    continue;
+                };
+                let Some(known) = g.m.globals.iter().find(|x| x.name == dg) else {
+                    continue;
+                };
+                if known.is_const {
+                    continue;
+                }
+                out.insert(s.dst.clone());
+            }
+        }
+        out
     }
     /// The register side of an `Add`/`Sub` against a constant: the value
     /// operand plus the literal. `Add` commutes, so a constant on either
@@ -4137,8 +4277,25 @@ impl<'m> Gen<'m> {
                         return;
                     }
                 }
-                // Direct values cover the whole slot through one setup.
-                // Indirect bytes seed FSR0 once and walk POSTINC0 (same
+                // A W-threaded const phi (epic-cc#825): every incoming
+                // edge left its byte in W with a `MOVLW`, so the store
+                // is one `MOVWF` to the direct global.
+                if let Val::Reg(r) = &s.val {
+                    if self.const_w_phis.contains(r) {
+                        let dst = s.ptr.strip_prefix('@').unwrap_or_else(|| {
+                            panic!(
+                                "isel-pic18: const-W phi store through non-global {:?}",
+                                s.ptr
+                            )
+                        });
+                        let dst = self.global_addr(dst);
+                        self.invalidate_fsr0_if_slot_written(dst, 1);
+                        self.emit_w_store(dst);
+                        return;
+                    }
+                    // Direct values cover the whole slot through one setup.
+                    // Indirect bytes seed FSR0 once and walk POSTINC0 (same
+                }
                 // single-loop ordering contract as the Load arm above,
                 // epic-cc#471). Each source byte still materializes into
                 // W (literals directly, registers via MOVF) before the
@@ -4892,8 +5049,23 @@ impl<'m> Gen<'m> {
                         self.emit_load_w(&s.cond, 0, true);
                     }
                     self.emit(format!("    BZ {l_else}")); // cond byte == 0 -> else
+                                                           // A W-threaded const select (epic-cc#825) leaves the
+                                                           // arm in W for the following store: `MOVLW` only.
+                                                           // Bytes resolve before any emission, so no closure
+                                                           // holds `self` across the branch lines below.
+                    let w_arms: Option<(u8, u8)> =
+                        if !addr_value && self.const_w_phis.contains(&s.dst) {
+                            let (Val::Const(ka), Val::Const(kb)) = (&s.a, &s.b) else {
+                                panic!("isel-pic18: W-only select arm without a constant")
+                            };
+                            Some(((*ka & 0xFF) as u8, (*kb & 0xFF) as u8))
+                        } else {
+                            None
+                        };
                     if addr_value {
                         self.emit_move_addr_to_slot(&s.a, dst);
+                    } else if let Some((ba, _)) = w_arms {
+                        self.emit(format!("    MOVLW 0x{ba:02X}"));
                     } else {
                         self.emit_move_val_to_slot(&s.a, s.ty, dst);
                     }
@@ -4901,6 +5073,8 @@ impl<'m> Gen<'m> {
                     self.emit_label(&l_else);
                     if addr_value {
                         self.emit_move_addr_to_slot(&s.b, dst);
+                    } else if let Some((_, bb)) = w_arms {
+                        self.emit(format!("    MOVLW 0x{bb:02X}"));
                     } else {
                         self.emit_move_val_to_slot(&s.b, s.ty, dst);
                     }
@@ -8897,7 +9071,7 @@ fn exit_bank(ends: &[Option<u8>]) -> Option<u8> {
 /// first (the edge defines each slot). A true cycle needs a temp
 /// register and panics: silent emission would miscompile.
 fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge: bool) {
-    let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
+    let pending: Vec<(u16, Option<u16>, Ty, Val, bool)> = copies
         .iter()
         .map(|(dst, ty, val)| {
             let da = g.slot_addr(g.cur_func, dst).direct();
@@ -8906,7 +9080,11 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
                 Val::Reg(r) => Some(g.slot_addr(g.cur_func, r).direct()),
                 _ => None,
             };
-            (da, src, *ty, val.clone())
+            // A W-threaded const-phi incoming (epic-cc#825) leaves its
+            // byte in W for the merge block's store: only the `MOVLW`
+            // emits. Every other const copy keeps the slot write.
+            let w_only = matches!(val, Val::Const(_)) && g.const_w_phis.contains(dst);
+            (da, src, *ty, val.clone(), w_only)
         })
         .collect();
     let n = pending.len();
@@ -8918,8 +9096,10 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
             if emitted[i] {
                 continue;
             }
-            let (da, src, ty, val) = &pending[i];
-            let blocked = if back_edge {
+            let (da, src, ty, val, w_only) = &pending[i];
+            let blocked = if *w_only {
+                false
+            } else if back_edge {
                 (0..n).any(|j| !emitted[j] && j != i && pending[j].1 == Some(*da))
             } else {
                 match src {
@@ -8928,7 +9108,14 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
                 }
             };
             if !blocked {
-                g.emit_move_val_to_slot(val, *ty, *da);
+                if *w_only {
+                    let Val::Const(k) = val else {
+                        panic!("isel-pic18: W-only phi copy without a constant")
+                    };
+                    g.emit(format!("    MOVLW 0x{:02X}", ((*k & 0xFF) as u8)));
+                } else {
+                    g.emit_move_val_to_slot(val, *ty, *da);
+                }
                 emitted[i] = true;
                 emitted_count += 1;
                 progress = true;
@@ -9209,6 +9396,7 @@ pub fn select_with_opts(
             phi_fold: HashMap::new(),
             inplace_bins: HashSet::new(),
             store_consumed: HashSet::new(),
+            const_w_phis: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -9241,6 +9429,10 @@ pub fn select_with_opts(
         let (phi_fold, inplace_bins) = Gen::find_inplace_folds(&g, f);
         g.phi_fold = phi_fold;
         g.inplace_bins = inplace_bins;
+        // Const-phis threaded through W (epic-cc#825): all-constant
+        // incoming edges feeding one direct-global store. Runs with the
+        // other pre-scans; the copy and store arms read the set.
+        g.const_w_phis = Gen::find_const_w_phis(&g, f);
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
         // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
@@ -9890,6 +10082,7 @@ pub fn select_with_opts(
                 phi_fold: HashMap::new(),
                 inplace_bins: HashSet::new(),
                 store_consumed: HashSet::new(),
+                const_w_phis: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -10235,6 +10428,7 @@ mod tests {
                 phi_fold: HashMap::new(),
                 inplace_bins: HashSet::new(),
                 store_consumed: HashSet::new(),
+                const_w_phis: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -10269,6 +10463,7 @@ mod tests {
                 phi_fold: HashMap::new(),
                 inplace_bins: HashSet::new(),
                 store_consumed: HashSet::new(),
+                const_w_phis: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -10318,6 +10513,7 @@ mod p3_gen_tests {
             phi_fold: HashMap::new(),
             inplace_bins: HashSet::new(),
             store_consumed: HashSet::new(),
+            const_w_phis: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
