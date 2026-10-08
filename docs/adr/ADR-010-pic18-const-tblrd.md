@@ -1,6 +1,8 @@
 # ADR-010: PIC18 const via TBLRD (DB-packed flash, per-byte TBLPTR re-setup)
 
-**Status:** Accepted 2026-08-20 (implemented in feat/pic18-p4-tblrd)
+**Status:** Accepted 2026-08-20 (implemented in feat/pic18-p4-tblrd).
+Walk amendment 2026-10-08 (epic-cc#745, epic-cc#778): adjacent reads share
+one seed and walk `TBLRD*+`, superseding item 2 below.
 
 ## Decision
 
@@ -15,12 +17,15 @@ PIC18 `const` (flash) globals are read with the `TBLRD` family
    symbol table is byte-addressed, P1's proven convention). The 511-byte
    `RETLW` ceiling of PIC14 stops existing: any table that fits flash is
    linear.
-2. **Per-byte `TBLPTR` re-setup.** Every const byte load recomputes
-   `TBLPTR = table_base + k + Σ scale×%reg + byte_off` from scratch
-   (`MOVLW LOW/HIGH/UPPER(table); MOVWF TBLPTRL/H/U` + carry-chain adds),
-   then a single `TBLRD*` + `MOVFF TABLAT, dst`. No `TBLRD*+`
-   auto-increment: that would tie multi-byte loads to ordering, the same
-   hidden-state hazard P3's ADR-009 rejected for FSR0.
+2. **Shared seeds with `TBLRD*+` walks.** Adjacent const reads seed once
+   and walk: static-adjacent reads share via the backend tracker
+   (epic-cc#745), and dynamically indexed runs share when a pre-scan
+   proves same table, identical terms, and consecutive offsets with no
+   term-slot write or `TBLPTR` use between (epic-cc#778). The ordering
+   contract that answers the old hidden-state objection: every walk
+   advances exactly one byte per read, labels and calls end all runs,
+   and the ISR prologue saves `TBLPTR`/`TABLAT`, so a walked sequence
+   survives interrupts like the memcpy walk does.
 3. **Loud ROM-write panic.** A `store` through a `const` base panics
    ("ROM is not writable"), matching PIC14's store-through-const panic.
 4. **Dynamic index adds onto `TBLPTR` with full 21-bit carry**, and a
@@ -39,10 +44,12 @@ PIC18 `const` (flash) globals are read with the `TBLRD` family
 - **`DB` is the assembler's native byte form** and `gpasm` packs it the
   same way our assembler does (verified byte-for-byte), so the HEX
   cross-check oracle holds without special-casing.
-- **Per-byte re-setup is a pure function of the pointer.** Same reasoning
-  as ADR-009: no hidden state, no ordering contract between the setup
-  calls of a multi-byte load, and the emitter is trivially correct to
-  review.
+- **Sharing is a proven adjacency, not trusted state.** Same reasoning
+  as ADR-009's reuse rules: a skip happens only when the previous site
+  provably left `TBLPTR` on the wanted byte (identical table and terms,
+  consecutive offset, no term-slot write between), and every label, call,
+  or second table ends the run. The emitter stays reviewable because
+  each skip cites that proof instead of a standing belief.
 
 ## Rejected alternatives
 
@@ -51,18 +58,17 @@ PIC18 `const` (flash) globals are read with the `TBLRD` family
   PIC18 has a dedicated table-read instruction. Also every const read
   would cost a hardware-stack level (CALL/RETURN) where `TBLRD` costs
   none.
-- **`TBLRD*+` auto-increment for multi-byte loads.** One setup + N
-  increments is shorter, but leaves `TBLPTR` at an arbitrary place after
-  the load, coupling the next access to the previous one's width. The
-  per-byte model keeps every access independent, matching ADR-009's
-  per-byte `FSR0` re-setup.
+- **`TBLRD*+` auto-increment for multi-byte loads.** Adopted (see item 2):
+  one setup plus N walks, with the ordering contract the original entry
+  asked for. Isolated reads keep the per-byte model, so every access
+  stays independent, matching ADR-009's per-byte `FSR0` re-setup.
 - **Emitting tables through `.table`/alignment directives.** Unneeded:
   PIC18's `TBLPTR` addresses flash linearly, so there are no windows to
   align to and no `.table` size assertion to enforce.
 
 ## Revisit if
 
-A P4+ program shows the per-byte re-setup in profiling (the `TBLRD*+`
-form is a drop-in, with an explicit ordering contract), or a `const`
-fixture needs simultaneous indirect RAM + flash pointers beyond the
-single-FSR0 + single-TBLPTR the emitters already handle.
+A `const` fixture needs simultaneous indirect RAM + flash pointers
+beyond the single-FSR0 + single-TBLPTR the emitters already handle.
+(The profiling clause fired as epic-cc#745 and epic-cc#778; loop-carried
+sharing across back edges is tracked as epic-cc#961.)
