@@ -48,8 +48,8 @@ pass means a CI pass. While iterating, scope it down and compile small
 programs directly:
 
 ```bash
-make test CRATE=asm                                  # one crate only
-make compile FILE=examples/add.c TARGET=p16f877a     # C to HEX, printed
+make test CRATE=asm                                                # one crate only
+make compile FILE=crates/driver/tests/fixtures/add.c TARGET=p16f877a  # C to HEX, printed
 ```
 
 Two suites deserve a special mention. The **size ladder** and the **cycle
@@ -59,9 +59,11 @@ program uses, checked into `crates/driver/tests/fixtures/`. They fail when a
 change makes a program bigger, and under the strict CI setting they also fail
 when a program gets smaller without the baseline being updated, so a silent
 shrink can never mask a later regression. If your change moves a ladder row
-in either direction, update the baseline file, regenerate the report with
-`make size-report`, and call the move out in your pull request. A row you move
-should be a net win: explain any regression.
+in either direction, re-baseline the ladder you moved (`UPDATE_SIZE_BASELINE=1`
+for `size_baseline.toml`, `UPDATE_CYCLE_BASELINE=1` for
+`cycle_baseline.toml`, each set when running its ladder test), regenerate the
+report with `make size-report`, and call the move out in your pull request. A
+row you move should be a net win: explain any regression.
 
 ## Conventions, in brief
 

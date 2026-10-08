@@ -250,7 +250,7 @@ Full design conversation, ADRs, and per-milestone plans live in
 - [`docs/03-decisions.md`](docs/03-decisions.md): ADRs, with rejected alternatives
 - [`docs/12-backend-design.md`](docs/12-backend-design.md): the approved backend spec
 - [`docs/34-debugger-design.md`](docs/34-debugger-design.md): the GDB/simulator debugger design
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`CLAUDE.md`](CLAUDE.md): conventions for contributors and agents
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`AGENTS.md`](AGENTS.md): conventions for contributors and agents
 
 ## Non-goals
 
