@@ -7395,6 +7395,30 @@ fn runtime_ptr_select_materializes_arm_then_derefs_indirect() {
 }
 
 #[test]
+fn ptr_select_with_offset_gep_arm_materializes_base_plus_k() {
+    // epic-cc#781: `%g = gep @b +1` and `@a` share no base, so the
+    // select seeds as an indirect slot; the offset arm materializes as
+    // base plus k (0x21+1), the bare arm as its base (0x20).
+    let m = parse("global a i8\nglobal b i8\nglobal c i8\nfn main(void) ()\n  block entry:\n    %l = load i8 @c\n    %g = gep @b +1\n    %s = select i1 %l, ptr %g, ptr @a\n    ret void\n");
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("c", 0x22),
+        ("main::l", 0x25),
+        ("main::s", 0x26),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        asm.contains("MOVLW 0x22"),
+        "offset arm materializes base+k:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x20"),
+        "bare arm materializes its base:\n{asm}"
+    );
+}
+
+#[test]
 fn runtime_ptr_phi_derefs_through_slot_after_phi_copies() {
     // The GetFlag -O1 shape: a pointer phi joining a literal-arm select
     // result and the INTCON literal. Phi elimination copies the incoming's

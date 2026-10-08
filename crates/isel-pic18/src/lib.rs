@@ -2054,9 +2054,10 @@ impl<'m> Gen<'m> {
     /// a `Const` literal writes the constant bytes, a `Global` writes its
     /// link-time address as two literals, a `Reg` copies the two bytes of
     /// its runtime-address slot (a seeded select dst, an IntToPtr dst, or
-    /// a pointer param). Used by the pointer-select materialization
-    /// A reg with dynamic terms is a computed address with
-    /// no single materializable value and panics. (epic-cc#147)
+    /// a pointer param) or materializes a global base plus the constant
+    /// offset (epic-cc#781). Used by the pointer-select materialization.
+    /// A reg with dynamic terms, or an offset over a slot, is a computed
+    /// address with no single materializable value and panics. (epic-cc#147)
     fn emit_move_addr_to_slot(&mut self, val: &Val, dst: u16) {
         match val {
             Val::Const(k) => {
@@ -2105,17 +2106,55 @@ impl<'m> Gen<'m> {
             Val::Reg(r) => {
                 let (base, k, terms) = self.resolved_for(r);
                 assert!(
-                    k == 0 && terms.is_empty(),
+                    terms.is_empty(),
                     "isel-pic18: cannot materialize a computed address ({base:?} k={k} terms={terms:?}) as a select arm"
                 );
                 match &base {
                     Base::Slot(sname, true) => {
+                        assert!(
+                            k == 0,
+                            "isel-pic18: cannot materialize a computed address ({base:?} k={k} terms={terms:?}) as a select arm"
+                        );
                         let sa = self.slot_addr(self.cur_func, sname).direct();
                         self.emit_copy_byte(sa, dst);
                         self.emit_copy_byte(sa + 1, dst + 1);
                     }
                     Base::Global(name) => {
-                        let addr = self.global_addr(name);
+                        if self.global_is_const(name) {
+                            // Flash label with no RAM address: LOW/HIGH
+                            // literals with k folded in. LOW/HIGH are 8-bit
+                            // link-time literals, so the low byte's carry
+                            // rides STATUS,C into the high byte: ADDLW sets
+                            // it and MOVLW leaves it alone, so the carry
+                            // test sits before the high byte's own ADDLW.
+                            let adds_in_byte0 = (k & 0xFF) != 0;
+                            self.emit(format!("    MOVLW LOW({name})"));
+                            let lo = (k & 0xFF) as u8;
+                            if lo != 0 {
+                                self.emit(format!("    ADDLW 0x{lo:02X}"));
+                            }
+                            let (a0, f0) = self.operand(dst);
+                            self.emit(format!(
+                                "    MOVWF 0x{f0:03X},{}",
+                                if a0 == 0 { "A" } else { "B" }
+                            ));
+                            self.emit(format!("    MOVLW HIGH({name})"));
+                            if adds_in_byte0 {
+                                self.emit("    BTFSC 0xFD8,0,A".to_string());
+                                self.emit("    ADDLW 0x01".to_string());
+                            }
+                            let hi = (k >> 8) as u8;
+                            if hi != 0 {
+                                self.emit(format!("    ADDLW 0x{hi:02X}"));
+                            }
+                            let (a1, f1) = self.operand(dst + 1);
+                            self.emit(format!(
+                                "    MOVWF 0x{f1:03X},{}",
+                                if a1 == 0 { "A" } else { "B" }
+                            ));
+                            return;
+                        }
+                        let addr = self.global_addr(name).wrapping_add(k);
                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                         let (a0, f0) = self.operand(dst);
                         self.emit(format!(

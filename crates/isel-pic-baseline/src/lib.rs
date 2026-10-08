@@ -767,7 +767,10 @@ impl<'m> Gen<'m> {
         )
     }
 
-    /// Copy the two-byte ADDRESS VALUE of `val` into the slot at `dst`.
+    /// Copy the two-byte ADDRESS VALUE of `val` into the slot at `dst`:
+    /// literals, link-time addresses (a global base plus the constant
+    /// offset, epic-cc#781), and runtime address slots. A dynamic term,
+    /// or an offset over a slot, names no single value and panics.
     fn emit_move_addr_to_slot(&mut self, val: &Val, dst: u16) {
         match val {
             Val::Const(k) => {
@@ -793,13 +796,19 @@ impl<'m> Gen<'m> {
             Val::Reg(r) => {
                 let (base, k, terms) = self.resolved_for(r);
                 assert!(
-                    k == 0 && terms.is_empty(),
+                    terms.is_empty(),
                     "isel: cannot materialize a computed address ({base:?} k={k} terms={terms:?}) as a select arm"
                 );
                 let sa = match &base {
-                    Base::Slot(sname, true) => self.slot_addr(self.cur_func, sname).direct(),
+                    Base::Slot(sname, true) => {
+                        assert!(
+                            k == 0,
+                            "isel: cannot materialize a computed address ({base:?} k={k} terms={terms:?}) as a select arm"
+                        );
+                        self.slot_addr(self.cur_func, sname).direct()
+                    }
                     Base::Global(name) => {
-                        let addr = self.global_addr(name);
+                        let addr = self.global_addr(name).wrapping_add(k);
                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                         self.emit_w_store(dst);
                         self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));

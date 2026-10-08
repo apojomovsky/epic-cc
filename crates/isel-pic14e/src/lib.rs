@@ -1612,11 +1612,12 @@ impl<'m> Gen<'m> {
     }
 
     /// Copy flash const `name` into the shared staging buffer and write the
-    /// buffer's address into `dst` (2 bytes): staged consts have no RAM
-    /// address (epic-cc#790). The bytes move inside the per-string
+    /// buffer's address plus `k` into `dst` (2 bytes): staged consts have
+    /// no RAM address (epic-cc#790). The bytes move inside the per-string
     /// `__stage_<name>` routine (emitted with the const tables); the site
-    /// only calls it. Membership in `self.staged` (precomputed) decides.
-    fn emit_stage_const_to_slot(&mut self, name: &str, dst: u16) {
+    /// only calls it. `k` folds a select arm's GEP offset in, so the
+    /// pointer names the selected byte, not the table start.
+    fn emit_stage_const_to_slot(&mut self, name: &str, dst: u16, k: u16) {
         assert!(
             self.staged.contains(name),
             "isel: staging unlisted const @{name}"
@@ -1625,10 +1626,11 @@ impl<'m> Gen<'m> {
         self.emit("    MOVWF PCLATH".to_string());
         self.emit(format!("    CALL __stage_{name}"));
         self.emit_pclath_restore(&format!("__stage_{name}"));
-        let stage = *self
+        let stage = self
             .addrs
             .get("__const_stage")
-            .expect("isel: staged const with no staging buffer in map");
+            .expect("isel: staged const with no staging buffer in map")
+            .wrapping_add(k);
         self.emit(format!("    MOVLW 0x{:02X}", (stage & 0xFF) as u8));
         self.emit(format!("    MOVWF 0x{dst:02X}"));
         self.emit(format!("    MOVLW 0x{:02X}", ((stage >> 8) & 0xFF) as u8));
@@ -1636,9 +1638,10 @@ impl<'m> Gen<'m> {
     }
 
     /// Copies the two-byte address value of `val` into `dst`. Handles
-    /// literals, link-time addresses, and runtime address slots
-    /// (epic-cc#147). A computed address with terms panics: it names no
-    /// single value.
+    /// literals, link-time addresses (a global base plus the constant
+    /// offset, epic-cc#781), and runtime address slots
+    /// (epic-cc#147). A dynamic term, or an offset over a slot, panics:
+    /// it names no single value.
     fn emit_move_addr_to_slot(&mut self, val: &Val, dst: u16) {
         match val {
             Val::Const(k) => {
@@ -1651,7 +1654,7 @@ impl<'m> Gen<'m> {
                 if self.staged.contains(g) {
                     // No RAM address: copy the table through the shared
                     // buffer and pass the buffer instead.
-                    self.emit_stage_const_to_slot(g, dst);
+                    self.emit_stage_const_to_slot(g, dst, 0);
                     return;
                 }
                 if self.is_function(g) {
@@ -1670,12 +1673,24 @@ impl<'m> Gen<'m> {
             Val::Reg(r) => {
                 let (base, k, terms) = self.resolved_for(r);
                 assert!(
-                    k == 0 && terms.is_empty(),
+                    terms.is_empty(),
                     "isel: cannot materialize a computed address ({base:?} k={k} terms={terms:?}) as a select arm"
                 );
                 let sa = match &base {
-                    Base::Slot(sname, true) => self.slot_addr(self.cur_func, sname).direct(),
+                    Base::Slot(sname, true) => {
+                        assert!(
+                            k == 0,
+                            "isel: cannot materialize a computed address ({base:?} k={k} terms={terms:?}) as a select arm"
+                        );
+                        self.slot_addr(self.cur_func, sname).direct()
+                    }
                     Base::Global(name) => {
+                        if self.staged.contains(name) {
+                            // No RAM address: the staged copy lives at the
+                            // shared buffer plus the arm's offset.
+                            self.emit_stage_const_to_slot(name, dst, k);
+                            return;
+                        }
                         let addr = self.ptr_value_addr(name, k);
                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                         self.emit(format!("    MOVWF 0x{:02X}", dst));
@@ -2093,7 +2108,7 @@ impl<'m> Gen<'m> {
                         } else if self.staged.contains(g) {
                             // No RAM address: copy the table through the
                             // shared buffer into the param slot.
-                            self.emit_stage_const_to_slot(g, pa);
+                            self.emit_stage_const_to_slot(g, pa, 0);
                         } else {
                             if self.global_is_const(g) {
                                 let size = self.global_size(g);

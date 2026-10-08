@@ -2219,12 +2219,13 @@ impl<'m> Gen<'m> {
     }
 
     /// Copy flash const `name` into the shared staging buffer and write the
-    /// buffer's address into `dst` (2 bytes): staged consts have no RAM
-    /// address on small cores (epic-cc#790). The bytes move inside the
-    /// per-string `__stage_<name>` routine (emitted with the const tables:
-    /// inline copies would overflow single functions' pages); the site only
-    /// calls it. Membership in `self.staged` (precomputed below) decides.
-    fn emit_stage_const_to_slot(&mut self, name: &str, dst: u16) {
+    /// buffer's address plus `k` into `dst` (2 bytes): staged consts have
+    /// no RAM address on small cores (epic-cc#790). The bytes move inside
+    /// the per-string `__stage_<name>` routine (emitted with the const
+    /// tables: inline copies would overflow single functions' pages); the
+    /// site only calls it. `k` folds a select arm's GEP offset in, so the
+    /// pointer names the selected byte, not the table start.
+    fn emit_stage_const_to_slot(&mut self, name: &str, dst: u16, k: u16) {
         assert!(
             self.staged.contains(name),
             "isel: staging unlisted const @{name}"
@@ -2233,10 +2234,11 @@ impl<'m> Gen<'m> {
         self.emit("    MOVWF PCLATH".to_string());
         self.emit(format!("    CALL __stage_{name}"));
         self.emit_pclath_restore(&format!("__stage_{name}"));
-        let stage = *self
+        let stage = self
             .addrs
             .get("__const_stage")
-            .expect("isel: staged const with no staging buffer in map");
+            .expect("isel: staged const with no staging buffer in map")
+            .wrapping_add(k);
         self.emit(format!("    MOVLW 0x{:02X}", (stage & 0xFF) as u8));
         self.emit(format!("    MOVWF 0x{dst:02X}"));
         self.emit(format!("    MOVLW 0x{:02X}", ((stage >> 8) & 0xFF) as u8));
@@ -2247,9 +2249,10 @@ impl<'m> Gen<'m> {
     /// a `Const` literal writes the constant bytes, a `Global` writes its
     /// link-time address as two literals, a `Reg` reads the two bytes of
     /// its runtime-address slot (a seeded select dst, an IntToPtr dst, or
-    /// a pointer param). A reg with dynamic terms is a computed address
-    /// with no single materializable value and panics. Used by the
-    /// pointer-select materialization (epic-cc#147).
+    /// a pointer param) or materializes a global base plus the constant
+    /// offset (epic-cc#781). A reg with dynamic terms, or an offset over
+    /// a slot, is a computed address with no single materializable value
+    /// and panics. Used by the pointer-select materialization (epic-cc#147).
     fn emit_move_addr_to_slot(&mut self, val: &Val, dst: u16) {
         match val {
             Val::Const(k) => {
@@ -2262,7 +2265,7 @@ impl<'m> Gen<'m> {
                 if self.staged.contains(g) {
                     // No RAM address on small cores: copy the table through
                     // the shared buffer and pass the buffer instead.
-                    self.emit_stage_const_to_slot(g, dst);
+                    self.emit_stage_const_to_slot(g, dst, 0);
                     return;
                 }
                 if let Some((chunk, off)) = self.pool_lit(g) {
@@ -2293,22 +2296,56 @@ impl<'m> Gen<'m> {
             Val::Reg(r) => {
                 let (base, k, terms) = self.resolved_for(r);
                 assert!(
-                    k == 0 && terms.is_empty(),
+                    terms.is_empty(),
                     "isel: cannot materialize a computed address ({base:?} k={k} terms={terms:?}) as a select arm"
                 );
                 let sa = match &base {
-                    Base::Slot(sname, true) => self.slot_addr(self.cur_func, sname).direct(),
+                    Base::Slot(sname, true) => {
+                        assert!(
+                            k == 0,
+                            "isel: cannot materialize a computed address ({base:?} k={k} terms={terms:?}) as a select arm"
+                        );
+                        self.slot_addr(self.cur_func, sname).direct()
+                    }
                     Base::Global(name) => {
                         if let Some((chunk, off)) = self.pool_lit(name) {
-                            // Gated copy (epic-cc#816): the pooled flash
-                            // address (k is 0 by the assert above).
-                            self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, off, 0)));
+                            // Gated copy (epic-cc#816): k folds into the
+                            // pooled offset once, no carry dance.
+                            let at = off.wrapping_add(k);
+                            self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, at, 0)));
                             self.emit(format!("    MOVWF 0x{:02X}", dst));
-                            self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, off, 1)));
+                            self.emit(format!("    MOVLW {}", Self::pool_lit_op(&chunk, at, 1)));
                             self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
                             return;
                         }
-                        let addr = self.global_addr(name);
+                        if self.staged.contains(name) {
+                            // No RAM address: the staged copy lives at the
+                            // shared buffer plus the arm's offset.
+                            self.emit_stage_const_to_slot(name, dst, k);
+                            return;
+                        }
+                        if self.global_is_const(name) {
+                            // Flash label with no RAM address: LOW/HIGH
+                            // literals with k folded in (epic-cc#645).
+                            self.emit(format!("    MOVLW LOW({name})"));
+                            let lo = (k & 0xFF) as u8;
+                            if lo != 0 {
+                                self.emit(format!("    ADDLW 0x{lo:02X}"));
+                            }
+                            self.emit(format!("    MOVWF 0x{:02X}", dst));
+                            self.emit(format!("    MOVLW HIGH({name})"));
+                            if lo != 0 {
+                                self.emit("    BTFSC STATUS, 0".to_string());
+                                self.emit("    ADDLW 0x01".to_string());
+                            }
+                            let hi = (k >> 8) as u8;
+                            if hi != 0 {
+                                self.emit(format!("    ADDLW 0x{hi:02X}"));
+                            }
+                            self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
+                            return;
+                        }
+                        let addr = self.global_addr(name).wrapping_add(k);
                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                         self.emit(format!("    MOVWF 0x{:02X}", dst));
                         self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -2855,7 +2892,7 @@ impl<'m> Gen<'m> {
                         } else if self.staged.contains(g) {
                             // No RAM address on small cores: copy the table
                             // through the shared buffer into the param slot.
-                            self.emit_stage_const_to_slot(g, pa);
+                            self.emit_stage_const_to_slot(g, pa, 0);
                         } else if let Some((chunk, off)) = self.pool_lit(g) {
                             // Gated copy (epic-cc#816): the pooled flash
                             // address, for the flash-side reader.
