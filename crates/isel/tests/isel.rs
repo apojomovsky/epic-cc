@@ -3423,6 +3423,20 @@ fn norm_u16_o2_simulates_quotient_and_remainder() {
         ),
         (
             "__udiv_u16",
+            &[0x89, 0x00],
+            &[0x89, 0x00],
+            &[0x01, 0x00],
+            &[],
+        ),
+        (
+            "__urem_u16",
+            &[0x89, 0x00],
+            &[0x89, 0x00],
+            &[0x00, 0x00],
+            &[],
+        ),
+        (
+            "__udiv_u16",
             &[0x05, 0x00],
             &[0x00, 0x00],
             &[0xFF, 0xFF],
@@ -3490,6 +3504,36 @@ fn norm_u32_o2_simulates_quotient_and_remainder() {
             &[0x07, 0x00, 0x00, 0x00],
             &[0x78, 0x56, 0x34, 0x12],
             &[0x07, 0x00, 0x00, 0x00],
+            &[],
+        ),
+        // k = 1 (num == den, longest prescale into one iteration).
+        (
+            "__udiv_u32",
+            &[0x87, 0xD6, 0x12, 0x00],
+            &[0x87, 0xD6, 0x12, 0x00],
+            &[0x01, 0x00, 0x00, 0x00],
+            &[],
+        ),
+        (
+            "__urem_u32",
+            &[0x87, 0xD6, 0x12, 0x00],
+            &[0x87, 0xD6, 0x12, 0x00],
+            &[0x00, 0x00, 0x00, 0x00],
+            &[],
+        ),
+        // Full-width non-poison quotient (k = 32, no prescale).
+        (
+            "__udiv_u32",
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            &[0x01, 0x00, 0x00, 0x00],
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            &[],
+        ),
+        (
+            "__urem_u32",
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            &[0x01, 0x00, 0x00, 0x00],
+            &[0x00, 0x00, 0x00, 0x00],
             &[],
         ),
         (
