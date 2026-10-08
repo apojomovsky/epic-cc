@@ -308,8 +308,9 @@ struct Gen<'m> {
     w_folds: iselcore::ValueFolds,
     /// Single-use loads feeding inlined multiply args, folded to read
     /// the source global directly (epic-cc#892): reg to global base
-    /// address. The slot stays allocated; only emission skips it.
-    mul_load_fold: HashMap<String, u16>,
+    /// address plus load position. The slot stays allocated; only
+    /// emission skips it.
+    mul_load_fold: HashMap<String, (u16, usize)>,
     /// Single-use multiply results feeding a direct-global store,
     /// computed into the store address (epic-cc#892): reg to global
     /// base address. Only recorded when the inline plan resolves, so
@@ -1510,7 +1511,7 @@ impl<'m> Gen<'m> {
     /// load folds only when the call inlines, and a store fuses only
     /// when the plan resolves with the fused address, so the fallback
     /// call path always finds its slots. Folded reads keep IR order.
-    fn find_mul_folds(g: &Gen, f: &Func) -> (HashMap<String, u16>, HashMap<String, u16>) {
+    fn find_mul_folds(g: &Gen, f: &Func) -> (HashMap<String, (u16, usize)>, HashMap<String, u16>) {
         let mut uses: HashMap<String, usize> = HashMap::new();
         for b in &f.blocks {
             for inst in &b.insts {
@@ -1537,7 +1538,7 @@ impl<'m> Gen<'m> {
             }
             Some(addr)
         };
-        let mut load_fold: HashMap<String, u16> = HashMap::new();
+        let mut load_fold: HashMap<String, (u16, usize)> = HashMap::new();
         let mut store_fwd: HashMap<String, u16> = HashMap::new();
         for b in &f.blocks {
             for (ci, inst) in b.insts.iter().enumerate() {
@@ -1632,25 +1633,13 @@ impl<'m> Gen<'m> {
                         break;
                     }
                 }
-                // Emission reads args in order, so kept loads must sit
-                // in arg order too; an inverted pair folds neither,
-                // leaving both reads at their IR positions.
-                {
-                    let mut order: Vec<(usize, usize)> = cands
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| kept[*i])
-                        .map(|(_, c)| (c.3, c.0))
-                        .collect();
-                    order.sort();
-                    if order.windows(2).any(|w| w[0].1 >= w[1].1) {
-                        kept.fill(false);
-                    }
-                }
-                let mut trial: HashMap<String, u16> = HashMap::new();
-                for (i, (_, r, addr, _)) in cands.iter().enumerate() {
+                // Emission reads sides in load order (swapping the
+                // commuting operands when inverted), so kept loads
+                // carry their positions for the ordering.
+                let mut trial: HashMap<String, (u16, usize)> = HashMap::new();
+                for (i, (_, r, addr, lp)) in cands.iter().enumerate() {
                     if kept[i] {
-                        trial.insert(r.clone(), *addr);
+                        trial.insert(r.clone(), (*addr, *lp));
                     }
                 }
                 let slot_dst = match &c.dst {
@@ -4211,7 +4200,7 @@ impl<'m> Gen<'m> {
     /// into W.
     fn inline_mul_operand(
         g: &Gen,
-        load_fold: &HashMap<String, u16>,
+        load_fold: &HashMap<String, (u16, usize)>,
         v: &Val,
         width: u8,
     ) -> Option<Vec<MulOp>> {
@@ -4223,10 +4212,10 @@ impl<'m> Gen<'m> {
                 Some(vec![MulOp::Lit((*k & 0xFF) as u8)])
             }
             Val::Reg(r) => {
-                if let Some(base) = load_fold.get(r) {
+                if let Some((base, _)) = load_fold.get(r) {
                     return Some(
                         (0..width)
-                            .map(|i| MulOp::Ram(base + u16::from(i)))
+                            .map(|i| MulOp::Ram(*base + u16::from(i)))
                             .collect(),
                     );
                 }
@@ -4269,6 +4258,24 @@ impl<'m> Gen<'m> {
         Self::inline_mul_plan_for(self, &self.mul_load_fold, c, dst)
     }
 
+    /// The call's operand sides in the order emission reads them.
+    /// Folded volatile reads must follow IR load order, so an
+    /// inverted pair swaps sides (the product commutes); anything
+    /// else keeps call-arg order.
+    fn mul_operands_ordered<'v>(
+        load_fold: &HashMap<String, (u16, usize)>,
+        a: &'v Val,
+        b: &'v Val,
+    ) -> (&'v Val, &'v Val) {
+        match (a, b) {
+            (Val::Reg(r0), Val::Reg(r1)) => match (load_fold.get(r0), load_fold.get(r1)) {
+                (Some((_, p0)), Some((_, p1))) if p0 > p1 => (b, a),
+                _ => (a, b),
+            },
+            _ => (a, b),
+        }
+    }
+
     /// The plan core over explicit maps, so the pre-scan can gate
     /// store fusion on the same predicate emission uses. Pure:
     /// resolves addresses and checks shapes, never emits. Every RAM
@@ -4276,9 +4283,10 @@ impl<'m> Gen<'m> {
     /// costs the words the inline saves), and no u16 operand byte may
     /// alias the retval temps (a retval-homed call result parks there,
     /// epic-cc#738).
+
     fn inline_mul_plan_for(
         g: &Gen,
-        load_fold: &HashMap<String, u16>,
+        load_fold: &HashMap<String, (u16, usize)>,
         c: &ir::Call,
         dst: Option<u16>,
     ) -> Option<InlineMul> {
@@ -4299,8 +4307,9 @@ impl<'m> Gen<'m> {
                 return None;
             }
         }
-        let a = Self::inline_mul_operand(g, load_fold, &c.args[0].val, width)?;
-        let b = Self::inline_mul_operand(g, load_fold, &c.args[1].val, width)?;
+        let (av, bv) = Self::mul_operands_ordered(load_fold, &c.args[0].val, &c.args[1].val);
+        let a = Self::inline_mul_operand(g, load_fold, av, width)?;
+        let b = Self::inline_mul_operand(g, load_fold, bv, width)?;
         if width == 1 {
             if matches!((a[0], b[0]), (MulOp::Lit(_), MulOp::Lit(_))) {
                 return None;

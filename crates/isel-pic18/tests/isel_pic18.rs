@@ -1427,11 +1427,11 @@ fn inline_u8_multiuse_load_keeps_its_slot() {
     );
 }
 
-/// Loads in the opposite order of the call args fold neither: the
-/// sequence reads args in order, so folding the pair would swap two
-/// observable reads. Both stage, and the inline reads the slots.
+/// Loads in the opposite order of the call args still fold: the
+/// sequence reads sides in load order (the product commutes), so
+/// both observable reads keep their IR positions.
 #[test]
-fn inline_u8_inverted_load_order_folds_neither() {
+fn inline_u8_inverted_load_order_folds_in_order() {
     let m = parse(
         "global a i8\nglobal b i8\nglobal r i8\n\
          fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
@@ -1455,10 +1455,17 @@ fn inline_u8_inverted_load_order_folds_neither() {
         "no call on the inline path:\n{asm}"
     );
     assert!(
-        asm.contains("MOVFF 0x020") && asm.contains("MOVFF 0x021"),
-        "both loads stage in IR order:\n{asm}"
+        !asm.contains("MOVFF 0x020") && !asm.contains("MOVFF 0x021"),
+        "both loads fold:\n{asm}"
     );
     assert_eq!(asm.matches("MULWF").count(), 1, "one partial:\n{asm}");
+    let movf = asm
+        .find("MOVF 0x021,W,A")
+        .unwrap_or_else(|| panic!("first-loaded global reads first:\n{asm}"));
+    let mulwf = asm
+        .find("MULWF 0x020,A")
+        .unwrap_or_else(|| panic!("second-loaded global rides MULWF:\n{asm}"));
+    assert!(movf < mulwf, "IR load order at the sequence:\n{asm}");
     assert!(
         asm.contains("MOVFF 0xFF3, 0x022"),
         "PRODL lands straight in r:\n{asm}"
