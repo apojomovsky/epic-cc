@@ -39,9 +39,9 @@ keep that bank live across the call.
   clearing; the indirect done label restores the candidate meet directly,
   because its linear fall-through comes from the trap block, whose bank is
   unknown.
-- **Unknown clears.** An absent map entry (runtime recipe, naked body,
-  ISR body, forward reference outside the graph) or an unknown exit
-  clears the tracked bank exactly as master did. ISR bodies record no
+- **Unknown clears.** An absent map entry (naked body, ISR body,
+  forward reference outside the graph) or an unknown exit clears the
+  tracked bank exactly as master did. ISR bodies record no
   entry because their epilogue restores the interrupted context's BSR
   in hardware, a state the tracked model never sees.
 
@@ -64,15 +64,14 @@ Measured on the menu-demo fixture (whole-program, 18F4550): function-body
 (bench-switch 94 to 64 words, pic16 encoder 7071 to 6984, menu-demo 12137
 to 11974). The simulator is the oracle for every elided select in the unit
 tests, which pin carry across direct and indirect calls, conservatism on
-poisoned and disagreeing exits, forward-defined callees, and the recipe
-fallback.
+poisoned and disagreeing exits, and forward-defined callees; epic-cc#609
+replaced the recipe fallback with carry tests over recorded recipe exits.
 
 ## Consequences
 
-- Calls to runtime recipes keep the post-call `MOVLB`: recipes have no
-  `Gen` run and no map entry. The residual provable-exit sites in the
-  post-change listing are exactly the `__mul_u32`/`__mul_u16` callers.
-  Giving recipes recorded exit banks is deferred, not decided here.
+- Calls to runtime recipes kept the post-call `MOVLB` until epic-cc#609:
+  recipes now pre-seed the map from a throwaway `Gen` run over their
+  fixed bodies, so recipe callers carry the exit like any other callee.
 - A banked select inside the terminator lowering (per-edge phi copies,
   banked retval routing) sets `bsr_dirty`, which poisons the block's
   end state and leaves the callee's exit unknown. Expected and
