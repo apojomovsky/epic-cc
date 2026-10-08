@@ -18,9 +18,9 @@
 8-bit PIC still ships in enormous volume, and the only C toolchain for it has been
 Microchip's closed-source XC8: nothing to inspect when it miscompiles, and no
 say in how it evolves. `epic-cc` is a real compiler instead: clang's front end
-for genuine C diagnostics, a from-scratch whole-program backend with nothing
-to license, and every stage checked against a byte-for-byte oracle. It's the
-default toolchain behind
+for genuine C diagnostics, a from-scratch whole-program backend that is fully
+open source and MIT licensed, and every stage checked against a byte-for-byte
+oracle. It's the default toolchain behind
 [epic-hal](https://github.com/apojomovsky/epic-hal)'s one-command PIC projects.
 
 ## Quickstart
@@ -41,12 +41,12 @@ void main(void) { out = in + 1; }
 
 $ ./epic-cc --target p16f877a add.c -o add.hex && cat add.hex
 :020000040000FA
-:10000000012800308A00052063002008A200220891
-:0A001000013EA3002308A100080030
+:10000000012800308A00052063002008013EA2007C
+:04001000A100080043
 :00000001FF
 ```
 
-(That's the literal output of the `v0.1.0` release binary above, run against this exact file: not a hand-typed transcript.)
+(Actual compiler output on this exact file, verified against the tree: not a hand-typed transcript.)
 
 No `gh` CLI? Download the zip straight from
 [Releases](https://github.com/apojomovsky/epic-cc/releases/latest). Building
@@ -64,6 +64,25 @@ cargo test --workspace
 
 See [`docs/09-build-environment.md`](docs/09-build-environment.md) for the
 pinned versions and build-cache notes.
+
+Prefer PlatformIO? The
+[platform-epic8](https://github.com/apojomovsky/epic-platformio) platform
+builds PIC projects with epic-cc as the default toolchain:
+
+```bash
+pio pkg install -g --platform apojomovsky/epic8
+```
+
+```ini
+; platformio.ini
+[env:epic8]
+platform = apojomovsky/epic8
+board = pic16f877a
+```
+
+Its [getting-started
+guide](https://github.com/apojomovsky/epic-platformio/blob/master/docs/getting-started.md)
+covers boards, examples, and the XC8 alternate toolchain.
 
 ## What you get
 
@@ -102,10 +121,13 @@ feature-by-feature. A fast test subset gates every commit.
 | PIC18 target, in addition to PIC14 | ✅ |
 | Recursion | ⛔ by design: compile error, no escape hatch |
 
-Devices ship as one file each (`crates/device/devices/*.toml`, generated from
-Microchip's own device packs) and the registry grows continuously. See the
-[device directory](crates/device/devices/) for the current list. Adding a
-same-core part is a file, not a feature; see
+Four cores are supported: PIC14 (mid-range), PIC14 Enhanced, PIC18, and
+PIC-baseline for the smallest parts. Devices ship as one file each
+(`crates/device/devices/*.toml`, generated from Microchip's own device
+packs) and the registry, already over a hundred profiles, grows
+continuously. See the [device
+directory](crates/device/devices/) for the current list. Adding a same-core
+part is a file, not a feature; see
 [ADR-019](docs/adr/ADR-019-pic-variants-device-registry.md).
 
 <a id="under-the-hood"></a>
