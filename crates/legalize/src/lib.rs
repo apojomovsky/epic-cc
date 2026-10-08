@@ -4580,8 +4580,8 @@ fn param(name: &str, width: u8) -> Param {
 ///
 /// | routine | `__scr` size | offsets |
 /// |---|---|---|
-/// | `__mul_u8` | 6 | `bk`@0 (multiplier backup, shifted to test bits), `cnt`@1 (loop counter, 8), `r_lo`@2 / `r_hi`@3 (16-bit running product), `t_lo`@4 / `t_hi`@5 (shifted multiplicand) |
-/// | `__mul_u16` | 14 | `bk_lo`@0 / `bk_hi`@1 (multiplier backup), `cnt`@2 (loop counter, 16), `r`@3-6 (32-bit running product), `t`@7-10 (shifted multiplicand), `spare`@11-13 (recipe scratch) |
+/// | `__mul_u8` | 6 | `r`@0 (8-bit running product: the i8 result keeps the low byte, so the loop accumulates mod 256 in the param slots and exits once the multiplier shifts out; the rest is unused) |
+/// | `__mul_u16` | 14 | `r`@0-1 (16-bit running product: the i16 result keeps the low half, so the loop accumulates mod 65536 in the param slots and exits once the multiplier shifts out; the rest is unused) |
 /// | `__udiv_u8`, `__urem_u8` | 4 | `rem_lo`@0 / `rem_hi`@1 (partial remainder: 2 bytes, since the 8-bit rem shift can carry), `cnt`@2 (loop counter, 8), `restore`@3 (restore-step scratch) |
 /// | `__udiv_u16`, `__urem_u16` | 7 | `rem`@0-1 (partial remainder), `cnt`@2 (loop counter, 16), `spare`@3 (recipe scratch), `restore`@4-6 (restore-step scratch) |
 /// | `__sdiv_i8`, `__srem_i8` | 5 | `flags`@0 (sign state: bit0 = negate quotient, bit1 = negate remainder; `\|num\|`/`\|den\|` live in the param slots), `rem_lo`@1 / `rem_hi`@2, `cnt`@3, `restore`@4 |
