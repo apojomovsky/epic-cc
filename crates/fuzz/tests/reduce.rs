@@ -229,10 +229,41 @@ fn reducer_minimizes_a_generated_program_with_a_planted_bug() {
     // statements (the generator's own body, with its local references)
     // down to the planted culprit while preserving the mismatch.
     let mut prog = generate(1);
+    // Pin in0 = 200 on BOTH sides: the PIC side reads inputs from the
+    // source initializers while the host side re-seeds from `inputs`
+    // metadata, so metadata alone would skew the sides and the generated
+    // body itself would mismatch without the culprit.
+    prog.inputs[0].value = 200;
+    let marker = "volatile u8 in0 =";
+    assert!(
+        prog.prologue.contains(marker),
+        "the generated prologue must declare in0"
+    );
+    let prologue = std::mem::take(&mut prog.prologue);
+    prog.prologue = prologue
+        .lines()
+        .map(|line| {
+            if line.starts_with(marker) {
+                "volatile u8 in0 = 0xC8u;"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    prog.c_source = format!("{}{}\n}}\n", prog.prologue, prog.statements.join("\n"));
+    // Premise pin: the generated body is differential-clean at the pinned
+    // inputs, so the planted culprit is the only mismatch source.
+    match run_differential(&prog, &device::PIC16F877A) {
+        Ok(_) => {}
+        Err(f) => {
+            panic!("the generated body must be differential-clean at the pinned inputs, got {f}")
+        }
+    }
     let culprit = format!("  checksum = (u8)(checksum ^ (u8)({CULPRIT}));");
     prog.statements.push(culprit);
     prog.c_source = format!("{}{}\n}}\n", prog.prologue, prog.statements.join("\n"));
-    prog.inputs[0].value = 200; // in0 = 200 (the value that flips the comparison)
     prog.seed = 9998;
 
     let failure = match run_differential(&prog, &device::PIC16F877A) {
