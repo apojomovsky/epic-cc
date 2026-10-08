@@ -3562,6 +3562,142 @@ fn a_six_byte_copy_run_becomes_a_postinc_loop() {
 }
 
 #[test]
+fn consecutive_zero_stores_become_a_postinc_loop() {
+    // Field-by-field zeroing of an aggregate reaches isel as one zero
+    // store per byte; past ZERO_LOOP_MIN_BYTES the drain replaces the
+    // run with one LFSR-seeded loop counting in WREG, the #486 shape
+    // with a single pointer (epic-cc#789).
+    let m = parse(
+        "global g0 i8\n\
+         global g1 i8\n\
+         global g2 i8\n\
+         global g3 i8\n\
+         global g4 i8\n\
+         global g5 i8\n\
+         global g6 i8\n\
+         global g7 i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i8 0 @g0\n\
+             store i8 0 @g1\n\
+             store i8 0 @g2\n\
+             store i8 0 @g3\n\
+             store i8 0 @g4\n\
+             store i8 0 @g5\n\
+             store i8 0 @g6\n\
+             store i8 0 @g7\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("g0", 0x120),
+        ("g1", 0x121),
+        ("g2", 0x122),
+        ("g3", 0x123),
+        ("g4", 0x124),
+        ("g5", 0x125),
+        ("g6", 0x126),
+        ("g7", 0x127),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(main_asm.contains("LFSR 0, 0x120"), "seed missing:\n{asm}");
+    assert!(main_asm.contains("MOVLW 0x08"), "count missing:\n{asm}");
+    assert!(
+        main_asm.contains("CLRF 0xFEE,A"),
+        "POSTINC0 body missing:\n{asm}"
+    );
+    assert!(
+        main_asm.contains("DECFSZ 0xFE8,F,A"),
+        "WREG-counted tail missing:\n{asm}"
+    );
+    for i in 0..8u16 {
+        let direct = format!("CLRF 0x{:03X},B", 0x20 + i);
+        assert!(
+            !main_asm.contains(&direct),
+            "the loop replaces the run, {direct} must not coexist:\n{asm}"
+        );
+    }
+}
+
+#[test]
+fn short_zero_run_stays_straight_clrfs() {
+    // Below ZERO_LOOP_MIN_BYTES the 6-word loop cannot beat one word
+    // per CLRF: four zero stores stay four CLRFs (epic-cc#789).
+    let m = parse(
+        "global g0 i8\n\
+         global g1 i8\n\
+         global g2 i8\n\
+         global g3 i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i8 0 @g0\n\
+             store i8 0 @g1\n\
+             store i8 0 @g2\n\
+             store i8 0 @g3\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("g0", 0x120), ("g1", 0x121), ("g2", 0x122), ("g3", 0x123)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    for i in 0..4u16 {
+        let direct = format!("CLRF 0x{:03X},B", 0x20 + i);
+        assert!(main_asm.contains(&direct), "{direct} missing:\n{asm}");
+    }
+    assert!(
+        !main_asm.contains("CLRF 0xFEE,A"),
+        "no POSTINC loop below the threshold:\n{asm}"
+    );
+}
+
+#[test]
+fn zero_run_broken_by_a_nonzero_store_stays_straight() {
+    // A nonzero byte between zero runs breaks staging: two 3-long runs
+    // replay as straight CLRFs around the MOVLW/MOVWF pair (epic-cc#789).
+    let m = parse(
+        "global g0 i8\n\
+         global g1 i8\n\
+         global g2 i8\n\
+         global g3 i8\n\
+         global g4 i8\n\
+         global g5 i8\n\
+         global g6 i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i8 0 @g0\n\
+             store i8 0 @g1\n\
+             store i8 0 @g2\n\
+             store i8 1 @g3\n\
+             store i8 0 @g4\n\
+             store i8 0 @g5\n\
+             store i8 0 @g6\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("g0", 0x120),
+        ("g1", 0x121),
+        ("g2", 0x122),
+        ("g3", 0x123),
+        ("g4", 0x124),
+        ("g5", 0x125),
+        ("g6", 0x126),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    for i in [0, 1, 2, 4, 5, 6u16] {
+        let direct = format!("CLRF 0x{:03X},B", 0x20 + i);
+        assert!(main_asm.contains(&direct), "{direct} missing:\n{asm}");
+    }
+    assert!(
+        main_asm.contains("MOVLW 0x01"),
+        "middle byte missing:\n{asm}"
+    );
+    assert!(
+        !main_asm.contains("CLRF 0xFEE,A"),
+        "no POSTINC loop for broken runs:\n{asm}"
+    );
+}
+
+#[test]
 fn a_w_shortcut_store_after_a_loop_run_keeps_the_source_byte() {
     // A Bin-held byte copied out after a 6-byte staged run: the W
     // shortcut must reload the source byte when the drain loops, or

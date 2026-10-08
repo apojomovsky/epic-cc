@@ -31,6 +31,31 @@ const PIC18_SFR_ACCESS_LO: u16 = 0xF60;
 /// per byte. (epic-cc#486)
 const COPY_LOOP_MIN_PAIRS: usize = 6;
 
+/// A straight `CLRF` zero byte costs 1 word; a seeded POSTINC zero loop
+/// costs 6 words for any length (`LFSR`, `MOVLW`, `CLRF POSTINC0`,
+/// `DECFSZ`, `BRA`), so it ties at 6 and pays from 7 on. The floor stays
+/// 6 to match the ticket's length-6 runs: at 6 the loop costs what the
+/// straight run did while running slower per byte (epic-cc#789).
+const ZERO_LOOP_MIN_BYTES: usize = 6;
+/// Skip instructions: each skips the next instruction word when its test
+/// holds. Shared by `track_skip` and the `branch_reload_redundant` audit,
+/// matching the outliner's `SKIPS` list.
+fn is_skip_mnem(mnem: &str) -> bool {
+    matches!(
+        mnem,
+        "DECFSZ"
+            | "INCFSZ"
+            | "DCFSNZ"
+            | "INFSNZ"
+            | "BTFSC"
+            | "BTFSS"
+            | "CPFSEQ"
+            | "CPFSGT"
+            | "CPFSLT"
+            | "TSTFSZ"
+    )
+}
+
 /// Codegen options. `copy_loop` keeps the POSTINC drain (epic-cc#486):
 /// long staged runs lower to the 9-word seeded loop, which runs about
 /// 3x slower per byte than straight `MOVFF`s. The speed profile turns it
@@ -216,6 +241,24 @@ struct Gen<'m> {
     /// Whether long staged runs drain as the POSTINC loop. Off under the
     /// speed profile, where straight `MOVFF`s trade flash for cycles.
     copy_loop: bool,
+    /// Consecutive zero bytes staged by `stage_zero` instead of emitted:
+    /// long runs drain as one LFSR-seeded POSTINC zero loop, short ones
+    /// replay as the straight `CLRF`s they would have been (epic-cc#789).
+    /// Each entry carries the source location active when it was staged
+    /// so the parallel `locs` vector stays index-aligned either way. At
+    /// most one of this and `pending_copies` is ever non-empty: staging
+    /// into one drains the other first, so program order survives.
+    pending_zeros: Vec<(u16, Option<SrcLoc>)>,
+    /// `pending_zeros` started right after a skip instruction, so only
+    /// straight replay is sound: skipping the loop seed would run it on
+    /// a stale pointer, while skipping one straight `CLRF` just shortens
+    /// the run. Recorded when the first byte stages, consumed at drain.
+    zero_after_skip: bool,
+    /// The last emitted line was a skip (`DECFSZ`, `BTFSC`, ...), whose
+    /// target is whatever stages or emits next. Labels, comments and
+    /// directives leave it alone: they are not instructions, so a skip
+    /// still reaches past them.
+    after_skip: bool,
     /// Every RAM address a global occupies. The W cache never records or
     /// reuses one: an interrupt can write a global between the store and
     /// the reload, while the ISR epilogue restores W to its pre-interrupt
@@ -290,7 +333,8 @@ impl<'m> Gen<'m> {
         // `emit_w_load` may move W or set a flag, so the cache cannot
         // survive it (epic-cc#502).
         self.w_holds = None;
-        let line = s.into();
+        let line: String = s.into();
+        self.track_skip(&line);
         if let Some(t) = Self::fwd_target(&line) {
             // A user function literally named `tmp` plus digits would
             // collide with fresh labels; tail calls to one must not
@@ -303,6 +347,23 @@ impl<'m> Gen<'m> {
         }
         self.out.push(line);
         self.locs.push(self.cur_loc.clone());
+    }
+
+    /// Record whether `line` is a skip instruction for `stage_zero`.
+    /// Labels, comments and blank lines are not instructions, so a skip
+    /// still reaches past them; any other unindented text is inline asm
+    /// `emit` cannot read, which counts as a skip (epic-cc#789).
+    fn track_skip(&mut self, line: &str) {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with(';') || t.ends_with(':') {
+            return;
+        }
+        if !line.starts_with(char::is_whitespace) {
+            self.after_skip = true;
+            return;
+        }
+        let mnem = t.split_whitespace().next().unwrap_or("");
+        self.after_skip = is_skip_mnem(mnem);
     }
 
     /// `MOVWF f`, unless the byte at `f` already equals W from an
@@ -382,8 +443,8 @@ impl<'m> Gen<'m> {
         };
         // Staged copies drain at the next emit, between these lines and
         // the branch; today's drain forms leave STATUS alone, but the skip
-        // must not depend on that.
-        if !self.pending_copies.is_empty() || self.out.len() < 2 {
+        // must not depend on that. Staged zeros drain the same way.
+        if !self.pending_copies.is_empty() || !self.pending_zeros.is_empty() || self.out.len() < 2 {
             return false;
         }
         let movwf = self.out[self.out.len() - 1].trim();
@@ -391,11 +452,7 @@ impl<'m> Gen<'m> {
         // A skip in front of the ALU op may have bypassed it, leaving `Z`
         // from older code while the slot holds whatever `W` was.
         if let Some(prev) = self.out.len().checked_sub(3).map(|i| self.out[i].trim()) {
-            const SKIPS: [&str; 10] = [
-                "BTFSC", "BTFSS", "DECFSZ", "INCFSZ", "DCFSNZ", "INFSNZ", "CPFSEQ", "CPFSGT",
-                "CPFSLT", "TSTFSZ",
-            ];
-            if SKIPS.contains(&prev.split_whitespace().next().unwrap_or("")) {
+            if is_skip_mnem(prev.split_whitespace().next().unwrap_or("")) {
                 return false;
             }
         }
@@ -484,6 +541,11 @@ impl<'m> Gen<'m> {
     /// tracked FSR0 position does not. Raw pushes, not `emit`: flush runs
     /// from inside `emit`.
     fn flush_copies(&mut self) {
+        // Staged zeros precede any copy staged later (staging into one
+        // buffer drains the other first), so they drain first here too.
+        // Every explicit `flush_copies` call site inherits this, and the
+        // at-most-one-nonempty invariant makes the order moot elsewhere.
+        self.flush_zeros();
         if self.pending_copies.is_empty() {
             return;
         }
@@ -524,6 +586,82 @@ impl<'m> Gen<'m> {
         for (src, dst, loc) in pairs {
             self.out.push(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
             self.locs.push(loc);
+        }
+    }
+    /// One zero byte at `addr`, staged instead of emitted: consecutive
+    /// addresses drain as a single POSTINC zero loop once long enough
+    /// (epic-cc#789). A breaking address drains first, so the buffer is
+    /// always one maximal run; staged copies drain first for the same
+    /// reason, keeping program order across the two buffers. Invalidation
+    /// stays eager, at the byte's logical position: later address
+    /// computations read the tracked state before the drain. The W cache
+    /// clears like the plain `emit` the straight form used to route
+    /// through, so short runs replay with identical tracked state.
+    fn stage_zero(&mut self, addr: u16) {
+        if let Some(&(last, _)) = self.pending_zeros.last() {
+            if addr != last.wrapping_add(1) {
+                self.flush_zeros();
+                self.zero_after_skip = self.after_skip;
+            }
+        } else {
+            self.flush_copies();
+            self.zero_after_skip = self.after_skip;
+        }
+        self.invalidate_fsr0_if_slot_written(addr, 1);
+        self.w_holds = None;
+        self.pending_zeros.push((addr, self.cur_loc.clone()));
+    }
+
+    /// Drains `pending_zeros`. A run that reached `ZERO_LOOP_MIN_BYTES`
+    /// lowers to the seeded loop (`LFSR`, count in WREG, `CLRF POSTINC0`,
+    /// `DECFSZ`, `BRA`: 6 words, the #486 shape with one pointer); anything
+    /// shorter, or any run with `copy_loop` off or started after a skip,
+    /// replays as the straight `CLRF`s it would have been. Runs over 255
+    /// split: the count is one `MOVLW` literal. Raw pushes, not `emit`:
+    /// flush runs from inside `emit`, and the straight replay resolves
+    /// banks through `operand`, whose `MOVLB` re-enters the empty flush.
+    /// The loop body is bank-free, so the tracked `bsr` survives it; the
+    /// POSTINC walk moves FSR0, and the count clobbers W, so neither
+    /// belief survives. The drain's last line is a real instruction, so
+    /// no skip is pending across it.
+    fn flush_zeros(&mut self) {
+        if self.pending_zeros.is_empty() {
+            return;
+        }
+        let run = std::mem::take(&mut self.pending_zeros);
+        let after_skip = std::mem::replace(&mut self.zero_after_skip, false);
+        self.after_skip = false;
+        let mut rest = run.as_slice();
+        while !rest.is_empty() {
+            let take = rest.len().min(255);
+            let (chunk, next) = rest.split_at(take);
+            rest = next;
+            if self.copy_loop && !after_skip && chunk.len() >= ZERO_LOOP_MIN_BYTES {
+                let n = chunk.len();
+                let base = chunk[0].0;
+                let loc = chunk[0].1.clone();
+                self.w_holds = None;
+                self.fsr0_holds = None;
+                let l_loop = self.fresh_label();
+                for (text, line_loc) in [
+                    (format!("    LFSR 0, 0x{base:03X}"), loc.clone()),
+                    (format!("    MOVLW 0x{n:02X}"), loc.clone()),
+                    (format!("{l_loop}:"), loc.clone()),
+                    ("    CLRF 0xFEE,A".to_string(), loc.clone()),
+                    ("    DECFSZ 0xFE8,F,A".to_string(), loc.clone()),
+                    (format!("    BRA {l_loop}"), loc.clone()),
+                ] {
+                    self.out.push(text);
+                    self.locs.push(line_loc);
+                }
+                continue;
+            }
+            for (addr, loc) in chunk {
+                let (a, f) = self.operand(*addr);
+                let bank = if a == 0 { "A" } else { "B" };
+                self.out.push(format!("    CLRF 0x{f:03X},{bank}"));
+                self.locs.push(loc.clone());
+            }
         }
     }
 
@@ -1985,9 +2123,15 @@ impl<'m> Gen<'m> {
         } else {
             let bank = (addr >> 8) as u8;
             if self.bsr != Some(bank) {
-                self.emit(format!("    MOVLB 0x{bank:X}"));
-                self.bsr = Some(bank);
-                self.bsr_dirty = true;
+                // A straight zero replay resolves its own operands, so
+                // the drain triggered below may select this bank itself:
+                // re-check before emitting, or its MOVLB duplicates.
+                self.flush_zeros();
+                if self.bsr != Some(bank) {
+                    self.emit(format!("    MOVLB 0x{bank:X}"));
+                    self.bsr = Some(bank);
+                    self.bsr_dirty = true;
+                }
             }
             (1, addr & 0xFF)
         }
@@ -2007,6 +2151,9 @@ impl<'m> Gen<'m> {
         if src == dst {
             return;
         }
+        // Staged zeros precede this copy; drain them first so the two
+        // buffers never hold a reordered pair at once.
+        self.flush_zeros();
         self.invalidate_fsr0_if_slot_written(dst, 1);
         // A staged copy replays as a raw `MOVFF` push, which the plain
         // `emit` cannot see, so a copy into the tracked slot must drop the
@@ -2176,9 +2323,9 @@ impl<'m> Gen<'m> {
 
     /// Copy `val` (width `ty.bytes`) into the slot starting at `dst`. A
     /// register/global source uses `MOVFF` (no access bit needed); a
-    /// constant has no `MOVFF` literal form: a zero byte writes a
-    /// one-word `CLRF`, an all-ones byte a one-word `SETF`, and any
-    /// other byte stages through `W` via `MOVLW`/`MOVWF` (all forms
+    /// constant has no `MOVFF` literal form: a zero byte stages for the
+    /// zero loop (`stage_zero`), an all-ones byte a one-word `SETF`, and
+    /// any other byte stages through `W` via `MOVLW`/`MOVWF` (all forms
     /// touch `operand`/`BSR` the same way: this is the one place a
     /// plain copy still touches `operand`).
     fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u16) {
@@ -2187,8 +2334,6 @@ impl<'m> Gen<'m> {
             Val::Const(k) => {
                 for i in 0..ty.bytes() {
                     let byte = ((k >> (i as u32 * 8)) & 0xFF) as u8;
-                    let (a, f) = self.operand(dst + u16::from(i));
-                    let bank = if a == 0 { "A" } else { "B" };
                     if byte == 0 {
                         // A zero byte needs no W staging: CLRF writes it
                         // in one word where the pair costs two. CLRF
@@ -2196,8 +2341,12 @@ impl<'m> Gen<'m> {
                         // STATUS across insts, every consumer sets its
                         // own flags first (compare chains, shift
                         // carries).
-                        self.emit(format!("    CLRF 0x{f:03X},{bank}"));
-                    } else if byte == 0xFF {
+                        self.stage_zero(dst + u16::from(i));
+                        continue;
+                    }
+                    let (a, f) = self.operand(dst + u16::from(i));
+                    let bank = if a == 0 { "A" } else { "B" };
+                    if byte == 0xFF {
                         // An all-ones byte is the same shape with no
                         // flag hazard at all: SETF touches no STATUS
                         // bit. (epic-cc#666)
@@ -9196,6 +9345,9 @@ pub fn select_with_opts(
             fsr0_holds: None,
             tblptr_holds: None,
             pending_copies: Vec::new(),
+            pending_zeros: Vec::new(),
+            zero_after_skip: false,
+            after_skip: false,
             copy_loop: opts.copy_loop,
             cur_func: &f.name,
             global_addrs: &global_addrs,
@@ -9877,6 +10029,9 @@ pub fn select_with_opts(
                 fsr0_holds: None,
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
+                pending_zeros: Vec::new(),
+                zero_after_skip: false,
+                after_skip: false,
                 copy_loop: opts.copy_loop,
                 cur_func: &f.name,
                 global_addrs: &global_addrs,
@@ -10222,6 +10377,9 @@ mod tests {
                 fsr0_holds: None,
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
+                pending_zeros: Vec::new(),
+                zero_after_skip: false,
+                after_skip: false,
                 copy_loop: true,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
@@ -10256,6 +10414,9 @@ mod tests {
                 fsr0_holds: None,
                 tblptr_holds: None,
                 pending_copies: Vec::new(),
+                pending_zeros: Vec::new(),
+                zero_after_skip: false,
+                after_skip: false,
                 copy_loop: true,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
@@ -10305,6 +10466,9 @@ mod p3_gen_tests {
             fsr0_holds: None,
             tblptr_holds: None,
             pending_copies: Vec::new(),
+            pending_zeros: Vec::new(),
+            zero_after_skip: false,
+            after_skip: false,
             copy_loop: true,
             cur_func: "main",
             global_addrs: empty_global_addrs(),
@@ -10357,6 +10521,73 @@ mod p3_gen_tests {
             g.out.iter().any(|l| l.contains("MOVLB")),
             "the banked range needs a MOVLB"
         );
+    }
+
+    #[test]
+    fn zero_run_drains_as_a_seeded_loop() {
+        // Eight staged zero bytes drain as LFSR/MOVLW/CLRF POSTINC0/
+        // DECFSZ/BRA: 6 words against 8 straight CLRFs. Drives `Gen`
+        // directly, the way the forward-join tests below do.
+        let m = Module {
+            globals: Vec::new(),
+            funcs: Vec::new(),
+            module_asm: Vec::new(),
+        };
+        let addrs = HashMap::new();
+        let resolved: PtrResolution = HashMap::new();
+        let mut tmp = 0u32;
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
+        for a in 0x120..0x128u16 {
+            g.stage_zero(a);
+        }
+        g.emit("    NOP".to_string());
+        let text = g.out.join("\n");
+        for line in [
+            "LFSR 0, 0x120",
+            "MOVLW 0x08",
+            "CLRF 0xFEE,A",
+            "DECFSZ 0xFE8,F,A",
+        ] {
+            assert!(text.contains(line), "{line} missing:\n{text}");
+        }
+        assert!(
+            !text.contains("CLRF 0x020,B"),
+            "the loop replaces the run:\n{text}"
+        );
+        assert!(g.fsr0_holds.is_none(), "the POSTINC walk moves FSR0");
+        assert!(g.w_holds.is_none(), "the count clobbers W");
+    }
+
+    #[test]
+    fn zero_run_after_a_skip_replays_straight() {
+        // A skip in front of the run would skip the loop seed, so the
+        // drain replays straight CLRFs instead: skipping one of those
+        // just shortens the run.
+        let m = Module {
+            globals: Vec::new(),
+            funcs: Vec::new(),
+            module_asm: Vec::new(),
+        };
+        let addrs = HashMap::new();
+        let resolved: PtrResolution = HashMap::new();
+        let mut tmp = 0u32;
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
+        g.emit("    BTFSC 0xFD8,2,A".to_string());
+        for a in 0x120..0x128u16 {
+            g.stage_zero(a);
+        }
+        g.emit("    NOP".to_string());
+        let text = g.out.join("\n");
+        assert!(
+            !text.contains("LFSR 0, 0x120"),
+            "no loop seed after a skip:\n{text}"
+        );
+        for a in 0x20..0x28u16 {
+            let direct = format!("CLRF 0x{a:03X},B");
+            assert!(text.contains(&direct), "{direct} missing:\n{text}");
+        }
     }
 
     #[test]

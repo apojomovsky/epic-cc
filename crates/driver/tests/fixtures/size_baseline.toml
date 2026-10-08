@@ -30,7 +30,7 @@ ram_bytes = 6
 [[entry]]
 name = "bench-zero-init-18f4550"
 device = "18F4550"
-flash_words = 25
+flash_words = 19
 ram_bytes = 12
 
 [[entry]]
@@ -162,13 +162,13 @@ ram_bytes = 326
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 9311
+flash_words = 9315
 ram_bytes = 781
 
 [[entry]]
 name = "hal-pic18-control-demo-18f4550"
 device = "18F4550"
-flash_words = 9519
+flash_words = 9507
 ram_bytes = 963
 
 [[entry]]
@@ -180,7 +180,7 @@ ram_bytes = 500
 [[entry]]
 name = "hal-pic18-bridge-demo-18f4550"
 device = "18F4550"
-flash_words = 13575
+flash_words = 13568
 ram_bytes = 1312
 
 [[entry]]
