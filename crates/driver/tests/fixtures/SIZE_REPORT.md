@@ -2,10 +2,10 @@
 
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
-- Date (UTC): 2026-10-07
-- Commit: b86c730
+- Date (UTC): 2026-10-08
+- Commit: b27233c
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
-- Menu-demo listing: 9299 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
+- Menu-demo listing: 9263 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
 ## Micro benches (flash / RAM)
 
@@ -22,7 +22,7 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | bench-w-roundtrip | 18F4550 | 18 | 4 | = / = |
 | bench-bank | 18F4550 | 23 | 10 | = / = |
 | bench-handle-init | 18F4550 | 21 | 4 | = / = |
-| bench-switch-calls | 18F4550 | 49 | 6 | = / = |
+| bench-switch-calls | 18F4550 | 45 | 6 | = / = |
 | bench-u32-loop | 18F4550 | 48 | 19 | = / = |
 | bench-u16-dec | 18F4550 | 67 | 21 | = / = |
 | bench-struct-scan | 18F4550 | 109 | 95 | = / = |
@@ -44,10 +44,10 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | hal-pic18-blink-18f4550 | 18F4550 | 313 | 30 | = / = |
 | hal-pic14e-blink-16f1937 | 16F1937 | 100 | 6 | = / = |
 | hal-pic16-encoder-full-16f877a | 16F877A | 5460 | 326 | = / = |
-| hal-pic18-menu-demo-18f4550 | 18F4550 | 9311 | 781 | = / = |
-| hal-pic18-control-demo-18f4550 | 18F4550 | 9519 | 963 | = / = |
+| hal-pic18-menu-demo-18f4550 | 18F4550 | 9307 | 781 | = / = |
+| hal-pic18-control-demo-18f4550 | 18F4550 | 9468 | 963 | = / = |
 | hal-pic18-pid-18f4550 | 18F4550 | 3259 | 500 | = / = |
-| hal-pic18-bridge-demo-18f4550 | 18F4550 | 13575 | 1312 | = / = |
+| hal-pic18-bridge-demo-18f4550 | 18F4550 | 13498 | 1312 | = / = |
 
 ## Menu-demo clusters (listing words)
 
@@ -69,14 +69,14 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 
 Top profiler categories on the same listing:
 
-- `data-move`: 1417 (15.2%)
-- `shared-code`: 1354 (14.6%)
+- `data-move`: 1405 (15.2%)
+- `shared-code`: 1346 (14.5%)
 - `struct-copy-movff`: 1264 (13.6%)
-- `branch`: 764 (8.2%)
-- `scalar-alu`: 532 (5.7%)
-- `cond-branch`: 525 (5.6%)
-- `literal-load`: 490 (5.3%)
-- `wide-literal-arith`: 423 (4.5%)
+- `branch`: 759 (8.2%)
+- `scalar-alu`: 527 (5.7%)
+- `cond-branch`: 518 (5.6%)
+- `literal-load`: 492 (5.3%)
+- `wide-literal-arith`: 423 (4.6%)
 
 ## Regenerating
 

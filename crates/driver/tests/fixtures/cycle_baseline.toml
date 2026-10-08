@@ -336,16 +336,16 @@ ram_bytes = 54
 [[entry]]
 name = "speed-switch16-18f4550"
 device = "18F4550"
-cycles = 98
-flash_words = 91
+cycles = 92
+flash_words = 87
 ram_bytes = 10
 
 [[entry]]
 name = "speed-switch16-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 74
-flash_words = 107
+cycles = 68
+flash_words = 103
 ram_bytes = 10
 
 [[entry]]
@@ -472,7 +472,7 @@ ram_bytes = 131
 name = "scen-control-pass-18f4550"
 device = "18F4550"
 cycles = 812
-flash_words = 4020
+flash_words = 4014
 ram_bytes = 653
 
 [[entry]]
@@ -480,7 +480,7 @@ name = "scen-control-pass-18f4550"
 device = "18F4550"
 profile = "O2"
 cycles = 758
-flash_words = 4307
+flash_words = 4301
 ram_bytes = 749
 
 [[entry]]
