@@ -176,6 +176,10 @@ struct Gen<'m> {
     prov: FlashProvenance,
     scratch: u16,
     retval_lo: u16,
+    /// Normalized divide loops (epic-cc#895): under the speed profile the
+    /// unsigned divmod routines run a bit-length-derived iteration count
+    /// instead of the full width, trading flash for cycles.
+    fast_divmod: bool,
     cur_func: &'m str,
     /// Module-scoped fresh-label counter, shared across every function so the
     /// emitted `tmp{n}:` labels stay unique in the single `.asm` output.
@@ -4067,15 +4071,25 @@ impl<'m> Gen<'m> {
     /// borrow chain is exact: no extended-bit special case. C after the
     /// last SUBWF is 1 iff rem >= den (the quotient-bit discriminator).
     fn emit_divmod32(&mut self, num: u16, scr: u16) {
-        let (rem0, den0, cnt) = (scr, scr + 4, scr + 8);
-        let l_loop = self.fresh_label();
-        let l_restore = self.fresh_label();
-        let l_next = self.fresh_label();
+        let (rem0, cnt) = (scr, scr + 8);
         for i in 0..4 {
             self.emit(format!("    CLRF 0x{:02X}", rem0 + i));
         }
         self.emit("    MOVLW 0x20".to_string());
         self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        self.emit_divmod32_loop(num, scr, scr + 4);
+    }
+
+    /// The 32-iteration restoring loop over `num`/`rem`, reading the
+    /// denominator from `den0`: the copy at `scr + 4` on the default path,
+    /// the param slots on the O2 normalized path (which skips the copy).
+    /// The counter arrives loaded; shared by both paths so their loop
+    /// text cannot drift apart.
+    fn emit_divmod32_loop(&mut self, num: u16, scr: u16, den0: u16) {
+        let (rem0, cnt) = (scr, scr + 8);
+        let l_loop = self.fresh_label();
+        let l_restore = self.fresh_label();
+        let l_next = self.fresh_label();
         self.emit(format!("{l_loop}:"));
         self.emit("    BCF STATUS, 0".to_string());
         for i in 0..4 {
@@ -4115,6 +4129,289 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_next}:"));
         self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
         self.emit(format!("    GOTO {l_loop}"));
+    }
+
+    /// Bit length of the 32-bit value at `n3:n2:n1:n0` into `dst` (0 for
+    /// zero): byte tests move the top nonzero byte to `tmp` with its base
+    /// (24/16/8/0) in `base`; one shared 8-bit cascade finishes it and
+    /// the base adds back in. All labels are fresh per call.
+    fn emit_bitlen32(&mut self, n3: u16, n2: u16, n1: u16, n0: u16, dst: u16, tmp: u16, base: u16) {
+        let l_t2 = self.fresh_label();
+        let l_t1 = self.fresh_label();
+        let l_t0 = self.fresh_label();
+        let l_casc = self.fresh_label();
+        self.emit(format!("    MOVF 0x{n3:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_t2}"));
+        self.emit(format!("    MOVWF 0x{tmp:02X}"));
+        self.emit("    MOVLW 0x18".to_string());
+        self.emit(format!("    MOVWF 0x{base:02X}"));
+        self.emit(format!("    GOTO {l_casc}"));
+        self.emit(format!("{l_t2}:"));
+        self.emit(format!("    MOVF 0x{n2:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_t1}"));
+        self.emit(format!("    MOVWF 0x{tmp:02X}"));
+        self.emit("    MOVLW 0x10".to_string());
+        self.emit(format!("    MOVWF 0x{base:02X}"));
+        self.emit(format!("    GOTO {l_casc}"));
+        self.emit(format!("{l_t1}:"));
+        self.emit(format!("    MOVF 0x{n1:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_t0}"));
+        self.emit(format!("    MOVWF 0x{tmp:02X}"));
+        self.emit("    MOVLW 0x08".to_string());
+        self.emit(format!("    MOVWF 0x{base:02X}"));
+        self.emit(format!("    GOTO {l_casc}"));
+        self.emit(format!("{l_t0}:"));
+        self.emit(format!("    MOVF 0x{n0:02X}, W"));
+        self.emit(format!("    MOVWF 0x{tmp:02X}"));
+        self.emit(format!("    CLRF 0x{base:02X}"));
+        self.emit(format!("{l_casc}:"));
+        self.emit_bitlen8(tmp);
+        self.emit(format!("    ADDWF 0x{base:02X}, W"));
+        self.emit(format!("    MOVWF 0x{dst:02X}"));
+    }
+
+    /// O2 normalized u32 divide core: the shared 32-bit restoring loop
+    /// runs exactly the quotient's significant bits. Denominator reads
+    /// come straight from the param slots (no copy); the prescale shifts
+    /// whole bytes first, then bits. Same contract as the u16 core:
+    /// `den == 0` runs the full loop, `k <= 0` answers without looping.
+    /// Ends at the loop; the caller emits `{l_tail}:` plus its stores.
+    fn emit_norm_u32(&mut self, num: u16, den: u16, scr: u16, l_tail: &str) {
+        let (rem0, k, bl, cnt) = (scr, scr + 4, scr + 5, scr + 8);
+        let l_bl = self.fresh_label();
+        let l_pre = self.fresh_label();
+        let l_pb = self.fresh_label();
+        let l_pbits = self.fresh_label();
+        let l_psb = self.fresh_label();
+        let l_loop = self.fresh_label();
+        let l_skip = self.fresh_label();
+        // den == 0 pins k = 32 (the poison path runs the full loop).
+        self.emit(format!("    MOVF 0x{den:02X}, W"));
+        self.emit(format!("    IORWF 0x{:02X}, W", den + 1));
+        self.emit(format!("    IORWF 0x{:02X}, W", den + 2));
+        self.emit(format!("    IORWF 0x{:02X}, W", den + 3));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_bl}"));
+        self.emit("    MOVLW 0x20".to_string());
+        self.emit(format!("    MOVWF 0x{k:02X}"));
+        self.emit(format!("    GOTO {l_pre}"));
+        self.emit(format!("{l_bl}:"));
+        self.emit_bitlen32(den + 3, den + 2, den + 1, den, bl, scr + 6, scr + 7);
+        // bl_n into cnt, reusing the counter slot.
+        self.emit_bitlen32(num + 3, num + 2, num + 1, num, cnt, scr + 6, scr + 7);
+        self.emit(format!("    MOVF 0x{bl:02X}, W"));
+        self.emit(format!("    SUBWF 0x{cnt:02X}, W"));
+        self.emit("    BTFSS STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l_skip}"));
+        self.emit("    ADDLW 0x01".to_string());
+        self.emit(format!("    MOVWF 0x{k:02X}"));
+        self.emit(format!("{l_pre}:"));
+        for i in 0..4 {
+            self.emit(format!("    CLRF 0x{:02X}", rem0 + i));
+        }
+        // t = 32 - k into cnt.
+        self.emit(format!("    MOVF 0x{k:02X}, W"));
+        self.emit("    SUBLW 0x20".to_string());
+        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        // Whole bytes first, then the remaining bits.
+        self.emit(format!("{l_pb}:"));
+        self.emit("    MOVLW 0x08".to_string());
+        self.emit(format!("    SUBWF 0x{cnt:02X}, W"));
+        self.emit("    BTFSS STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l_pbits}"));
+        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", rem0 + 2));
+        self.emit(format!("    MOVWF 0x{:02X}", rem0 + 3));
+        self.emit(format!("    MOVF 0x{:02X}, W", rem0 + 1));
+        self.emit(format!("    MOVWF 0x{:02X}", rem0 + 2));
+        self.emit(format!("    MOVF 0x{:02X}, W", rem0));
+        self.emit(format!("    MOVWF 0x{:02X}", rem0 + 1));
+        self.emit(format!("    MOVF 0x{:02X}, W", num + 3));
+        self.emit(format!("    MOVWF 0x{:02X}", rem0));
+        self.emit(format!("    MOVF 0x{:02X}, W", num + 2));
+        self.emit(format!("    MOVWF 0x{:02X}", num + 3));
+        self.emit(format!("    MOVF 0x{:02X}, W", num + 1));
+        self.emit(format!("    MOVWF 0x{:02X}", num + 2));
+        self.emit(format!("    MOVF 0x{:02X}, W", num));
+        self.emit(format!("    MOVWF 0x{:02X}", num + 1));
+        self.emit(format!("    CLRF 0x{num:02X}"));
+        self.emit(format!("    GOTO {l_pb}"));
+        self.emit(format!("{l_pbits}:"));
+        self.emit(format!("    MOVF 0x{cnt:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_loop}"));
+        self.emit(format!("{l_psb}:"));
+        self.emit("    BCF STATUS, 0".to_string());
+        for i in 0..4 {
+            self.emit(format!("    RLF 0x{:02X}, F", num + i));
+        }
+        for i in 0..4 {
+            self.emit(format!("    RLF 0x{:02X}, F", rem0 + i));
+        }
+        self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
+        self.emit(format!("    GOTO {l_psb}"));
+        self.emit(format!("{l_loop}:"));
+        self.emit(format!("    MOVF 0x{k:02X}, W"));
+        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        self.emit_divmod32_loop(num, scr, den);
+        self.emit(format!("    GOTO {l_tail}"));
+        self.emit(format!("{l_skip}:"));
+        for i in 0..4 {
+            self.emit(format!("    MOVF 0x{:02X}, W", num + i));
+            self.emit(format!("    MOVWF 0x{:02X}", rem0 + i));
+        }
+        for i in 0..4 {
+            self.emit(format!("    CLRF 0x{:02X}", num + i));
+        }
+    }
+
+    /// Bit length of the byte at `addr` into W (0 for a zero byte): the
+    /// normalization setup for the O2 divide loops. Straight-line BTFSS
+    /// cascade, no tables or FSR, so no page or banking hazards. A set bit
+    /// skips its GOTO into the MOVLW; a clear bit takes the GOTO onward,
+    /// and an all-clear byte falls through every level to the zero MOVLW.
+    fn emit_bitlen8(&mut self, addr: u16) {
+        let l_done = self.fresh_label();
+        let l_zero = self.fresh_label();
+        for bit in (1..8).rev() {
+            let l_next = self.fresh_label();
+            self.emit(format!("    BTFSS 0x{addr:02X}, {bit}"));
+            self.emit(format!("    GOTO {l_next}"));
+            self.emit(format!("    MOVLW 0x{:02X}", bit + 1));
+            self.emit(format!("    GOTO {l_done}"));
+            self.emit(format!("{l_next}:"));
+        }
+        self.emit(format!("    BTFSS 0x{addr:02X}, 0"));
+        self.emit(format!("    GOTO {l_zero}"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    GOTO {l_done}"));
+        self.emit(format!("{l_zero}:"));
+        self.emit("    MOVLW 0x00".to_string());
+        self.emit(format!("{l_done}:"));
+    }
+
+    /// Bit length of the 16-bit value at `hi:lo` into `dst` (0 for zero).
+    /// The top nonzero byte moves to `tmp` with its base (8 or 0) in
+    /// `base`; one shared 8-bit cascade finishes it and the base adds
+    /// back in. All labels are fresh per call.
+    fn emit_bitlen16(&mut self, hi: u16, lo: u16, dst: u16, tmp: u16, base: u16) {
+        let l_lo = self.fresh_label();
+        let l_casc = self.fresh_label();
+        self.emit(format!("    MOVF 0x{hi:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_lo}"));
+        self.emit(format!("    MOVWF 0x{tmp:02X}"));
+        self.emit("    MOVLW 0x08".to_string());
+        self.emit(format!("    MOVWF 0x{base:02X}"));
+        self.emit(format!("    GOTO {l_casc}"));
+        self.emit(format!("{l_lo}:"));
+        self.emit(format!("    MOVF 0x{lo:02X}, W"));
+        self.emit(format!("    MOVWF 0x{tmp:02X}"));
+        self.emit(format!("    CLRF 0x{base:02X}"));
+        self.emit(format!("{l_casc}:"));
+        self.emit_bitlen8(tmp);
+        self.emit(format!("    ADDWF 0x{base:02X}, W"));
+        self.emit(format!("    MOVWF 0x{dst:02X}"));
+    }
+
+    /// O2 normalized u16 divide core: the standard restoring loop below
+    /// runs exactly the quotient's significant bits instead of all 16.
+    /// The leading iterations provably fail (their partial remainder is
+    /// the dividend's top bits, below the divisor), so prescaling
+    /// `(rem:num)` left by their count reproduces the loop state and the
+    /// short loop finishes identically. `k` is the bit-length difference
+    /// plus one; `k <= 0` means `num < den`, answered without looping.
+    /// `den == 0` takes `k = 16`, the full loop, so the poison result
+    /// matches the default body exactly. Ends at the loop; the caller
+    /// emits `{l_tail}:` plus its result stores, which `l_skip` jumps to.
+    fn emit_norm_u16(&mut self, num: u16, den: u16, scr: u16, l_tail: &str) {
+        let (rem_lo, rem_hi, cnt, k, bl) = (scr, scr + 1, scr + 2, scr + 3, scr + 4);
+        let l_bl = self.fresh_label();
+        let l_pre = self.fresh_label();
+        let l_ps = self.fresh_label();
+        let l_loop = self.fresh_label();
+        let l_body = self.fresh_label();
+        let l_restore = self.fresh_label();
+        let l_next = self.fresh_label();
+        let l_skip = self.fresh_label();
+        // den == 0 pins k = 16 (the poison path runs the full loop).
+        self.emit(format!("    MOVF 0x{den:02X}, W"));
+        self.emit(format!("    IORWF 0x{:02X}, W", den + 1));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_bl}"));
+        self.emit("    MOVLW 0x10".to_string());
+        self.emit(format!("    MOVWF 0x{k:02X}"));
+        self.emit(format!("    GOTO {l_pre}"));
+        self.emit(format!("{l_bl}:"));
+        // bl_d = bitlen16(den) into bl; the top byte stages through
+        // tmp/base (free __scr tail, O2 path only).
+        self.emit_bitlen16(den + 1, den, bl, scr + 5, scr + 6);
+        // bl_n = bitlen16(num) into cnt, reusing the counter slot.
+        self.emit_bitlen16(num + 1, num, cnt, scr + 5, scr + 6);
+        // k = bl_n - bl_d + 1; bl_n < bl_d answers 0 without looping.
+        self.emit(format!("    MOVF 0x{bl:02X}, W"));
+        self.emit(format!("    SUBWF 0x{cnt:02X}, W"));
+        self.emit("    BTFSS STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l_skip}"));
+        self.emit("    ADDLW 0x01".to_string());
+        self.emit(format!("    MOVWF 0x{k:02X}"));
+        self.emit(format!("{l_pre}:"));
+        self.emit(format!("    CLRF 0x{rem_lo:02X}"));
+        self.emit(format!("    CLRF 0x{rem_hi:02X}"));
+        // t = 16 - k into cnt; a zero count skips the prescale.
+        self.emit(format!("    MOVF 0x{k:02X}, W"));
+        self.emit("    SUBLW 0x10".to_string());
+        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_loop}"));
+        self.emit(format!("{l_ps}:"));
+        self.emit("    BCF STATUS, 0".to_string());
+        self.emit(format!("    RLF 0x{num:02X}, F"));
+        self.emit(format!("    RLF 0x{:02X}, F", num + 1));
+        self.emit(format!("    RLF 0x{rem_lo:02X}, F"));
+        self.emit(format!("    RLF 0x{rem_hi:02X}, F"));
+        self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
+        self.emit(format!("    GOTO {l_ps}"));
+        self.emit(format!("{l_loop}:"));
+        self.emit(format!("    MOVF 0x{k:02X}, W"));
+        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        self.emit(format!("{l_body}:"));
+        self.emit("    BCF STATUS, 0".to_string());
+        self.emit(format!("    RLF 0x{num:02X}, F"));
+        self.emit(format!("    RLF 0x{:02X}, F", num + 1));
+        self.emit(format!("    RLF 0x{rem_lo:02X}, F"));
+        self.emit(format!("    RLF 0x{rem_hi:02X}, F"));
+        self.emit(format!("    MOVF 0x{den:02X}, W"));
+        self.emit(format!("    SUBWF 0x{rem_lo:02X}, F"));
+        self.emit(format!("    MOVF 0x{:02X}, W", den + 1));
+        self.emit("    BTFSS STATUS, 0".to_string());
+        self.emit(format!("    INCFSZ 0x{:02X}, W", den + 1));
+        self.emit(format!("    SUBWF 0x{rem_hi:02X}, F"));
+        self.emit("    BTFSS STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l_restore}"));
+        self.emit(format!("    BSF 0x{num:02X}, 0"));
+        self.emit(format!("    GOTO {l_next}"));
+        self.emit(format!("{l_restore}:"));
+        self.emit(format!("    MOVF 0x{den:02X}, W"));
+        self.emit(format!("    ADDWF 0x{rem_lo:02X}, F"));
+        self.emit(format!("    MOVF 0x{:02X}, W", den + 1));
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit(format!("    INCFSZ 0x{:02X}, W", den + 1));
+        self.emit(format!("    ADDWF 0x{rem_hi:02X}, F"));
+        self.emit(format!("{l_next}:"));
+        self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
+        self.emit(format!("    GOTO {l_body}"));
+        self.emit(format!("    GOTO {l_tail}"));
+        self.emit(format!("{l_skip}:"));
+        self.emit(format!("    MOVF 0x{num:02X}, W"));
+        self.emit(format!("    MOVWF 0x{rem_lo:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", num + 1));
+        self.emit(format!("    MOVWF 0x{rem_hi:02X}"));
+        self.emit(format!("    CLRF 0x{num:02X}"));
+        self.emit(format!("    CLRF 0x{:02X}", num + 1));
     }
 
     /// The recipe body for one of the fifteen mul/div/rem runtime routines
@@ -4305,39 +4602,45 @@ impl<'m> Gen<'m> {
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 1, den, den + 1, scr, scr + 6], name);
                 let (rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2);
-                let l_loop = self.fresh_label();
-                let l_restore = self.fresh_label();
-                let l_next = self.fresh_label();
-                self.emit(format!("    CLRF 0x{rem_lo:02X}"));
-                self.emit(format!("    CLRF 0x{rem_hi:02X}"));
-                self.emit("    MOVLW 0x10".to_string());
-                self.emit(format!("    MOVWF 0x{cnt:02X}"));
-                self.emit(format!("{l_loop}:"));
-                self.emit("    BCF STATUS, 0".to_string());
-                self.emit(format!("    RLF 0x{num:02X}, F"));
-                self.emit(format!("    RLF 0x{:02X}, F", num + 1));
-                self.emit(format!("    RLF 0x{rem_lo:02X}, F"));
-                self.emit(format!("    RLF 0x{rem_hi:02X}, F"));
-                self.emit(format!("    MOVF 0x{den:02X}, W"));
-                self.emit(format!("    SUBWF 0x{rem_lo:02X}, F"));
-                self.emit(format!("    MOVF 0x{:02X}, W", den + 1));
-                self.emit("    BTFSS STATUS, 0".to_string());
-                self.emit(format!("    INCFSZ 0x{:02X}, W", den + 1)); // den_hi + borrow
-                self.emit(format!("    SUBWF 0x{rem_hi:02X}, F")); // C = (rem >= den)
-                self.emit("    BTFSS STATUS, 0".to_string());
-                self.emit(format!("    GOTO {l_restore}"));
-                self.emit(format!("    BSF 0x{num:02X}, 0"));
-                self.emit(format!("    GOTO {l_next}"));
-                self.emit(format!("{l_restore}:"));
-                self.emit(format!("    MOVF 0x{den:02X}, W"));
-                self.emit(format!("    ADDWF 0x{rem_lo:02X}, F"));
-                self.emit(format!("    MOVF 0x{:02X}, W", den + 1));
-                self.emit("    BTFSC STATUS, 0".to_string());
-                self.emit(format!("    INCFSZ 0x{:02X}, W", den + 1)); // den_hi + carry
-                self.emit(format!("    ADDWF 0x{rem_hi:02X}, F"));
-                self.emit(format!("{l_next}:"));
-                self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
-                self.emit(format!("    GOTO {l_loop}"));
+                if self.fast_divmod {
+                    let l_tail = self.fresh_label();
+                    self.emit_norm_u16(num, den, scr, &l_tail);
+                    self.emit(format!("{l_tail}:"));
+                } else {
+                    let l_loop = self.fresh_label();
+                    let l_restore = self.fresh_label();
+                    let l_next = self.fresh_label();
+                    self.emit(format!("    CLRF 0x{rem_lo:02X}"));
+                    self.emit(format!("    CLRF 0x{rem_hi:02X}"));
+                    self.emit("    MOVLW 0x10".to_string());
+                    self.emit(format!("    MOVWF 0x{cnt:02X}"));
+                    self.emit(format!("{l_loop}:"));
+                    self.emit("    BCF STATUS, 0".to_string());
+                    self.emit(format!("    RLF 0x{num:02X}, F"));
+                    self.emit(format!("    RLF 0x{:02X}, F", num + 1));
+                    self.emit(format!("    RLF 0x{rem_lo:02X}, F"));
+                    self.emit(format!("    RLF 0x{rem_hi:02X}, F"));
+                    self.emit(format!("    MOVF 0x{den:02X}, W"));
+                    self.emit(format!("    SUBWF 0x{rem_lo:02X}, F"));
+                    self.emit(format!("    MOVF 0x{:02X}, W", den + 1));
+                    self.emit("    BTFSS STATUS, 0".to_string());
+                    self.emit(format!("    INCFSZ 0x{:02X}, W", den + 1)); // den_hi + borrow
+                    self.emit(format!("    SUBWF 0x{rem_hi:02X}, F")); // C = (rem >= den)
+                    self.emit("    BTFSS STATUS, 0".to_string());
+                    self.emit(format!("    GOTO {l_restore}"));
+                    self.emit(format!("    BSF 0x{num:02X}, 0"));
+                    self.emit(format!("    GOTO {l_next}"));
+                    self.emit(format!("{l_restore}:"));
+                    self.emit(format!("    MOVF 0x{den:02X}, W"));
+                    self.emit(format!("    ADDWF 0x{rem_lo:02X}, F"));
+                    self.emit(format!("    MOVF 0x{:02X}, W", den + 1));
+                    self.emit("    BTFSC STATUS, 0".to_string());
+                    self.emit(format!("    INCFSZ 0x{:02X}, W", den + 1)); // den_hi + carry
+                    self.emit(format!("    ADDWF 0x{rem_hi:02X}, F"));
+                    self.emit(format!("{l_next}:"));
+                    self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
+                    self.emit(format!("    GOTO {l_loop}"));
+                }
                 match recipe {
                     "__urem_u16" => self.store_retval(rem_lo, 2),
                     "__udivmod_u16" => {
@@ -4552,11 +4855,17 @@ impl<'m> Gen<'m> {
                 let num = self.slot_addr(name, "num").direct();
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 3, den, den + 3, scr, scr + 9], name);
-                for i in 0..4 {
-                    self.emit(format!("    MOVF 0x{:02X}, W", den + i));
-                    self.emit(format!("    MOVWF 0x{:02X}", scr + 4 + i)); // den copy
+                if self.fast_divmod {
+                    let l_tail = self.fresh_label();
+                    self.emit_norm_u32(num, den, scr, &l_tail);
+                    self.emit(format!("{l_tail}:"));
+                } else {
+                    for i in 0..4 {
+                        self.emit(format!("    MOVF 0x{:02X}, W", den + i));
+                        self.emit(format!("    MOVWF 0x{:02X}", scr + 4 + i)); // den copy
+                    }
+                    self.emit_divmod32(num, scr);
                 }
-                self.emit_divmod32(num, scr);
                 match recipe {
                     "__urem_u32" => self.store_retval(scr, 4),
                     "__udivmod_u32" => {
@@ -7075,6 +7384,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         prov: g.prov.clone(),
         scratch: g.scratch,
         retval_lo: g.retval_lo,
+        fast_divmod: g.fast_divmod,
         cur_func: g.cur_func,
         bool_temps: HashSet::new(),
         tmp: &mut *g.tmp,
@@ -9078,6 +9388,22 @@ fn ref_byte_operand(addrs: &HashMap<String, u16>, offset: usize, target: &str, a
     }
 }
 
+/// Codegen options. Every field defaults to today's output, so unflagged
+/// callers keep byte-identical asm.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// Normalized divide loops (epic-cc#895): the unsigned divmod routines
+    /// run a bit-length-derived iteration count instead of the full width.
+    /// The speed profile turns it on, trading flash for cycles.
+    pub fast_divmod: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { fast_divmod: false }
+    }
+}
+
 /// `select` plus a parallel per-line source-location vector, index-aligned
 /// with the returned asm text. `None` marks a compiler-generated line (the
 /// header, `__start`, const tables, prologue glue). The driver threads this
@@ -9091,6 +9417,21 @@ pub fn select_with_locs(
     addrs: &HashMap<String, u16>,
     staged: &HashSet<String>,
     pool: &ConstPool,
+) -> (String, Vec<Option<SrcLoc>>, HashMap<String, Vec<String>>) {
+    select_with_opts(device, m, addrs, staged, pool, Options::default())
+}
+
+/// `select_with_locs` with codegen options. The driver passes
+/// `fast_divmod: true` under the speed profile, so the unsigned divide
+/// routines run normalized loops instead of trading cycles for flash
+/// (epic-cc#895).
+pub fn select_with_opts(
+    device: &Device,
+    m: &Module,
+    addrs: &HashMap<String, u16>,
+    staged: &HashSet<String>,
+    pool: &ConstPool,
+    opts: Options,
 ) -> (String, Vec<Option<SrcLoc>>, HashMap<String, Vec<String>>) {
     let mut out: Vec<String> = Vec::new();
     let mut locs: Vec<Option<SrcLoc>> = Vec::new();
@@ -9279,6 +9620,7 @@ pub fn select_with_locs(
                 prov: prov.clone(),
                 scratch,
                 retval_lo,
+                fast_divmod: opts.fast_divmod,
                 cur_func: &f.name,
                 bool_temps: HashSet::new(),
                 tmp: &mut tmp,
@@ -9509,6 +9851,7 @@ pub fn select_with_locs(
                     prov: prov.clone(),
                     scratch,
                     retval_lo,
+                    fast_divmod: opts.fast_divmod,
                     cur_func: &f.name,
                     bool_temps: HashSet::new(),
                     tmp: &mut tmp2,
@@ -9833,6 +10176,7 @@ pub fn select_with_locs(
                                 prov: prov.clone(),
                                 scratch,
                                 retval_lo,
+                                fast_divmod: opts.fast_divmod,
                                 cur_func: &f.name,
                                 bool_temps: HashSet::new(),
                                 tmp: &mut tmp,

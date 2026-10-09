@@ -2,10 +2,10 @@
 
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
-- Date (UTC): 2026-10-08
-- Commit: 640bc10
+- Date (UTC): 2026-10-09
+- Commit: 1a08ccc
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
-- Menu-demo listing: 9179 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
+- Menu-demo listing: 9065 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
 ## Micro benches (flash / RAM)
 
@@ -22,7 +22,7 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | bench-w-roundtrip | 18F4550 | 18 | 4 | = / = |
 | bench-bank | 18F4550 | 23 | 10 | = / = |
 | bench-handle-init | 18F4550 | 21 | 4 | = / = |
-| bench-switch-calls | 18F4550 | 49 | 6 | = / = |
+| bench-switch-calls | 18F4550 | 44 | 6 | = / = |
 | bench-u32-loop | 18F4550 | 48 | 19 | = / = |
 | bench-u16-dec | 18F4550 | 67 | 21 | = / = |
 | bench-struct-scan | 18F4550 | 92 | 95 | = / = |
@@ -43,40 +43,40 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | hal-pic16-blink-16f877a | 16F877A | 462 | 44 | = / = |
 | hal-pic18-blink-18f4550 | 18F4550 | 313 | 30 | = / = |
 | hal-pic14e-blink-16f1937 | 16F1937 | 100 | 6 | = / = |
-| hal-pic16-encoder-full-16f877a | 16F877A | 5460 | 326 | = / = |
-| hal-pic18-menu-demo-18f4550 | 18F4550 | 9191 | 781 | = / = |
-| hal-pic18-control-demo-18f4550 | 18F4550 | 9368 | 963 | = / = |
-| hal-pic18-pid-18f4550 | 18F4550 | 3195 | 500 | = / = |
-| hal-pic18-bridge-demo-18f4550 | 18F4550 | 13273 | 1312 | = / = |
+| hal-pic16-encoder-full-16f877a | 16F877A | 5372 | 326 | = / = |
+| hal-pic18-menu-demo-18f4550 | 18F4550 | 9119 | 781 | = / = |
+| hal-pic18-control-demo-18f4550 | 18F4550 | 9313 | 963 | = / = |
+| hal-pic18-pid-18f4550 | 18F4550 | 3188 | 500 | = / = |
+| hal-pic18-bridge-demo-18f4550 | 18F4550 | 12916 | 1296 | = / = |
 
 ## Menu-demo clusters (listing words)
 
 | cluster | ours |
 |---|---|
-| menu_demo_init +7 folded | 1700 |
+| menu_demo_init +7 folded | 1697 |
 | redraw | 485 |
 | main | 367 |
 | redraw_status | 329 |
 | EPIC_USART_Init | 327 |
-| epic_taskmgr_run +1 folded | 323 |
+| epic_taskmgr_run +1 folded | 321 |
 | epic_dispatch_all_irqs_isr | 267 |
-| menu_demo_task_heartbeat +1 folded | 264 |
+| menu_demo_task_heartbeat +1 folded | 243 |
 | epic_dispatch_all_irqs +5 folded | 235 |
-| menu_demo_task_ui | 206 |
+| menu_demo_task_ui | 205 |
 | __epic_config | 196 |
 | EPIC_IRQ_GetFlag_isr | 185 |
 | epic_taskmgr_attach_timer0 +2 folded | 183 |
 
 Top profiler categories on the same listing:
 
-- `data-move`: 1418 (15.4%)
-- `shared-code`: 1321 (14.4%)
-- `struct-copy-movff`: 1182 (12.9%)
-- `branch`: 763 (8.3%)
-- `scalar-alu`: 579 (6.3%)
-- `cond-branch`: 549 (6.0%)
-- `literal-load`: 479 (5.2%)
-- `slot-copy`: 396 (4.3%)
+- `data-move`: 1405 (15.5%)
+- `shared-code`: 1239 (13.7%)
+- `struct-copy-movff`: 1184 (13.1%)
+- `branch`: 758 (8.4%)
+- `scalar-alu`: 574 (6.3%)
+- `cond-branch`: 534 (5.9%)
+- `literal-load`: 485 (5.4%)
+- `slot-copy`: 388 (4.3%)
 
 ## Regenerating
 
