@@ -1,6 +1,6 @@
 use device::PIC16F877A;
 use ir::parse;
-use isel::{select, verify_page_fit};
+use isel::{select, select_with_opts, verify_page_fit, ConstPool, Options};
 use std::collections::{HashMap, HashSet};
 
 fn addrs(pairs: &[(&str, u16)]) -> HashMap<String, u16> {
@@ -3333,6 +3333,245 @@ fn sim_run_bytes(
     p.run(200_000);
     assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
     (0..n).map(|i| p.ram()[out as usize + i]).collect()
+}
+
+/// `sim_run_bytes` through the O2 normalized divide bodies.
+fn sim_run_bytes_o2(
+    ir_text: &str,
+    map: &[(String, u16)],
+    seed: &[(u16, u8)],
+    out: u16,
+    n: usize,
+) -> Vec<u8> {
+    use pic14_sim::Pic14;
+    let m = parse(ir_text);
+    let opts = Options { fast_divmod: true };
+    let (asm, _, _) = select_with_opts(
+        &PIC16F877A,
+        &m,
+        &addrs(&map_refs(map)),
+        &HashSet::new(),
+        &ConstPool::empty(),
+        opts,
+    );
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    for (a, v) in seed {
+        p.ram_mut()[*a as usize] = *v;
+    }
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    (0..n).map(|i| p.ram()[out as usize + i]).collect()
+}
+
+/// O2 normalized u16 divides return exact quotients and remainders,
+/// including the quotient-zero, den-greater, and den-zero shapes. The
+/// den-zero row pins poison parity with the default body.
+#[test]
+fn norm_u16_o2_simulates_quotient_and_remainder() {
+    // (routine, x bytes lo..hi, y bytes lo..hi, expected out bytes,
+    // expected spill bytes for the combined spelling, empty otherwise)
+    let cases: &[(&str, &[u8], &[u8], &[u8], &[u8])] = &[
+        (
+            "__udiv_u16",
+            &[0x50, 0xC3],
+            &[0x89, 0x00],
+            &[0x6C, 0x01],
+            &[],
+        ),
+        (
+            "__urem_u16",
+            &[0x50, 0xC3],
+            &[0x89, 0x00],
+            &[0x84, 0x00],
+            &[],
+        ),
+        (
+            "__udivmod_u16",
+            &[0x50, 0xC3],
+            &[0x89, 0x00],
+            &[0x6C, 0x01],
+            &[0x84, 0x00],
+        ),
+        (
+            "__udiv_u16",
+            &[0x07, 0x00],
+            &[0x2D, 0x01],
+            &[0x00, 0x00],
+            &[],
+        ),
+        (
+            "__urem_u16",
+            &[0x07, 0x00],
+            &[0x2D, 0x01],
+            &[0x07, 0x00],
+            &[],
+        ),
+        (
+            "__udiv_u16",
+            &[0xFF, 0xFF],
+            &[0x01, 0x00],
+            &[0xFF, 0xFF],
+            &[],
+        ),
+        (
+            "__urem_u16",
+            &[0x00, 0x00],
+            &[0x89, 0x00],
+            &[0x00, 0x00],
+            &[],
+        ),
+        (
+            "__udiv_u16",
+            &[0x89, 0x00],
+            &[0x89, 0x00],
+            &[0x01, 0x00],
+            &[],
+        ),
+        (
+            "__urem_u16",
+            &[0x89, 0x00],
+            &[0x89, 0x00],
+            &[0x00, 0x00],
+            &[],
+        ),
+        (
+            "__udiv_u16",
+            &[0x05, 0x00],
+            &[0x00, 0x00],
+            &[0xFF, 0xFF],
+            &[],
+        ),
+        (
+            "__urem_u16",
+            &[0x05, 0x00],
+            &[0x00, 0x00],
+            &[0x05, 0x00],
+            &[],
+        ),
+    ];
+    for &(name, x, y, want, want_r) in cases {
+        let (ir, map) = routine_module(name);
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((0x20 + i as u16, *b));
+        }
+        for (i, b) in y.iter().enumerate() {
+            seed.push((0x22 + i as u16, *b));
+        }
+        let got = sim_run_bytes_o2(&ir, &map, &seed, 0x24, want.len());
+        assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) out");
+        if !want_r.is_empty() {
+            let slot = map
+                .iter()
+                .find(|(k, _)| k == slot_name(name))
+                .expect("spill slot in map")
+                .1;
+            let got_r = sim_run_bytes_o2(&ir, &map, &seed, slot, want_r.len());
+            assert_eq!(&got_r[..], want_r, "{name}({x:?}, {y:?}) spill");
+        }
+    }
+}
+
+/// O2 normalized u32 divides: the bench pair, a quotient-zero shape, and
+/// den-zero poison parity with the default body.
+#[test]
+fn norm_u32_o2_simulates_quotient_and_remainder() {
+    let cases: &[(&str, &[u8], &[u8], &[u8], &[u8])] = &[
+        (
+            "__udiv_u32",
+            &[0x00, 0x5E, 0xD0, 0xB2],
+            &[0x87, 0xD6, 0x12, 0x00],
+            &[0x7E, 0x09, 0x00, 0x00],
+            &[],
+        ),
+        (
+            "__urem_u32",
+            &[0x00, 0x5E, 0xD0, 0xB2],
+            &[0x87, 0xD6, 0x12, 0x00],
+            &[0x8E, 0x08, 0x00, 0x00],
+            &[],
+        ),
+        (
+            "__udivmod_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[0x00, 0x10, 0x00, 0x00],
+            &[0x45, 0x23, 0x01, 0x00],
+            &[0x78, 0x06, 0x00, 0x00],
+        ),
+        (
+            "__urem_u32",
+            &[0x07, 0x00, 0x00, 0x00],
+            &[0x78, 0x56, 0x34, 0x12],
+            &[0x07, 0x00, 0x00, 0x00],
+            &[],
+        ),
+        // k = 1 (num == den, longest prescale into one iteration).
+        (
+            "__udiv_u32",
+            &[0x87, 0xD6, 0x12, 0x00],
+            &[0x87, 0xD6, 0x12, 0x00],
+            &[0x01, 0x00, 0x00, 0x00],
+            &[],
+        ),
+        (
+            "__urem_u32",
+            &[0x87, 0xD6, 0x12, 0x00],
+            &[0x87, 0xD6, 0x12, 0x00],
+            &[0x00, 0x00, 0x00, 0x00],
+            &[],
+        ),
+        // Full-width non-poison quotient (k = 32, no prescale).
+        (
+            "__udiv_u32",
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            &[0x01, 0x00, 0x00, 0x00],
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            &[],
+        ),
+        (
+            "__urem_u32",
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            &[0x01, 0x00, 0x00, 0x00],
+            &[0x00, 0x00, 0x00, 0x00],
+            &[],
+        ),
+        (
+            "__udiv_u32",
+            &[0x05, 0x00, 0x00, 0x00],
+            &[0x00, 0x00, 0x00, 0x00],
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            &[],
+        ),
+        (
+            "__urem_u32",
+            &[0x05, 0x00, 0x00, 0x00],
+            &[0x00, 0x00, 0x00, 0x00],
+            &[0x05, 0x00, 0x00, 0x00],
+            &[],
+        ),
+    ];
+    for &(name, x, y, want, want_r) in cases {
+        let (ir, map) = routine_module32(name);
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((0x20 + i as u16, *b));
+        }
+        for (i, b) in y.iter().enumerate() {
+            seed.push((0x24 + i as u16, *b));
+        }
+        let got = sim_run_bytes_o2(&ir, &map, &seed, 0x28, want.len());
+        assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) out");
+        if !want_r.is_empty() {
+            let slot = map
+                .iter()
+                .find(|(k, _)| k == slot_name(name))
+                .expect("spill slot in map")
+                .1;
+            let got_r = sim_run_bytes_o2(&ir, &map, &seed, slot, want_r.len());
+            assert_eq!(&got_r[..], want_r, "{name}({x:?}, {y:?}) spill");
+        }
+    }
 }
 
 /// Every routine emits a real body — the label, recipe instructions, and a
