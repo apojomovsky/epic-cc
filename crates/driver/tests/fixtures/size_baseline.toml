@@ -124,6 +124,12 @@ flash_words = 40
 ram_bytes = 23
 
 [[entry]]
+name = "bench-indf-rmw-18f4550"
+device = "18F4550"
+flash_words = 41
+ram_bytes = 71
+
+[[entry]]
 name = "bench-branch-computed-18f4550"
 device = "18F4550"
 flash_words = 35
