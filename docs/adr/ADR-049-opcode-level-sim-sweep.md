@@ -39,8 +39,8 @@ truth and triangulated with gpsim 0.31 (the in-tree sim matches truth
 on all 15 probe points): ADDWFC drops the (W+C) low-nibble carry from
 DC, SUBWFB and SUBFWB miscompute DC+OV with borrow-in, and DAW tests
 the original high nibble (wrong for valid BCD sums like 0x99+0x06,
-which must yield 0x05 with C set). The three STATUS bits are masked
-per lane in-program on both executors, DAW has no lane, and the
+which must yield 0x05 with C set). Those bits are masked per lane
+in-program on both executors, DAW has no lane, and the
 masked behavior stays pinned by in-tree sim tests. Remainder in
 epic-cc#1001.
 
