@@ -2810,6 +2810,67 @@ fn drops_dead_reloads_for_chained_remainders() {
         "dead reloads dropped once:\n{text}"
     );
 }
+/// A reload read from a successor block stays: the liveness scan covers the
+/// whole function, so a cross-block use keeps the load even though the
+/// fused block itself no longer reads it.
+#[test]
+fn keeps_reload_used_in_successor_block_after_fusion() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal extra i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %4 = load i16 @a\n\
+             %5 = load i16 @b\n\
+             %6 = urem i16 %4 %5\n\
+             store i16 %6 @m\n\
+             br next\n\
+           block next:\n\
+             store i16 %4 @extra\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(i16 %1, i16 %2)"),
+        "pair fused:\n{text}"
+    );
+    assert!(
+        text.contains("%4 = load i16 @a") && !text.contains("%5 = load"),
+        "cross-block reload kept, private sibling dropped:\n{text}"
+    );
+}
+/// An address leaked as a stored global value keeps the reload too: the
+/// escape guard covers every operand position, not just `gep` bases.
+#[test]
+fn keeps_reload_leaked_as_store_value_after_fusion() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal extra i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %4 = load i16 @a\n\
+             %5 = load i16 @b\n\
+             %6 = urem i16 %4 %5\n\
+             store i16 %6 @m\n\
+             store i16 @a @extra\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(i16 %1, i16 %2)"),
+        "pair fused:\n{text}"
+    );
+    assert!(
+        text.contains("%4 = load i16 @a") && !text.contains("%5 = load"),
+        "leaked reload kept, untaken sibling dropped:\n{text}"
+    );
+}
 
 /// One volatile load pair shared by both operations fuses: a single read
 /// has one value, however it was obtained.
