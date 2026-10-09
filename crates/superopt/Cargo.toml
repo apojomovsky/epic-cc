@@ -6,4 +6,5 @@ publish = false
 
 [dependencies]
 asm = { path = "../asm" }
+device = { path = "../device" }
 pic14-sim = { path = "../sim" }
