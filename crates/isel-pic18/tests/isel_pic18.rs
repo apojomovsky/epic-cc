@@ -1490,64 +1490,79 @@ fn nibble_shift_result_stores_via_movwf() {
 
 #[test]
 fn isr_emits_vector_prologue_and_retfie() {
+    // The handler increments a global in place (`INCF`, no W traffic):
+    // STATUS stays live while W and everything else narrow away
+    // (epic-cc#783). The vector, the STATUS restore, and RETFIE keep
+    // their shape.
     let m = parse(
-        "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
+        "global g i8\n\
+         fn isr(void) [isr] ()\n  block entry:\n    %1 = load i8 @g\n    %2 = add i8 %1, 1\n    store i8 %2 @g\n    ret void\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
-    let asm = select_isr(&PIC18F4550, &m, &addrs(&[]));
+    let asm = select_isr(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("g", 0x20), ("isr::1", 0x30), ("isr::2", 0x31)]),
+    );
     assert!(
         asm.contains("org 0x0008"),
         "ISR must be placed at the high vector:\n{asm}"
     );
-    assert!(
-        asm.contains("MOVFF 0x000, 0x00C"),
-        "retval snapshot lo:\n{asm}"
-    );
-    assert!(
-        asm.contains("MOVFF 0x003, 0x00F"),
-        "retval snapshot hi:\n{asm}"
-    );
     assert!(asm.contains("MOVFF 0xFD8, 0x009"), "STATUS save:\n{asm}");
-    assert!(asm.contains("MOVFF 0xFE0, 0x00A"), "BSR save:\n{asm}");
-    assert!(asm.contains("MOVFF 0xFE9, 0x00B"), "FSR0L save:\n{asm}");
-    assert!(asm.contains("MOVFF 0xFEA, 0x004"), "FSR0H save:\n{asm}");
-    assert!(asm.contains("MOVFF 0xFF6, 0x005"), "TBLPTRL save:\n{asm}");
-    assert!(asm.contains("MOVFF 0xFF7, 0x006"), "TBLPTRH save:\n{asm}");
-    assert!(asm.contains("MOVFF 0xFF8, 0x007"), "TBLPTRU save:\n{asm}");
-    assert!(asm.contains("MOVFF 0xFFA, 0x045"), "PCLATH save:\n{asm}");
-    assert!(asm.contains("MOVFF 0xFFB, 0x046"), "PCLATU save:\n{asm}");
-    assert!(asm.contains("MOVWF 0x008,A"), "W save last:\n{asm}");
-    // The epilogue: MOVFF-based (flags survive); W restores before STATUS
-    // because MOVF sets Z/N, so STATUS comes last and the ISR return is
-    // flag-transparent (epic-cc#604).
-    assert!(
-        asm.contains("MOVFF 0x00F, 0x003"),
-        "retval restore hi:\n{asm}"
-    );
-    let w = asm.find("MOVF 0x008, W, A").expect("W restore:\n{asm}");
+    for line in [
+        "MOVFF 0x000, 0x00C",
+        "MOVWF 0x008,A",
+        "MOVF 0x008, W, A",
+        "MOVFF 0xFE0, 0x00A",
+        "MOVFF 0xFE9, 0x00B",
+        "MOVFF 0xFE1,",
+        "MOVFF 0xFF3,",
+        "MOVFF 0xFF6,",
+        "MOVFF 0xFFA,",
+    ] {
+        assert!(
+            !asm.contains(line),
+            "untouched save must narrow away ({line}):\n{asm}"
+        );
+    }
     let st = asm
         .find("MOVFF 0x009, 0xFD8")
         .expect("STATUS restore:\n{asm}");
     let ret = asm
         .find("RETFIE")
         .expect("ISR must end with RETFIE:\n{asm}");
-    assert!(
-        w < st && st < ret,
-        "W restores before STATUS, STATUS last before RETFIE:\n{asm}"
-    );
+    assert!(st < ret, "STATUS restores before RETFIE:\n{asm}");
 }
 
 #[test]
 fn isr_save_set_covers_pclath_pclatu() {
     // epic-cc#641: an IRQ inside a main-line switch-dispatch window
-    // mis-jumps on return unless the ISR saves PCLATH/PCLATU. The lone
-    // ISR below uses the fixed block plus the 0x040 carve (`select_isr`),
-    // so the two bytes land at 0x045/0x046.
-    let m = parse(
-        "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
+    // mis-jumps on return unless the ISR saves PCLATH/PCLATU. The handler
+    // below dispatches its own table, so narrowing (epic-cc#783) must keep
+    // the two bytes at 0x045/0x046 while PROD still narrows away: the
+    // switch uses no multiply.
+    let cases = [
+        "0 %c0", "1 %c1", "2 %c2", "3 %c3", "4 %c4", "5 %c5", "6 %c6", "7 %c7",
+    ];
+    let mut blocks = String::new();
+    for (i, _) in cases.iter().enumerate() {
+        blocks.push_str(&format!(
+            "  block c{i}:\n    store i8 {i} @out\n    ret void\n"
+        ));
+    }
+    let m = parse(&format!(
+        "global sel i16\nglobal out i8\n\
+         fn isr(void) [isr] ()\n  block entry:\n    %1 = load i16 @sel\n    \
+         switch i16 %1, default %def, cases {}\n{blocks}  \
+         block def:\n    store i8 99 @out\n    ret void\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
+        cases.join(", ")
+    ));
+    let asm = select_isr(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("sel", 0x20), ("out", 0x28), ("isr::1", 0x30)]),
     );
-    let asm = select_isr(&PIC18F4550, &m, &addrs(&[]));
     for line in [
         "MOVFF 0xFFA, 0x045",
         "MOVFF 0xFFB, 0x046",
@@ -1559,6 +1574,23 @@ fn isr_save_set_covers_pclath_pclatu() {
             "ISR save set must contain {line}:\n{asm}"
         );
     }
+    assert!(
+        !asm.contains("MOVFF 0xFF3,"),
+        "PROD still narrows away without a multiply:\n{asm}"
+    );
+    // The switch runs through W, so its save stays too, and the epilogue
+    // keeps the W-before-STATUS order (epic-cc#604): `MOVF` sets Z/N.
+    let w = asm.find("MOVF 0x008, W, A").expect("W restore:\n{asm}");
+    let st = asm
+        .find("MOVFF 0x009, 0xFD8")
+        .expect("STATUS restore:\n{asm}");
+    let ret = asm
+        .find("RETFIE")
+        .expect("ISR must end with RETFIE:\n{asm}");
+    assert!(
+        w < st && st < ret,
+        "W restores before STATUS, STATUS last before RETFIE:\n{asm}"
+    );
 }
 
 #[test]
@@ -6294,17 +6326,27 @@ fn widening_zext_between_compare_and_branch_keeps_the_branch_sound() {
 /// ISR on the fixed save block, and the low ISR on its own save area.
 #[test]
 fn priority_pair_emits_both_vectors_and_save_areas() {
+    // Both handlers store through W, so W saves stay while the untouched
+    // classes narrow away (epic-cc#783): the high ISR keeps the fixed
+    // block, the low ISR its banked area, and neither keeps PROD.
     let m = parse(
-        "fn hi(void) [isr] [irq1] ()\n  block entry:\n    ret void\n\
-         fn lo(void) [isr] [irq2] ()\n  block entry:\n    ret void\n\
+        "global g i8\n\
+         fn hi(void) [isr] [irq1] ()\n  block entry:\n    store i8 1 @g\n    ret void\n\
+         fn lo(void) [isr] [irq2] ()\n  block entry:\n    store i8 2 @g\n    ret void\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
     // A banked save area (0x120, above the access window): W goes
     // through an explicit bank select, not `,A` (which would resolve
     // into the SFR page).
-    let asm =
-        isel_pic18::select_with_locs(&PIC18F4550, &m, &addrs(&[]), Some(0x120), None, Some(0x160))
-            .0;
+    let asm = isel_pic18::select_with_locs(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("g", 0x20)]),
+        Some(0x120),
+        None,
+        Some(0x160),
+    )
+    .0;
     assert!(
         asm.contains("org 0x0008") && asm.contains("goto hi"),
         "high stub at vector 0x0008:\n{asm}"
@@ -6325,12 +6367,22 @@ fn priority_pair_emits_both_vectors_and_save_areas() {
         "low ISR saves W banked:\n{asm}"
     );
     assert!(
-        asm.contains("MOVFF 0x000, 0x128"),
-        "low ISR snapshots retval into its own area:\n{asm}"
+        !asm.contains("MOVFF 0x000, 0x128"),
+        "low ISR without calls keeps no retval snapshot:\n{asm}"
     );
     assert!(
         asm.contains("MOVF 0x120, W, B"),
         "low ISR restores W banked:\n{asm}"
+    );
+    // Both handlers only write W, and W restores through flag-setting
+    // `MOVF`, so STATUS stays with W for flag transparency (epic-cc#604).
+    assert!(
+        asm.contains("MOVFF 0xFD8, 0x009") && asm.contains("MOVFF 0xFD8, 0x121"),
+        "STATUS stays wherever W stays:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVFF 0xFF3,"),
+        "neither handler multiplies, so no PROD saves:\n{asm}"
     );
     assert_eq!(
         asm.matches("RETFIE").count(),
@@ -7244,13 +7296,20 @@ fn low_priority_epilogue_restores_bsr_after_the_banked_w_restore() {
     // against the save bank instead of its own (epic-cc#534 makes
     // tracked agreement load-bearing there).
     let m = parse(
-        "fn hi(void) [isr] [irq1] ()\n  block entry:\n    ret void\n\
-         fn lo(void) [isr] [irq2] ()\n  block entry:\n    ret void\n\
+        "global g i8\n\
+         fn hi(void) [isr] [irq1] ()\n  block entry:\n    ret void\n\
+         fn lo(void) [isr] [irq2] ()\n  block entry:\n    store i8 2 @g\n    ret void\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
-    let asm =
-        isel_pic18::select_with_locs(&PIC18F4550, &m, &addrs(&[]), Some(0x140), None, Some(0x150))
-            .0;
+    let asm = isel_pic18::select_with_locs(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("g", 0x20)]),
+        Some(0x140),
+        None,
+        Some(0x150),
+    )
+    .0;
     let w = asm.find("MOVF 0x140, W, B").expect("banked W restore");
     let after_w = &asm[w..];
     let re = after_w
