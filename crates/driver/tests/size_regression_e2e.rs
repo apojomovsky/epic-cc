@@ -377,6 +377,16 @@ fn cases() -> Vec<Case> {
             inputs: vec![fixture("size-bench/bench-plusw.c")],
         },
         Case {
+            // Indirect read-modify-write through a 16-bit array: the
+            // scale-2 index stays off the `PLUSW` shape, so the const
+            // add accumulates into the load temp in place (epic-cc#969).
+            name: "bench-indf-rmw-18f4550",
+            device: "18F4550",
+            includes: vec![],
+            defines: vec![],
+            inputs: vec![fixture("size-bench/bench-indf-rmw.c")],
+        },
+        Case {
             // Branch on a just-computed byte with no reload (epic-cc#668).
             name: "bench-branch-computed-18f4550",
             device: "18F4550",
