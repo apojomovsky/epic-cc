@@ -73,6 +73,26 @@ Full 65536-pair and 2^32 domains stay sim-only: they exceed 16K-word
 flash and 2 KB RAM as unrolled HEX, and executor divergence is
 systematic, so structured edges plus deterministic LCG samples catch it.
 
+The opcode sweep (`crates/superopt/src/sweep.rs`, four matrix shards:
+`pic18-arith`, `pic18-logic`, `pic14-arith`, `pic14-logic`) replays one
+ALU opcode per lane across entry-`W`, operand, and entry-`STATUS`
+corners, so the sim cannot share the compiler's wrong belief about an
+opcode the way the `SUBFWB`/`SUBWFB` mixup did. Each mismatch log names
+every failing lane. The PIC14 lanes store through RP1:RP0 bank selects
+into a table spanning banks 0-3, mask TO/PD out of the captured `STATUS`
+in-program (SIM reports POR-or-WDT values there nondeterministically),
+and park on `clrwdt`/`goto` against WDT resets during the wait. The PR
+tier runs only on oracle-input changes (`crates/sim`, `crates/asm`,
+`crates/superopt`, the oracle script and workflow); wider corners ride
+the nightly sweep. Running the sweep convicted MPLAB SIM 6.35 itself on
+three flag models, hand-verified against boolean truth and triangulated
+with gpsim: ADDWFC drops the (W+C) low-nibble carry from DC, SUBWFB and
+SUBFWB miscompute DC+OV with borrow-in, and DAW tests the original high
+nibble (wrong for valid BCD like 0x99+0x06). Those STATUS bits are
+masked per lane in-program on both executors, DAW has no lane, and the
+masked behavior stays pinned by in-tree sim tests instead (epic-cc#819,
+remainder in #1001).
+
 Three hardware facts the harness depends on: reset `STATUS` reads `0x00`
 in both SIM and model (no TO/PD masking needed); the device proof reads
 `TRISB`, never `TRISA` (RA6/RA7 are oscillator pins and the SIM returns

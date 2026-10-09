@@ -28,15 +28,17 @@ const MAX_STEPS: usize = 64;
 
 /// One emitted program plus its readback contract: `reads` are the
 /// addresses to dump with `x /1xbr` in order, `expected` the byte each
-/// must hold (proof register first, then guards, then per-case `W`,
-/// `STATUS`, allowed addresses). `stepi` is the instruction count plus
-/// margin, for a `stepi` backstop after the runner's wall-clock
-/// `run`+`wait`: overshoot lands in the side-effect-free spin, so the
-/// session is deterministic even when the wait expires mid-program.
+/// must hold (proof first, then guards, then per-case `W`, `STATUS`,
+/// allowed). `tags` names each read's source in order (`proof`,
+/// `guard`, or the case lane), so a mismatch log names the failing
+/// lane without re-running. `stepi` is the instruction count plus
+/// margin: overshoot lands in the side-effect-free spin, so the
+/// session stays deterministic when the wait expires mid-program.
 pub struct Batch {
     pub src: String,
     pub reads: Vec<usize>,
     pub expected: Vec<u8>,
+    pub tags: Vec<String>,
     pub stepi: usize,
 }
 
@@ -94,6 +96,7 @@ pub fn build_batch(candidate: &Candidate, cases: &[Case], out_base: usize) -> Ba
     let mut src = String::from("goto start\nstart:\n");
     let mut reads = vec![PROOF_ADDR];
     let mut expected = vec![PROOF_POR];
+    let mut tags = vec![String::from("proof")];
     let mut guards: Vec<usize> = Vec::new();
     // A guard asserts its byte still reads poison: it must never cover
     // an address a case pokes (every replay overwrites it), only
@@ -168,18 +171,23 @@ pub fn build_batch(candidate: &Candidate, cases: &[Case], out_base: usize) -> Ba
     for &g in &guards {
         reads.push(g);
         expected.push(POISON);
+        tags.push(String::from("guard"));
     }
     for (i, case) in cases.iter().enumerate() {
         let slot = out_base + i * slots;
         let words = asm::assemble_pic18(&candidate_source(candidate));
         let vals = run_expected(&words, case).expect("spec case must verify in-sim");
+        let tag = format!("case{i}");
         reads.push(slot);
         reads.push(slot + 1);
         expected.push(vals.0);
         expected.push(vals.1);
+        tags.push(tag.clone());
+        tags.push(tag.clone());
         for (j, &v) in vals.2.iter().enumerate() {
             reads.push(slot + 2 + j);
             expected.push(v);
+            tags.push(tag.clone());
         }
     }
     let words = asm::assemble_pic18(&src);
@@ -197,6 +205,7 @@ pub fn build_batch(candidate: &Candidate, cases: &[Case], out_base: usize) -> Ba
         src,
         reads,
         expected,
+        tags,
         stepi: instrs + 2000,
     }
 }
@@ -274,10 +283,20 @@ pub fn parse_xbr(text: &str, reads: &[usize]) -> Result<Vec<u8>, String> {
     Ok(values)
 }
 
-/// Byte-for-byte diff of hardware readback against sim expectation.
-/// Any length, address-order, or value mismatch fails: there is no
-/// "close enough" for an execution oracle.
-pub fn compare_batch(batch: &Batch, values: &[u8]) -> Result<(), String> {
+/// One readback byte that disagrees with the simulator, carrying the
+/// lane tag of its read so a sweep log names every failing opcode lane.
+pub struct Mismatch {
+    pub index: usize,
+    pub addr: usize,
+    pub tag: String,
+    pub got: u8,
+    pub want: u8,
+}
+
+/// Every disagreeing byte, in readback order. Length mismatch is an
+/// `Err`; value mismatches collect instead of stopping at the first, so
+/// one log names every failing lane of a sweep shard.
+pub fn diff_batch(batch: &Batch, values: &[u8]) -> Result<Vec<Mismatch>, String> {
     if values.len() != batch.expected.len() {
         return Err(format!(
             "mdb: got {} bytes, expected {}",
@@ -285,6 +304,7 @@ pub fn compare_batch(batch: &Batch, values: &[u8]) -> Result<(), String> {
             batch.expected.len()
         ));
     }
+    let mut out = Vec::new();
     for (i, (&addr, (&got, &want))) in batch
         .reads
         .iter()
@@ -292,12 +312,51 @@ pub fn compare_batch(batch: &Batch, values: &[u8]) -> Result<(), String> {
         .enumerate()
     {
         if got != want {
-            return Err(format!(
-                "mdb: mismatch at 0x{addr:03X} (readback {i}): got 0x{got:02X}, sim says 0x{want:02X}"
-            ));
+            let tag = batch.tags.get(i).cloned().unwrap_or_default();
+            out.push(Mismatch {
+                index: i,
+                addr,
+                tag,
+                got,
+                want,
+            });
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+/// Byte-for-byte diff of hardware readback against sim expectation.
+/// Any length, address-order, or value mismatch fails: there is no
+/// "close enough" for an execution oracle. Reports every mismatch
+/// grouped by lane tag with the first details inline, so a sweep shard
+/// log names each failing opcode lane explicitly.
+pub fn compare_batch(batch: &Batch, values: &[u8]) -> Result<(), String> {
+    let mismatches = diff_batch(batch, values)?;
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    let mut lanes: Vec<(&str, usize)> = Vec::new();
+    for m in &mismatches {
+        match lanes.iter_mut().find(|(t, _)| *t == m.tag) {
+            Some(slot) => slot.1 += 1,
+            None => lanes.push((m.tag.as_str(), 1)),
+        }
+    }
+    let mut msg = format!(
+        "mdb: {} readback(s) disagree with sim across {} lane(s)",
+        mismatches.len(),
+        lanes.len()
+    );
+    for (tag, n) in &lanes {
+        msg.push_str(&format!("\nlane {tag}: {n} mismatch(es)"));
+    }
+    for m in mismatches.iter().take(8) {
+        msg.push_str(&format!(
+            "\n0x{:03X} [{}] (readback {}): got 0x{:02X}, sim says 0x{:02X}",
+            m.addr, m.tag, m.index, m.got, m.want
+        ));
+    }
+    Err(msg)
 }
 
 #[cfg(test)]

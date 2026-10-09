@@ -661,3 +661,69 @@ fn movff_dereferences_indf_and_postinc_operands() {
         "FSR1L must read 0x22 after POSTINC1's increment"
     );
 }
+
+#[test]
+fn addwfc_digit_carry_includes_incoming_carry() {
+    // F=0xFE, W=0x7F, C=1: 0xFE+0x7F+1 = 0x17E. DC is the carry from
+    // bit 3 of the full three-operand sum (0xE+0xF+1), which MPLAB SIM
+    // 6.35 reports as 0 (epic-cc#819); the MDB sweep masks DC on this
+    // lane, so this test pins the bit in-tree instead.
+    let words = vec![0x0EFE, 0x6E20, 0x0EFF, 0x0F01, 0x0E7F, 0x2220];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0x7E);
+    assert_eq!(p.ram()[0xFD8], 0x03, "C and DC set, N/Z/OV clear");
+}
+
+#[test]
+fn subwfb_sets_dc_and_ov_on_borrow_in() {
+    // F=0x80, W=0x7F, C=0: 0x80-0x7F-1 = 0x00. No low-nibble borrow
+    // survives (0x0-0xF-1 borrows), so DC stays clear; the signed
+    // -256 result overflows, so OV sets. MPLAB SIM 6.35 reports
+    // DC=1/OV=0 here (epic-cc#819); the sweep masks both bits on this
+    // lane, so this test pins them in-tree instead.
+    let words = vec![0x0E80, 0x6E20, 0x0E7F, 0x5A20];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0x00);
+    assert_eq!(p.ram()[0xFD8], 0x0D, "Z, C and OV set, DC clear");
+}
+
+#[test]
+fn subfwb_sets_dc_and_ov_on_borrow_in() {
+    // W=0x80, F=0x7F, C=0: 0x80-0x7F-1 = 0x00. Same borrow-in quirk
+    // family as SUBWFB (epic-cc#819): MPLAB SIM 6.35 reports DC=1/OV=0
+    // here, the adder says DC=0/OV=1, and the sweep masks both bits on
+    // this lane, so this test pins them in-tree instead.
+    let words = vec![0x0E7F, 0x6E20, 0x0E80, 0x5620];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0x00);
+    assert_eq!(p.ram()[0xFD8], 0x0D, "Z, C and OV set, DC clear");
+}
+
+#[test]
+fn daw_adjusts_tens_on_intermediate_nibble() {
+    // W=0x9F (0x99+0x06), C=0: low F>9 adds 6 (0xA5), then the high
+    // test runs on that intermediate (0xA>9), adding 0x60 with C set:
+    // 0x05, C=1. MPLAB SIM 6.35 tests the original high nibble and
+    // reports 0xA5 with C clear (epic-cc#819); DAW has no sweep lane,
+    // so this test pins the op in-tree instead.
+    let words = vec![0x0E9F, 0x0007];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.w(), 0x05);
+    assert_eq!(p.ram()[0xFD8] & 0x01, 0x01, "C set by tens adjust");
+}
+
+#[test]
+fn daw_honors_digit_carry_without_tens_adjust() {
+    // W=0x42 with DC set (0x09+0x09 low half): low 2 plus DC adds 6
+    // (0x48); high 4 with C clear needs nothing. C stays clear: DAW
+    // sets C on a tens adjust and never clears it.
+    let words = vec![0x0E09, 0x0F09, 0x0E42, 0x0007];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.w(), 0x48);
+    assert_eq!(p.ram()[0xFD8] & 0x01, 0x00, "C stays clear");
+}

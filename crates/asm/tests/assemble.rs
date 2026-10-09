@@ -369,3 +369,14 @@ fn low_high_label_plus_offset_operands_resolve() {
     assert_eq!(words[0x1FE], 0x3E00 | 0x02, "ADDLW LOW(mytable+4)");
     assert_eq!(words[0x1FF], 0x3E00 | 0x02, "ADDLW HIGH(mytable+4)");
 }
+
+#[test]
+fn assembles_decf_and_clrw() {
+    // The opcode sweep replays these against MPLAB SIM (epic-cc#819):
+    // DECF is `00 0011 dfff ffff`, CLRW operandless `00 0001 0000 0000`.
+    let src = "    org 0x0000\n    decf 0x20, W\n    decf 0x21, F\n    clrw\n    end\n";
+    let words = assemble(src);
+    assert_eq!(words[0], 0x0320, "decf 0x20, W (d = 0)");
+    assert_eq!(words[1], 0x03A1, "decf 0x21, F (d = 1)");
+    assert_eq!(words[2], 0x0100, "clrw");
+}

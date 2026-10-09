@@ -77,11 +77,15 @@ read -r CASES PER_CHUNK <<< "$COUNT"
 # otherwise skip the chunk loop and exit 0 with no hardware evidence.
 [ "$CASES" -gt 0 ] || { echo "mdb-oracle: FAIL: $SPEC/$TIER has no cases" >&2; exit 1; }
 NCHUNKS=$(( (CASES + PER_CHUNK - 1) / PER_CHUNK ))
-[ "$MUTATE" -eq 1 ] && NCHUNKS=1
+# Mutation proves chunk 0 only, under the normal chunking: the driver
+# guarantees the mutant is observable on exactly the emitted chunk, and
+# one chunk keeps large sweep shards inside flash and RAM.
+LAST=$NCHUNKS
+[ "$MUTATE" -eq 1 ] && LAST=1
 echo "mdb-oracle: $SPEC/$TIER: $CASES cases in $NCHUNKS chunk(s)"
 trap '[ "$KEEP" -eq 1 ] || rm -f "$HAL/build/epiccc/mdb-oracle.hex"' EXIT
 i=0
-while [ "$i" -lt "$NCHUNKS" ]; do
+while [ "$i" -lt "$LAST" ]; do
   OUT="$OUT_BASE/chunk$i"
   mkdir -p "$OUT"
   cc_bin emit --spec $SPEC --tier $TIER --chunk $i/$NCHUNKS --out-dir /workspace/$OUT $MUT_FLAG
@@ -98,7 +102,9 @@ while [ "$i" -lt "$NCHUNKS" ]; do
   else
     HEX_ARG="build/epiccc/mdb-oracle.hex"
   fi
-  if ! hal_mdb "$HEX_ARG" PIC18F4550 5000 "$EXTRA_MDB" "$OUT/mdb.log"; then
+  DEVICE="$(cat "$OUT/device.txt")"
+  [ -n "$DEVICE" ] || { echo "mdb-oracle: chunk $i: empty device.txt" >&2; exit 1; }
+  if ! hal_mdb "$HEX_ARG" "$DEVICE" 5000 "$EXTRA_MDB" "$OUT/mdb.log"; then
     echo "mdb-oracle: chunk $i: mdb session failed, see $OUT/mdb.log" >&2
     tail -20 "$OUT/mdb.log" >&2
     exit 1

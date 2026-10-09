@@ -45,6 +45,7 @@ pub type Candidate = Vec<&'static str>;
 
 pub mod mdb;
 pub mod specs;
+pub mod sweep;
 
 const MAX_STEPS: usize = 64;
 
