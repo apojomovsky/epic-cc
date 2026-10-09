@@ -2,8 +2,8 @@
 # One-time (idempotent) dev-environment setup for epic-cc. Everything
 # runs inside the docker dev image, so the host needs only docker, make
 # and git: no rustup, clang, or gpasm are ever installed on the host
-# (AGENTS.md). This checks those host deps, installs the git hooks, and
-# builds the dev image.
+# (AGENTS.md). This checks those host deps, installs the git hooks,
+# ensures the ssh push keepalive (#994), and builds the dev image.
 #
 #   ./scripts/bootstrap.sh [--check-only]   --check-only: report only, exit
 #                                            nonzero if anything is missing
@@ -68,6 +68,59 @@ if [ "$check_only" = 1 ]; then
     done
 else
     make -C "$repo_root" setup-hooks
+fi
+
+# ---- ssh keepalive for long pre-push hooks ----
+# git connects to learn remote refs before running the pre-push hook, so
+# the minutes-long make ci-local run idles the ssh connection until the
+# server kills it and the push dies after a green hook (#994). A
+# Host github.com keepalive fixes it. The marker block below is appended
+# once and existing entries are never edited. A config with an active
+# ServerAliveInterval covering github.com (global or matching Host
+# stanza, not a comment or another host) is left alone.
+keepalive_begin="# BEGIN epic-cc push keepalive (#994)"
+keepalive_end="# END epic-cc push keepalive"
+ssh_config="${HOME}/.ssh/config"
+keepalive_wanted=0
+if grep -qF "$keepalive_begin" "$ssh_config" 2>/dev/null; then
+    echo "bootstrap: ssh push keepalive already installed."
+# Active ServerAliveInterval lines only: global ones, or a Host stanza
+# matching github.com. Comments and other hosts do not count.
+elif [ -f "$ssh_config" ] && awk '
+    /^[ \t]*#/ || /^[ \t]*$/ { next }
+    { line = $0; sub(/[ \t]+#.*$/, "", line); n = split(line, w) }
+    tolower(w[1]) == "host" {
+        scope = 0
+        for (i = 2; i <= n; i++) { if (tolower(w[i]) == "*" || index(tolower(w[i]), "github") > 0) scope = 1 }
+        seen_host = 1; next
+    }
+    tolower(w[1]) == "serveraliveinterval" && (!seen_host || scope) { found = 1; exit 0 }
+    END { exit !found }
+' "$ssh_config"; then
+    echo "bootstrap: ssh config already keeps github.com alive, leaving it alone."
+else
+    keepalive_wanted=1
+    if [ "$check_only" = 1 ]; then
+        echo "bootstrap: ssh push keepalive not installed (run ./scripts/bootstrap.sh)."
+        problems=1
+    fi
+fi
+if [ "$keepalive_wanted" = 1 ] && [ "$check_only" = 0 ]; then
+    mkdir -p "${HOME}/.ssh"
+    chmod 700 "${HOME}/.ssh"
+    touch "$ssh_config"
+    chmod 600 "$ssh_config"
+    if [ -s "$ssh_config" ] && [ -n "$(tail -c 1 "$ssh_config")" ]; then
+        printf '\n' >> "$ssh_config"
+    fi
+    {
+        echo "$keepalive_begin"
+        echo "Host github.com"
+        echo "    ServerAliveInterval 15"
+        echo "    ServerAliveCountMax 40"
+        echo "$keepalive_end"
+    } >> "$ssh_config"
+    echo "bootstrap: ssh push keepalive installed ($ssh_config)."
 fi
 
 # ---- docker dev image ----
