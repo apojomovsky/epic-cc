@@ -65,6 +65,10 @@ save, spin) assembled with `asm::assemble_pic18` and rendered with
 `pr` (small domains whole, large domains stratified) gating landings,
 `nightly` (wider sweeps) in `.github/workflows/mdb-oracle.yml`, which
 pulls epic-hal's private toolchain image the way its family-check does.
+The PR tier runs only on oracle-input changes (`crates/sim`, `crates/asm`,
+`crates/superopt` including the spec case lists, `scripts/mdb-oracle.sh`,
+this workflow); `isel-pic18` changes skip it and ride the nightly sweep,
+which fails red in Actions like every other scheduled job.
 Full 65536-pair and 2^32 domains stay sim-only: they exceed 16K-word
 flash and 2 KB RAM as unrolled HEX, and executor divergence is
 systematic, so structured edges plus deterministic LCG samples catch it.
