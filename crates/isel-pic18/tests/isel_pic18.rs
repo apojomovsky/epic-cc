@@ -9113,6 +9113,200 @@ fn phi_folded_i16_increment_reads_the_phi_home_through_a_materialized_compare() 
 }
 
 #[test]
+fn phi_folded_i16_increment_with_earlier_index_uses_folds_in_place() {
+    // A counted copy loop reads its index for both ends before bumping
+    // it, so the phi has three uses and the single-use gate of
+    // epic-cc#767 stays shut. The two index reads sit before the `Bin`
+    // in the latch block and nothing on the exit path observes the
+    // slot, so the increment still computes into the phi's home
+    // (epic-cc#937): the backedge copies degrade to skipped self-copies
+    // exactly like the single-use shape.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %g1 = gep @src +0 +1*%i\n\
+             %v = load i8 %g1\n\
+             %g2 = gep @dst +0 +1*%i\n\
+             store i8 %v %g2\n\
+             %r = add i16 %i, 1\n\
+             %c = icmp eq i16 %r, 11\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x020),
+        ("dst", 0x030),
+        ("main::i", 0x040),
+        ("main::v", 0x042),
+        ("main::r", 0x044),
+        ("main::c", 0x046),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(lp.contains("INCF 0x040,F,A"), "loop:\n{lp}");
+    assert!(lp.contains("BTFSC 0xFD8,0,A"), "loop:\n{lp}");
+    assert!(lp.contains("INCF 0x041,F,A"), "loop:\n{lp}");
+    assert!(!lp.contains("0x044"), "dead temp must go unread:\n{lp}");
+    assert!(!lp.contains("MOVWF 0x040"), "no staged low store:\n{lp}");
+    assert!(!lp.contains("MOVWF 0x041"), "no staged high store:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for k in 0..11u8 {
+        p.ram_mut()[0x20 + usize::from(k)] = 0x50 + k;
+    }
+    p.run(4000);
+    assert!(p.halted(), "program must halt");
+    for k in 0..11u8 {
+        assert_eq!(p.ram()[0x30 + usize::from(k)], 0x50 + k, "copied byte {k}");
+    }
+    assert_eq!(p.ram()[0x40], 11, "counter lo must hold the bound");
+    assert_eq!(p.ram()[0x41], 0, "counter hi must hold the bound");
+}
+
+#[test]
+fn phi_folded_i16_increment_with_split_header_and_latch_folds() {
+    // The increment may sit in a latch block apart from the header
+    // holding the phi. The backedge phi reads the result, so the same
+    // in-place fold applies (epic-cc#937): the header phi is the one
+    // reader the region check counts.
+    let m = parse(
+        "global limit i16\nfn main(void) ()\n  block entry:\n    br header\n  block header:\n    %i = phi i16 %r latch 0 entry\n    br latch\n  block latch:\n    %r = add i16 %i, 1\n    %lv = load i16 @limit\n    %c = icmp eq i16 %r, %lv\n    br i1 %c, exit, header\n  block exit:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("limit", 0x20),
+        ("main::i", 0x30),
+        ("main::r", 0x34),
+        ("main::lv", 0x36),
+        ("main::c", 0x38),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Llatch");
+    assert!(lp.contains("INCF 0x030,F,A"), "latch:\n{lp}");
+    assert!(lp.contains("BTFSC 0xFD8,0,A"), "latch:\n{lp}");
+    assert!(lp.contains("INCF 0x031,F,A"), "latch:\n{lp}");
+    assert!(!lp.contains("0x034"), "dead temp must go unread:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    for limit in [1u16, 5, 300] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20] = (limit & 0xFF) as u8;
+        p.ram_mut()[0x21] = (limit >> 8) as u8;
+        p.run(500 + 200 * usize::from(limit));
+        assert!(p.halted(), "program must halt (limit={limit})");
+        assert_eq!(
+            p.ram()[0x30],
+            (limit & 0xFF) as u8,
+            "counter lo (limit={limit})"
+        );
+        assert_eq!(
+            p.ram()[0x31],
+            (limit >> 8) as u8,
+            "counter hi (limit={limit})"
+        );
+    }
+}
+
+#[test]
+fn phi_folded_i16_increment_with_separate_continuation_folds() {
+    // The backedge may leave from a latch continuation past the
+    // increment's own block, as in the menu demo's flag-latched copy
+    // tails. The region spans both blocks and the same in-place fold
+    // applies (epic-cc#937): the continuation carries the result with
+    // no code of its own to disturb the lanes.
+    let m = parse(
+        "global flag i8\nfn main(void) ()\n  block entry:\n    br header\n  block header:\n    %i = phi i16 %r cont 0 entry\n    br bin\n  block bin:\n    %r = add i16 %i, 1\n    %f = load i8 @flag\n    %c = icmp eq i8 %f, 0\n    br i1 %c, cont, exit\n  block cont:\n    br header\n  block exit:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("flag", 0x20),
+        ("main::i", 0x30),
+        ("main::r", 0x34),
+        ("main::f", 0x36),
+        ("main::c", 0x37),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lbin");
+    assert!(lp.contains("INCF 0x030,F,A"), "bin:\n{lp}");
+    assert!(lp.contains("BTFSC 0xFD8,0,A"), "bin:\n{lp}");
+    assert!(lp.contains("INCF 0x031,F,A"), "bin:\n{lp}");
+    assert!(!lp.contains("0x034"), "dead temp must go unread:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x20] = 1;
+    p.run(1000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x30], 1, "counter lo must hold one bump");
+    assert_eq!(p.ram()[0x31], 0, "counter hi must hold one bump");
+}
+
+#[test]
+fn phi_folded_i16_increment_with_carried_pointer_folds() {
+    // Real counted loops carry their buffer pointer alongside the
+    // index, so the header holds pointer phis with no RAM home. The
+    // fold only cares about the index lanes: pointer edges carry
+    // address state, never a home copy (epic-cc#937).
+    let m = parse(
+        "global buf i8\nglobal flag i8\nfn main(void) ()\n  block entry:\n    %b = gep @buf +0\n    br header\n  block header:\n    %p = phi ptr %q latch %b entry\n    %i = phi i16 %r latch 0 entry\n    br latch\n  block latch:\n    %v = load i8 %p\n    store i8 %v @flag\n    %r = add i16 %i, 1\n    %c = icmp eq i16 %r, 5\n    %q = gep %p +1\n    br i1 %c, exit, header\n  block exit:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("flag", 0x022),
+        ("main::b", 0x024),
+        // The pointer phi home deliberately overlaps the folded index
+        // lanes: homes alone would reject the edge, only the resolution
+        // skip accepts it, so the pin discriminates the skip. The GEP
+        // dst stays disjoint: a region writer homing in the lanes must
+        // still keep the fold staged (epic-cc#937).
+        ("main::p", 0x030),
+        ("main::q", 0x028),
+        ("main::i", 0x030),
+        ("main::v", 0x032),
+        ("main::r", 0x034),
+        ("main::c", 0x036),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Llatch");
+    assert!(lp.contains("INCF 0x030,F,A"), "latch:\n{lp}");
+    assert!(lp.contains("BTFSC 0xFD8,0,A"), "latch:\n{lp}");
+    assert!(lp.contains("INCF 0x031,F,A"), "latch:\n{lp}");
+    assert!(!lp.contains("0x034"), "dead temp must go unread:\n{lp}");
+}
+
+#[test]
+fn phi_folded_i16_increment_beside_a_second_disjoint_bin_folds() {
+    // A latch may bump two counters at once (the menu demo nests its
+    // line and digit indices). Each increment folds independently: the
+    // other lane homes outside the folded lanes (epic-cc#937).
+    let m = parse(
+        "global limit i16\nfn main(void) ()\n  block entry:\n    br header\n  block header:\n    %i = phi i16 %r latch 0 entry\n    %j = phi i16 %s latch 0 entry\n    br latch\n  block latch:\n    %r = add i16 %i, 1\n    %s = add i16 %j, 1\n    %lv = load i16 @limit\n    %c = icmp eq i16 %r, %lv\n    br i1 %c, exit, header\n  block exit:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("limit", 0x20),
+        ("main::i", 0x30),
+        ("main::j", 0x32),
+        ("main::r", 0x34),
+        ("main::s", 0x36),
+        ("main::lv", 0x38),
+        ("main::c", 0x3A),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Llatch");
+    assert!(lp.contains("INCF 0x030,F,A"), "latch:\n{lp}");
+    assert!(lp.contains("INCF 0x031,F,A"), "latch:\n{lp}");
+    assert!(lp.contains("INCF 0x032,F,A"), "latch:\n{lp}");
+    assert!(lp.contains("INCF 0x033,F,A"), "latch:\n{lp}");
+    assert!(!lp.contains("0x034"), "dead temp must go unread:\n{lp}");
+    assert!(!lp.contains("0x036"), "dead temp must go unread:\n{lp}");
+}
+
+#[test]
 fn inplace_add_i16_with_zero_low_byte_skips_the_lane() {
     // `x += 0x0100` needs no low lane and no carry seed: the low add
     // carries nothing in, so the high lane takes the plain form
