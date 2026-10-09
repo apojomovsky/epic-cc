@@ -22,6 +22,21 @@ or one-shot for automation:
 make exec CMD='bash scripts/ci-test.sh'
 ```
 
+## Push keepalive for the pre-push hook
+
+git opens the ssh connection to learn remote refs before running the
+pre-push hook, so the minutes-long `make ci-local` run idles it until
+the server kills it and the push dies after a green hook (#994).
+`scripts/bootstrap.sh` appends a managed `Host github.com` keepalive
+(`ServerAliveInterval 15`, `ServerAliveCountMax 40`) to `~/.ssh/config`
+once, and `make doctor` reports when it is missing. A config that
+already sets `ServerAliveInterval` is left alone. One-off escape hatch
+on a machine without the entry:
+
+```bash
+GIT_SSH_COMMAND='ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=40' git push
+```
+
 ## What is pinned
 
 | Tool | Version | Role |
