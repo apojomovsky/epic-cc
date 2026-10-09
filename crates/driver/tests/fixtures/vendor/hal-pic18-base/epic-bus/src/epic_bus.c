@@ -92,20 +92,13 @@ static uint8_t i2c_real_read_byte(int ack)
     return b;
 }
 
-#ifdef __EPIC_CC__
-/* epic-cc cannot place a struct of function pointers in flash (irparse
- * SPIKE LIMIT on const struct fields), and a statically-initialized
- * RAM table is still address-taken data; populate the default tables
- * at init instead. */
-static epic_bus_i2c_ops_t g_i2c_default;
-static const epic_bus_i2c_ops_t *g_i2c_ops = &g_i2c_default;
-#else
+/* Default I2C ops in flash: const structs of function pointers lower to
+ * flash tables (epic-cc#833), so no mutable copy is needed. */
 static const epic_bus_i2c_ops_t g_i2c_default = {
     i2c_real_start, i2c_real_repeated_start, i2c_real_stop,
     i2c_real_write_byte, i2c_real_read_byte
 };
 static const epic_bus_i2c_ops_t *g_i2c_ops = &g_i2c_default;
-#endif
 
 /**
  * @brief  Install a custom I2C ops table (see the header for the full
@@ -140,13 +133,6 @@ void epic_bus_i2c_init(uint32_t fosc_hz, uint32_t fscl_hz)
     h.SSPADD = (uint8_t)SSP_ComputeSSPADD(fosc_hz, fscl_hz);
     s_ssp = h;
     EPIC_SSP_Init(&s_ssp);
-#ifdef __EPIC_CC__
-    g_i2c_default.start = i2c_real_start;
-    g_i2c_default.repeated_start = i2c_real_repeated_start;
-    g_i2c_default.stop = i2c_real_stop;
-    g_i2c_default.write_byte = i2c_real_write_byte;
-    g_i2c_default.read_byte = i2c_real_read_byte;
-#endif
     g_i2c_ops = &g_i2c_default;
 }
 
@@ -179,15 +165,10 @@ static uint8_t spi_real_exchange(uint8_t b)
     return EPIC_SSP_ReadByte();
 }
 
-#ifdef __EPIC_CC__
-static epic_bus_spi_ops_t g_spi_default;
-static const epic_bus_spi_ops_t *g_spi_ops = &g_spi_default;
-#else
 static const epic_bus_spi_ops_t g_spi_default = {
     spi_real_select, spi_real_deselect, spi_real_exchange
 };
 static const epic_bus_spi_ops_t *g_spi_ops = &g_spi_default;
-#endif
 
 /**
  * @brief  Install a custom SPI ops table (see the header for the full
@@ -234,11 +215,6 @@ void epic_bus_spi_init(uint32_t fosc_hz, uint32_t f_sclk_hz, uint8_t cs_port, ui
     s_cs_pin  = cs_pin;
     EPIC_GPIO_Init((GPIO_TypeDef)cs_port, (uint16_t)EPIC_BIT(cs_pin), GPIO_MODE_OUTPUT);
     EPIC_GPIO_WritePin((GPIO_TypeDef)cs_port, (uint16_t)EPIC_BIT(cs_pin), GPIO_PIN_SET);
-#ifdef __EPIC_CC__
-    g_spi_default.select = spi_real_select;
-    g_spi_default.deselect = spi_real_deselect;
-    g_spi_default.exchange = spi_real_exchange;
-#endif
     g_spi_ops = &g_spi_default;
 }
 

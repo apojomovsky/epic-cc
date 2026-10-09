@@ -35,14 +35,28 @@ const COPY_LOOP_MIN_PAIRS: usize = 6;
 /// long staged runs lower to the 9-word seeded loop, which runs about
 /// 3x slower per byte than straight `MOVFF`s. The speed profile turns it
 /// off, trading flash for cycles on those runs (epic-cc#883).
+/// `divmod_fold` folds the software divide/modulo loop counter into both
+/// bit paths (epic-cc#894), dropping the taken `BRA` off the success path
+/// at 2 words per helper. Speed profile only.
+/// `inline_mul16` inlines the u16 widening multiply at the call site
+/// instead of calling `__mul_u16`. The inline form parks both operand
+/// bytes in the retval region, so it costs flash per site; the speed
+/// profile pays it for cycles (epic-cc#892). The u8 multiply always
+/// inlines: one MULWF is shorter than the call either way.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     pub copy_loop: bool,
+    pub divmod_fold: bool,
+    pub inline_mul16: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { copy_loop: true }
+        Self {
+            copy_loop: true,
+            divmod_fold: false,
+            inline_mul16: false,
+        }
     }
 }
 
@@ -54,6 +68,32 @@ impl Default for Options {
 enum Addr {
     Direct(u16),
     Indirect,
+}
+/// One inline-multiply operand byte: RAM contents, or a literal the
+/// u8 form stages into W with MOVLW. A literal cannot ride MULWF
+/// directly, so the u16 form takes RAM operands only.
+#[derive(Clone, Copy)]
+enum MulOp {
+    Ram(u16),
+    Lit(u8),
+}
+
+/// An inlineable narrow-multiply call, resolved but not emitted.
+/// `dst` is `None` for a dead result: the reads still run (a
+/// volatile operand is observable), only the store is skipped.
+enum InlineMul {
+    U8 {
+        a: MulOp,
+        b: MulOp,
+        dst: Option<u16>,
+    },
+    U16 {
+        a0: u16,
+        a1: u16,
+        b0: u16,
+        b1: u16,
+        dst: Option<(u16, u16)>,
+    },
 }
 
 /// Which scaled-term form won: the hardware multiplier, or the
@@ -212,6 +252,17 @@ struct Gen<'m> {
     /// read. The ISR prologue saves `TBLPTR`/`TABLAT`, so a walked sequence
     /// survives interrupts like the memcpy walk does (epic-cc#492).
     tblptr_holds: Option<(String, u16)>,
+    /// `(block, inst, byte)` of dynamically indexed const reads whose seed
+    /// the `find_tblptr_walks` pre-scan proved redundant (epic-cc#778): the
+    /// previous same-block run site left `TBLPTR` one past its last byte,
+    /// the table and dynamic terms match, and nothing between them writes
+    /// a term slot or touches `TBLPTR`. The emitter skips the seed and
+    /// walks `TBLRD*+`; the scan's own accounting (not this set) is what
+    /// makes each skip sound, so emission never extends a run by itself.
+    tblptr_walk: HashSet<(String, usize, u8)>,
+    /// `(block label, inst index)` of the instruction under emission. The
+    /// seed skip above keys off it; the driver sets it per instruction.
+    cur_site: (String, usize),
     /// Direct-to-direct `MOVFF` byte copies staged by `emit_copy_byte`,
     /// drained as straight MOVFFs or, once long enough, as one
     /// LFSR-seeded POSTINC copy loop (epic-cc#486). Each entry carries
@@ -221,6 +272,11 @@ struct Gen<'m> {
     /// Whether long staged runs drain as the POSTINC loop. Off under the
     /// speed profile, where straight `MOVFF`s trade flash for cycles.
     copy_loop: bool,
+    /// Whether the divmod bit loop folds its counter into both paths. On
+    /// under the speed profile only.
+    divmod_fold: bool,
+    /// Whether `__mul_u16` calls inline at the site (epic-cc#892).
+    inline_mul16: bool,
     /// Every RAM address a global occupies. The W cache never records or
     /// reuses one: an interrupt can write a global between the store and
     /// the reload, while the ISR epilogue restores W to its pre-interrupt
@@ -250,6 +306,9 @@ struct Gen<'m> {
     /// Shares one module-scoped label counter across functions so `tmp{n}:`
     /// labels stay unique in the single output. Mirrors the `isel` counter.
     tmp: &'m mut u32,
+    /// Records each callee a real `CALL` line emitted, `None` outside
+    /// pass A. Pass B drops runtime routines absent from the set.
+    emitted_calls: Option<&'m mut HashSet<String>>,
     /// The source location of the instruction currently being emitted, or
     /// `None` for compiler-generated glue (prologue, `__start`, const
     /// tables, runtime routines). `emit` records it on the line it pushes,
@@ -640,11 +699,10 @@ impl<'m> Gen<'m> {
     ///   terminator. Any instruction between them would be skipped by the
     ///   fused exits, so adjacency is what makes the fusion sound rather
     ///   than merely likely;
-    /// - the compare is multi-byte, or a single-byte `eq`/`ne`. Fusing
-    ///   skips the 0/1 result byte (preclear, set, reload and test), which
-    ///   is an i8 compare's real cost: its own lane is already one word.
-    ///   Single-byte ordering compares keep the materializing path, which
-    ///   routes them to the per-lane cascade (epic-cc#625).
+    /// - any width the backends lower (`n == 1 || n == 2 || n == 4`).
+    ///   Single bytes fuse to the one-lane lowering (the same flags the
+    ///   materializing byte path reads, with the exits rebound), wider
+    ///   values to the borrow chain or sign check plus chain.
     ///
     /// A fused compare emits its exits as the branch's own targets and
     /// never writes the result slot, so the 0/1 byte, its preclear, and
@@ -659,40 +717,37 @@ impl<'m> Gen<'m> {
         if c.dst != *cond {
             return None;
         }
-        let is_eq_ne = matches!(c.pred.as_str(), "eq" | "ne");
         // The same width guard `emit_inst`'s `Inst::Icmp` arm applies
         // (`n == 1 || n == 2 || n == 4`). Fusing an i64 compare would
-        // route it to the chain and compile, while the identical compare
+        // route it to a lowering and compile, while the identical compare
         // with any other use still panics; keep the two paths consistent
         // and the unsupported width loud.
         if !matches!(c.ty.bytes(), 1 | 2 | 4) {
             return None;
         }
-        // Only the predicates with a fused lowering. Single-byte orderings
-        // have none: fusion has no single-lane ordering lowering, only the
-        // borrow chain, so single-byte unsigned orderings keep the
-        // materializing path with the signed ones below.
-        // (`emit_icmp_signed_chain` covers the multi-byte signed half.)
+        // Only the predicates with a fused lowering (all ten: single
+        // bytes take the one-lane lowering, wider values the chain or
+        // sign check plus chain).
         if !matches!(
             c.pred.as_str(),
             "eq" | "ne" | "ult" | "uge" | "ugt" | "ule" | "slt" | "sle" | "sgt" | "sge"
-        ) || (c.ty.bytes() == 1 && !is_eq_ne)
-        {
+        ) {
             return None;
         }
-        // The unsigned ordering compares lower to the borrow chain, which
-        // holds STATUS,C across lanes; a rhs lane load that writes C would
-        // corrupt it. The materializing path routes that shape to the
-        // per-lane cascade instead (see `emit_icmp_i16`), but fusion has
-        // no cascade lowering, so decline to fuse it.
+        // The unsigned multi-byte compares lower to the borrow chain,
+        // which holds STATUS,C across lanes; a rhs lane load that writes
+        // C would corrupt it. The one-lane lowering consumes its flags
+        // immediately and needs no such guard, but the gate stays uniform
+        // across widths: the declined shapes keep the correct cascade.
         if matches!(c.pred.as_str(), "ult" | "uge" | "ugt" | "ule") && g.load_w_writes_carry(&c.b) {
             return None;
         }
         // The signed chain re-reads both high bytes in its sign check, so
-        // SFR operands and address-math rhs loads keep the cascade; fusion
-        // has no cascade lowering, so decline those too. A same-block
-        // single-use load feeding the compare is fine to fuse: the lanes
-        // then read a GPR global twice, and GPR reads have no side
+        // SFR operands and address-math rhs loads keep the cascade. The
+        // one-lane lowering reads each byte once and needs no such guard,
+        // but the gate stays uniform across widths for the same reason. A
+        // same-block single-use load feeding the compare is fine to fuse:
+        // the lanes then read a GPR global twice, and GPR reads have no side
         // effects (only SFRs do, and those never fuse). The rewrite that
         // could expose an SFR global directly keeps slot reads instead
         // (see `fused_chain_sources`).
@@ -1544,6 +1599,352 @@ impl<'m> Gen<'m> {
             }
         }
         (phi_fold, inplace)
+    }
+
+    /// Per-function `TBLPTR` walk pre-scan (epic-cc#778): `(block, inst,
+    /// byte)` of dynamically indexed const reads whose seed is redundant.
+    /// A run extends while each next site reads the same table with
+    /// identical terms at the offset the walk left `TBLPTR` on; later
+    /// bytes of a multi-byte site always join. Anything that could move
+    /// `TBLPTR` or rewrite a term slot ends the run, as do static reads
+    /// (the `#745` tracker owns those). All breaks are conservative:
+    /// an unrecognized shape only loses sharing, never soundness.
+    fn find_tblptr_walks(g: &Gen, f: &Func) -> HashSet<(String, usize, u8)> {
+        let unplaced = g.w_folds.unplaced();
+        let mut marks = HashSet::new();
+        for b in &f.blocks {
+            let fused: HashSet<String> = Gen::fusable_icmp(g, f, b)
+                .map(|c| {
+                    Gen::fused_chain_sources(g, f, b, c)
+                        .consumed
+                        .into_iter()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut run: Option<(String, u16, Vec<(u16, String)>, Vec<(u16, u16)>)> = None;
+            for (ii, inst) in b.insts.iter().enumerate() {
+                match inst {
+                    Inst::Phi(_) => run = None,
+                    Inst::Load(l) if fused.contains(&l.dst) => {}
+                    Inst::Load(l) => {
+                        let ptr = Self::tblptr_ptr_val(&l.ptr);
+                        match ptr.as_ref().and_then(|v| Self::tblptr_const_base(g, f, v)) {
+                            Some((table, k, terms)) if !terms.is_empty() && terms.len() <= 1 => {
+                                let mut tslots = Vec::new();
+                                let mut placed = true;
+                                for (_, reg) in &terms {
+                                    match (
+                                        g.addrs.get(&ssa_key(&f.name, reg)),
+                                        Self::tblptr_term_width(f, reg),
+                                    ) {
+                                        (Some(a), Some(w)) => tslots.push((*a, u16::from(w))),
+                                        _ => {
+                                            placed = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !placed {
+                                    run = None;
+                                    continue;
+                                }
+                                let n = u16::from(l.ty.bytes());
+                                let start = match &run {
+                                    Some((t, off, tm, _))
+                                        if *t == table && *tm == terms && *off == k =>
+                                    {
+                                        0
+                                    }
+                                    _ => 1,
+                                };
+                                for j in start..n {
+                                    marks.insert((b.label.clone(), ii, j as u8));
+                                }
+                                run = Some((table, k.wrapping_add(n), terms, tslots));
+                                if Self::tblptr_home_hits(
+                                    g,
+                                    f,
+                                    &l.dst,
+                                    n,
+                                    &unplaced,
+                                    Self::tblptr_run_terms(&run),
+                                ) {
+                                    run = None;
+                                }
+                            }
+                            Some(_) => run = None,
+                            None => {
+                                if let Some(r) = l.ptr.strip_prefix('%') {
+                                    let key = ssa_key(&f.name, r);
+                                    if g.prov.flash.contains(&key) || g.prov.mixed.contains(&key) {
+                                        run = None;
+                                        continue;
+                                    }
+                                }
+                                if Self::tblptr_home_hits(
+                                    g,
+                                    f,
+                                    &l.dst,
+                                    u16::from(l.ty.bytes()),
+                                    &unplaced,
+                                    Self::tblptr_run_terms(&run),
+                                ) {
+                                    run = None;
+                                }
+                            }
+                        }
+                    }
+                    Inst::Store(s) => {
+                        if let Val::Reg(r) = &s.val {
+                            if g.store_consumed.contains(r) {
+                                continue;
+                            }
+                        }
+                        if let Some(hex) = s.ptr.strip_prefix("0x") {
+                            match u16::from_str_radix(hex, 16) {
+                                Ok(a) => {
+                                    if Self::tblptr_range_hits(
+                                        Self::tblptr_run_terms(&run),
+                                        a,
+                                        u16::from(s.ty.bytes()),
+                                    ) {
+                                        run = None;
+                                    }
+                                }
+                                Err(_) => run = None,
+                            }
+                            continue;
+                        }
+                        match Self::static_base(g, &f.name, &s.ptr) {
+                            Some(a) => {
+                                if Self::tblptr_range_hits(
+                                    Self::tblptr_run_terms(&run),
+                                    a,
+                                    u16::from(s.ty.bytes()),
+                                ) {
+                                    run = None;
+                                }
+                            }
+                            None => run = None,
+                        }
+                    }
+                    Inst::Bin(x) => {
+                        if Self::tblptr_home_hits(
+                            g,
+                            f,
+                            &x.dst,
+                            u16::from(x.ty.bytes()),
+                            &unplaced,
+                            Self::tblptr_run_terms(&run),
+                        ) {
+                            run = None;
+                        }
+                    }
+                    Inst::Select(s) => {
+                        let emits = !s.ptr
+                            || matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_)))
+                            || g.select_is_seeded(&s.dst);
+                        if emits
+                            && Self::tblptr_home_hits(
+                                g,
+                                f,
+                                &s.dst,
+                                u16::from(s.ty.bytes()),
+                                &unplaced,
+                                Self::tblptr_run_terms(&run),
+                            )
+                        {
+                            run = None;
+                        }
+                    }
+                    Inst::Memcpy(mc) => {
+                        if !Self::tblptr_memcpy_step(g, f, mc, &b.label, ii, &mut marks, &mut run) {
+                            run = None;
+                        }
+                    }
+                    Inst::Gep(_) | Inst::Alloca(_) => {}
+                    _ => run = None,
+                }
+            }
+        }
+        marks
+    }
+
+    /// Whether `[addr, addr + n)` overlaps a term slot range. Every write
+    /// the walk scan classifies funnels through here or `tblptr_home_hits`.
+    fn tblptr_range_hits(terms: &[(u16, u16)], addr: u16, n: u16) -> bool {
+        terms.iter().any(|(s, w)| addr < s + w && *s < addr + n)
+    }
+
+    /// Term slot ranges of the current walk run, if any.
+    fn tblptr_run_terms(
+        run: &Option<(String, u16, Vec<(u16, String)>, Vec<(u16, u16)>)>,
+    ) -> &[(u16, u16)] {
+        run.as_ref().map(|(_, _, _, t)| t.as_slice()).unwrap_or(&[])
+    }
+
+    /// Whether the value `dst` of width `w` is written into a term slot.
+    /// Mirrors where the emitter puts it: a store-folded producer writes
+    /// the store's slot, a phi-folded increment the phi's slot, otherwise
+    /// its own frame slot. Slotless folded loads emit nothing. Anything
+    /// else (lanes, missing maps) ends the run rather than risk a miss.
+    fn tblptr_home_hits(
+        g: &Gen,
+        f: &Func,
+        dst: &str,
+        w: u16,
+        unplaced: &HashSet<String>,
+        terms: &[(u16, u16)],
+    ) -> bool {
+        if let Some(a) = g.store_fwd.get(dst) {
+            return Self::tblptr_range_hits(terms, *a, w);
+        }
+        if g.store_consumed.contains(dst) {
+            return true;
+        }
+        if let Some(p) = g.phi_fold.get(dst) {
+            return match g.addrs.get(&ssa_key(&f.name, p)) {
+                Some(a) => Self::tblptr_range_hits(terms, *a, w),
+                None => true,
+            };
+        }
+        if let Some(a) = g.addrs.get(&ssa_key(&f.name, dst)) {
+            return Self::tblptr_range_hits(terms, *a, w);
+        }
+        if g.bit_lanes.contains_key(dst) || g.lane_consumed.contains(dst) {
+            return true;
+        }
+        !unplaced.contains(dst)
+    }
+
+    /// `@g`/`%r` pointer operand in `Val` form. `None` for literal (`0x`)
+    /// pointers, which read RAM, and for malformed operands, which make
+    /// the emitter panic: both end any run without marking anything.
+    fn tblptr_ptr_val(ptr: &str) -> Option<Val> {
+        if let Some(name) = ptr.strip_prefix('@') {
+            Some(Val::Global(name.to_string()))
+        } else if let Some(name) = ptr.strip_prefix('%') {
+            Some(Val::Reg(name.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// `const_base_of` without the missing-resolution panic: the emitter
+    /// still panics there, so the scan only needs the `None` fallback to
+    /// end the run on the way past.
+    fn tblptr_const_base(
+        g: &Gen,
+        f: &Func,
+        ptr: &Val,
+    ) -> Option<(String, u16, Vec<(u16, String)>)> {
+        match ptr {
+            Val::Global(name) if g.global_is_const(name) => Some((name.clone(), 0, Vec::new())),
+            Val::Reg(r) => match g.resolved.get(&ssa_key(&f.name, r)) {
+                Some((Base::Global(name), k, terms)) if g.global_is_const(name) => {
+                    Some((name.clone(), *k, terms.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `reg_width` without its no-def panic: a term without a width bails
+    /// the site, and the emitter panics on the way past exactly as today.
+    fn tblptr_term_width(f: &Func, reg: &str) -> Option<u8> {
+        for p in &f.params {
+            if p.name == reg {
+                return Some(if p.sret { 2 } else { p.width });
+            }
+        }
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let d = match inst {
+                    Inst::Load(l) if l.dst == reg => Some(l.ty.bytes()),
+                    Inst::Bin(x) if x.dst == reg => Some(x.ty.bytes()),
+                    Inst::Zext(z) if z.dst == reg => Some(z.to.bytes()),
+                    Inst::Sext(s) if s.dst == reg => Some(s.to.bytes()),
+                    Inst::Trunc(t) if t.dst == reg => Some(t.to.bytes()),
+                    Inst::IntToPtr(p) if p.dst == reg => Some(p.to.bytes()),
+                    Inst::Icmp(c) if c.dst == reg => Some(1),
+                    Inst::Select(s) if s.dst == reg => Some(s.ty.bytes()),
+                    Inst::Call(c) => match (&c.dst, &c.ty) {
+                        (Some(d), Some(t)) if d == reg => Some(t.bytes()),
+                        _ => None,
+                    },
+                    Inst::Phi(p) if p.dst == reg => Some(p.ty.bytes()),
+                    Inst::Alloca(a) if a.dst == reg => Some(a.size),
+                    Inst::Freeze(x) if x.dst == reg => Some(x.ty.bytes()),
+                    Inst::VaArg(v) if v.dst == reg => Some(v.ty.bytes()),
+                    _ => None,
+                };
+                if d.is_some() {
+                    return d;
+                }
+            }
+        }
+        None
+    }
+
+    /// Fold one `Memcpy` into the walk: a const-source copy of `n` bytes
+    /// is one run member (its single seed skips when adjacent, its walk
+    /// advances the run past all `n` bytes). Returns false for anything
+    /// that ends the run instead: a clobbered term slot, a dynamic or
+    /// unknown destination, a non-const source, or a dynamic length.
+    fn tblptr_memcpy_step(
+        g: &Gen,
+        f: &Func,
+        mc: &ir::Memcpy,
+        label: &str,
+        ii: usize,
+        marks: &mut HashSet<(String, usize, u8)>,
+        run: &mut Option<(String, u16, Vec<(u16, String)>, Vec<(u16, u16)>)>,
+    ) -> bool {
+        let n = match &mc.len {
+            ir::MemLen::Const(n) => u16::from(*n),
+            ir::MemLen::Reg(_) => return false,
+        };
+        if n == 0 {
+            return true;
+        }
+        let Some((table, k, terms)) = Self::tblptr_const_base(g, f, &mc.src) else {
+            return false;
+        };
+        if terms.is_empty() || terms.len() > 1 {
+            return false;
+        }
+        let mut tslots = Vec::new();
+        for (_, reg) in &terms {
+            match (
+                g.addrs.get(&ssa_key(&f.name, reg)),
+                Self::tblptr_term_width(f, reg),
+            ) {
+                (Some(a), Some(w)) => tslots.push((*a, u16::from(w))),
+                _ => return false,
+            }
+        }
+        match &mc.dst {
+            Val::Global(name) if g.global_is_const(name) => return false,
+            Val::Global(_) => {}
+            Val::Reg(r) => {
+                let ptr = format!("%{r}");
+                match Self::static_base(g, &f.name, &ptr) {
+                    Some(a) => {
+                        if Self::tblptr_range_hits(&tslots, a, n) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            Val::Const(_) => return false,
+        }
+        if matches!(run, Some((t, off, tm, _)) if *t == table && *tm == terms && *off == k) {
+            marks.insert((label.to_string(), ii, 0));
+        }
+        *run = Some((table, k.wrapping_add(n), terms, tslots));
+        true
     }
 
     /// The backedge incoming of `preg`'s phi carrying this `Bin`'s result:
@@ -3440,11 +3841,12 @@ impl<'m> Gen<'m> {
         self.add_dynamic_to_tblptr(terms);
     }
     /// Seed `TBLPTR` for `(table, k + byte_off)` unless it already points
-    /// there from the previous const read, then the 6-word static seed is
-    /// skipped and the caller walks on with `TBLRD*+` (epic-cc#745). Only
-    /// static reads share: a dynamic term or chain seed clears the tracked
-    /// state and seeds from scratch. Records the position either way, so
-    /// the next adjacent read can share in turn.
+    /// there: either from the previous static const read (epic-cc#745), or
+    /// by a `find_tblptr_walks` mark proving the same-block run left it on
+    /// this dynamic address (epic-cc#778). A marked site records no static
+    /// position: its address carries terms the `(table, off)` tracker
+    /// cannot name, so trusting it there would miscompile. Unmarked
+    /// dynamic reads keep the old clear-and-reseed behavior.
     fn emit_tblptr_setup_shared(
         &mut self,
         table: &str,
@@ -3452,6 +3854,13 @@ impl<'m> Gen<'m> {
         terms: &[(u16, String)],
         byte_off: u8,
     ) {
+        if self
+            .tblptr_walk
+            .contains(&(self.cur_site.0.clone(), self.cur_site.1, byte_off))
+        {
+            self.tblptr_holds = None;
+            return;
+        }
         if !terms.is_empty() {
             self.emit_tblptr_setup(table, k, terms, byte_off);
             self.tblptr_holds = None;
@@ -3543,9 +3952,11 @@ impl<'m> Gen<'m> {
 
     /// One `const` (flash) byte read: `TBLPTR = table_base + k + terms +
     /// byte_off`, then `TABLAT` to `dst`. Static reads share one seed across
-    /// adjacent bytes and walk with `TBLRD*+`; dynamic reads keep the old
-    /// per-byte seed with `TBLRD*`. Multi-byte loads call this once per byte
-    /// with an increasing `byte_off`.
+    /// adjacent bytes and walk with `TBLRD*+`; dynamic reads seed per byte
+    /// unless a `find_tblptr_walks` mark proved the run already points there
+    /// (epic-cc#778), and always walk with `TBLRD*+` so the next run member
+    /// finds `TBLPTR` one past this byte. Multi-byte loads call this once
+    /// per byte with an increasing `byte_off`.
     fn emit_const_load_byte(
         &mut self,
         table: &str,
@@ -3564,7 +3975,7 @@ impl<'m> Gen<'m> {
             self.emit("    TBLRD*+".to_string());
             self.note_tblptr_walked(table, k.wrapping_add(u16::from(byte_off)));
         } else {
-            self.emit("    TBLRD*".to_string());
+            self.emit("    TBLRD*+".to_string());
         }
         self.emit_copy_byte(0xFF5, dst); // TABLAT -> dst
     }
@@ -3947,6 +4358,231 @@ impl<'m> Gen<'m> {
                 }
             }
         }
+    }
+
+    /// The narrow-multiply width of a runtime routine name, with the ISR
+    /// suffixes stripped the way `emit_routine` strips them. `__mul_u32`
+    /// stays a call: its widening form is already fast (epic-cc#892).
+    fn inline_mul_width(func: &str) -> Option<u8> {
+        let base = func
+            .strip_suffix("_isr_high")
+            .or_else(|| func.strip_suffix("_isr"))
+            .unwrap_or(func);
+        match base {
+            "__mul_u8" => Some(1),
+            "__mul_u16" => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Resolve `v` to `width` operand bytes, or `None` when the call path
+    /// must handle it. A reg behind pointer resolution holds an address,
+    /// not a value; a data global in value position is its address
+    /// literal (the `emit_move_val_to_slot` contract), which only the u8
+    /// form stages into W.
+    fn inline_mul_operand(&self, v: &Val, width: u8) -> Option<Vec<MulOp>> {
+        match v {
+            Val::Const(k) => {
+                if width != 1 {
+                    return None;
+                }
+                Some(vec![MulOp::Lit((*k & 0xFF) as u8)])
+            }
+            Val::Reg(r) => {
+                if self
+                    .resolved
+                    .contains_key(&iselcore::ssa_key(self.cur_func, r))
+                {
+                    return None;
+                }
+                let base = match self.w_folds.loads.get(r) {
+                    Some(iselcore::LoadFold::Direct(g)) => *self.addrs.get(g)?,
+                    _ => *self.addrs.get(&iselcore::ssa_key(self.cur_func, r))?,
+                };
+                Some(
+                    (0..width)
+                        .map(|i| MulOp::Ram(base + u16::from(i)))
+                        .collect(),
+                )
+            }
+            Val::Global(g) => {
+                if width != 1 || self.is_function(g) || self.global_is_const(g) {
+                    return None;
+                }
+                Some(vec![MulOp::Lit((self.addrs.get(g)? & 0xFF) as u8)])
+            }
+        }
+    }
+
+    /// The inline form of a narrow-multiply call, or `None` for the
+    /// ordinary call path. Pure: resolves addresses and checks shapes,
+    /// never emits. Every RAM byte touched must sit in the access bank
+    /// (a MOVLB mid-sequence costs the words the inline saves), and no
+    /// u16 operand byte may alias the retval temps (a retval-homed call
+    /// result parks there, epic-cc#738).
+    fn inline_mul_plan(&self, c: &ir::Call) -> Option<InlineMul> {
+        let width = Self::inline_mul_width(&c.func)?;
+        if !c.callees.is_empty() || c.args.len() != 2 {
+            return None;
+        }
+        let want = match width {
+            1 => Ty::I8,
+            2 => Ty::I16,
+            _ => return None,
+        };
+        if c.ty != Some(want) {
+            return None;
+        }
+        for arg in &c.args {
+            if arg.ty != Some(want) || arg.byval.is_some() || arg.sret {
+                return None;
+            }
+        }
+        if width == 2 && !self.inline_mul16 {
+            return None;
+        }
+        let a = self.inline_mul_operand(&c.args[0].val, width)?;
+        let b = self.inline_mul_operand(&c.args[1].val, width)?;
+        let dst = match &c.dst {
+            None => None,
+            Some(d) => Some(*self.addrs.get(&iselcore::ssa_key(self.cur_func, d))?),
+        };
+        if width == 1 {
+            if matches!((a[0], b[0]), (MulOp::Lit(_), MulOp::Lit(_))) {
+                return None;
+            }
+            let mut ram = Vec::new();
+            for op in a.iter().chain(b.iter()) {
+                if let MulOp::Ram(addr) = op {
+                    ram.push(*addr);
+                }
+            }
+            if let Some(d) = dst {
+                ram.push(d);
+            }
+            if ram.iter().any(|x| self.lane_bank(*x).is_some()) {
+                return None;
+            }
+            return Some(InlineMul::U8 {
+                a: a[0],
+                b: b[0],
+                dst,
+            });
+        }
+        let ([MulOp::Ram(a0), MulOp::Ram(a1)], [MulOp::Ram(b0), MulOp::Ram(b1)]) =
+            (a.as_slice(), b.as_slice())
+        else {
+            return None;
+        };
+        let (a0, a1, b0, b1) = (*a0, *a1, *b0, *b1);
+        let mut ram = vec![a0, a1, b0, b1];
+        let dst16 = match dst {
+            None => None,
+            Some(d) => {
+                ram.push(d);
+                ram.push(d + 1);
+                Some((d, d + 1))
+            }
+        };
+        if ram.iter().any(|x| self.lane_bank(*x).is_some()) {
+            return None;
+        }
+        for x in [a0, a1, b0, b1] {
+            if (self.retval_lo..self.retval_lo + 4).contains(&x) {
+                return None;
+            }
+        }
+        Some(InlineMul::U16 {
+            a0,
+            a1,
+            b0,
+            b1,
+            dst: dst16,
+        })
+    }
+
+    /// Emit an inline narrow multiply, `true` when a plan resolved. Each
+    /// operand byte is read exactly once (a second read would observe a
+    /// volatile twice), so the u16 form parks both low bytes in retval
+    /// temps across the three partials. The ISR prologue snapshots the
+    /// retval region and PROD, so an interrupt mid-sequence restores
+    /// both. Staged copies drain first: a parked retval copy must land
+    /// before the temps are reused (the `emit_delay` rule).
+    fn try_emit_inline_mul(&mut self, c: &ir::Call) -> bool {
+        let Some(plan) = self.inline_mul_plan(c) else {
+            return false;
+        };
+        self.flush_copies();
+        match plan {
+            InlineMul::U8 { a, b, dst } => {
+                if let Some(d) = dst {
+                    self.invalidate_fsr0_if_slot_written(d, 1);
+                }
+                match (a, b) {
+                    (MulOp::Ram(aa), MulOp::Ram(bb)) => {
+                        self.emit(format!("    MOVF 0x{aa:03X},W,A"));
+                        self.emit(format!("    MULWF 0x{bb:03X},A"));
+                    }
+                    (MulOp::Lit(k), MulOp::Ram(bb)) => {
+                        self.emit(format!("    MOVLW 0x{k:02X}"));
+                        self.emit(format!("    MULWF 0x{bb:03X},A"));
+                    }
+                    (MulOp::Ram(aa), MulOp::Lit(k)) => {
+                        self.emit(format!("    MOVLW 0x{k:02X}"));
+                        self.emit(format!("    MULWF 0x{aa:03X},A"));
+                    }
+                    (MulOp::Lit(_), MulOp::Lit(_)) => {
+                        unreachable!("isel-pic18: inline u8 plan rejects const/const")
+                    }
+                }
+                if let Some(d) = dst {
+                    self.emit(format!("    MOVFF 0xFF3, 0x{d:03X}"));
+                }
+            }
+            InlineMul::U16 {
+                a0,
+                a1,
+                b0,
+                b1,
+                dst,
+            } => {
+                assert!(
+                    self.retval_lo + 3 <= self.access_bank_hi,
+                    "isel-pic18: inline u16 multiply needs 4 retval bytes in the access bank"
+                );
+                let (t0, t1, t2) = (self.retval_lo, self.retval_lo + 1, self.retval_lo + 2);
+                let (d0, d1) = dst.unwrap_or((self.retval_lo + 3, self.retval_lo + 3));
+                if let Some((x0, _)) = dst {
+                    self.invalidate_fsr0_if_slot_written(x0, 2);
+                }
+                self.invalidate_fsr0_if_slot_written(t0, 4);
+                // P10 first while both low bytes park in t0/t1, then
+                // P01, then P00 with the high accumulator in t2. d0
+                // lands after the last operand read, so any dst/operand
+                // overlay is already consumed.
+                self.emit(format!("    MOVF 0x{b0:03X},W,A"));
+                self.emit(format!("    MOVWF 0x{t0:03X},A"));
+                self.emit(format!("    MOVF 0x{a0:03X},W,A"));
+                self.emit(format!("    MOVWF 0x{t1:03X},A"));
+                self.emit(format!("    MOVF 0x{a1:03X},W,A"));
+                self.emit(format!("    MULWF 0x{t0:03X},A"));
+                self.emit("    MOVF 0xFF3,W,A".to_string());
+                self.emit(format!("    MOVWF 0x{t2:03X},A"));
+                self.emit(format!("    MOVF 0x{t1:03X},W,A"));
+                self.emit(format!("    MULWF 0x{b1:03X},A"));
+                self.emit("    MOVF 0xFF3,W,A".to_string());
+                self.emit(format!("    ADDWF 0x{t2:03X},F,A"));
+                self.emit(format!("    MOVF 0x{t1:03X},W,A"));
+                self.emit(format!("    MULWF 0x{t0:03X},A"));
+                self.emit("    MOVF 0xFF3,W,A".to_string());
+                self.emit(format!("    MOVWF 0x{d0:03X},A"));
+                self.emit("    MOVF 0xFF4,W,A".to_string());
+                self.emit(format!("    ADDWF 0x{t2:03X},F,A"));
+                self.emit(format!("    MOVF 0x{t2:03X},W,A"));
+                self.emit(format!("    MOVWF 0x{d1:03X},A"));
+            }
+        }
+        true
     }
 
     fn emit_inst(&mut self, i: &Inst) {
@@ -4653,7 +5289,13 @@ impl<'m> Gen<'m> {
                     "isel-pic18: only i8/i16/i32 Icmp implemented so far (n={n})"
                 );
                 if n == 1 {
-                    self.emit_icmp_byte(self.fold_reg(&c.a), self.fold_reg(&c.b), &c.pred, &c.dst);
+                    self.emit_icmp_byte(
+                        self.fold_reg(&c.a),
+                        self.fold_reg(&c.b),
+                        &c.pred,
+                        &c.dst,
+                        None,
+                    );
                 } else if n == 2 {
                     self.emit_icmp_i16(self.fold_reg(&c.a), self.fold_reg(&c.b), &c.pred, &c.dst);
                 } else {
@@ -4923,6 +5565,9 @@ impl<'m> Gen<'m> {
             }
             Inst::Call(c) => {
                 if !c.callees.is_empty() {
+                    if let Some(set) = self.emitted_calls.as_mut() {
+                        set.extend(c.callees.iter().cloned());
+                    }
                     self.emit_indirect_call(&c.dst, c.ty, &c.func, &c.args, &c.callees);
                 } else if !self.is_function(&c.func) {
                     // An indirect call site (numeric `func`, the SSA
@@ -4935,7 +5580,15 @@ impl<'m> Gen<'m> {
                     let l_trap = self.fresh_label();
                     self.emit_label(&l_trap);
                     self.emit(format!("    BRA {l_trap}"));
+                } else if self.try_emit_inline_mul(&c) {
+                    // Narrow multiply inlined as MULWF partials: no call
+                    // ran, so BSR, FSR0 and TBLPTR carry through untouched.
                 } else {
+                    // A real `CALL` line leaves: record the callee so pass
+                    // B keeps its body. Inlined multiplies record nothing.
+                    if let Some(set) = self.emitted_calls.as_mut() {
+                        set.insert(c.func.clone());
+                    }
                     self.emit_call_args(&c.func, &c.args);
                     self.emit(format!("    CALL {}", c.func));
                     // A `CALL` return joins like a label: the callee ran its
@@ -5118,7 +5771,19 @@ impl<'m> Gen<'m> {
     /// equality directly to the predicate answer: true for `eq`/`uge`/`ule`/
     /// `sge`/`sle`, false for the strict ones. Routing equality uniformly
     /// to `l_false` inverts the non-strict predicates at equal inputs.
-    fn emit_icmp_byte(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
+    ///
+    /// `fuse` carries the two exit labels of a consuming `BrCond` in this
+    /// function, when this compare's result has no other use. With it, the
+    /// lane branches straight to the branch targets and no 0/1 byte is
+    /// materialized (see `emit_fused_branch`).
+    fn emit_icmp_byte(
+        &mut self,
+        a: Val,
+        b: Val,
+        pred: &str,
+        dst: &str,
+        fuse: Option<(String, String)>,
+    ) {
         // `val_addr` maps `Val::Const(k)` to a RAM address, not a literal:
         // a constant LHS would compare against the byte at that address
         // instead of the literal. Same hazard as the `Bin` LHS arm;
@@ -5127,20 +5792,38 @@ impl<'m> Gen<'m> {
             !matches!(a, Val::Const(_)),
             "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
         );
-        let l_true = self.fresh_label();
-        let l_false = self.fresh_label();
-        let l_done = self.fresh_label();
+        let (l_true, l_false, l_done);
+        match fuse {
+            Some((t, f)) => {
+                l_true = t;
+                l_false = f;
+                l_done = None;
+            }
+            None => {
+                l_true = self.fresh_label();
+                l_false = self.fresh_label();
+                l_done = Some(self.fresh_label());
+            }
+        }
         let l_equal = if matches!(pred, "eq" | "uge" | "ule" | "sge" | "sle") {
             l_true.clone()
         } else {
             l_false.clone()
         };
-        let pre = self.bool_result_preclear(&a, &b, dst, 1);
+        // The materializing path writes a 0/1 byte only; a fused compare
+        // leaves the slot alone entirely, so the preclear is skipped.
+        let pre = if l_done.is_some() {
+            self.bool_result_preclear(&a, &b, dst, 1)
+        } else {
+            None
+        };
         if let Some(d) = pre {
             self.emit_banked("CLRF", d, "");
         }
         self.emit_cmp_branch(&a, &b, 0, pred, &l_true, &l_false, &l_equal);
-        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst, pre);
+        if let Some(done) = l_done {
+            self.emit_materialize_bool(&l_true, &l_false, &done, dst, pre);
+        }
     }
 
     /// Computes the 16-bit predicate by comparing the high byte first with
@@ -5612,8 +6295,10 @@ impl<'m> Gen<'m> {
     /// `l_false` on a decisive mismatch, `l_equal` on equal bytes. Equality
     /// stays ambiguous by design: the caller binds `l_equal` to defer (the
     /// high-byte step) or to answer (single bytes and low-byte tie-breaks).
-    /// `eq`/`ne` skip the split: one byte decides them, so only `l_true` and
-    /// `l_false` apply.
+    /// A caller that binds `l_equal` to the trailing branch's own target
+    /// gets no middle branch: equal bytes would fall into that target
+    /// either way, so the `BZ` is dead. `eq`/`ne` skip the split: one byte
+    /// decides them, so only `l_true` and `l_false` apply.
     fn emit_cmp_branch(
         &mut self,
         a: &Val,
@@ -5637,22 +6322,30 @@ impl<'m> Gen<'m> {
             }
             "ult" => {
                 self.emit(format!("    BNC {l_true}")); // C=0: a<b, definite
-                self.emit(format!("    BZ {l_equal}"));
+                if l_equal != l_false {
+                    self.emit(format!("    BZ {l_equal}"));
+                }
                 self.emit(format!("    BRA {l_false}"));
             }
             "uge" => {
                 self.emit(format!("    BNC {l_false}")); // C=0: a<b, definite
-                self.emit(format!("    BZ {l_equal}"));
+                if l_equal != l_true {
+                    self.emit(format!("    BZ {l_equal}"));
+                }
                 self.emit(format!("    BRA {l_true}")); // C=1,Z=0: a>b, definite
             }
             "ugt" => {
                 self.emit(format!("    BNC {l_false}")); // C=0: a<b, definite
-                self.emit(format!("    BZ {l_equal}"));
+                if l_equal != l_true {
+                    self.emit(format!("    BZ {l_equal}"));
+                }
                 self.emit(format!("    BRA {l_true}")); // C=1,Z=0: a>b, definite
             }
             "ule" => {
                 self.emit(format!("    BNC {l_true}")); // C=0: a<b, definite
-                self.emit(format!("    BZ {l_equal}"));
+                if l_equal != l_false {
+                    self.emit(format!("    BZ {l_equal}"));
+                }
                 self.emit(format!("    BRA {l_false}")); // C=1,Z=0: a>b, definite
             }
             "slt" => {
@@ -6236,6 +6929,8 @@ impl<'m> Gen<'m> {
     /// branches free the frame from any single-bank constraint. Shared by the
     /// unsigned and signed wrappers. The u8 case pairs a 2-byte remainder
     /// with a 1-byte divisor (implicit high byte 0 via `MOVLW 0` folds).
+    /// With `fold` the counter lives in both bit paths, dropping the taken
+    /// `BRA` off the success path at 2 words.
     fn emit_divmod_loop(
         &mut self,
         num: u16,
@@ -6244,10 +6939,18 @@ impl<'m> Gen<'m> {
         cnt: u16,
         den_bytes: u8,
         rem_bytes: u8,
+        fold: bool,
     ) {
+        // Mint order matches the old head so unfolded output keeps its
+        // label numbering; the fold-only label never shifts it.
         let l_loop = self.fresh_label();
         let l_restore = self.fresh_label();
         let l_next = self.fresh_label();
+        let l_done = if fold {
+            self.fresh_label()
+        } else {
+            String::new()
+        };
         for i in 0..u16::from(rem_bytes) {
             let (ra, rf) = self.operand(rem_base + i);
             self.emit(format!(
@@ -6297,15 +7000,48 @@ impl<'m> Gen<'m> {
             ));
         }
         // C after the last byte = (rem >= den): set the quotient bit or restore.
+        // Folded form counts down in both paths, dropping the taken `BRA`
+        // off the success path; the plain form keeps the old shared tail.
         self.emit(format!("    BNC {l_restore}"));
         let (na, nf) = self.operand(num);
         self.emit(format!(
             "    BSF 0x{nf:03X},0,{}",
             if na == 0 { "A" } else { "B" }
         ));
-        self.emit(format!("    BRA {l_next}"));
-        self.emit_label(&l_restore);
-        // rem += den back (ADDWF, then ADDWFC for the carries).
+        if fold {
+            let (ca, cf) = self.operand(cnt);
+            self.emit(format!(
+                "    DECFSZ 0x{cf:03X},F,{}",
+                if ca == 0 { "A" } else { "B" }
+            ));
+            self.emit(format!("    BRA {l_loop}"));
+            self.emit(format!("    BRA {l_done}"));
+            self.emit_label(&l_restore);
+            self.emit_div_restore(den, rem_base, den_bytes, rem_bytes);
+            let (ca, cf) = self.operand(cnt);
+            self.emit(format!(
+                "    DECFSZ 0x{cf:03X},F,{}",
+                if ca == 0 { "A" } else { "B" }
+            ));
+            self.emit(format!("    BRA {l_loop}"));
+            self.emit_label(&l_done);
+        } else {
+            self.emit(format!("    BRA {l_next}"));
+            self.emit_label(&l_restore);
+            self.emit_div_restore(den, rem_base, den_bytes, rem_bytes);
+            self.emit_label(&l_next);
+            let (ca, cf) = self.operand(cnt);
+            self.emit(format!(
+                "    DECFSZ 0x{cf:03X},F,{}",
+                if ca == 0 { "A" } else { "B" }
+            ));
+            self.emit(format!("    BRA {l_loop}"));
+        }
+    }
+
+    /// The restore half of one division bit: `rem += den` back after a
+    /// borrowing trial subtract (ADDWF, then ADDWFC for the carries).
+    fn emit_div_restore(&mut self, den: u16, rem_base: u16, den_bytes: u8, rem_bytes: u8) {
         for i in 0..u16::from(rem_bytes) {
             if i < u16::from(den_bytes) {
                 let (da, df) = self.operand(den + i);
@@ -6323,13 +7059,6 @@ impl<'m> Gen<'m> {
                 if ra == 0 { "A" } else { "B" }
             ));
         }
-        self.emit_label(&l_next);
-        let (ca, cf) = self.operand(cnt);
-        self.emit(format!(
-            "    DECFSZ 0x{cf:03X},F,{}",
-            if ca == 0 { "A" } else { "B" }
-        ));
-        self.emit(format!("    BRA {l_loop}"));
     }
 
     /// The restoring-division recipe for `den_bytes` = 1, 2, or 4, quotient
@@ -6347,6 +7076,7 @@ impl<'m> Gen<'m> {
             scr + u16::from(rem_bytes),
             den_bytes,
             rem_bytes,
+            self.divmod_fold,
         );
         if quotient {
             self.store_retval(num, den_bytes);
@@ -6384,8 +7114,9 @@ impl<'m> Gen<'m> {
         let l_done = self.fresh_label();
         self.emit_label(&l_digits);
         // One restoring-division pass: quotient back into `num`, remainder
-        // (the digit value, 0-9) into `rem`.
-        self.emit_divmod_loop(num, den, rem, cnt, 4, 4);
+        // (the digit value, 0-9) into `rem`. Unfolded: the digit rows pin
+        // the full-count timing and are out of scope.
+        self.emit_divmod_loop(num, den, rem, cnt, 4, 4, false);
         // digit = rem0 | 48, then POSTINC0 (0xFEE) = digit: the FSR walks
         // the buffer, one advance per digit. (0xFEB is PLUSW0, the indexed
         // form, not this.)
@@ -6426,8 +7157,8 @@ impl<'m> Gen<'m> {
         let l_digits = self.fresh_label();
         self.emit_label(&l_digits);
         // One restoring-division pass: quotient back into `num`, remainder
-        // (the binary digit, 0-9) into `rem`.
-        self.emit_divmod_loop(num, den, rem, dcnt, 2, 2);
+        // (the binary digit, 0-9) into `rem`. Unfolded like its u32 sibling.
+        self.emit_divmod_loop(num, den, rem, dcnt, 2, 2, false);
         // digit = rem0, then POSTINC0 (0xFEE) = digit.
         self.emit_banked("MOVF", rem, ",W");
         self.emit_banked("MOVWF", digit, "");
@@ -6495,6 +7226,7 @@ impl<'m> Gen<'m> {
             scr + 1 + u16::from(rem_bytes),
             den_bytes,
             rem_bytes,
+            self.divmod_fold,
         );
         if quotient {
             let (sa, sf) = self.operand(scr);
@@ -8745,6 +9477,11 @@ fn emit_fused_branch<'m>(
     let fuse = Some((l_t, l_f));
     if c.pred == "eq" || c.pred == "ne" {
         g.emit_icmp_eq_ne(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
+    } else if n == 1 {
+        // Single-byte orderings never reach the borrow chain: one lane
+        // has no carry to hold, so the lane branches straight to the
+        // exits with equality bound to its final answer.
+        g.emit_icmp_byte(c.a.clone(), c.b.clone(), &c.pred, &c.dst, fuse);
     } else if matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge") {
         g.emit_icmp_signed_chain(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
     } else {
@@ -9912,6 +10649,9 @@ pub fn select_with_opts(
     // Shared across every `Gen` below so `fresh_label` never repeats a
     // `tmp{n}:` label across two different functions in the same output.
     let mut tmp = 0u32;
+    // Every callee a `CALL` line actually emitted, filled by the pass-A
+    // `Gen` runs. Pass B drops uncalled runtime routines (epic-cc#892).
+    let mut emitted_calls: HashSet<String> = HashSet::new();
     // Every pointer reg in the module, folded once up front; later tasks'
     // pointer emitters consume it via `Gen::resolved_for`.
     let resolved = resolve_pointers(m);
@@ -10007,13 +10747,18 @@ pub fn select_with_opts(
                 routine_ends: Some(Vec::new()),
                 fsr0_holds: None,
                 tblptr_holds: None,
+                tblptr_walk: HashSet::new(),
+                cur_site: (String::new(), 0),
                 pending_copies: Vec::new(),
                 copy_loop: opts.copy_loop,
+                divmod_fold: opts.divmod_fold,
+                inline_mul16: opts.inline_mul16,
                 cur_func: &f.name,
                 global_addrs: &global_addrs,
                 w_holds: None,
                 isr: f.isr,
                 tmp: &mut recipe_tmp,
+                emitted_calls: None,
                 cur_loc: None,
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
@@ -10076,13 +10821,18 @@ pub fn select_with_opts(
             routine_ends: None,
             fsr0_holds: None,
             tblptr_holds: None,
+            tblptr_walk: HashSet::new(),
+            cur_site: (String::new(), 0),
             pending_copies: Vec::new(),
             copy_loop: opts.copy_loop,
+            divmod_fold: opts.divmod_fold,
+            inline_mul16: opts.inline_mul16,
             cur_func: &f.name,
             global_addrs: &global_addrs,
             w_holds: None,
             isr: f.isr,
             tmp: &mut tmp,
+            emitted_calls: Some(&mut emitted_calls),
             cur_loc: None,
             bit_lanes: HashMap::new(),
             lane_consumed: HashSet::new(),
@@ -10122,6 +10872,10 @@ pub fn select_with_opts(
         let (phi_fold, inplace_bins) = Gen::find_inplace_folds(&g, f);
         g.phi_fold = phi_fold;
         g.inplace_bins = inplace_bins;
+        // `TBLPTR` walk marks for this function (epic-cc#778): dynamically
+        // indexed const reads whose seed the run scan proved redundant.
+        // Runs after every other scan since dst-home checks read them.
+        g.tblptr_walk = Gen::find_tblptr_walks(&g, f);
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
         // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
@@ -10322,7 +11076,8 @@ pub fn select_with_opts(
                     fc
                 });
             let mut terminator: Option<&Inst> = None;
-            for inst in &b.insts {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                g.cur_site = (b.label.clone(), ii);
                 match inst {
                     Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
                     Inst::Br(_) | Inst::BrCond(_) | Inst::Switch(_) | Inst::Ret(..) => {
@@ -10734,14 +11489,17 @@ pub fn select_with_opts(
             if f.isr { None } else { exit_bank(&ret_ends) },
         );
     }
-    // Routines and naked bodies buffer here rather than streaming inside
-    // pass B: the ISR narrowing below scans every reachable body, and a
-    // routine defined after the handler in module order would otherwise
-    // go unscanned. Emission order stays module order, so the shared
-    // `tmp` counter hands out identical label names.
+    // Reached routines buffer here rather than streaming inside pass B:
+    // the ISR narrowing below scans every reachable body, and a routine
+    // defined after the handler in module order would otherwise go
+    // unscanned. Only routines an emitted `CALL` reaches are buffered, so
+    // pass B drops the rest like master (epic-cc#892) and the shared
+    // `tmp` counter hands out identical label names. A routine called
+    // only from naked or module asm is untracked there; the scan then
+    // keeps the full save set for its callers.
     let mut routine_bodies: HashMap<String, (Vec<String>, Vec<Option<SrcLoc>>)> = HashMap::new();
     for f in &funcs {
-        if !ir::is_runtime_routine(&f.name) {
+        if !ir::is_runtime_routine(&f.name) || !emitted_calls.contains(f.name.as_str()) {
             continue;
         }
         let mut g = Gen {
@@ -10758,13 +11516,18 @@ pub fn select_with_opts(
             routine_ends: None,
             fsr0_holds: None,
             tblptr_holds: None,
+            tblptr_walk: HashSet::new(),
+            cur_site: (String::new(), 0),
             pending_copies: Vec::new(),
             copy_loop: opts.copy_loop,
+            divmod_fold: opts.divmod_fold,
+            inline_mul16: opts.inline_mul16,
             cur_func: &f.name,
             global_addrs: &global_addrs,
             w_holds: None,
             isr: f.isr,
             tmp: &mut tmp,
+            emitted_calls: None,
             cur_loc: None,
             bit_lanes: HashMap::new(),
             lane_consumed: HashSet::new(),
@@ -10848,13 +11611,18 @@ pub fn select_with_opts(
         // A runtime routine (or its `_isr` copy) holds only the `__scr`
         // alloca in its entry block, which the generic block emitter would
         // render as an empty label (silently falling through into the next
-        // function). The pre-pass above emitted the recipe body instead.
-        // Runtime routines stream from the pre-pass buffer: their text is
-        // identical, and the buffer is what the ISR narrowing scanned.
+        // function). The pre-pass above buffered its recipe body instead.
+        // Routines no emitted `CALL` reaches stay dropped, or outline
+        // would factor real calls back into the dead body (epic-cc#892).
+        // Streaming reuses the buffer the ISR narrowing scanned, so both
+        // see identical text.
+        if ir::is_runtime_routine(&f.name) && !emitted_calls.contains(f.name.as_str()) {
+            continue;
+        }
         if ir::is_runtime_routine(&f.name) {
             let (rlines, rlocs) = routine_bodies
                 .remove(f.name.as_str())
-                .expect("every runtime routine has a buffered body");
+                .expect("every reached runtime routine has a buffered body");
             out.extend(rlines);
             locs.extend(rlocs);
             continue;
@@ -11129,13 +11897,18 @@ mod tests {
                 routine_ends: None,
                 fsr0_holds: None,
                 tblptr_holds: None,
+                tblptr_walk: HashSet::new(),
+                cur_site: (String::new(), 0),
                 pending_copies: Vec::new(),
                 copy_loop: true,
+                divmod_fold: false,
+                inline_mul16: false,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
                 w_holds: None,
                 isr: false,
                 tmp: &mut tmp,
+                emitted_calls: None,
                 cur_loc: None,
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
@@ -11164,13 +11937,18 @@ mod tests {
                 routine_ends: None,
                 fsr0_holds: None,
                 tblptr_holds: None,
+                tblptr_walk: HashSet::new(),
+                cur_site: (String::new(), 0),
                 pending_copies: Vec::new(),
                 copy_loop: true,
+                divmod_fold: false,
+                inline_mul16: false,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
                 w_holds: None,
                 isr: false,
                 tmp: &mut tmp,
+                emitted_calls: None,
                 cur_loc: None,
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
@@ -11214,13 +11992,18 @@ mod p3_gen_tests {
             routine_ends: None,
             fsr0_holds: None,
             tblptr_holds: None,
+            tblptr_walk: HashSet::new(),
+            cur_site: (String::new(), 0),
             pending_copies: Vec::new(),
             copy_loop: true,
+            divmod_fold: false,
+            inline_mul16: false,
             cur_func: "main",
             global_addrs: empty_global_addrs(),
             w_holds: None,
             isr: false,
             tmp,
+            emitted_calls: None,
             cur_loc: None,
             bit_lanes: HashMap::new(),
             lane_consumed: HashSet::new(),
