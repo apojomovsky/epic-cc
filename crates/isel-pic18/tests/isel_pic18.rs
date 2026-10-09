@@ -9893,3 +9893,67 @@ fn multi_use_zext_into_ret_stays_staged() {
     assert!(asm.contains("0x043"), "zext temp staged:\n{asm}");
     assert!(asm.contains("MOVWF 0x000"), "ret round trip kept:\n{asm}");
 }
+
+/// A store between trunc and call keeps the fold off (epic-cc#978): the
+/// folded read would move past a memory op, so the temp stays staged.
+#[test]
+fn store_between_trunc_and_call_stays_staged() {
+    let m = parse(
+        "global a i16\nglobal flag i8\n\
+         fn callee(i8) (p=i8, q=i8)\n  block entry:\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %t = trunc i16 %1 to i8\n\
+           store i8 0 @flag\n    %3 = call i8 @callee(i8 %t, i8 5)\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("flag", 0x22),
+        ("callee::p", 0x30),
+        ("callee::q", 0x31),
+        ("main::1", 0x40),
+        ("main::t", 0x42),
+        ("main::3", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x040, 0x042"),
+        "trunc stages its temp:\n{asm}"
+    );
+}
+
+/// A store between load and zext keeps the fold off (epic-cc#978).
+#[test]
+fn store_between_load_and_zext_stays_staged() {
+    let m = parse(
+        "global g i8\nglobal r i16\nglobal flag i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @g\n\
+           store i8 0 @flag\n    %2 = zext i8 %1 to i16\n    store i16 %2 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("g", 0x20),
+        ("r", 0x24),
+        ("flag", 0x26),
+        ("main::1", 0x40),
+        ("main::2", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("0x040"), "load temp staged:\n{asm}");
+}
+
+/// A store between zext and ret keeps the fold off (epic-cc#978).
+#[test]
+fn store_between_zext_and_ret_stays_staged() {
+    let m = parse(
+        "global flag i8\nglobal r i16\nfn main(i16) (x=i8, y=i8)\n  block entry:\n    %c = icmp eq i8 %x, %y\n\
+           %z = zext i1 %c to i16\n    store i8 0 @flag\n    ret i16 %z\n",
+    );
+    let addrs = addrs(&[
+        ("flag", 0x22),
+        ("r", 0x24),
+        ("main::x", 0x40),
+        ("main::y", 0x41),
+        ("main::c", 0x42),
+        ("main::z", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("0x043"), "zext temp staged:\n{asm}");
+    assert!(asm.contains("MOVWF 0x000"), "ret round trip kept:\n{asm}");
+}
