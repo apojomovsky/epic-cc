@@ -357,6 +357,11 @@ struct Gen<'m> {
     /// loads whose byte never stages to a slot. `alloc` drops those
     /// slots; the load arm skips them and consumers read the source.
     w_folds: iselcore::ValueFolds,
+    /// Flash bytes forwarded through `TABLAT` (epic-cc#977). Holds a
+    /// single-use one-byte flash-load dst feeding a dynamic store in
+    /// the same block with a clean span: the load arm skips the temp
+    /// staging copy and the store arm reads `TABLAT` directly.
+    tablat_fwd: HashSet<String>,
     out: Vec<String>,
     /// One source location per emitted line, index-aligned with `out`.
     /// `None` marks a compiler-generated line (no source instruction).
@@ -1528,6 +1533,124 @@ impl<'m> Gen<'m> {
             }
         }
         (fwd, consumed)
+    }
+    /// Static `const_base_of` for pre-scans: whether `ptr` resolves to a
+    /// `const` (flash) global, without touching emitter state.
+    fn const_base_in(g: &Gen, func: &str, ptr: &Val) -> Option<(String, u16, Vec<(u16, String)>)> {
+        match ptr {
+            Val::Global(name) if g.global_is_const(name) => Some((name.clone(), 0, Vec::new())),
+            Val::Reg(r) => match g.resolved.get(&ssa_key(func, r)) {
+                Some((Base::Global(name), k, terms)) if g.global_is_const(name) => {
+                    Some((name.clone(), *k, terms.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    /// Per-function TABLAT-forward pre-scan (epic-cc#977): a single-use
+    /// same-block flash byte load feeding a dynamic store leaves its
+    /// byte in `TABLAT` for the store to read directly. The mirror of
+    /// #723, which folds producers into static destinations and
+    /// excludes flash loads; here the dynamic destination is the point.
+    /// The #723 span rule keeps `TBLRD` and calls out of the span and
+    /// the ISR saves `TABLAT`, so nothing disturbs the staged byte.
+    /// Single-byte only: wider pairs stage per byte on both sides.
+    fn find_tablat_forwards(g: &Gen, f: &Func) -> HashSet<String> {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut fwd: HashSet<String> = HashSet::new();
+        for b in &f.blocks {
+            for (si, inst) in b.insts.iter().enumerate() {
+                let Inst::Store(s) = inst else { continue };
+                let Val::Reg(r) = &s.val else { continue };
+                if uses.get(r).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                if s.ty.bytes() != 1 || !s.ptr.starts_with('%') {
+                    continue;
+                }
+                if Self::static_base(g, &f.name, &s.ptr).is_some() {
+                    continue;
+                }
+                let ptr_val = Val::Reg(s.ptr[1..].to_string());
+                if Self::const_base_in(g, &f.name, &ptr_val).is_some() {
+                    continue;
+                }
+                if let Val::Reg(pr) = &ptr_val {
+                    let pkey = ssa_key(&f.name, pr);
+                    if g.prov.flash.contains(&pkey) || g.prov.mixed.contains(&pkey) {
+                        continue;
+                    }
+                }
+                if g.lane_consumed.contains(r) || g.bit_lanes.contains_key(r) {
+                    continue;
+                }
+                if g.w_folds.loads.contains_key(r) || g.bin_w_srcs.contains(r) {
+                    continue;
+                }
+                if g.store_fwd.contains_key(r) || g.store_consumed.contains(r) {
+                    continue;
+                }
+                let Some(pi) = b.insts[..si].iter().rposition(|i| match i {
+                    Inst::Load(l) => &l.dst == r,
+                    _ => false,
+                }) else {
+                    continue;
+                };
+                let Inst::Load(l) = &b.insts[pi] else {
+                    continue;
+                };
+                if l.ty.bytes() != 1 || l.ptr_ty {
+                    continue;
+                }
+                let load_ptr = if let Some(gb) = l.ptr.strip_prefix('@') {
+                    Val::Global(gb.to_string())
+                } else if let Some(rr) = l.ptr.strip_prefix('%') {
+                    Val::Reg(rr.to_string())
+                } else {
+                    continue;
+                };
+                let Some((_table, _k, terms)) = Self::const_base_in(g, &f.name, &load_ptr) else {
+                    continue;
+                };
+                if terms.len() > 1 {
+                    continue;
+                }
+                // Same span rule as #723: the folded byte is staged
+                // earlier, so the span holds no memory behavior at all.
+                // In particular no second load may stage `TABLAT` and no
+                // call may run code that reads flash.
+                let span_clean = b.insts[pi + 1..si].iter().all(|i| match i {
+                    Inst::Call(_)
+                    | Inst::Asm(_)
+                    | Inst::Store(_)
+                    | Inst::Memcpy(_)
+                    | Inst::VaStart(_)
+                    | Inst::VaArg(_)
+                    | Inst::Load(_)
+                    | Inst::Br(_)
+                    | Inst::BrCond(_)
+                    | Inst::Switch(_)
+                    | Inst::Ret(_, _) => false,
+                    _ => true,
+                });
+                if !span_clean {
+                    continue;
+                }
+                fwd.insert(r.clone());
+            }
+        }
+        fwd
     }
     /// Const-producer pre-scan (epic-cc#825): a block with exactly one
     /// phi, one byte wide, every incoming a constant, consumed only by
@@ -5194,6 +5317,18 @@ impl<'m> Gen<'m> {
                 // (RAM globals, allocas, sret slots, dynamic pointers)
                 // keeps the integer-spine/pointer-lowering FSR/INDF path.
                 if let Some((table, k, terms)) = self.const_base_of(&ptr_val) {
+                    // A TABLAT-forwarded byte (epic-cc#977) stays in
+                    // TABLAT for its dynamic store: seed and read, skip
+                    // the temp staging copy. Same seed and walk as the
+                    // staged path below, minus the copy.
+                    if self.tablat_fwd.contains(&l.dst) {
+                        self.emit_tblptr_setup_shared(&table, k, &terms, 0);
+                        self.emit("    TBLRD*+".to_string());
+                        if terms.is_empty() {
+                            self.note_tblptr_walked(&table, k);
+                        }
+                        return;
+                    }
                     for kk in 0..l.ty.bytes() {
                         self.emit_const_load_byte(&table, k, &terms, kk, dst + u16::from(kk));
                     }
@@ -5373,6 +5508,33 @@ impl<'m> Gen<'m> {
                     Val::Reg(r) => self.addrs.get(&ssa_key(self.cur_func, &r)).copied(),
                     _ => None,
                 };
+                // A TABLAT-forwarded byte (epic-cc#977): the const-load
+                // arm left it in TABLAT, so read it directly once the
+                // setup below lands. The scan proves a single byte, a
+                // dynamic destination, and a span nothing disturbs.
+                if let Val::Reg(r) = &s.val {
+                    if self.tablat_fwd.contains(r) {
+                        assert_eq!(
+                            s.ty.bytes(),
+                            1,
+                            "isel-pic18: TABLAT forward is single-byte only"
+                        );
+                        if let (Some(shape), Some(_)) = (self.plusw_shape(&ptr_val), val_slot) {
+                            self.emit_plusw_setup(&shape, 0, false);
+                            self.emit("    MOVFF 0xFF5, 0xFEB".to_string());
+                            return;
+                        }
+                        match self.emit_ptr_setup(&ptr_val, 0) {
+                            Addr::Direct(_) => panic!(
+                                "isel-pic18: TABLAT-forwarded store has a static destination"
+                            ),
+                            Addr::Indirect => {
+                                self.emit("    MOVFF 0xFF5, 0xFEF".to_string());
+                            }
+                        }
+                        return;
+                    }
+                }
                 if let (Some(shape), Some(vslot)) = (self.plusw_shape(&ptr_val), val_slot) {
                     let n = s.ty.bytes();
                     for k in 0..n {
@@ -11460,6 +11622,7 @@ pub fn select_with_opts(
                 const_w_phis: HashSet::new(),
                 bin_w_srcs: HashSet::new(),
                 rmw_fwd: HashMap::new(),
+                tablat_fwd: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -11537,6 +11700,7 @@ pub fn select_with_opts(
             const_w_phis: HashSet::new(),
             bin_w_srcs: HashSet::new(),
             rmw_fwd: HashMap::new(),
+            tablat_fwd: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -11580,6 +11744,9 @@ pub fn select_with_opts(
         // so the two never claim one load.
         g.bin_w_srcs = Gen::find_bin_w_srcs(&g, f);
         g.rmw_fwd = Gen::find_rmw_fwds(&g, f, &g.bin_w_srcs);
+        // TABLAT-forwarded bytes for this function (epic-cc#977): runs
+        // after the W and RMW scans so no load is claimed twice.
+        g.tablat_fwd = Gen::find_tablat_forwards(&g, f);
         // `TBLPTR` walk marks for this function (epic-cc#778): dynamically
         // indexed const reads whose seed the run scan proved redundant.
         // Runs after every other scan since dst-home checks read them.
@@ -12246,6 +12413,7 @@ pub fn select_with_opts(
             const_w_phis: HashSet::new(),
             bin_w_srcs: HashSet::new(),
             rmw_fwd: HashMap::new(),
+            tablat_fwd: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -12630,6 +12798,7 @@ mod tests {
                 const_w_phis: HashSet::new(),
                 bin_w_srcs: HashSet::new(),
                 rmw_fwd: HashMap::new(),
+                tablat_fwd: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -12673,6 +12842,7 @@ mod tests {
                 const_w_phis: HashSet::new(),
                 bin_w_srcs: HashSet::new(),
                 rmw_fwd: HashMap::new(),
+                tablat_fwd: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -12731,6 +12901,7 @@ mod p3_gen_tests {
             const_w_phis: HashSet::new(),
             bin_w_srcs: HashSet::new(),
             rmw_fwd: HashMap::new(),
+            tablat_fwd: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),

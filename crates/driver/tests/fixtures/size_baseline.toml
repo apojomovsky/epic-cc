@@ -42,7 +42,7 @@ ram_bytes = 45
 [[entry]]
 name = "bench-counted-copy-18f4550"
 device = "18F4550"
-flash_words = 76
+flash_words = 74
 ram_bytes = 25
 
 [[entry]]
@@ -168,19 +168,19 @@ ram_bytes = 326
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 9003
+flash_words = 8982
 ram_bytes = 781
 
 [[entry]]
 name = "hal-pic18-control-demo-18f4550"
 device = "18F4550"
-flash_words = 9240
+flash_words = 9214
 ram_bytes = 963
 
 [[entry]]
 name = "hal-pic18-pid-18f4550"
 device = "18F4550"
-flash_words = 3169
+flash_words = 3163
 ram_bytes = 500
 
 [[entry]]
@@ -228,5 +228,5 @@ ram_bytes = 339
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
 profile = "O2"
-flash_words = 10447
+flash_words = 10417
 ram_bytes = 818
