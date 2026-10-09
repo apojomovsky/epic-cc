@@ -2,10 +2,10 @@
 
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
-- Date (UTC): 2026-10-08
-- Commit: f142eb2
+- Date (UTC): 2026-10-09
+- Commit: 98d55be
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
-- Menu-demo listing: 9211 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
+- Menu-demo listing: 9209 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
 ## Micro benches (flash / RAM)
 
@@ -47,7 +47,7 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | hal-pic18-menu-demo-18f4550 | 18F4550 | 9266 | 781 | = / = |
 | hal-pic18-control-demo-18f4550 | 18F4550 | 9403 | 963 | = / = |
 | hal-pic18-pid-18f4550 | 18F4550 | 3209 | 500 | = / = |
-| hal-pic18-bridge-demo-18f4550 | 18F4550 | 13421 | 1312 | = / = |
+| hal-pic18-bridge-demo-18f4550 | 18F4550 | 13207 | 1296 | = / = |
 
 ## Menu-demo clusters (listing words)
 
@@ -69,9 +69,9 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 
 Top profiler categories on the same listing:
 
-- `data-move`: 1404 (15.2%)
+- `data-move`: 1403 (15.2%)
 - `shared-code`: 1297 (14.1%)
-- `struct-copy-movff`: 1264 (13.7%)
+- `struct-copy-movff`: 1266 (13.7%)
 - `branch`: 759 (8.2%)
 - `scalar-alu`: 526 (5.7%)
 - `cond-branch`: 510 (5.5%)
