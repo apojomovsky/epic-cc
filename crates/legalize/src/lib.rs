@@ -10,9 +10,9 @@
 //!   `__udiv_u32`, `__urem_u8`/`__urem_u16`/`__urem_u32`,
 //!   `__sdiv_i8`/`__sdiv_i16`/`__sdiv_i32`, `__srem_i8`/`__srem_i16`/
 //!   `__srem_i32`) with the dst/ty preserved and both operands copied as
-//!   typed args. A same-block `udiv`/`urem` pair on identical operands then
-//!   fuses into one `__udivmod_uW` call plus a load of its remainder spill
-//!   slot (see `fuse_divmod_pairs`).
+//!   typed args. A same-block `udiv`/`urem` or `sdiv`/`srem` pair on
+//!   identical operands then fuses into one `__udivmod_uW` / `__sdivmod_iW`
+//!   call plus a load of its remainder spill slot (see `fuse_divmod_pairs`).
 //! `shl`/`lshr`/`ashr` with a const count stay as `Bin`: isel inlines
 //! the fixed RLF/RRF sequence. With a reg count they become a call to
 //! the shift routine (`__shl_u8`/`__shl_u16`/`__shl_u32`,
@@ -1498,42 +1498,53 @@ fn split_isr_routines(funcs: &mut [Func], used: &[String]) -> Vec<String> {
     );
     out
 }
-/// The combined divide routine and remainder slot for an unsigned divide
-/// width. Matches the exact base `__udiv_uW` spelling and an already-fused
-/// `__udivmod_uW` (a second remainder below the first fuses onto the same
-/// call). Suffixed ISR spellings never match, so each context keeps its
+/// The combined divide routine and remainder slot for a divide width, signed
+/// and unsigned. Matches the exact base `__udiv_uW` / `__sdiv_iW` spelling
+/// and an already-fused `__udivmod_uW` / `__sdivmod_iW` (a second remainder
+/// below the first fuses onto the same call). The slot separates the signs,
+/// so an unsigned divide never fuses with a signed remainder and vice
+/// versa. Suffixed ISR spellings never match, so each context keeps its
 /// own remainder slot (see `fuse_divmod_pairs`).
 fn divmod_width(func: &str) -> Option<(Ty, &'static str, &'static str)> {
     match func {
         "__udiv_u8" | "__udivmod_u8" => Some((Ty::I8, "__udivmod_u8", "__udivmod_rem_u8")),
         "__udiv_u16" | "__udivmod_u16" => Some((Ty::I16, "__udivmod_u16", "__udivmod_rem_u16")),
         "__udiv_u32" | "__udivmod_u32" => Some((Ty::I32, "__udivmod_u32", "__udivmod_rem_u32")),
+        "__sdiv_i8" | "__sdivmod_i8" => Some((Ty::I8, "__sdivmod_i8", "__sdivmod_rem_i8")),
+        "__sdiv_i16" | "__sdivmod_i16" => Some((Ty::I16, "__sdivmod_i16", "__sdivmod_rem_i16")),
+        "__sdiv_i32" | "__sdivmod_i32" => Some((Ty::I32, "__sdivmod_i32", "__sdivmod_rem_i32")),
         _ => None,
     }
 }
 
-/// The remainder half of a fusable pair: the exact base `__urem_uW`
-/// spelling, with its width and remainder slot.
+/// The remainder half of a fusable pair: the exact base `__urem_uW` /
+/// `__srem_iW` spelling, with its width and remainder slot.
 fn divmod_rem_width(func: &str) -> Option<(Ty, &'static str)> {
     match func {
         "__urem_u8" => Some((Ty::I8, "__udivmod_rem_u8")),
         "__urem_u16" => Some((Ty::I16, "__udivmod_rem_u16")),
         "__urem_u32" => Some((Ty::I32, "__udivmod_rem_u32")),
+        "__srem_i8" => Some((Ty::I8, "__sdivmod_rem_i8")),
+        "__srem_i16" => Some((Ty::I16, "__sdivmod_rem_i16")),
+        "__srem_i32" => Some((Ty::I32, "__sdivmod_rem_i32")),
         _ => None,
     }
 }
-/// Fuse a same-block `udiv`/`urem` pair on identical operands into one
-/// combined divide call (epic-cc#895). Every unsigned divide routine
-/// already computes both halves and discards one, so the fused shape runs
-/// the loop once: quotient to retval, remainder spilled to the slot the
-/// old remainder site loads. Identity is one shared SSA value or two
-/// non-volatile loads of one global (volatile reads may differ); no call,
-/// opaque write, or operand-global store may sit between the pair.
+/// Fuse a same-block `udiv`/`urem` or `sdiv`/`srem` pair on identical
+/// operands into one combined divide call (epic-cc#895, signed half
+/// epic-cc#981). Every divide routine already computes both halves and
+/// discards one, so the fused shape runs the loop once: quotient to
+/// retval, remainder spilled to the slot the old remainder site loads.
+/// Identity is one shared SSA value or two non-volatile loads of one
+/// global (volatile reads may differ); no call, opaque write, or
+/// operand-global store may sit between the pair.
 fn fuse_divmod_pairs(funcs: &mut [Func], globals: &mut Vec<Global>, used: &mut Vec<String>) {
     // A remainder slot shadowed by any user global never fuses: reusing it
     // would alias the user's variable even at the same type.
     let blocked = |slot: &str| globals.iter().any(|g| g.name == slot);
-    let mut fused: Vec<Ty> = Vec::new();
+    // One entry per combined routine fused: signed and unsigned share
+    // widths but not slots, so the width alone cannot key this list.
+    let mut fused: Vec<(Ty, String, String)> = Vec::new();
     for f in funcs.iter_mut() {
         for b in f.blocks.iter_mut() {
             // Same-block loads resolving an operand to its global: reg ->
@@ -1662,6 +1673,9 @@ fn fuse_divmod_pairs(funcs: &mut [Func], globals: &mut Vec<Global>, used: &mut V
                 };
                 let mdst = rem.dst.clone().expect("legalize: remainder call has a dst");
                 let mloc = rem.loc.clone();
+                if !fused.iter().any(|f| f.1 == combined) {
+                    fused.push((w, combined.clone(), slot.clone()));
+                }
                 if let Inst::Call(c) = &mut b.insts[i] {
                     c.func = combined;
                 }
@@ -1673,23 +1687,14 @@ fn fuse_divmod_pairs(funcs: &mut [Func], globals: &mut Vec<Global>, used: &mut V
                     volatile: true,
                     loc: mloc,
                 });
-                if !fused.contains(&w) {
-                    fused.push(w);
-                }
                 // Rescan from the same divide: a second remainder below
                 // the first fuses onto the same call. Each fuse removes a
                 // call, so the loop still terminates.
             }
         }
     }
-    for w in &fused {
-        let (_, combined, slot) = divmod_width(match w {
-            Ty::I8 => "__udiv_u8",
-            Ty::I16 => "__udiv_u16",
-            _ => "__udiv_u32",
-        })
-        .expect("legalize: fused width has a combined routine");
-        if !globals.iter().any(|g| g.name == slot) {
+    for (w, combined, slot) in &fused {
+        if !globals.iter().any(|g| g.name == *slot) {
             globals.push(Global {
                 name: slot.to_string(),
                 ty: *w,
@@ -4583,7 +4588,9 @@ fn param(name: &str, width: u8) -> Param {
 /// | `__udiv_u8`, `__urem_u8` | 4 | `rem_lo`@0 / `rem_hi`@1 (partial remainder: 2 bytes, since the 8-bit rem shift can carry), `cnt`@2 (loop counter, 8), `restore`@3 (restore-step scratch) |
 /// | `__udiv_u16`, `__urem_u16` | 7 | `rem`@0-1 (partial remainder), `cnt`@2 (loop counter, 16), `spare`@3 (recipe scratch), `restore`@4-6 (restore-step scratch) |
 /// | `__sdiv_i8`, `__srem_i8` | 5 | `flags`@0 (sign state: bit0 = negate quotient, bit1 = negate remainder; `\|num\|`/`\|den\|` live in the param slots), `rem_lo`@1 / `rem_hi`@2, `cnt`@3, `restore`@4 |
+/// | `__sdivmod_i8` | 5 | same frame as `__sdiv_i8`: both halves negate in place, quotient to retval, remainder to the spill slot |
 /// | `__sdiv_i16`, `__srem_i16` | 7 | `flags`@0 (as i8), `rem`@1-2, `cnt`@3, `restore`@4-5, `spare`@6 |
+/// | `__sdivmod_i16` | 7 | same frame as `__sdiv_i16`: both halves negate in place, quotient to retval, remainder to the spill slot |
 /// | `__shl_u8`, `__lshr_u8`, `__ashr_i8` | 3 | `cnt`@0 (masked count / loop counter: the value shifts in the `val` param slot), `spare`@1-2 (recipe scratch) |
 /// | `__shl_u16`, `__lshr_u16`, `__ashr_i16` | 4 | `cnt`@0-1 (masked count / loop counter), `spare`@2-3 (recipe scratch) |
 /// | `__mul_u32` | 11 | `bk_lo`@0 / `bk_hi`@1 (multiplier backup: 2 bytes, the low 16 bits first, reloaded from `b`'s high half for the second 16 of the 32 iterations), `cnt`@2 (loop counter, 32), `r`@3-6 (32-bit running product: the low 32 bits of the full product), `t`@7-10 (shifted multiplicand: 4 bytes, shifting left with wraparound, so the shifted-out high bits drop and i32 `mul` wraps) |
@@ -4591,6 +4598,7 @@ fn param(name: &str, width: u8) -> Param {
 /// | `__udec_u32` | 11 | `den`@0-3 (baked divisor 10, set once: the loop divides by a constant), `rem`@4-7 (divmod remainder, digit source), `cnt`@8 (bit counter, 32), `digit`@9 (ASCII digit staging), `n`@10 (digit count, the return value) |
 /// | `__udec_u16_5` | 7 | `den`@0-1 (baked divisor 10), `rem`@2-3 (divmod remainder, digit source), `dcnt`@4 (bit counter, 16), `iter`@5 (digit counter, 5), `digit`@6 (binary digit staging) |
 /// | `__sdiv_i32`, `__srem_i32` | 12 | the divmod part at the unsigned offsets: `rem`@0-3, `den`@4-7, `cnt`@8, `spare`@9, plus `flags`@10 (sign state: bit0 = negate quotient = num<0 XOR den<0, bit1 = negate remainder = num<0), `spare`@11 |
+/// | `__sdivmod_i32` | 12 | same frame as `__sdiv_i32`: both halves negate in place, quotient to retval, remainder to the spill slot |
 /// | `__shl_u32`, `__lshr_u32`, `__ashr_i32` | 2 | `cnt`@0 (masked count / loop counter: the value shifts in the `val` param slot), `spare`@1 (recipe scratch) |
 /// | `__add_f32`, `__sub_f32` | 14 | `sa`@0 (sign of a), `ea`@1 (biased exponent of a), `ma`@2-4 (24-bit mantissa of a with the implicit bit), `sb`@5, `eb`@6, `mb`@7-9 (same for b), `stick`@10 (sticky collector for the right-alignment shift), `cnt`@11 (alignment/normalize shift counter), `ta1`@12 / `ta2`@13 (the 24-bit fraction window; `ta0` reuses the dead `eb` slot at offset 6) |
 /// | `__mul_f32` | 14 | `sign`@0 (result sign = sa XOR sb), `e`@1-2 (biased result exponent: e1+e2-127, 16-bit intermediate), `bk`@3-5 (multiplier backup, shifted to test bits), `cnt`@6 (loop counter, 24), `m`@7-10 (running product: the top 25 bits of the 24x24 product accumulate here), `spare`@11-13 (rounding scratch) |
@@ -4637,9 +4645,15 @@ fn routine_func(name: &str) -> Func {
             ],
             11,
         ),
-        "__sdiv_i8" | "__srem_i8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 5),
-        "__sdiv_i16" | "__srem_i16" => (Ty::I16, vec![param("num", 2), param("den", 2)], 7),
-        "__sdiv_i32" | "__srem_i32" => (Ty::I32, vec![param("num", 4), param("den", 4)], 12),
+        "__sdiv_i8" | "__srem_i8" | "__sdivmod_i8" => {
+            (Ty::I8, vec![param("num", 1), param("den", 1)], 5)
+        }
+        "__sdiv_i16" | "__srem_i16" | "__sdivmod_i16" => {
+            (Ty::I16, vec![param("num", 2), param("den", 2)], 7)
+        }
+        "__sdiv_i32" | "__srem_i32" | "__sdivmod_i32" => {
+            (Ty::I32, vec![param("num", 4), param("den", 4)], 12)
+        }
         "__shl_u8" | "__lshr_u8" | "__ashr_i8" => {
             (Ty::I8, vec![param("val", 1), param("cnt", 1)], 3)
         }
