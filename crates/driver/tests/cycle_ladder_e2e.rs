@@ -499,9 +499,10 @@ fn result_mismatch(map: &str, name: &str, read: impl Fn(usize) -> u8) -> Option<
 }
 
 /// Step the sim from the `bench_mark` 1 store to the 2 store and return
-/// the cycle delta. The program must halt afterwards: kernels are
-/// straight-line, so a non-halting run is a broken fixture, not a slow one.
-fn measure_marks(hex: &str, map: &str, device: &str, name: &str) -> u64 {
+/// the cycle delta plus the first result mismatch, if any. The caller
+/// routes mismatches through failures, so one run lists every bad row
+/// instead of stopping at the first. Kernels must halt afterwards.
+fn measure_marks(hex: &str, map: &str, device: &str, name: &str) -> (u64, Option<String>) {
     let addr = map_addr(map, "bench_mark");
     if device == "18F4550" {
         let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(hex));
@@ -511,10 +512,7 @@ fn measure_marks(hex: &str, map: &str, device: &str, name: &str) -> u64 {
         let c2 = p.cycles();
         p.run(5_000_000);
         assert!(p.halted(), "{name}: kernel must halt");
-        if let Some(m) = result_mismatch(map, name, |a| p.ram_byte(a)) {
-            panic!("{m}");
-        }
-        c2 - c1
+        (c2 - c1, result_mismatch(map, name, |a| p.ram_byte(a)))
     } else {
         let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(hex));
         step_to_mark(&mut p, addr, 1, name);
@@ -523,10 +521,7 @@ fn measure_marks(hex: &str, map: &str, device: &str, name: &str) -> u64 {
         let c2 = p.cycles();
         p.run(5_000_000);
         assert!(p.halted(), "{name}: kernel must halt");
-        if let Some(m) = result_mismatch(map, name, |a| p.ram_byte(a)) {
-            panic!("{m}");
-        }
-        c2 - c1
+        (c2 - c1, result_mismatch(map, name, |a| p.ram_byte(a)))
     }
 }
 
@@ -702,6 +697,10 @@ fn cycle_counts_do_not_regress() {
     let mut measured = Vec::new();
     let mut rows = Vec::new();
     let mut failures = Vec::new();
+    let mut value_failures = Vec::new();
+    // Report mode prints numbers for tooling and never fails, so value
+    // mismatches are kept only when the run can report them.
+    let report_mode = std::env::var("SPEED_REPORT_JSON").is_ok();
 
     let cases = cases();
     // Validate the filter before measuring: a typo must fail fast, not
@@ -766,7 +765,10 @@ fn cycle_counts_do_not_regress() {
                     });
                 }
             } else {
-                let cycles = measure_marks(&hex, &map, c.device, &c.name);
+                let (cycles, value_mismatch) = measure_marks(&hex, &map, c.device, &c.name);
+                if !report_mode {
+                    value_failures.extend(value_mismatch);
+                }
                 let key = entry_key(&c.name, profile);
                 let base = baseline
                     .entry
@@ -802,10 +804,18 @@ fn cycle_counts_do_not_regress() {
         }
     }
     write_step_summary(&rows);
-    if std::env::var("SPEED_REPORT_JSON").is_ok() {
+    if report_mode {
         print_report_json(&measured);
         return;
     }
+
+    // Values pin on every asserting run, including baseline updates, so a
+    // re-baseline never absorbs a miscompile alongside new cycle numbers.
+    assert!(
+        value_failures.is_empty(),
+        "result value mismatch(es):\n{}",
+        value_failures.join("\n")
+    );
 
     if update {
         let (to_save, updated, skipped) = merge_baseline(&baseline, &measured, filter.as_ref());
