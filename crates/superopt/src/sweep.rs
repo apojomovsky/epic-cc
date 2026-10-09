@@ -148,22 +148,18 @@ fn lit_cases() -> Vec<SweepCase> {
 
 /// Deterministic stride over the full byte for nightly: catches a
 /// value-dependent divergence the six corners miss, without paying
-/// for 256 values per lane.
-fn stride_cases(poke_f: bool) -> Vec<SweepCase> {
+/// for 256 values per lane. Always pokes the watch: the builders
+/// refuse unpoked watches outright.
+fn stride_cases() -> Vec<SweepCase> {
     let mut out = Vec::new();
     for i in 0..32u16 {
         let w = (i * 8 + 3) as u8;
         let f = (i * 8 + 5) as u8;
         for &s in &[0x00u8, 0x01] {
-            let pokes = if poke_f {
-                vec![(LANE_ADDR, f)]
-            } else {
-                Vec::new()
-            };
             out.push(SweepCase {
                 entry_w: w,
                 entry_status: s,
-                pokes,
+                pokes: vec![(LANE_ADDR, f)],
             });
         }
     }
@@ -172,21 +168,22 @@ fn stride_cases(poke_f: bool) -> Vec<SweepCase> {
 
 fn byte_nightly() -> Vec<SweepCase> {
     let mut cases = byte_cases();
-    cases.extend(stride_cases(true));
+    cases.extend(stride_cases());
     cases
 }
 
 fn fonly_nightly() -> Vec<SweepCase> {
     let mut cases = fonly_cases();
-    cases.extend(stride_cases(true));
+    cases.extend(stride_cases());
     cases
 }
 
 fn lit_nightly() -> Vec<SweepCase> {
     let mut cases = lit_cases();
-    cases.extend(stride_cases(true));
+    cases.extend(stride_cases());
     cases
 }
+
 /// DAW has no sweep lane: MPLAB SIM 6.35 tests the original high
 /// nibble for the tens adjust, which is wrong for valid BCD sums
 /// (0x99+0x06 must yield 0x05 with C set; SIM yields 0xA5 with C
@@ -781,9 +778,9 @@ mod tests {
                 let words = asm::assemble_pic18(&batch.src);
                 assert!(!words.is_empty());
                 let lanes: Vec<_> = items.iter().map(|it| it.lane).collect();
-                for tag in batch.tags.iter().skip(1 + 4) {
+                for tag in &batch.tags {
                     assert!(
-                        tag == "guard" || lanes.contains(&tag.as_str()),
+                        tag == "proof" || tag == "guard" || lanes.contains(&tag.as_str()),
                         "stray tag {tag}"
                     );
                 }
@@ -815,12 +812,20 @@ mod tests {
                 let words = asm::assemble(&batch.src);
                 assert!(!words.is_empty());
                 assert!(words.len() < PIC14_MAX_WORDS);
+                let lanes: Vec<_> = items.iter().map(|it| it.lane).collect();
+                for tag in &batch.tags {
+                    assert!(
+                        tag == "proof" || tag == "guard" || lanes.contains(&tag.as_str()),
+                        "stray tag {tag}"
+                    );
+                }
             }
         }
-        let (_, items) = pr_items("pic14-arith");
-        for it in items.iter().take(50) {
-            let (_, status, _) = run_expected_14(it).unwrap();
-            assert_eq!(status & 0x18, 0, "TO/PD must stay masked");
+        for name in ["pic14-arith", "pic14-logic"] {
+            for it in pr_items(name).1.iter() {
+                let (_, status, _) = run_expected_14(it).unwrap();
+                assert_eq!(status & 0x18, 0, "TO/PD must stay masked");
+            }
         }
     }
 
