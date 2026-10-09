@@ -979,6 +979,10 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
         "CLRWDT" => 0x0064,
         "MOVWF" => 0x0080 | f(op),
         "CLRF" => 0x0180 | f(op),
+        // DECF is `00 0011 dfff ffff` and CLRW operandless `00 0001 0000 0000`
+        // (the W-side counterpart of CLRF).
+        "CLRW" => 0x0100,
+        "DECF" => 0x0300 | (d << 7) | f(op),
         "MOVF" => 0x0800 | (d << 7) | f(op),
         "ADDWF" => 0x0700 | (d << 7) | f(op),
         "SUBWF" => 0x0200 | (d << 7) | f(op),
