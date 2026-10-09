@@ -9563,6 +9563,60 @@ fn rmw_producer_accumulates_into_its_load_temp() {
 }
 
 #[test]
+fn indf_rmw_producer_accumulates_into_its_load_temp() {
+    // A 16-bit `INDF` load feeding a const `add` feeding an `INDF`
+    // store: the binop accumulates into the load temp with in-place
+    // lanes, so its own result temp disappears (epic-cc#969). The
+    // scale-2 index keeps the access off the `PLUSW` shape, so both
+    // sides walk `POSTINC0`/`INDF0`.
+    let m = parse(
+        "global ram i16\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +0 +2*%i\n\
+             %v = load i16 %p\n\
+             %w = add i16 %v, 7\n\
+             store i16 %w %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x122),
+        ("main::i", 0x123),
+        ("main::v", 0x124),
+        ("main::w", 0x126),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("ADDWF 0x024,F,B"),
+        "low lane accumulates into the load temp:\n{main_asm}"
+    );
+    assert!(
+        !main_asm.contains("0x026,") && !main_asm.contains("0x026 "),
+        "result temp never written:\n{main_asm}"
+    );
+    assert!(
+        main_asm.contains("MOVF 0x024,W,B"),
+        "store reads the load temp:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (lo, hi, elo, ehi) in [(10u8, 0u8, 17u8, 0u8), (250, 16, 1, 17)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x120] = lo;
+        p.ram_mut()[0x121] = hi;
+        p.ram_mut()[0x122] = 0;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x120], elo, "rmw low byte");
+        assert_eq!(p.ram()[0x121], ehi, "rmw high byte");
+    }
+}
+
+#[test]
 fn adjacent_plusw_static_parts_step_without_reseeding() {
     // The two bytes of one 16-bit `PLUSW` access seed once: the second
     // byte steps `FSR0L` instead of a fresh `LFSR`, and reuses the index
