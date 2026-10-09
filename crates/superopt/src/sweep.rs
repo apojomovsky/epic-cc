@@ -66,8 +66,6 @@ const OPERAND_CORNERS: &[u8] = &[0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF];
 /// Entry-STATUS corners: clear, carry set, N/OV/Z set. No ALU op reads
 /// Z/N/OV, so the third variant proves no hidden dependence on them.
 const STATUS_CORNERS: &[u8] = &[0x00, 0x01, 0x1C];
-/// DAW reads C and DC, so it crosses those two bits explicitly.
-const DAW_STATUS: &[u8] = &[0x00, 0x01, 0x02, 0x03];
 /// `W` values for lanes that ignore `W`: both extremes prove it.
 const W_PAIR: &[u8] = &[0x00, 0xFF];
 /// PIC14 STATUS bits the sweep sets up (C, DC, Z); RP/TO/PD/IRP are
@@ -189,39 +187,10 @@ fn lit_nightly() -> Vec<SweepCase> {
     cases.extend(stride_cases(true));
     cases
 }
-
-fn daw_cases() -> Vec<SweepCase> {
-    let mut out = Vec::new();
-    for &w in &[0x00u8, 0x09, 0x0A, 0x10, 0x99, 0x9A, 0xA0, 0xFF] {
-        for &f in &[0x00u8, 0xFF] {
-            for &s in DAW_STATUS {
-                out.push(SweepCase {
-                    entry_w: w,
-                    entry_status: s,
-                    pokes: vec![(LANE_ADDR, f)],
-                });
-            }
-        }
-    }
-    out
-}
-
-fn daw_nightly() -> Vec<SweepCase> {
-    let mut cases = daw_cases();
-    for i in 0..32u16 {
-        let w = (i * 8 + 3) as u8;
-        for &f in &[0x00u8, 0xFF] {
-            for &s in DAW_STATUS {
-                cases.push(SweepCase {
-                    entry_w: w,
-                    entry_status: s,
-                    pokes: vec![(LANE_ADDR, f)],
-                });
-            }
-        }
-    }
-    cases
-}
+/// DAW has no sweep lane: MPLAB SIM 6.35 tests the original high
+/// nibble for the tens adjust, which is wrong for valid BCD sums
+/// (0x99+0x06 must yield 0x05 with C set; SIM yields 0xA5 with C
+/// clear). The op stays pinned by in-tree sim tests instead.
 
 /// Rig canary: `MOVLW` overwrites `W` unconditionally, so any harness
 /// breakage (assemble, emit, parse, compare) fails this lane first.
@@ -285,7 +254,6 @@ fn pic18_arith_lanes() -> Vec<Lane> {
         lane!(incf, single!("incf 0x020,F,A"), fonly_cases, fonly_nightly),
         lane!(decf, single!("decf 0x020,F,A"), fonly_cases, fonly_nightly),
         lane!(negf, single!("negf 0x020,A"), fonly_cases, fonly_nightly),
-        lane!(daw, single!("daw"), daw_cases, daw_nightly),
     ]
 }
 
