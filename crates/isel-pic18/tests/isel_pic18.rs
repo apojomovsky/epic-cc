@@ -1306,6 +1306,128 @@ fn udiv_u16_recipe_emits_restoring_loop() {
     assert_eq!(asm.matches("DECFSZ").count(), 1, "loop counter:\n{asm}");
 }
 
+/// The fused u16 divide runs the plain restoring loop once, then spills
+/// the remainder to the fusion slot and the quotient to retval: one
+/// `MOVFF` pair each, so no `MOVLB` can land in a skip-sensitive frame.
+#[test]
+fn udivmod_u16_recipe_spills_remainder_and_returns_quotient() {
+    let m = parse(
+        "global __udivmod_rem_u16 i16\n\
+         fn __udivmod_u16(i16) (num=i16, den=i16)\n  block entry:\n    %__scr = alloca 7\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = call i16 @__udivmod_u16(i16 50000, i16 137)\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("__udivmod_rem_u16", 0x50),
+        ("__udivmod_u16::num", 0x20),
+        ("__udivmod_u16::den", 0x22),
+        ("__udivmod_u16::__scr", 0x30),
+        ("main::1", 0x40),
+    ]);
+    for fold in [false, true] {
+        let opts = isel_pic18::Options {
+            copy_loop: true,
+            divmod_fold: fold,
+            inline_mul16: false,
+        };
+        let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+        assert_eq!(
+            asm.matches("RLCF").count(),
+            4,
+            "same restoring loop as the plain divide (fold={fold}):\n{asm}"
+        );
+        assert!(
+            asm.contains("MOVFF 0x030, 0x050") && asm.contains("MOVFF 0x031, 0x051"),
+            "remainder spill to the fusion slot (fold={fold}):\n{asm}"
+        );
+        assert!(
+            asm.contains("MOVFF 0x020, 0x000") && asm.contains("MOVFF 0x021, 0x001"),
+            "quotient to retval, as usual (fold={fold}):\n{asm}"
+        );
+    }
+}
+
+/// Fused divides return both halves: the quotient through the call, the
+/// remainder through the spill slot. Each case asserts both, so a spill
+/// to the wrong address or width fails here.
+#[test]
+fn udivmod_routines_simulate_quotient_and_remainder() {
+    // (routine, slot, x bytes, y bytes, quotient bytes, remainder bytes)
+    let cases: &[(&str, &str, &[u8], &[u8], &[u8], &[u8])] = &[
+        (
+            "__udivmod_u8",
+            "__udivmod_rem_u8",
+            &[200],
+            &[3],
+            &[66],
+            &[2],
+        ),
+        ("__udivmod_u8", "__udivmod_rem_u8", &[7], &[200], &[0], &[7]),
+        (
+            "__udivmod_u16",
+            "__udivmod_rem_u16",
+            &[0x50, 0xC3],
+            &[0x89, 0x00],
+            &[0x6C, 0x01],
+            &[0x84, 0x00],
+        ),
+        (
+            "__udivmod_u32",
+            "__udivmod_rem_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[0x00, 0x01, 0x00, 0x00],
+            &[0x56, 0x34, 0x12, 0x00],
+            &[0x78, 0x00, 0x00, 0x00],
+        ),
+    ];
+    for (name, slot, x, y, want_q, want_r) in cases {
+        let w = want_q.len();
+        let ret = match w {
+            1 => "i8",
+            2 => "i16",
+            _ => "i32",
+        };
+        let m = parse(&format!(
+            "global a {ret}\nglobal b {ret}\nglobal q {ret}\nglobal m {ret}\nglobal {slot} {ret}\n\
+             fn {name}({ret}) (num={ret}, den={ret})\n  block entry:\n    %__scr = alloca 10\n    ret {ret} 0\n\
+             fn main(void) ()\n  block entry:\n    %1 = load {ret} @a\n    %2 = load {ret} @b\n\
+               %3 = call {ret} @{name}({ret} %1, {ret} %2)\n    store {ret} %3 @q\n\
+               %4 = load {ret} @{slot}\n    store {ret} %4 @m\n    ret void\n"
+        ));
+        let (ga, gb, gq, gm, gs) = (0x10, 0x14, 0x18, 0x1C, 0x50);
+        let addrs = addrs(&[
+            ("a", ga),
+            ("b", gb),
+            ("q", gq),
+            ("m", gm),
+            (slot, gs),
+            (&format!("{name}::num"), 0x20),
+            (&format!("{name}::den"), 0x24),
+            (&format!("{name}::__scr"), 0x30),
+            ("main::1", 0x40),
+            ("main::2", 0x44),
+            ("main::3", 0x48),
+            ("main::4", 0x4C),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        let words = asm::assemble_pic18(&asm);
+        let start = start_steps(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start);
+        for (i, b) in x.iter().enumerate() {
+            p.ram_mut()[ga as usize + i] = *b;
+        }
+        for (i, b) in y.iter().enumerate() {
+            p.ram_mut()[gb as usize + i] = *b;
+        }
+        p.run(20_000);
+        assert!(p.halted(), "{name} must halt");
+        let got_q: Vec<u8> = (0..w).map(|i| p.ram()[gq as usize + i]).collect();
+        assert_eq!(&got_q[..], *want_q, "{name}({x:?}, {y:?}) quotient");
+        let got_r: Vec<u8> = (0..w).map(|i| p.ram()[gm as usize + i]).collect();
+        assert_eq!(&got_r[..], *want_r, "{name}({x:?}, {y:?}) remainder");
+    }
+}
+
 #[test]
 fn load_and_store_i16_copy_both_bytes_low_then_high() {
     // Two stores keep the loaded value multi-use, off the single-use
