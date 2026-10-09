@@ -38,6 +38,7 @@ of an interrupted run against a clean baseline run.
 
 - `speed-mul-u8/u16/u32`: the widening multiply per width.
 - `speed-divmod-u8/u16/u32`: software division both cores lower to.
+- `speed-divmod-i8/i16/i32`: the signed half (abs, unsigned loop, negate).
 - `speed-shift`: variable-count shifts with unknown counts.
 - `speed-memcpy-32`, `speed-memset-32`: 32-byte block ops plus their loops.
 - `speed-strlen-strcmp`: string walk plus full-length compare.

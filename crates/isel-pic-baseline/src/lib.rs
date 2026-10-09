@@ -2734,7 +2734,7 @@ impl<'m> Gen<'m> {
             // param slots (unsigned abs, INT_MIN safe), run the unsigned
             // divmod, negate the quotient if the signs differed (bit0) /
             // the remainder if the dividend was negative (bit1).
-            "__sdiv_i8" | "__srem_i8" => {
+            "__sdiv_i8" | "__srem_i8" | "__sdivmod_i8" => {
                 let num = self.slot_addr(&name, "num").direct();
                 let den = self.slot_addr(&name, "den").direct();
                 let (flags, rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2, scr + 3);
@@ -2816,6 +2816,26 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    INCF {}, F", self.fop(num)));
                     self.emit(format!("{l_store}:"));
                     self.store_retval(num, 1);
+                } else if recipe == "__sdivmod_i8" {
+                    // Fused pair: negate both halves in place, spill the
+                    // remainder, return the quotient.
+                    let l_rem = self.fresh_label();
+                    self.emit_bank_select(flags);
+                    self.emit(format!("    BTFSS {}, 0", self.fop(flags)));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.emit_bank_select(num);
+                    self.emit(format!("    COMF {}, F", self.fop(num)));
+                    self.emit(format!("    INCF {}, F", self.fop(num)));
+                    self.emit(format!("{l_store}:"));
+                    self.emit_bank_select(flags);
+                    self.emit(format!("    BTFSS {}, 1", self.fop(flags)));
+                    self.emit(format!("    GOTO {l_rem}"));
+                    self.emit_bank_select(rem_lo);
+                    self.emit(format!("    COMF {}, F", self.fop(rem_lo)));
+                    self.emit(format!("    INCF {}, F", self.fop(rem_lo)));
+                    self.emit(format!("{l_rem}:"));
+                    self.store_rem_slot(rem_lo, 1, "__sdivmod_rem_i8");
+                    self.store_retval(num, 1);
                 } else {
                     self.emit_bank_select(flags);
                     self.emit(format!("    BTFSS {}, 1", self.fop(flags)));
@@ -2830,7 +2850,7 @@ impl<'m> Gen<'m> {
             }
             // Signed 16-bit wrappers: same structure, 16-bit abs/negate
             // and the 16-bit divmod with the register-direct borrow idiom.
-            "__sdiv_i16" | "__srem_i16" => {
+            "__sdiv_i16" | "__srem_i16" | "__sdivmod_i16" => {
                 let num = self.slot_addr(&name, "num").direct();
                 let den = self.slot_addr(&name, "den").direct();
                 let (flags, rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2, scr + 3);
@@ -2926,6 +2946,22 @@ impl<'m> Gen<'m> {
                     self.neg16_in_place(num); // -quotient
                     self.emit(format!("{l_store}:"));
                     self.store_retval(num, 2);
+                } else if recipe == "__sdivmod_i16" {
+                    // Fused pair: negate both halves in place, spill the
+                    // remainder, return the quotient.
+                    let l_rem = self.fresh_label();
+                    self.emit_bank_select(flags);
+                    self.emit(format!("    BTFSS {}, 0", self.fop(flags)));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.neg16_in_place(num); // -quotient
+                    self.emit(format!("{l_store}:"));
+                    self.emit_bank_select(flags);
+                    self.emit(format!("    BTFSS {}, 1", self.fop(flags)));
+                    self.emit(format!("    GOTO {l_rem}"));
+                    self.neg16_in_place(rem_lo); // -remainder
+                    self.emit(format!("{l_rem}:"));
+                    self.store_rem_slot(rem_lo, 2, "__sdivmod_rem_i16");
+                    self.store_retval(num, 2);
                 } else {
                     self.emit_bank_select(flags);
                     self.emit(format!("    BTFSS {}, 1", self.fop(flags)));
@@ -2939,7 +2975,7 @@ impl<'m> Gen<'m> {
             // Signed 32-bit wrappers: abs in place, unsigned divmod,
             // negate quotient iff signs differed / remainder iff the
             // dividend was negative.
-            "__sdiv_i32" | "__srem_i32" => {
+            "__sdiv_i32" | "__srem_i32" | "__sdivmod_i32" => {
                 let num = self.slot_addr(&name, "num").direct();
                 let den = self.slot_addr(&name, "den").direct();
                 let (rem, den_s, flags) = (scr, scr + 4, scr + 10);
@@ -2977,6 +3013,22 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    GOTO {l_store}"));
                     self.neg32_in_place(num); // -quotient
                     self.emit(format!("{l_store}:"));
+                    self.store_retval(num, 4);
+                } else if recipe == "__sdivmod_i32" {
+                    // Fused pair: negate both halves in place, spill the
+                    // remainder, return the quotient.
+                    let l_rem = self.fresh_label();
+                    self.emit_bank_select(flags);
+                    self.emit(format!("    BTFSS {}, 0", self.fop(flags)));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.neg32_in_place(num); // -quotient
+                    self.emit(format!("{l_store}:"));
+                    self.emit_bank_select(flags);
+                    self.emit(format!("    BTFSS {}, 1", self.fop(flags)));
+                    self.emit(format!("    GOTO {l_rem}"));
+                    self.neg32_in_place(rem); // -remainder
+                    self.emit(format!("{l_rem}:"));
+                    self.store_rem_slot(rem, 4, "__sdivmod_rem_i32");
                     self.store_retval(num, 4);
                 } else {
                     self.emit_bank_select(flags);
