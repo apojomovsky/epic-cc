@@ -423,16 +423,17 @@ const PIC18_WREG: usize = 0xFE8;
 const PIC18_STATUS: usize = 0xFD8;
 const PIC18_SFR_FLOOR: usize = 0xF80;
 
-/// STATUS bits the gate compares per lane. MPLAB SIM 6.35 models two
-/// borrow-lane flags wrongly (hand-probed against boolean truth,
-/// triangulated with gpsim): ADDWFC drops the (W+C) low-nibble carry
-/// from DC, and SUBWFB miscomputes DC+OV with borrow-in. Those bits
-/// are masked where proven wrong; every other bit on every lane still
-/// compares, and the masked bits stay pinned by in-tree sim tests.
+/// STATUS bits the gate compares per lane. MPLAB SIM 6.35 models the
+/// carry-reading add/sub flags wrongly (hand-probed against boolean
+/// truth, triangulated with gpsim): ADDWFC drops the (W+C) low-nibble
+/// carry from DC, and SUBWFB/SUBFWB miscompute DC+OV with borrow-in.
+/// Those bits are masked where proven wrong; every other bit on every
+/// lane still compares, and the masked bits stay pinned by in-tree
+/// sim tests.
 pub fn status_mask(lane: &str) -> u8 {
     match lane {
         "addwfc" => 0xFD,
-        "subwfb" => 0xF5,
+        "subwfb" | "subfwb" => 0xF5,
         _ => 0xFF,
     }
 }

@@ -688,3 +688,16 @@ fn subwfb_sets_dc_and_ov_on_borrow_in() {
     assert_eq!(p.ram()[0x20], 0x00);
     assert_eq!(p.ram()[0xFD8], 0x0D, "Z, C and OV set, DC clear");
 }
+
+#[test]
+fn subfwb_sets_dc_and_ov_on_borrow_in() {
+    // W=0x80, F=0x7F, C=0: 0x80-0x7F-1 = 0x00. Same borrow-in quirk
+    // family as SUBWFB (epic-cc#819): MPLAB SIM 6.35 reports DC=1/OV=0
+    // here, the adder says DC=0/OV=1, and the sweep masks both bits on
+    // this lane, so this test pins them in-tree instead.
+    let words = vec![0x0E7F, 0x6E20, 0x0E80, 0x5620];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0x00);
+    assert_eq!(p.ram()[0xFD8], 0x0D, "Z, C and OV set, DC clear");
+}
