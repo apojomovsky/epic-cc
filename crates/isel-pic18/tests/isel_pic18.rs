@@ -9171,6 +9171,113 @@ fn phi_folded_i16_increment_with_earlier_index_uses_folds_in_place() {
 }
 
 #[test]
+fn tablat_staged_byte_forwards_directly_to_plusw_store() {
+    // A flash byte copied to an indexed RAM slot stages through a
+    // dead temp today: `MOVFF TABLAT,T` then `MOVFF T,PLUSW0`. The
+    // byte stays in TABLAT instead and the store reads it directly,
+    // saving both words (epic-cc#977). Simulated over every index.
+    let m = with_bytes(
+        parse(
+            "const lit i8\n\
+             global buf i64\n\
+             global idx i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i8 @idx\n\
+                 %gp = gep @lit +0 +1*%i\n\
+                 %v = load i8 %gp\n\
+                 %gq = gep @buf +0 +1*%i\n\
+                 store i8 %v %gq\n\
+                 ret void\n",
+        ),
+        "lit",
+        &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+    );
+    let addrs = addrs(&[
+        ("buf", 0x120),
+        ("idx", 0x130),
+        ("main::i", 0x131),
+        ("main::v", 0x132),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("MOVFF 0xFF5, 0xFEB"),
+        "store must read TABLAT directly:\n{main_asm}"
+    );
+    assert!(
+        !main_asm.contains("0x132,"),
+        "dead temp must go unwritten:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..8u8 {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x130] = x;
+        p.run(200);
+        assert!(p.halted(), "program must halt (index={x})");
+        assert_eq!(
+            p.ram()[0x120 + usize::from(x)],
+            0x11 + 0x11 * x,
+            "copied byte (index={x})"
+        );
+    }
+}
+
+#[test]
+fn tablat_staged_byte_forwards_directly_to_indirect_store() {
+    // Same fold through a non-PLUSW dynamic destination (a scale-2
+    // index keeps the small-array shape shut): the store seeds FSR0
+    // then reads TABLAT into INDF0, no temp stage (epic-cc#977).
+    let m = with_bytes(
+        parse(
+            "const lit i8\n\
+             global ram i64\n\
+             global idx i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i8 @idx\n\
+                 %gp = gep @lit +0 +1*%i\n\
+                 %v = load i8 %gp\n\
+                 %gq = gep @ram +0 +2*%i\n\
+                 store i8 %v %gq\n\
+                 ret void\n",
+        ),
+        "lit",
+        &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x130),
+        ("main::i", 0x131),
+        ("main::v", 0x132),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("MOVFF 0xFF5, 0xFEF"),
+        "store must read TABLAT into INDF0:\n{main_asm}"
+    );
+    assert!(
+        !main_asm.contains("0x132,"),
+        "dead temp must go unwritten:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..4u8 {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x130] = x;
+        p.run(200);
+        assert!(p.halted(), "program must halt (index={x})");
+        assert_eq!(
+            p.ram()[0x120 + usize::from(2 * x)],
+            0x11 + 0x11 * x,
+            "copied byte (index={x})"
+        );
+    }
+}
+
+#[test]
 fn phi_folded_i16_increment_with_split_header_and_latch_folds() {
     // The increment may sit in a latch block apart from the header
     // holding the phi. The backedge phi reads the result, so the same
@@ -9546,6 +9653,60 @@ fn rmw_producer_accumulates_into_its_load_temp() {
     );
     assert!(
         main_asm.contains("MOVFF 0x124, 0xFEB"),
+        "store reads the load temp:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (lo, hi, elo, ehi) in [(10u8, 0u8, 17u8, 0u8), (250, 16, 1, 17)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x120] = lo;
+        p.ram_mut()[0x121] = hi;
+        p.ram_mut()[0x122] = 0;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x120], elo, "rmw low byte");
+        assert_eq!(p.ram()[0x121], ehi, "rmw high byte");
+    }
+}
+
+#[test]
+fn indf_rmw_producer_accumulates_into_its_load_temp() {
+    // A 16-bit `INDF` load feeding a const `add` feeding an `INDF`
+    // store: the binop accumulates into the load temp with in-place
+    // lanes, so its own result temp disappears (epic-cc#969). The
+    // scale-2 index keeps the access off the `PLUSW` shape, so both
+    // sides walk `POSTINC0`/`INDF0`.
+    let m = parse(
+        "global ram i16\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +0 +2*%i\n\
+             %v = load i16 %p\n\
+             %w = add i16 %v, 7\n\
+             store i16 %w %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x122),
+        ("main::i", 0x123),
+        ("main::v", 0x124),
+        ("main::w", 0x126),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("ADDWF 0x024,F,B"),
+        "low lane accumulates into the load temp:\n{main_asm}"
+    );
+    assert!(
+        !main_asm.contains("0x026,") && !main_asm.contains("0x026 "),
+        "result temp never written:\n{main_asm}"
+    );
+    assert!(
+        main_asm.contains("MOVF 0x024,W,B"),
         "store reads the load temp:\n{main_asm}"
     );
     let words = asm::assemble_pic18(&asm);
