@@ -28,14 +28,12 @@ const MAX_STEPS: usize = 64;
 
 /// One emitted program plus its readback contract: `reads` are the
 /// addresses to dump with `x /1xbr` in order, `expected` the byte each
-/// must hold (proof register first, then guards, then per-case `W`,
-/// `STATUS`, allowed addresses). `tags` names the source of each read in
-/// the same order (`proof`, `guard`, or the case lane), so a mismatch log
-/// identifies the failing lane without re-running. `stepi` is the
-/// instruction count plus margin, for a `stepi` backstop after the
-/// runner's wall-clock `run`+`wait`: overshoot lands in the
-/// side-effect-free spin, so the session is deterministic even when the
-/// wait expires mid-program.
+/// must hold (proof first, then guards, then per-case `W`, `STATUS`,
+/// allowed). `tags` names each read's source in order (`proof`,
+/// `guard`, or the case lane), so a mismatch log names the failing
+/// lane without re-running. `stepi` is the instruction count plus
+/// margin: overshoot lands in the side-effect-free spin, so the
+/// session stays deterministic when the wait expires mid-program.
 pub struct Batch {
     pub src: String,
     pub reads: Vec<usize>,

@@ -31,6 +31,19 @@ isolation across carry and borrow states.
   `crates/sim`, `crates/asm`, `crates/superopt`, the oracle script and
   workflow; wider corners ride the nightly sweep.
 
+## What the hardware taught (amendment 2026-10-09)
+
+Running the sweep convicted MPLAB SIM 6.35 itself on three flag
+models, each hand-verified instruction by instruction against boolean
+truth and triangulated with gpsim 0.31 (the in-tree sim matches truth
+on all 15 probe points): ADDWFC drops the (W+C) low-nibble carry from
+DC, SUBWFB and SUBFWB miscompute DC+OV with borrow-in, and DAW tests
+the original high nibble (wrong for valid BCD sums like 0x99+0x06,
+which must yield 0x05 with C set). The three STATUS bits are masked
+per lane in-program on both executors, DAW has no lane, and the
+masked behavior stays pinned by in-tree sim tests. Remainder in
+epic-cc#1001.
+
 ## Rejected alternatives
 
 - **One spec per opcode (44 matrix jobs).** Free attribution but 44

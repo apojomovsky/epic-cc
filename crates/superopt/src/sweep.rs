@@ -564,11 +564,35 @@ fn pic14_table_ranges() -> (Vec<usize>, Vec<usize>) {
         let start = lo.max(PIC14_TABLE_START);
         assert!(start < hi, "sweep: 16F877A bank {lo:#X} has no table room");
         for addr in start..hi {
+            assert_banked(device, addr);
             usable.push(addr);
         }
+        assert_banked(device, hi);
         guards.push(hi);
     }
+    for addr in [
+        LANE_ADDR,
+        PIC14_PROOF_ADDR,
+        PIC14_WORK_GUARD,
+        PIC14_TABLE_GUARD,
+    ] {
+        assert_banked(device, addr);
+    }
     (usable, guards)
+}
+
+/// Every emitted PIC14 address must be real GPR in the bank the RP
+/// bits will select: `bank_of` is the map's authority, and the
+/// `addr / 0x80` page the builder programs into RP1:RP0 must agree
+/// with it, or stores alias SFRs or common RAM. STATUS is exempt:
+/// it is mirrored bank-independently and only touched from bank 0.
+fn assert_banked(device: &device::Device, addr: usize) {
+    assert_eq!(
+        device.bank_of(addr as u16),
+        Some((addr / 0x80) as u8),
+        "sweep: 0x{addr:X} is not GPR in bank {}",
+        addr / 0x80
+    );
 }
 
 /// Select a PIC14 RAM bank: RP1:RP0 are STATUS bits 6:5, and
@@ -807,6 +831,11 @@ mod tests {
                     assert!(
                         addr == PIC14_PROOF_ADDR || in_gpr(addr),
                         "read 0x{addr:X} outside GPR"
+                    );
+                    assert_eq!(
+                        device.bank_of(addr as u16),
+                        Some((addr / 0x80) as u8),
+                        "read 0x{addr:X} not GPR in its RP bank"
                     );
                 }
                 let words = asm::assemble(&batch.src);

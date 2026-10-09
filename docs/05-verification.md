@@ -84,7 +84,14 @@ in-program (SIM reports POR-or-WDT values there nondeterministically),
 and park on `clrwdt`/`goto` against WDT resets during the wait. The PR
 tier runs only on oracle-input changes (`crates/sim`, `crates/asm`,
 `crates/superopt`, the oracle script and workflow); wider corners ride
-the nightly sweep.
+the nightly sweep. Running the sweep convicted MPLAB SIM 6.35 itself on
+three flag models, hand-verified against boolean truth and triangulated
+with gpsim: ADDWFC drops the (W+C) low-nibble carry from DC, SUBWFB and
+SUBFWB miscompute DC+OV with borrow-in, and DAW tests the original high
+nibble (wrong for valid BCD like 0x99+0x06). Those STATUS bits are
+masked per lane in-program on both executors, DAW has no lane, and the
+masked behavior stays pinned by in-tree sim tests instead (epic-cc#819,
+remainder in #1001).
 
 Three hardware facts the harness depends on: reset `STATUS` reads `0x00`
 in both SIM and model (no TO/PD masking needed); the device proof reads
