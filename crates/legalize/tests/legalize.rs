@@ -3123,9 +3123,10 @@ fn no_fuse_across_blocks() {
     );
 }
 
-/// The PIC18 entry skips fusion: its backend owns its own divide shape.
+/// The PIC18 entry fuses like the main one now that isel-pic18 owns
+/// combined recipes (epic-cc#982).
 #[test]
-fn no_fuse_on_pic18_entry() {
+fn fuses_matching_pair_on_pic18_entry() {
     use legalize::legalize_pic18;
     let m = parse(
         "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
@@ -3141,7 +3142,140 @@ fn no_fuse_on_pic18_entry() {
     );
     let text = ir::serialize(&legalize_pic18(m));
     assert!(
-        text.contains("@__udiv_u16(") && !text.contains("__udivmod"),
-        "pic18 pair fused:\n{text}"
+        text.contains("@__udivmod_u16(")
+            && text.contains("%6 = load volatile i16 @__udivmod_rem_u16"),
+        "pic18 pair kept two calls:\n{text}"
     );
+}
+
+/// A same-block `sdiv`/`srem` pair on identical operands fuses into one
+/// combined signed divide call plus a load of its remainder spill slot
+/// (epic-cc#981): the loop runs once instead of twice.
+#[test]
+fn fuses_matching_signed_divmod_pair() {
+    for (ty, width) in [("i8", "8"), ("i16", "16"), ("i32", "32")] {
+        let m = parse(&format!(
+            "global a {ty}\nglobal b {ty}\nglobal q {ty}\nglobal m {ty}\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load {ty} @a\n\
+                 %2 = load {ty} @b\n\
+                 %3 = sdiv {ty} %1 %2\n\
+                 store {ty} %3 @q\n\
+                 %6 = srem {ty} %1 %2\n\
+                 store {ty} %6 @m\n\
+                 ret void\n",
+        ));
+        let text = ir::serialize(&legalize(m));
+        assert!(
+            text.contains(&format!(
+                "%3 = call {ty} @__sdivmod_i{width}({ty} %1, {ty} %2)"
+            )),
+            "divide became the combined call:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("%6 = load volatile {ty} @__sdivmod_rem_i{width}")),
+            "remainder became a slot load:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("global __sdivmod_rem_i{width} {ty}")),
+            "spill slot injected:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("fn __sdivmod_i{width}({ty}) (num={ty}, den={ty})")),
+            "combined routine injected:\n{text}"
+        );
+        assert!(
+            !text.contains(&format!("fn __sdiv_i{width}("))
+                && !text.contains(&format!("fn __srem_i{width}(")),
+            "pruned routines not injected:\n{text}"
+        );
+    }
+}
+
+/// Mixed-sign pairs never fuse: the signed and unsigned halves spill to
+/// different slots, so a cross-sign fuse would return the wrong half.
+#[test]
+fn no_fuse_on_mixed_sign_pair() {
+    for (name, div, rem) in [
+        (
+            "unsigned div, signed rem",
+            "udiv i16 %1 %2",
+            "srem i16 %1 %2",
+        ),
+        (
+            "signed div, unsigned rem",
+            "sdiv i16 %1 %2",
+            "urem i16 %1 %2",
+        ),
+    ] {
+        let m = parse(&format!(
+            "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i16 @a\n\
+                 %2 = load i16 @b\n\
+                 %3 = {div}\n\
+                 store i16 %3 @q\n\
+                 %6 = {rem}\n\
+                 store i16 %6 @m\n\
+                 ret void\n",
+        ));
+        let text = ir::serialize(&legalize(m));
+        assert!(!text.contains("divmod"), "{name} fused:\n{text}");
+    }
+}
+
+/// Signed and unsigned pairs at one width fuse independently: each sign
+/// keeps its own combined routine and spill slot.
+#[test]
+fn fuses_signed_and_unsigned_same_width() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         global sa i16\nglobal sb i16\nglobal sq i16\nglobal sm i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %6 = urem i16 %1 %2\n\
+             store i16 %6 @m\n\
+             %11 = load i16 @sa\n\
+             %12 = load i16 @sb\n\
+             %13 = sdiv i16 %11 %12\n\
+             store i16 %13 @sq\n\
+             %16 = srem i16 %11 %12\n\
+             store i16 %16 @sm\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(")
+            && text.contains("@__udivmod_rem_u16")
+            && text.contains("@__sdivmod_i16(")
+            && text.contains("@__sdivmod_rem_i16"),
+        "both pairs fused to their own routine:\n{text}"
+    );
+}
+
+/// ISR spellings keep two calls on the PIC18 entry too: fusion only
+/// provides the main-context slot.
+#[test]
+fn no_fuse_on_pic18_isr_spellings() {
+    use legalize::legalize_pic18;
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = call i16 @__udiv_u16_isr(i16 %1, i16 %2)\n\
+             store i16 %3 @q\n\
+             %6 = call i16 @__urem_u16_isr(i16 %1, i16 %2)\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize_pic18(m));
+    assert!(!text.contains("__udivmod"), "isr pair fused:\n{text}");
 }

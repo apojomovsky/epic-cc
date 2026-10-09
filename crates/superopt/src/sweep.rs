@@ -1,10 +1,10 @@
 //! Opcode-level MPLAB SIM differential sweep (epic-cc#819).
 //!
-//! Each lane replays one ALU opcode across entry-W, operand, and
+//! Each lane replays one opcode across entry-W, operand, and
 //! entry-STATUS corners on hardware and in-tree, so the sim cannot share
 //! the compiler's wrong belief about an opcode the way epic-cc#632 did.
-//! Four shards (PIC18 arithmetic, PIC18 logic+rotates, PIC14 split in
-//! two) keep CI wall time flat; every mismatch log names each failing
+//! Six shards (PIC18/PIC14 flag lanes plus one no-flag shard per core)
+//! keep CI wall time flat; every mismatch log names each failing
 //! lane via [`mdb::Batch::tags`].
 
 use crate::mdb::{Batch, POISON};
@@ -183,6 +183,63 @@ fn lit_nightly() -> Vec<SweepCase> {
     cases.extend(stride_cases());
     cases
 }
+/// Entry-STATUS pair for the no-flag lanes (epic-cc#1001): the ops under
+/// test never read STATUS, so two extremes prove flag invariance both
+/// ways instead of the three-way carry-dependence cross the flag lanes
+/// need. Bits 5-7 stay clear (unimplemented on PIC18), and PIC14 setup
+/// reads only the low three bits, so the same pair serves both cores.
+const NOFLAG_STATUS: &[u8] = &[0x00, 0x1F];
+
+/// Compare, move, and multiply lanes: `W` corners crossed with `F`
+/// corners and the STATUS invariance pair. The `F` poke doubles as the
+/// watched address the builders require.
+fn noflag_byte_cases() -> Vec<SweepCase> {
+    let mut out = Vec::new();
+    for &w in OPERAND_CORNERS {
+        for &f in OPERAND_CORNERS {
+            for &s in NOFLAG_STATUS {
+                out.push(SweepCase {
+                    entry_w: w,
+                    entry_status: s,
+                    pokes: vec![(LANE_ADDR, f)],
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Skip, bit, and set lanes: `F` corners with both `W` extremes prove
+/// `W` independence, the STATUS pair proves no flag side effect. Skip
+/// lanes pair the op with a marker `movlw` below, so `W` also carries
+/// the taken/not-taken signal.
+fn noflag_fonly_cases() -> Vec<SweepCase> {
+    let mut out = Vec::new();
+    for &f in OPERAND_CORNERS {
+        for &w in W_PAIR {
+            for &s in NOFLAG_STATUS {
+                out.push(SweepCase {
+                    entry_w: w,
+                    entry_status: s,
+                    pokes: vec![(LANE_ADDR, f)],
+                });
+            }
+        }
+    }
+    out
+}
+
+fn noflag_byte_nightly() -> Vec<SweepCase> {
+    let mut cases = noflag_byte_cases();
+    cases.extend(stride_cases());
+    cases
+}
+
+fn noflag_fonly_nightly() -> Vec<SweepCase> {
+    let mut cases = noflag_fonly_cases();
+    cases.extend(stride_cases());
+    cases
+}
 
 /// DAW has no sweep lane: MPLAB SIM 6.35 tests the original high
 /// nibble for the tens adjust, which is wrong for valid BCD sums
@@ -221,6 +278,22 @@ macro_rules! single {
         || vec![$line]
     };
 }
+
+macro_rules! pair {
+    ($first:expr, $second:expr) => {
+        || vec![$first, $second]
+    };
+}
+
+macro_rules! triple {
+    ($first:expr, $second:expr, $third:expr) => {
+        || vec![$first, $second, $third]
+    };
+}
+
+/// Skip marker: no entry-`W` corner equals it, so a skip lane's `W`
+/// capture reads entry-`W` when the skip is taken and this when not.
+const SKIP_MARK: &str = "movlw 0xA5";
 
 fn pic18_arith_lanes() -> Vec<Lane> {
     vec![
@@ -320,7 +393,552 @@ fn pic14_logic_lanes() -> Vec<Lane> {
     ]
 }
 
-/// The four CI matrix shards.
+/// PIC18 lanes for the no-flag surface (epic-cc#1001): compare-skips,
+/// test/skip, bit ops, multiplies, and flag-free moves. Skip lanes pair
+/// the op with the marker, so `W` reads entry-`W` taken and the marker
+/// missed. Multiply lanes split PRODH:PRODL after the op: low byte in
+/// `W` via `movf`, high byte back in `f` via `movff`, all three capture
+/// slots stay meaningful with no builder change.
+fn pic18_noflag_lanes() -> Vec<Lane> {
+    vec![
+        lane!(
+            cpfseq,
+            pair!("cpfseq 0x020,A", SKIP_MARK),
+            noflag_byte_cases,
+            noflag_byte_nightly
+        ),
+        lane!(
+            cpfsgt,
+            pair!("cpfsgt 0x020,A", SKIP_MARK),
+            noflag_byte_cases,
+            noflag_byte_nightly
+        ),
+        lane!(
+            cpfslt,
+            pair!("cpfslt 0x020,A", SKIP_MARK),
+            noflag_byte_cases,
+            noflag_byte_nightly
+        ),
+        lane!(
+            tstfsz,
+            pair!("tstfsz 0x020,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            decfsz,
+            pair!("decfsz 0x020,F,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            dcfsnz,
+            pair!("dcfsnz 0x020,F,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            incfsz,
+            pair!("incfsz 0x020,F,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            infsnz,
+            pair!("infsnz 0x020,F,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b0,
+            single!("bsf 0x020,0,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b1,
+            single!("bsf 0x020,1,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b2,
+            single!("bsf 0x020,2,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b3,
+            single!("bsf 0x020,3,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b4,
+            single!("bsf 0x020,4,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b5,
+            single!("bsf 0x020,5,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b6,
+            single!("bsf 0x020,6,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b7,
+            single!("bsf 0x020,7,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b0,
+            single!("bcf 0x020,0,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b1,
+            single!("bcf 0x020,1,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b2,
+            single!("bcf 0x020,2,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b3,
+            single!("bcf 0x020,3,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b4,
+            single!("bcf 0x020,4,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b5,
+            single!("bcf 0x020,5,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b6,
+            single!("bcf 0x020,6,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b7,
+            single!("bcf 0x020,7,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btg_b0,
+            single!("btg 0x020,0,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btg_b1,
+            single!("btg 0x020,1,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btg_b2,
+            single!("btg 0x020,2,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btg_b3,
+            single!("btg 0x020,3,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btg_b4,
+            single!("btg 0x020,4,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btg_b5,
+            single!("btg 0x020,5,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btg_b6,
+            single!("btg 0x020,6,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btg_b7,
+            single!("btg 0x020,7,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b0,
+            pair!("btfsc 0x020,0,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b1,
+            pair!("btfsc 0x020,1,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b2,
+            pair!("btfsc 0x020,2,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b3,
+            pair!("btfsc 0x020,3,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b4,
+            pair!("btfsc 0x020,4,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b5,
+            pair!("btfsc 0x020,5,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b6,
+            pair!("btfsc 0x020,6,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b7,
+            pair!("btfsc 0x020,7,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b0,
+            pair!("btfss 0x020,0,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b1,
+            pair!("btfss 0x020,1,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b2,
+            pair!("btfss 0x020,2,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b3,
+            pair!("btfss 0x020,3,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b4,
+            pair!("btfss 0x020,4,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b5,
+            pair!("btfss 0x020,5,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b6,
+            pair!("btfss 0x020,6,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b7,
+            pair!("btfss 0x020,7,A", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            mulwf,
+            triple!("mulwf 0x020,A", "movf 0xFF3,W,A", "movff 0xFF4,0x020"),
+            noflag_byte_cases,
+            noflag_byte_nightly
+        ),
+        lane!(
+            mullw_k55,
+            triple!("mullw 0x55", "movf 0xFF3,W,A", "movff 0xFF4,0x020"),
+            noflag_byte_cases,
+            noflag_byte_nightly
+        ),
+        lane!(
+            movwf,
+            single!("movwf 0x020,A"),
+            noflag_byte_cases,
+            noflag_byte_nightly
+        ),
+        lane!(
+            setf,
+            single!("setf 0x020,A"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(movlw, single!("movlw 0xA5"), canary_cases, canary_cases),
+    ]
+}
+
+/// PIC14 lanes for the no-flag surface: the mid-range core has no
+/// compares, `BTG`, `SETF`, or hardware multiply, so this shard covers
+/// the two skip-decrements, the four bit ops, and `MOVWF`. `DECFSZ`
+/// and `INCFSZ` set `Z` on this core; the gate compares full masked
+/// STATUS, so that side effect is checked, not assumed away.
+fn pic14_noflag_lanes() -> Vec<Lane> {
+    vec![
+        lane!(
+            decfsz,
+            pair!("decfsz 0x20, F", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            incfsz,
+            pair!("incfsz 0x20, F", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b0,
+            single!("bsf 0x20, 0"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b1,
+            single!("bsf 0x20, 1"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b2,
+            single!("bsf 0x20, 2"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b3,
+            single!("bsf 0x20, 3"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b4,
+            single!("bsf 0x20, 4"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b5,
+            single!("bsf 0x20, 5"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b6,
+            single!("bsf 0x20, 6"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bsf_b7,
+            single!("bsf 0x20, 7"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b0,
+            single!("bcf 0x20, 0"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b1,
+            single!("bcf 0x20, 1"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b2,
+            single!("bcf 0x20, 2"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b3,
+            single!("bcf 0x20, 3"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b4,
+            single!("bcf 0x20, 4"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b5,
+            single!("bcf 0x20, 5"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b6,
+            single!("bcf 0x20, 6"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            bcf_b7,
+            single!("bcf 0x20, 7"),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b0,
+            pair!("btfsc 0x20, 0", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b1,
+            pair!("btfsc 0x20, 1", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b2,
+            pair!("btfsc 0x20, 2", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b3,
+            pair!("btfsc 0x20, 3", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b4,
+            pair!("btfsc 0x20, 4", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b5,
+            pair!("btfsc 0x20, 5", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b6,
+            pair!("btfsc 0x20, 6", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfsc_b7,
+            pair!("btfsc 0x20, 7", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b0,
+            pair!("btfss 0x20, 0", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b1,
+            pair!("btfss 0x20, 1", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b2,
+            pair!("btfss 0x20, 2", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b3,
+            pair!("btfss 0x20, 3", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b4,
+            pair!("btfss 0x20, 4", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b5,
+            pair!("btfss 0x20, 5", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b6,
+            pair!("btfss 0x20, 6", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            btfss_b7,
+            pair!("btfss 0x20, 7", SKIP_MARK),
+            noflag_fonly_cases,
+            noflag_fonly_nightly
+        ),
+        lane!(
+            movwf,
+            single!("movwf 0x20"),
+            noflag_byte_cases,
+            noflag_byte_nightly
+        ),
+        lane!(movlw, single!("movlw 0xA5"), canary_cases, canary_cases),
+    ]
+}
+
+/// The six CI matrix shards.
 pub fn all_sweeps() -> Vec<SweepSpec> {
     vec![
         SweepSpec {
@@ -345,6 +963,18 @@ pub fn all_sweeps() -> Vec<SweepSpec> {
             name: "pic14-logic",
             device: SweepDevice::Pic14,
             lanes: pic14_logic_lanes,
+            chunk_cases: 72,
+        },
+        SweepSpec {
+            name: "pic18-noflag",
+            device: SweepDevice::Pic18,
+            lanes: pic18_noflag_lanes,
+            chunk_cases: 400,
+        },
+        SweepSpec {
+            name: "pic14-noflag",
+            device: SweepDevice::Pic14,
+            lanes: pic14_noflag_lanes,
             chunk_cases: 72,
         },
     ]
@@ -792,7 +1422,7 @@ mod tests {
 
     #[test]
     fn pic18_shards_build_and_tag_every_read() {
-        for name in ["pic18-arith", "pic18-logic"] {
+        for name in ["pic18-arith", "pic18-logic", "pic18-noflag"] {
             let (spec, items) = pr_items(name);
             for batch in build_chunks_18(&spec, &items) {
                 assert_eq!(batch.reads.len(), batch.expected.len());
@@ -821,7 +1451,7 @@ mod tests {
                 .iter()
                 .any(|&(lo, hi)| addr >= lo as usize && addr <= hi as usize)
         };
-        for name in ["pic14-arith", "pic14-logic"] {
+        for name in ["pic14-arith", "pic14-logic", "pic14-noflag"] {
             let (spec, items) = pr_items(name);
             for batch in build_chunks_14(&spec, &items) {
                 assert_eq!(batch.reads.len(), batch.expected.len());
@@ -850,7 +1480,7 @@ mod tests {
                 }
             }
         }
-        for name in ["pic14-arith", "pic14-logic"] {
+        for name in ["pic14-arith", "pic14-logic", "pic14-noflag"] {
             for it in pr_items(name).1.iter() {
                 let (_, status, _) = run_expected_14(it).unwrap();
                 assert_eq!(status & 0x18, 0, "TO/PD must stay masked");
@@ -897,5 +1527,56 @@ mod tests {
         assert!(err.contains("lane addwf"), "missing addwf lane:\n{err}");
         assert!(err.contains("lane subwfb"), "missing subwfb lane:\n{err}");
         assert!(compare_batch(&batch, &batch.expected).is_ok());
+    }
+
+    /// Skip lanes must separate taken from missed in `W`, and multiply
+    /// lanes must land both product bytes: a marker collision or a dead
+    /// `movff` would pass the build tests above while proving nothing.
+    #[test]
+    fn noflag_skip_and_mul_lanes_observe() {
+        let item = |lane: &'static str, candidate: Candidate, w: u8, s: u8, f: u8| SweepItem {
+            lane,
+            candidate,
+            case: SweepCase {
+                entry_w: w,
+                entry_status: s,
+                pokes: vec![(LANE_ADDR, f)],
+            },
+        };
+        let cpfseq = || vec!["cpfseq 0x020,A", SKIP_MARK];
+        let taken = item("cpfseq", cpfseq(), 0x42, 0x00, 0x42);
+        let missed = item("cpfseq", cpfseq(), 0x42, 0x00, 0x43);
+        assert_eq!(run_expected_18(&taken).unwrap().0, 0x42);
+        assert_eq!(run_expected_18(&missed).unwrap().0, 0xA5);
+        assert_eq!(run_expected_18(&taken).unwrap().1, 0x00);
+        let btfss = || vec!["btfss 0x020,3,A", SKIP_MARK];
+        assert_eq!(
+            run_expected_18(&item("btfss_b3", btfss(), 0x00, 0x00, 0x08))
+                .unwrap()
+                .0,
+            0x00
+        );
+        assert_eq!(
+            run_expected_18(&item("btfss_b3", btfss(), 0x00, 0x00, 0x00))
+                .unwrap()
+                .0,
+            0xA5
+        );
+        let mul = || vec!["mulwf 0x020,A", "movf 0xFF3,W,A", "movff 0xFF4,0x020"];
+        let (w, _, f) = run_expected_18(&item("mulwf", mul(), 0x10, 0x00, 0x10)).unwrap();
+        assert_eq!((w, f), (0x00, 0x01), "0x10 * 0x10 splits LO in W, HI in f");
+        let dec = || vec!["decfsz 0x20, F", SKIP_MARK];
+        assert_eq!(
+            run_expected_14(&item("decfsz", dec(), 0x00, 0x00, 0x01))
+                .unwrap()
+                .0,
+            0x00
+        );
+        assert_eq!(
+            run_expected_14(&item("decfsz", dec(), 0x00, 0x00, 0x02))
+                .unwrap()
+                .0,
+            0xA5
+        );
     }
 }

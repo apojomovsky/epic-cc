@@ -491,6 +491,27 @@ def _movff_run(items, i, cfg):
     return (span, sfr) if span >= cfg.movff_run else (0, False)
 
 
+def match_indirect_seed(items, i, cfg):
+    """An FSR seed with its `INDF`/`POSTINC` staging: a pointer dereference.
+
+    `MOVFF slot,FSR0L; MOVFF slot+1,FSR0H; MOVFF INDF0,dst` is how a
+    pointer read lowers after inlining, repeated per loop trip. Every
+    move touches only an FSR or its shadow, which keeps ISR saves
+    (`STATUS`/`BSR`/`PROD`/`TABLAT`) and peripheral writes (`TXREG`,
+    `EECON`, `ADRES`) in `sfr-context-save` below.
+    """
+    if cfg.family != "pic18":
+        return 0
+    span, sfr = _movff_run(items, i, cfg)
+    if not span or not sfr:
+        return 0
+    for k in range(i, i + span):
+        touched = [a for a in _reg_operand_addresses(items[k]) if a >= PIC18_SFR_BASE]
+        if not all(a in _FSR_REGS for a in touched):
+            return 0
+    return span
+
+
 def match_sfr_context_save(items, i, cfg):
     """A `MOVFF` run where every move touches an SFR: a context save.
 
@@ -1066,6 +1087,7 @@ SINK_RULES = (
     Rule("shared-code", match_shared_code),
     Rule("runtime-routine", match_runtime_routine),
     Rule("dead-store-reload", match_dead_roundtrip),
+    Rule("indirect-seed", match_indirect_seed),
     Rule("sfr-context-save", match_sfr_context_save),
     Rule("struct-copy-movff", match_struct_copy),
     Rule("store-reload-gap", match_store_reload_gap),
