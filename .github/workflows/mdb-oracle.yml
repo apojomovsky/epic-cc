@@ -1,10 +1,11 @@
 name: mdb-oracle
 
 # MPLAB SIM execution oracle (epic-cc#712 sequences, epic-cc#819 opcode
-# sweep): PR tier runs only on oracle-input changes (sim, asm, superopt,
-# the oracle script and this workflow); isel-pic18 changes ride the
-# nightly sweep below. Sessions run in epic-hal's private toolchain
-# image (same pull as its family-check). Setup, not code:
+# sweep plus the epic-cc#1001 no-flag follow-up): PR tier runs only on
+# oracle-input changes (sim, asm, superopt, the oracle script and this
+# workflow); isel-pic18 changes ride the nightly sweep below.
+# Sessions run in epic-hal's private toolchain image (same pull as its
+# family-check). Setup, not code:
 # ghcr.io/<owner>/epic-hal-ci must grant this repo read access, else the
 # pull 401s.
 
@@ -75,6 +76,8 @@ jobs:
           - pic18-logic
           - pic14-arith
           - pic14-logic
+          - pic18-noflag
+          - pic14-noflag
     steps:
       - uses: actions/checkout@v5
 

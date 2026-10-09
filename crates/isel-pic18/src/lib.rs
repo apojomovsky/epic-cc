@@ -349,9 +349,9 @@ struct Gen<'m> {
     /// literal op, skipping the temp stage.
     bin_w_srcs: HashSet<String>,
     /// Binop producers computing into their load operand's slot
-    /// (epic-cc#825). Maps a single-use const `Add`/`Sub` feeding a
-    /// `PLUSW` store to the single-use load temp it must accumulate
-    /// into, so the staged result temp disappears.
+    /// (epic-cc#825, INDF stores by epic-cc#969). Maps a single-use const
+    /// `Add`/`Sub` feeding an indirect store to the single-use load temp
+    /// it must accumulate into, so the staged result temp disappears.
     rmw_fwd: HashMap<String, String>,
     /// Value folds from the shared per-function pre-scan (epic-cc#863):
     /// loads whose byte never stages to a slot. `alloc` drops those
@@ -1879,13 +1879,14 @@ impl<'m> Gen<'m> {
         }
         out
     }
-    /// In-place RMW pre-scan (epic-cc#825): a single-use const `Add`/`Sub`
-    /// immediately followed by the `PLUSW` store it feeds, whose value
-    /// operand is a single-use load temp. The binop accumulates into the
-    /// operand's slot with an in-place literal lane, so its own result
-    /// temp disappears. Adjacency is load-bearing: `alloc` ends the
-    /// operand's live range at the binop, so any gap def could be colored
-    /// into its slot.
+    /// In-place RMW pre-scan (epic-cc#825, INDF stores by epic-cc#969): a
+    /// single-use const `Add`/`Sub` immediately followed by the indirect
+    /// store it feeds (`PLUSW` or `INDF`/`POSTINC` destination), whose
+    /// value operand is a single-use load temp. The binop accumulates
+    /// into the operand's slot with an in-place literal lane, so its own
+    /// result temp disappears. Adjacency is load-bearing: `alloc` ends
+    /// the operand's live range at the binop, so any gap def could be
+    /// colored into its slot.
     /// Loads already riding W into their binop stay out; that fold wins
     /// more on the same shape.
     fn find_rmw_fwds(g: &Gen, f: &Func, bin_w: &HashSet<String>) -> HashMap<String, String> {
@@ -1970,13 +1971,40 @@ impl<'m> Gen<'m> {
                 } else {
                     continue;
                 };
-                if g.plusw_shape(&ptr_val).is_none() {
+                if g.plusw_shape(&ptr_val).is_none() && !Self::store_is_indirect(g, f, &ptr_val) {
                     continue;
                 }
                 out.insert(q.dst.clone(), lreg.clone());
             }
         }
         out
+    }
+    /// Whether an RMW-candidate store pointer resolves to an indirect
+    /// destination (`INDF`/`POSTINC` on FSR0), mirroring `emit_ptr_setup`'s
+    /// `Direct`/`Indirect` decision without emitting. A direct global
+    /// stays direct; a register pointer is indirect unless it folds to a
+    /// plain global address with no dynamic terms. Unresolved pointers
+    /// stay out: the store arm would reject them the same way.
+    /// (epic-cc#969)
+    fn store_is_indirect(g: &Gen, f: &Func, ptr_val: &Val) -> bool {
+        let Val::Reg(r) = ptr_val else {
+            return false;
+        };
+        let Some((base, _k, terms)) = g.resolved.get(&ssa_key(&f.name, r)) else {
+            return false;
+        };
+        match base {
+            Base::Global(_) => !terms.is_empty(),
+            Base::Slot(sname, indirect) => {
+                if *indirect {
+                    return true;
+                }
+                if f.params.iter().any(|p| p.name == *sname && p.ptr) {
+                    return true;
+                }
+                !terms.is_empty()
+            }
+        }
     }
     /// The register side of an `Add`/`Sub` against a constant: the value
     /// operand plus the literal. `Add` commutes, so a constant on either
@@ -5547,8 +5575,12 @@ impl<'m> Gen<'m> {
                         Addr::Direct(dst) => self.emit_move_val_to_slot(&s.val, s.ty, dst),
                         Addr::Indirect => {
                             let n = s.ty.bytes();
+                            // An in-place RMW producer (epic-cc#969) lives
+                            // in its load operand's slot, not the dead
+                            // result temp the store names.
+                            let val = self.rmw_reg(&s.val);
                             for k in 0..n {
-                                self.emit_load_w(&s.val, k, false);
+                                self.emit_load_w(&val, k, false);
                                 let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
                                 self.emit(format!("    MOVWF 0x{reg:03X},A"));
                             }
