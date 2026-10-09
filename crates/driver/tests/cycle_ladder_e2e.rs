@@ -22,7 +22,10 @@
 //!
 //! A checked-in baseline (`fixtures/cycle_baseline.toml`) records the
 //! last-accepted cycles plus flash/RAM per case; the test fails when a
-//! measured number **exceeds** its baseline. Shrinking is free.
+//! measured number **exceeds** its baseline. Shrinking is free. Result
+//! values pin separately: arithmetic rows also compare their result
+//! globals against checked-in bytes, so a miscompile that runs fast
+//! still fails (epic-cc#976). Cycles ratchet, values pin.
 //! Regenerate with `UPDATE_CYCLE_BASELINE=1 cargo test -p driver --test
 //! cycle_ladder_e2e` and diff before committing.
 //! `CYCLE_BASELINE_ONLY=a,b@O2` scopes the rewrite to named rows (`name`
@@ -447,10 +450,59 @@ fn parse_after(report: &str, marker: &str) -> u32 {
         .unwrap_or_else(|e| panic!("bad number after {marker:?}: {e}\n{report}"))
 }
 
+/// Expected result bytes per arithmetic kernel, little-endian, keyed by
+/// the row name without its device suffix. Derived from the fixture
+/// inputs by hand (quotients, products, shifts, digits, CRC); a row
+/// with no entry here gets no value check.
+fn expected_results(name: &str) -> Vec<(&'static str, Vec<u8>)> {
+    let stem = name
+        .strip_suffix("-18f4550")
+        .or_else(|| name.strip_suffix("-16f877a"))
+        .unwrap_or(name);
+    match stem {
+        // 200/13 = 15 rem 5.
+        "speed-divmod-u8" => vec![("q", vec![15]), ("m", vec![5])],
+        // 50000/137 = 364 rem 132; q needs both bytes (0x016C).
+        "speed-divmod-u16" => vec![("q", vec![108, 1]), ("m", vec![132, 0])],
+        // 3000000000/1234567 = 2430 rem 2190.
+        "speed-divmod-u32" => vec![("q", vec![126, 9, 0, 0]), ("m", vec![142, 8, 0, 0])],
+        // 37*29 = 1073, low byte 49.
+        "speed-mul-u8" => vec![("r", vec![49])],
+        // 0x1234*37 = 0xA184.
+        "speed-mul-u16" => vec![("r", vec![132, 161])],
+        // 0x12345678*0x9ABCDEF1 mod 2^32 = 0x366176F8.
+        "speed-mul-u32" => vec![("r", vec![248, 118, 97, 54])],
+        // (0xABCD << 5) >> 5 = 0x03CD; (0x12345678 << 19) >> 19 = 0x1678.
+        "speed-shift" => vec![("r16", vec![205, 3]), ("r32", vec![120, 22, 0, 0])],
+        // 48293 decimal digits, least significant first.
+        "speed-u16-dec" => vec![("digits", vec![3, 9, 2, 8, 4])],
+        // CRC-16/CCITT (init FFFF, poly 1021) over seed+i*7 bytes = 0x4F3C.
+        "speed-crc16" => vec![("crc", vec![60, 79])],
+        _ => vec![],
+    }
+}
+
+/// First result mismatch against sim RAM, if any. Reads after halt, so
+/// the sunk values are final. Whole bytes compare, never just the low
+/// byte: the #976 truncated quotient matched low and still failed high.
+fn result_mismatch(map: &str, name: &str, read: impl Fn(usize) -> u8) -> Option<String> {
+    for (global, want) in expected_results(name) {
+        let base = map_addr(map, global);
+        let got: Vec<u8> = (0..want.len()).map(|i| read(base + i)).collect();
+        if got != want {
+            return Some(format!(
+                "{name}: wrong {global}: expected {want:?} got {got:?}"
+            ));
+        }
+    }
+    None
+}
+
 /// Step the sim from the `bench_mark` 1 store to the 2 store and return
-/// the cycle delta. The program must halt afterwards: kernels are
-/// straight-line, so a non-halting run is a broken fixture, not a slow one.
-fn measure_marks(hex: &str, map: &str, device: &str, name: &str) -> u64 {
+/// the cycle delta plus the first result mismatch, if any. The caller
+/// routes mismatches through failures, so one run lists every bad row
+/// instead of stopping at the first. Kernels must halt afterwards.
+fn measure_marks(hex: &str, map: &str, device: &str, name: &str) -> (u64, Option<String>) {
     let addr = map_addr(map, "bench_mark");
     if device == "18F4550" {
         let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(hex));
@@ -460,7 +512,7 @@ fn measure_marks(hex: &str, map: &str, device: &str, name: &str) -> u64 {
         let c2 = p.cycles();
         p.run(5_000_000);
         assert!(p.halted(), "{name}: kernel must halt");
-        c2 - c1
+        (c2 - c1, result_mismatch(map, name, |a| p.ram_byte(a)))
     } else {
         let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(hex));
         step_to_mark(&mut p, addr, 1, name);
@@ -469,7 +521,7 @@ fn measure_marks(hex: &str, map: &str, device: &str, name: &str) -> u64 {
         let c2 = p.cycles();
         p.run(5_000_000);
         assert!(p.halted(), "{name}: kernel must halt");
-        c2 - c1
+        (c2 - c1, result_mismatch(map, name, |a| p.ram_byte(a)))
     }
 }
 
@@ -645,6 +697,10 @@ fn cycle_counts_do_not_regress() {
     let mut measured = Vec::new();
     let mut rows = Vec::new();
     let mut failures = Vec::new();
+    let mut value_failures = Vec::new();
+    // Report mode prints numbers for tooling and never fails, so value
+    // mismatches are kept only when the run can report them.
+    let report_mode = std::env::var("SPEED_REPORT_JSON").is_ok();
 
     let cases = cases();
     // Validate the filter before measuring: a typo must fail fast, not
@@ -709,7 +765,10 @@ fn cycle_counts_do_not_regress() {
                     });
                 }
             } else {
-                let cycles = measure_marks(&hex, &map, c.device, &c.name);
+                let (cycles, value_mismatch) = measure_marks(&hex, &map, c.device, &c.name);
+                if !report_mode {
+                    value_failures.extend(value_mismatch);
+                }
                 let key = entry_key(&c.name, profile);
                 let base = baseline
                     .entry
@@ -745,10 +804,18 @@ fn cycle_counts_do_not_regress() {
         }
     }
     write_step_summary(&rows);
-    if std::env::var("SPEED_REPORT_JSON").is_ok() {
+    if report_mode {
         print_report_json(&measured);
         return;
     }
+
+    // Values pin on every asserting run, including baseline updates, so a
+    // re-baseline never absorbs a miscompile alongside new cycle numbers.
+    assert!(
+        value_failures.is_empty(),
+        "result value mismatch(es):\n{}",
+        value_failures.join("\n")
+    );
 
     if update {
         let (to_save, updated, skipped) = merge_baseline(&baseline, &measured, filter.as_ref());
@@ -834,6 +901,44 @@ fn write_step_summary(rows: &[Row]) {
         .expect("open GITHUB_STEP_SUMMARY");
     f.write_all(out.as_bytes())
         .expect("write GITHUB_STEP_SUMMARY");
+}
+
+/// The #976 failure mode needs no compiler: a truncated divmod quotient
+/// matches the low byte and drops the high one, so the check must read
+/// every expected byte. Synthetic map plus canned RAM, nothing compiled.
+#[test]
+fn result_check_catches_a_truncated_divmod_quotient() {
+    let map = "global q 0x20\nglobal m 0x22\n";
+    let name = "speed-divmod-u16-18f4550";
+    let truncated = |a: usize| match a {
+        0x20 => 108,
+        0x21 => 0,
+        0x22 => 132,
+        0x23 => 0,
+        _ => 0,
+    };
+    let msg = result_mismatch(map, name, truncated).expect("high byte 0 != 1 must fail");
+    assert!(
+        msg.contains('q'),
+        "the message must name the wrong global: {msg}"
+    );
+    let correct = |a: usize| match a {
+        0x20 => 108,
+        0x21 => 1,
+        0x22 => 132,
+        0x23 => 0,
+        _ => 0,
+    };
+    assert_eq!(
+        result_mismatch(map, name, correct),
+        None,
+        "full bytes match"
+    );
+    assert_eq!(
+        result_mismatch(map, "speed-memcpy-32-18f4550", truncated),
+        None,
+        "rows without checked-in values stay cycle-only"
+    );
 }
 
 /// The strict-mode verdict is pure arithmetic on the two numbers, so it is
