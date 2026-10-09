@@ -9703,3 +9703,193 @@ fn w_operand_const_left_sub_consumes_w_with_sublw() {
         assert_eq!(p.ram()[0x130], expect, "255 - g for g={g}");
     }
 }
+
+/// Copy-forwarded trunc into a call arg (epic-cc#978): a single-use
+/// `trunc` feeding one scalar call arg never stages; arg setup reads
+/// the source slot, so one `MOVFF` replaces the trunc stage plus copy.
+#[test]
+fn trunc_into_call_arg_reads_the_source_slot() {
+    let m = parse(
+        "global a i16\n\
+         fn callee(i8) (p=i8, q=i8)\n  block entry:\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %t = trunc i16 %1 to i8\n\
+           %3 = call i8 @callee(i8 %t, i8 5)\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("callee::p", 0x30),
+        ("callee::q", 0x31),
+        ("main::1", 0x40),
+        ("main::t", 0x42),
+        ("main::3", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("CALL callee"), "call kept:\n{asm}");
+    assert!(
+        asm.contains("MOVFF 0x040, 0x030"),
+        "arg reads the trunc source:\n{asm}"
+    );
+    assert!(!asm.contains("0x042"), "trunc temp never staged:\n{asm}");
+}
+
+/// An earlier arg home overlapping the trunc source keeps the fold off
+/// (epic-cc#978): arg setup writes homes in order, so the source would
+/// be clobbered before our arg reads it.
+#[test]
+fn trunc_into_call_arg_with_overlapping_home_stays_staged() {
+    let m = parse(
+        "global a i16\n\
+         fn callee(i8) (p=i8, q=i8)\n  block entry:\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %t = trunc i16 %1 to i8\n\
+           %3 = call i8 @callee(i8 5, i8 %t)\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("callee::p", 0x40),
+        ("callee::q", 0x31),
+        ("main::1", 0x40),
+        ("main::t", 0x42),
+        ("main::3", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x040, 0x042"),
+        "trunc stages its temp:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0x042, 0x031"),
+        "arg reads the temp:\n{asm}"
+    );
+}
+
+/// A trunc with two uses stays staged (epic-cc#978).
+#[test]
+fn multi_use_trunc_into_call_arg_stays_staged() {
+    let m = parse(
+        "global a i16\nglobal r i8\n\
+         fn callee(i8) (p=i8, q=i8)\n  block entry:\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %t = trunc i16 %1 to i8\n\
+           %3 = call i8 @callee(i8 %t, i8 5)\n    store i8 %t @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("r", 0x22),
+        ("callee::p", 0x30),
+        ("callee::q", 0x31),
+        ("main::1", 0x40),
+        ("main::t", 0x42),
+        ("main::3", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x040, 0x042"),
+        "trunc stages its temp:\n{asm}"
+    );
+}
+
+/// Copy-forwarded load into a zext (epic-cc#978): a single-use `load`
+/// from an access-bank global feeding a `zext` never stages; the zext
+/// reads the global, so one `MOVFF` replaces the load stage plus copy.
+#[test]
+fn load_into_zext_reads_the_global() {
+    let m = parse(
+        "global g i8\nglobal r i16\nfn main(void) ()\n  block entry:\n    %1 = load i8 @g\n\
+           %2 = zext i8 %1 to i16\n    store i16 %2 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("g", 0x20),
+        ("r", 0x24),
+        ("main::1", 0x40),
+        ("main::2", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x020, 0x042"),
+        "zext reads the global:\n{asm}"
+    );
+    assert!(!asm.contains("0x040"), "load temp never staged:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (g, expect) in [(0u8, 0u16), (1, 1), (0xFF, 0xFF)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20] = g;
+        p.run(200);
+        assert!(p.halted());
+        let got = u16::from(p.ram()[0x24]) | (u16::from(p.ram()[0x25]) << 8);
+        assert_eq!(got, expect, "zero-extended store for g={g}");
+    }
+}
+
+/// A load with two uses stays staged (epic-cc#978).
+#[test]
+fn multi_use_load_into_zext_stays_staged() {
+    let m = parse(
+        "global g i8\nglobal r i16\nglobal s i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @g\n\
+           %2 = zext i8 %1 to i16\n    store i16 %2 @r\n    store i8 %1 @s\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("g", 0x20),
+        ("r", 0x24),
+        ("s", 0x26),
+        ("main::1", 0x40),
+        ("main::2", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("0x040"), "load temp staged:\n{asm}");
+}
+
+/// Retval-homed zext (epic-cc#978): a single-use `zext` feeding `ret`
+/// computes into the return bytes, and the ret skips its W round trip.
+/// One `MOVFF` plus `CLRF` where a temp stage and two reload-store
+/// pairs were.
+#[test]
+fn zext_into_ret_writes_retval_directly() {
+    let m = parse(
+        "fn main(i16) (x=i8, y=i8)\n  block entry:\n    %c = icmp eq i8 %x, %y\n\
+           %z = zext i1 %c to i16\n    ret i16 %z\n",
+    );
+    let addrs = addrs(&[
+        ("main::x", 0x40),
+        ("main::y", 0x41),
+        ("main::c", 0x42),
+        ("main::z", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x042, 0x000"),
+        "zext writes retval lo:\n{asm}"
+    );
+    assert!(asm.contains("CLRF 0x001"), "zext clears retval hi:\n{asm}");
+    assert!(!asm.contains("0x043"), "zext temp never staged:\n{asm}");
+    assert!(!asm.contains("MOVWF 0x000"), "no W round trip:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (x, y, expect) in [(7u8, 7u8, 1u16), (7, 8, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x40] = x;
+        p.ram_mut()[0x41] = y;
+        p.run(200);
+        assert!(p.halted());
+        let got = u16::from(p.ram()[0x000]) | (u16::from(p.ram()[0x001]) << 8);
+        assert_eq!(got, expect, "boolean return for x={x} y={y}");
+    }
+}
+
+/// A zext with two uses keeps its temp and round trip (epic-cc#978).
+#[test]
+fn multi_use_zext_into_ret_stays_staged() {
+    let m = parse(
+        "global r i16\nfn main(i16) (x=i8, y=i8)\n  block entry:\n    %c = icmp eq i8 %x, %y\n\
+           %z = zext i1 %c to i16\n    store i16 %z @r\n    ret i16 %z\n",
+    );
+    let addrs = addrs(&[
+        ("r", 0x24),
+        ("main::x", 0x40),
+        ("main::y", 0x41),
+        ("main::c", 0x42),
+        ("main::z", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("0x043"), "zext temp staged:\n{asm}");
+    assert!(asm.contains("MOVWF 0x000"), "ret round trip kept:\n{asm}");
+}
