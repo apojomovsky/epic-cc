@@ -605,3 +605,31 @@ fn parse_hex_pic14e_drops_the_ela_config_region() {
         "an erased-config value landed in the program image"
     );
 }
+
+#[test]
+fn decfsz_and_incfsz_leave_status_alone() {
+    // Same silicon rule as the mid-range core: skip on the result,
+    // STATUS untouched.
+    let p = run_asm(
+        "    org 0x20\n\
+             MOVLW 0x07\n\
+             MOVWF STATUS\n\
+             MOVLW 0x02\n\
+             MOVWF 0x20\n\
+             DECFSZ 0x20, F\n\
+             SLEEP\n",
+    );
+    assert_eq!(p.ram()[0x20], 0x01);
+    assert_eq!(p.ram()[0x03], 0x07);
+    let p = run_asm(
+        "    org 0x20\n\
+             MOVLW 0x07\n\
+             MOVWF STATUS\n\
+             MOVLW 0x01\n\
+             MOVWF 0x20\n\
+             INCFSZ 0x20, F\n\
+             SLEEP\n",
+    );
+    assert_eq!(p.ram()[0x20], 0x02);
+    assert_eq!(p.ram()[0x03], 0x07);
+}
