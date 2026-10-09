@@ -1077,12 +1077,13 @@ fn mul_u8_recipe_uses_hardware_mulwf() {
     // shift-add loop.
     let m = parse(
         "fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
-         fn main(void) ()\n  block entry:\n    ret void\n",
+         fn main(void) ()\n  block entry:\n    %1 = call i8 @__mul_u8(i8 3, i8 5)\n    ret void\n",
     );
     let addrs = addrs(&[
         ("__mul_u8::a", 0x20),
         ("__mul_u8::b", 0x21),
         ("__mul_u8::__scr", 0x30),
+        ("main::1", 0x40),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
@@ -1096,12 +1097,13 @@ fn mul_u8_recipe_uses_hardware_mulwf() {
 fn runtime_u16_mul_uses_schoolbook_partials() {
     let m = parse(
         "fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14\n    ret i16 0\n\
-         fn main(void) ()\n  block entry:\n    ret void\n",
+         fn main(void) ()\n  block entry:\n    %1 = call i16 @__mul_u16(i16 3, i16 5)\n    ret void\n",
     );
     let addrs = addrs(&[
         ("__mul_u16::a", 0x20),
         ("__mul_u16::b", 0x22),
         ("__mul_u16::__scr", 0x30),
+        ("main::1", 0x40),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     // P00 (shift 0), P01 + P10 (shift 8) contribute to the low 16 bits;
@@ -1113,16 +1115,187 @@ fn runtime_u16_mul_uses_schoolbook_partials() {
     );
 }
 
+/// Inline narrow multiply (epic-cc#892): a u8 call site lowers to one
+/// MULWF straight into the caller's dst. No `CALL` runs and the orphaned
+/// routine body is dropped, so outline has no second site to factor the
+/// inline back into a call.
+#[test]
+fn inline_u8_call_emits_one_mulwf_and_drops_the_routine() {
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal r i8\n\
+         fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n\
+           %3 = call i8 @__mul_u8(i8 %1, i8 %2)\n    store i8 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("r", 0x22),
+        ("__mul_u8::a", 0x30),
+        ("__mul_u8::b", 0x31),
+        ("__mul_u8::__scr", 0x32),
+        ("main::1", 0x40),
+        ("main::2", 0x41),
+        ("main::3", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("CALL __mul_u8"),
+        "no call on the inline path:\n{asm}"
+    );
+    assert!(
+        !asm.lines().any(|l| l.trim() == "__mul_u8:"),
+        "orphaned routine body is dropped:\n{asm}"
+    );
+    assert_eq!(asm.matches("MULWF").count(), 1, "one partial:\n{asm}");
+    assert!(
+        asm.contains("MOVFF 0xFF3"),
+        "result comes out of PRODL:\n{asm}"
+    );
+}
+
+/// The narrowing pass feeds the u8 multiply a constant operand; it rides
+/// W into MULWF while the RAM side stays the memory operand.
+#[test]
+fn inline_u8_const_operand_stages_through_w() {
+    let m = parse(
+        "global a i8\nglobal r i8\n\
+         fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @a\n\
+           %3 = call i8 @__mul_u8(i8 %1, i8 5)\n    store i8 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("r", 0x22),
+        ("__mul_u8::a", 0x30),
+        ("__mul_u8::b", 0x31),
+        ("__mul_u8::__scr", 0x32),
+        ("main::1", 0x40),
+        ("main::3", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("CALL __mul_u8"),
+        "no call on the inline path:\n{asm}"
+    );
+    assert!(asm.contains("MOVLW 0x05"), "const stages into W:\n{asm}");
+    assert_eq!(asm.matches("MULWF").count(), 1, "one partial:\n{asm}");
+}
+
+/// The u16 inline costs flash per site, so the default profile keeps the
+/// call: three MULWF partials in the routine, one `CALL` at the site.
+#[test]
+fn u16_call_stays_a_call_on_the_default_profile() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal r i16\n\
+         fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n\
+           %3 = call i16 @__mul_u16(i16 %1, i16 %2)\n    store i16 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x22),
+        ("r", 0x24),
+        ("__mul_u16::a", 0x30),
+        ("__mul_u16::b", 0x32),
+        ("__mul_u16::__scr", 0x34),
+        ("main::1", 0x40),
+        ("main::2", 0x42),
+        ("main::3", 0x44),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("CALL __mul_u16"), "call kept:\n{asm}");
+    assert!(
+        asm.lines().any(|l| l.trim() == "__mul_u16:"),
+        "called routine body is kept:\n{asm}"
+    );
+}
+
+/// Under the speed profile the u16 site inlines all three partials and
+/// the orphaned routine body goes with the call.
+#[test]
+fn inline_u16_call_emits_three_partials_under_the_speed_profile() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal r i16\n\
+         fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n\
+           %3 = call i16 @__mul_u16(i16 %1, i16 %2)\n    store i16 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x22),
+        ("r", 0x24),
+        ("__mul_u16::a", 0x30),
+        ("__mul_u16::b", 0x32),
+        ("__mul_u16::__scr", 0x34),
+        ("main::1", 0x40),
+        ("main::2", 0x42),
+        ("main::3", 0x44),
+    ]);
+    let opts = isel_pic18::Options {
+        copy_loop: true,
+        divmod_fold: false,
+        inline_mul16: true,
+    };
+    let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+    assert!(
+        !asm.contains("CALL __mul_u16"),
+        "no call on the inline path:\n{asm}"
+    );
+    assert!(
+        !asm.lines().any(|l| l.trim() == "__mul_u16:"),
+        "orphaned routine body is dropped:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MULWF").count(),
+        3,
+        "schoolbook partials, P11 dropped:\n{asm}"
+    );
+}
+
+/// A banked operand needs a MOVLB mid-sequence, which costs the words
+/// the inline saves: the site keeps its call even under the profile.
+#[test]
+fn inline_u16_with_a_banked_operand_keeps_the_call() {
+    let m = parse(
+        "global b i16\nglobal r i16\n\
+         fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @b\n    %2 = load i16 @b\n\
+           %3 = call i16 @__mul_u16(i16 %1, i16 %2)\n    store i16 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("b", 0x100),
+        ("r", 0x24),
+        ("__mul_u16::a", 0x30),
+        ("__mul_u16::b", 0x32),
+        ("__mul_u16::__scr", 0x34),
+        ("main::1", 0x110),
+        ("main::2", 0x112),
+        ("main::3", 0x44),
+    ]);
+    let opts = isel_pic18::Options {
+        copy_loop: true,
+        divmod_fold: false,
+        inline_mul16: true,
+    };
+    let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+    assert!(
+        asm.contains("CALL __mul_u16"),
+        "banked site keeps the call:\n{asm}"
+    );
+}
+
 #[test]
 fn udiv_u16_recipe_emits_restoring_loop() {
     let m = parse(
         "fn __udiv_u16(i16) (num=i16, den=i16)\n  block entry:\n    %__scr = alloca 7\n    ret i16 0\n\
-         fn main(void) ()\n  block entry:\n    ret void\n",
+         fn main(void) ()\n  block entry:\n    %1 = call i16 @__udiv_u16(i16 7, i16 3)\n    ret void\n",
     );
     let addrs = addrs(&[
         ("__udiv_u16::num", 0x20),
         ("__udiv_u16::den", 0x22),
         ("__udiv_u16::__scr", 0x30),
+        ("main::1", 0x40),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert_eq!(
@@ -3635,7 +3808,11 @@ fn speed_profile_drains_long_copy_runs_straight() {
              ret void\n",
     );
     let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
-    let opts = isel_pic18::Options { copy_loop: false };
+    let opts = isel_pic18::Options {
+        copy_loop: false,
+        divmod_fold: false,
+        inline_mul16: false,
+    };
     let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
     for i in 0..12u16 {
         let expect = format!("MOVFF 0x{:03X}, 0x{:03X}", 0x100 + i, 0x110 + i);
@@ -5093,6 +5270,319 @@ fn const_reads_from_different_tables_seed_each() {
         2,
         "each table seeds its own read:\n{asm}"
     );
+}
+
+#[test]
+fn dynamic_const_run_shares_one_seed_and_walks() {
+    // Two dynamically indexed reads from one table at consecutive offsets
+    // with the same index seed once and walk `TBLRD*+` (epic-cc#778), and
+    // the sim proves each byte lands in its own slot.
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in i8\n\
+             global a i8\n\
+             global b i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in\n\
+                 %p = gep @t +0 +1*%1\n\
+                 %2 = load i8 %p\n\
+                 %q = gep @t +1 +1*%1\n\
+                 %3 = load i8 %q\n\
+                 store i8 %2 @a\n\
+                 store i8 %3 @b\n\
+                 ret void\n",
+        ),
+        "t",
+        &[10, 20, 30, 40],
+    );
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("a", 0x110),
+        ("b", 0x111),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("main::3", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        1,
+        "one run seeds once:\n{asm}"
+    );
+    assert_eq!(asm.matches("TBLRD*+").count(), 2, "both reads walk:\n{asm}");
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 1;
+    p.run(1000);
+    assert_eq!(p.ram()[0x110], 20, "first byte must be t[1]:\n{asm}");
+    assert_eq!(p.ram()[0x111], 30, "second byte must be t[2]:\n{asm}");
+}
+
+#[test]
+fn dynamic_const_run_with_stride_shares_one_seed() {
+    // The menu-demo shape (epic-cc#778): a 4-byte struct read at a dynamic
+    // index is four consecutive offsets off one scaled term, so one seed
+    // serves all four walks.
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in i8\n\
+             global a i8\n\
+             global b i8\n\
+             global c i8\n\
+             global d i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in\n\
+                 %p = gep @t +0 +4*%1\n\
+                 %2 = load i8 %p\n\
+                 %q = gep @t +1 +4*%1\n\
+                 %3 = load i8 %q\n\
+                 %r = gep @t +2 +4*%1\n\
+                 %4 = load i8 %r\n\
+                 %s = gep @t +3 +4*%1\n\
+                 %5 = load i8 %s\n\
+                 store i8 %2 @a\n\
+                 store i8 %3 @b\n\
+                 store i8 %4 @c\n\
+                 store i8 %5 @d\n\
+                 ret void\n",
+        ),
+        "t",
+        &[0, 1, 2, 3, 4, 5, 6, 7],
+    );
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("a", 0x110),
+        ("b", 0x111),
+        ("c", 0x112),
+        ("d", 0x113),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("main::3", 0x13),
+        ("main::4", 0x14),
+        ("main::5", 0x15),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        1,
+        "one run seeds once:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("TBLRD*+").count(),
+        4,
+        "all four reads walk:\n{asm}"
+    );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 1;
+    p.run(1000);
+    assert_eq!(p.ram()[0x110], 4, "must read t[4]:\n{asm}");
+    assert_eq!(p.ram()[0x111], 5, "must read t[5]:\n{asm}");
+    assert_eq!(p.ram()[0x112], 6, "must read t[6]:\n{asm}");
+    assert_eq!(p.ram()[0x113], 7, "must read t[7]:\n{asm}");
+}
+
+#[test]
+fn dynamic_const_reads_with_different_indices_seed_each() {
+    // A varying index reads non-consecutive addresses: two reads off
+    // different index regs must reseed even at adjacent static offsets,
+    // or the second read walks the wrong address (epic-cc#778).
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in1 i8\n\
+             global in2 i8\n\
+             global a i8\n\
+             global b i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in1\n\
+                 %2 = load i8 @in2\n\
+                 %p = gep @t +0 +1*%1\n\
+                 %3 = load i8 %p\n\
+                 %q = gep @t +0 +1*%2\n\
+                 %4 = load i8 %q\n\
+                 store i8 %3 @a\n\
+                 store i8 %4 @b\n\
+                 ret void\n",
+        ),
+        "t",
+        &[10, 20, 30, 40],
+    );
+    let addrs = addrs(&[
+        ("in1", 0x10),
+        ("in2", 0x11),
+        ("a", 0x110),
+        ("b", 0x111),
+        ("main::1", 0x12),
+        ("main::2", 0x13),
+        ("main::3", 0x14),
+        ("main::4", 0x15),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        2,
+        "different indices reseed:\n{asm}"
+    );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 1;
+    p.ram_mut()[0x11] = 2;
+    p.run(1000);
+    assert_eq!(p.ram()[0x110], 20, "first byte must be t[1]:\n{asm}");
+    assert_eq!(p.ram()[0x111], 30, "second byte must be t[2]:\n{asm}");
+}
+
+#[test]
+fn dynamic_const_run_broken_by_call_seeds_each() {
+    // A call clobbers `TBLPTR`, so reads on either side seed afresh even
+    // with identical terms and consecutive offsets (epic-cc#778).
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in i8\n\
+             global a i8\n\
+             global b i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in\n\
+                 %p = gep @t +0 +1*%1\n\
+                 %2 = load i8 %p\n\
+                 call void @f()\n\
+                 %q = gep @t +1 +1*%1\n\
+                 %3 = load i8 %q\n\
+                 store i8 %2 @a\n\
+                 store i8 %3 @b\n\
+                 ret void\n\
+             fn f(void) ()\n\
+               block entry:\n\
+                 ret void\n",
+        ),
+        "t",
+        &[10, 20, 30, 40],
+    );
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("a", 0x110),
+        ("b", 0x111),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("main::3", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        2,
+        "a call ends the run:\n{asm}"
+    );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 1;
+    p.run(1000);
+    assert_eq!(p.ram()[0x110], 20, "first byte must be t[1]:\n{asm}");
+    assert_eq!(p.ram()[0x111], 30, "second byte must be t[2]:\n{asm}");
+}
+
+#[test]
+fn dynamic_const_run_broken_by_label_seeds_each() {
+    // Runs are intra-block: a label joins paths the scan cannot see, so
+    // the read past it reseeds (epic-cc#778).
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in i8\n\
+             global a i8\n\
+             global b i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in\n\
+                 %p = gep @t +0 +1*%1\n\
+                 %2 = load i8 %p\n\
+                 br label %next\n\
+               block next:\n\
+                 %q = gep @t +1 +1*%1\n\
+                 %3 = load i8 %q\n\
+                 store i8 %2 @a\n\
+                 store i8 %3 @b\n\
+                 ret void\n",
+        ),
+        "t",
+        &[10, 20, 30, 40],
+    );
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("a", 0x110),
+        ("b", 0x111),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("main::3", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        2,
+        "a label ends the run:\n{asm}"
+    );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 1;
+    p.run(1000);
+    assert_eq!(p.ram()[0x110], 20, "first byte must be t[1]:\n{asm}");
+    assert_eq!(p.ram()[0x111], 30, "second byte must be t[2]:\n{asm}");
+}
+
+#[test]
+fn dynamic_const_run_survives_unrelated_store() {
+    // A store into a slot no term reads leaves the run intact: only one
+    // seed for both reads (epic-cc#778).
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in i8\n\
+             global tmp i8\n\
+             global a i8\n\
+             global b i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in\n\
+                 %p = gep @t +0 +1*%1\n\
+                 %2 = load i8 %p\n\
+                 store i8 %2 @tmp\n\
+                 %q = gep @t +1 +1*%1\n\
+                 %3 = load i8 %q\n\
+                 store i8 %2 @a\n\
+                 store i8 %3 @b\n\
+                 ret void\n",
+        ),
+        "t",
+        &[10, 20, 30, 40],
+    );
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("tmp", 0x114),
+        ("a", 0x110),
+        ("b", 0x111),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("main::3", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        1,
+        "an unrelated store keeps the run:\n{asm}"
+    );
+    assert_eq!(asm.matches("TBLRD*+").count(), 2, "both reads walk:\n{asm}");
 }
 
 #[test]
@@ -7607,6 +8097,199 @@ fn fused_cond_icmp_i32_chain_break_the_tie_at_the_top_lane() {
     }
 }
 
+/// Single-byte ordering compares fuse to the one-lane lowering
+/// (epic-cc#848): the same flags the materializing byte path reads, with
+/// the exits rebound to the branch targets and no 0/1 byte. The IR shape
+/// is the one `fusable_icmp` recognizes: an i8 `icmp` immediately
+/// followed by the `br i1` that is its only consumer. Both rhs shapes
+/// run: a slot (the latch) and a literal (the loop entry's `0x1F` bound).
+#[test]
+fn fused_single_byte_ordering_icmp_branches_without_a_result_byte() {
+    for (pred, reg_cases, const_cases) in [
+        (
+            "ult",
+            vec![
+                ((0x00u8, 0x01u8), 1u8),
+                ((0x01, 0x00), 0),
+                ((0x05, 0x05), 0),
+                ((0xFF, 0x00), 0),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 1u8),
+                ((0x1F, 0x1F), 0),
+                ((0x20, 0x1F), 0),
+            ],
+        ),
+        (
+            "uge",
+            vec![
+                ((0x01u8, 0x00u8), 1u8),
+                ((0x00, 0x01), 0),
+                ((0x05, 0x05), 1),
+                ((0x00, 0xFF), 0),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 0u8),
+                ((0x1F, 0x1F), 1),
+                ((0x20, 0x1F), 1),
+            ],
+        ),
+        (
+            "ugt",
+            vec![
+                ((0x01u8, 0x00u8), 1u8),
+                ((0x00, 0x01), 0),
+                ((0x05, 0x05), 0),
+                ((0xFF, 0x00), 1),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 0u8),
+                ((0x1F, 0x1F), 0),
+                ((0x20, 0x1F), 1),
+            ],
+        ),
+        (
+            "ule",
+            vec![
+                ((0x00u8, 0x01u8), 1u8),
+                ((0x01, 0x00), 0),
+                ((0x05, 0x05), 1),
+                ((0xFF, 0x00), 0),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 1u8),
+                ((0x1F, 0x1F), 1),
+                ((0x20, 0x1F), 0),
+            ],
+        ),
+        (
+            "slt",
+            vec![
+                ((0x80u8, 0x00u8), 1u8),
+                ((0x00, 0x80), 0),
+                ((0xFF, 0x00), 1),
+                ((0x7F, 0x80), 0),
+                ((0x80, 0x7F), 1),
+                ((0x05, 0x05), 0),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 1u8),
+                ((0x1F, 0x1F), 0),
+                ((0x80, 0x1F), 1),
+            ],
+        ),
+        (
+            "sge",
+            vec![
+                ((0x80u8, 0x00u8), 0u8),
+                ((0x00, 0x80), 1),
+                ((0xFF, 0x00), 0),
+                ((0x7F, 0x80), 1),
+                ((0x05, 0x05), 1),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 0u8),
+                ((0x1F, 0x1F), 1),
+                ((0x20, 0x1F), 1),
+            ],
+        ),
+        (
+            "sgt",
+            vec![
+                ((0x00u8, 0x80u8), 1u8),
+                ((0x80, 0x00), 0),
+                ((0x00, 0xFF), 1),
+                ((0x80, 0x7F), 0),
+                ((0x05, 0x05), 0),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 0u8),
+                ((0x1F, 0x1F), 0),
+                ((0x20, 0x1F), 1),
+            ],
+        ),
+        (
+            "sle",
+            vec![
+                ((0x80u8, 0x00u8), 1u8),
+                ((0x00, 0x80), 0),
+                ((0xFF, 0x00), 1),
+                ((0x7F, 0x80), 0),
+                ((0x05, 0x05), 1),
+            ],
+            vec![
+                ((0x1Eu8, 0x1Fu8), 1u8),
+                ((0x1F, 0x1F), 1),
+                ((0x20, 0x1F), 0),
+            ],
+        ),
+    ] {
+        for (rhs_ir, cases) in [
+            ("%2".to_string(), reg_cases),
+            ("31".to_string(), const_cases),
+        ] {
+            let m = parse(&format!(
+                "global a i8\nglobal b i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+                 %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp {pred} i8 %1, {rhs_ir}\n    \
+                 br i1 %3 10 20\n  block 10:\n    store i8 1 @out\n    ret void\n  \
+                 block 20:\n    store i8 0 @out\n    ret void\n",
+            ));
+            // Both shapes keep the `%2` load (unused under a literal rhs),
+            // so its slot is pinned either way.
+            let addrs = addrs(&[
+                ("a", 0x20),
+                ("b", 0x24),
+                ("out", 0x28),
+                ("main::1", 0x30),
+                ("main::2", 0x34),
+                ("main::3", 0x38),
+            ]);
+            let asm = select(&PIC18F4550, &m, &addrs, None);
+            // The fusion must have fired: no preclear, no 0/1 byte, the
+            // lane branches straight to the two block labels.
+            assert!(
+                !asm.contains("INCF 0x38") && !asm.contains("CLRF 0x38"),
+                "{pred} i8 rhs {rhs_ir} was not fused:\n{asm}"
+            );
+            let block = {
+                let rest = asm.split("\nmain:").nth(1).expect("main");
+                rest.split("\n__start:").next().unwrap()
+            };
+            assert!(
+                !block.contains("MOVWF 0x038") && !block.contains("MOVFF 0x030, 0x038"),
+                "{pred} i8 rhs {rhs_ir} still materializes its result byte:\n{asm}"
+            );
+            // `ult`/`uge` bind equality to the trailing branch's own
+            // target, so the middle `BZ` is dead and skipped; `ugt`/`ule`
+            // split equal from ordered and keep it.
+            if pred == "ult" || pred == "uge" {
+                assert!(
+                    !block.contains("BZ "),
+                    "{pred} i8 rhs {rhs_ir} keeps a dead equality branch:\n{asm}"
+                );
+            } else if pred == "ugt" || pred == "ule" {
+                assert!(
+                    block.contains("BZ "),
+                    "{pred} i8 rhs {rhs_ir} lost its equality split:\n{asm}"
+                );
+            }
+            let words = asm::assemble_pic18(&asm);
+            for &((a, b), expect) in &cases {
+                let mut p = pic14_sim::Pic18::new(words.clone());
+                step_past_start(&mut p, start_steps(&asm));
+                p.ram_mut()[0x20] = a;
+                p.ram_mut()[0x24] = b;
+                p.run(300);
+                assert_eq!(
+                    p.ram()[0x28],
+                    expect,
+                    "{pred} i8 rhs {rhs_ir} {a:#04x} vs {b:#04x}"
+                );
+            }
+        }
+    }
+}
+
 /// A fused chain whose operands are single-use global loads reads the
 /// globals in place (epic-cc#721): no MOVFF staging temp, the lane
 /// `MOVF` sources are the global addresses themselves.
@@ -8186,12 +8869,13 @@ fn udiv_u32_recipe_subtracts_with_subwfb_borrow_chain() {
     // whose borrow crosses a byte boundary.
     let m = parse(
         "fn __udiv_u32(i16) (num=i32, den=i32)\n  block entry:\n    %__scr = alloca 7\n    ret i16 0\n\
-         fn main(void) ()\n  block entry:\n    ret void\n",
+         fn main(void) ()\n  block entry:\n    %1 = call i16 @__udiv_u32(i32 7, i32 3)\n    ret void\n",
     );
     let addrs = addrs(&[
         ("__udiv_u32::num", 0x20),
         ("__udiv_u32::den", 0x24),
         ("__udiv_u32::__scr", 0x30),
+        ("main::1", 0x40),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(asm.contains("SUBWF "), "lane 0 plain subtract:\n{asm}");
