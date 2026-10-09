@@ -423,6 +423,20 @@ const PIC18_WREG: usize = 0xFE8;
 const PIC18_STATUS: usize = 0xFD8;
 const PIC18_SFR_FLOOR: usize = 0xF80;
 
+/// STATUS bits the gate compares per lane. MPLAB SIM 6.35 models two
+/// borrow-lane flags wrongly (hand-probed against boolean truth,
+/// triangulated with gpsim): ADDWFC drops the (W+C) low-nibble carry
+/// from DC, and SUBWFB miscomputes DC+OV with borrow-in. Those bits
+/// are masked where proven wrong; every other bit on every lane still
+/// compares, and the masked bits stay pinned by in-tree sim tests.
+pub fn status_mask(lane: &str) -> u8 {
+    match lane {
+        "addwfc" => 0xFD,
+        "subwfb" => 0xF5,
+        _ => 0xFF,
+    }
+}
+
 /// Replay sweep items on PIC18, mirroring `mdb::build_batch` line for
 /// line (proof register, poisoned guards, per-case `W`/`STATUS`/watched
 /// slots) with the lane name as each read's tag.
@@ -489,7 +503,18 @@ pub fn build_sweep_18(items: &[SweepItem]) -> Batch {
         }
         let slot = PIC18_OUT_BASE + i * slots;
         src.push_str(&format!("movff 0x{PIC18_WREG:03X},0x{slot:03X}\n"));
-        src.push_str(&format!("movff 0x{PIC18_STATUS:03X},0x{:03X}\n", slot + 1));
+        let mask = status_mask(it.lane);
+        if mask == 0xFF {
+            src.push_str(&format!("movff 0x{PIC18_STATUS:03X},0x{:03X}\n", slot + 1));
+        } else {
+            // Quirk-masked lanes capture STATUS through W with the
+            // proven-wrong bits cleared on both executors (same trick
+            // as the PIC14 TO/PD mask). `movf` runs after the W save,
+            // so its Z side effect is already recorded.
+            src.push_str(&format!("movf 0x{PIC18_STATUS:03X},W,A\n"));
+            src.push_str(&format!("andlw 0x{mask:02X}\n"));
+            src.push_str(&format!("movff 0x{PIC18_WREG:03X},0x{:03X}\n", slot + 1));
+        }
         src.push_str(&format!("movff 0x{LANE_ADDR:03X},0x{:03X}\n", slot + 2));
     }
     src.push_str("spin:\ngoto spin\n");
@@ -552,7 +577,11 @@ fn run_expected_18(it: &SweepItem) -> Option<(u8, u8, u8)> {
     if !(sim.halted() && sim.pc() == sleep_addr) {
         return None;
     }
-    Some((sim.w(), sim.ram()[STATUS_ADDR], sim.ram()[LANE_ADDR]))
+    Some((
+        sim.w(),
+        sim.ram()[STATUS_ADDR] & status_mask(it.lane),
+        sim.ram()[LANE_ADDR],
+    ))
 }
 
 /// GPR ranges backing the PIC14 output table, derived from the
@@ -670,7 +699,8 @@ pub fn build_sweep_14(items: &[SweepItem]) -> Batch {
         src.push_str(&format!("movwf 0x{:02X}\n", slot_w % 0x80));
         sel_bank(&mut src, &mut cur, 0);
         src.push_str("movf 0x03, W\n");
-        src.push_str(&format!("andlw 0x{PIC14_STATUS_MASK:02X}\n"));
+        let mask = PIC14_STATUS_MASK & status_mask(it.lane);
+        src.push_str(&format!("andlw 0x{mask:02X}\n"));
         sel_bank(&mut src, &mut cur, (slot_s / 0x80) as u8);
         src.push_str(&format!("movwf 0x{:02X}\n", slot_s % 0x80));
         sel_bank(&mut src, &mut cur, 0);
@@ -743,7 +773,7 @@ fn run_expected_14(it: &SweepItem) -> Option<(u8, u8, u8)> {
     }
     Some((
         sim.w(),
-        sim.ram()[0x03] & PIC14_STATUS_MASK,
+        sim.ram()[0x03] & PIC14_STATUS_MASK & status_mask(it.lane),
         sim.ram()[LANE_ADDR],
     ))
 }
