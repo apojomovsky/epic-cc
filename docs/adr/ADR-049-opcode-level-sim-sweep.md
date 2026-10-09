@@ -1,4 +1,4 @@
-# ADR-049 -- Opcode-level MPLAB SIM sweep in four shards
+# ADR-049 -- Opcode-level MPLAB SIM sweep in six shards
 
 **Status:** Accepted 2026-10-09<br>
 **Decides:** `epic-cc#819`<br>
@@ -43,6 +43,20 @@ which must yield 0x05 with C set). Those bits are masked per lane
 in-program on both executors, DAW has no lane, and the
 masked behavior stays pinned by in-tree sim tests. Remainder in
 epic-cc#1001.
+
+## No-flag follow-up (amendment, epic-cc#1001)
+
+Two more shards cover the surface the flag sweep excluded:
+`pic18-noflag` (compare-skips, `TSTFSZ`/`DECFSZ` and friends, bit ops,
+`MULWF`/`MULLW`, `MOVWF`/`SETF`) and `pic14-noflag` (the mid-range
+subset: two skip-decrements, four bit ops, `MOVWF`). Same harness
+shape, minus the carry-dependence cross: cases cross entry-`W` with
+operand corners over a two-value `STATUS` invariance pair, and full
+masked `STATUS` still compares, so any flag touch is signal.
+Skip lanes pair the op with a `movlw` marker outside every entry-`W`
+corner, so `W` reads taken versus missed. Multiply lanes split
+`PRODH:PRODL` after the op (low byte to `W`, high byte back to `f`),
+keeping all three capture slots meaningful with no builder change.
 
 ## Rejected alternatives
 
