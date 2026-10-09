@@ -7439,6 +7439,15 @@ impl<'m> Gen<'m> {
             self.emit_copy_byte(src + u16::from(i), self.retval_lo + u16::from(i));
         }
     }
+    /// Spill a fused divide's remainder half to its global slot, which the
+    /// fused remainder site loads. `MOVFF` like the retval copy above, so
+    /// no `MOVLB` can land inside a skip-sensitive frame sequence.
+    fn store_rem_slot(&mut self, rem: u16, bytes: u8, slot: &str) {
+        let base = self.global_addr(slot);
+        for i in 0..bytes {
+            self.emit_copy_byte(rem + u16::from(i), base + u16::from(i));
+        }
+    }
 
     /// Two's-complement negate of a `bytes`-byte value in place: `COMF`
     /// every byte, then `INCF` the low byte, and each higher byte
@@ -7749,6 +7758,31 @@ impl<'m> Gen<'m> {
         } else {
             self.store_retval(scr, den_bytes);
         }
+        self.emit("    RETURN".to_string());
+    }
+    /// The fused divide recipe (epic-cc#982): one restoring-division loop,
+    /// remainder spilled to the fusion slot, quotient to retval. Same
+    /// layout as `emit_divmod`, same fold under the speed profile.
+    fn emit_udivmod(&mut self, name: &str, den_bytes: u8, scr: u16) {
+        let num = self.slot_addr(name, "num").direct();
+        let den = self.slot_addr(name, "den").direct();
+        let rem_bytes = den_bytes.max(2);
+        self.emit_divmod_loop(
+            num,
+            den,
+            scr,
+            scr + u16::from(rem_bytes),
+            den_bytes,
+            rem_bytes,
+            self.divmod_fold,
+        );
+        let slot = match den_bytes {
+            1 => "__udivmod_rem_u8",
+            2 => "__udivmod_rem_u16",
+            _ => "__udivmod_rem_u32",
+        };
+        self.store_rem_slot(scr, den_bytes, slot);
+        self.store_retval(num, den_bytes);
         self.emit("    RETURN".to_string());
     }
 
@@ -10011,10 +10045,13 @@ impl<'m> Gen<'m> {
             "__mul_u32" => self.emit_hw_mul(name, 4, scr),
             "__udiv_u8" => self.emit_divmod(name, 1, scr, true),
             "__urem_u8" => self.emit_divmod(name, 1, scr, false),
+            "__udivmod_u8" => self.emit_udivmod(name, 1, scr),
             "__udiv_u16" => self.emit_divmod(name, 2, scr, true),
             "__urem_u16" => self.emit_divmod(name, 2, scr, false),
+            "__udivmod_u16" => self.emit_udivmod(name, 2, scr),
             "__udiv_u32" => self.emit_divmod(name, 4, scr, true),
             "__urem_u32" => self.emit_divmod(name, 4, scr, false),
+            "__udivmod_u32" => self.emit_udivmod(name, 4, scr),
             "__udec_u32" => self.emit_udec_u32(name, scr),
             "__udec_u16_5" => self.emit_udec_u16_5(name, scr),
             "__sdiv_i8" => self.emit_sdivmod(name, 1, scr, true),

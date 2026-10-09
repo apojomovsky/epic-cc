@@ -170,10 +170,8 @@ fn legalize_inner(m: Module, pic18: bool) -> Module {
     let isr_used = split_isr_routines(&mut funcs, &used);
     // Div/mod fusion runs after the ISR split so the call spellings already
     // name their context: only main-context pairs fuse (see the function).
-    // Skipped on the PIC18 entry, whose backend owns its own divide shape.
-    if !pic18 {
-        fuse_divmod_pairs(&mut funcs, &mut m.globals, &mut used);
-    }
+    // Both entries fuse now that isel-pic18 owns combined recipes.
+    fuse_divmod_pairs(&mut funcs, &mut m.globals, &mut used);
     for name in &used {
         funcs.push(routine_func(name));
     }

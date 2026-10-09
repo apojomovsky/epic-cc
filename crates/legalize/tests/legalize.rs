@@ -2907,9 +2907,10 @@ fn no_fuse_across_blocks() {
     );
 }
 
-/// The PIC18 entry skips fusion: its backend owns its own divide shape.
+/// The PIC18 entry fuses like the main one now that isel-pic18 owns
+/// combined recipes (epic-cc#982).
 #[test]
-fn no_fuse_on_pic18_entry() {
+fn fuses_matching_pair_on_pic18_entry() {
     use legalize::legalize_pic18;
     let m = parse(
         "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
@@ -2925,7 +2926,29 @@ fn no_fuse_on_pic18_entry() {
     );
     let text = ir::serialize(&legalize_pic18(m));
     assert!(
-        text.contains("@__udiv_u16(") && !text.contains("__udivmod"),
-        "pic18 pair fused:\n{text}"
+        text.contains("@__udivmod_u16(")
+            && text.contains("%6 = load volatile i16 @__udivmod_rem_u16"),
+        "pic18 pair kept two calls:\n{text}"
     );
+}
+
+/// ISR spellings keep two calls on the PIC18 entry too: fusion only
+/// provides the main-context slot.
+#[test]
+fn no_fuse_on_pic18_isr_spellings() {
+    use legalize::legalize_pic18;
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = call i16 @__udiv_u16_isr(i16 %1, i16 %2)\n\
+             store i16 %3 @q\n\
+             %6 = call i16 @__urem_u16_isr(i16 %1, i16 %2)\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize_pic18(m));
+    assert!(!text.contains("__udivmod"), "isr pair fused:\n{text}");
 }
