@@ -22,8 +22,10 @@ pub enum SweepDevice {
 /// `entry_status` is a full STATUS value on PIC18; on PIC14 only its
 /// C/DC/Z bits take effect (RP bits stay clear so direct operands keep
 /// addressing bank 0, TO/PD are never written and are masked on
-/// capture). Every lane watches exactly one file address, so each case
-/// occupies the same three slots (`W`, `STATUS`, watched address).
+/// capture). Every lane watches exactly one file address and must poke
+/// it: an unpoked watch reads sim-poison in-tree against hardware POR
+/// on silicon, and both builders refuse such a case outright. Each
+/// case occupies the same three slots (`W`, `STATUS`, watched address).
 #[derive(Clone)]
 pub struct SweepCase {
     pub entry_w: u8,
@@ -126,16 +128,21 @@ fn fonly_cases() -> Vec<SweepCase> {
 }
 
 /// Literal lanes (`W` op `k`): the immediate is baked into the lane,
-/// so cases cross `W` corners with entry STATUS.
+/// so cases cross `W` and `F` corners with entry STATUS. The `F` poke
+/// is load-bearing, not coverage: an unpoked watched address reads
+/// sim-poison in-tree against hardware POR on silicon, so every watch
+/// must be poked (the same rule `mdb`'s guards rely on).
 fn lit_cases() -> Vec<SweepCase> {
     let mut out = Vec::new();
     for &w in OPERAND_CORNERS {
-        for &s in STATUS_CORNERS {
-            out.push(SweepCase {
-                entry_w: w,
-                entry_status: s,
-                pokes: Vec::new(),
-            });
+        for &f in OPERAND_CORNERS {
+            for &s in STATUS_CORNERS {
+                out.push(SweepCase {
+                    entry_w: w,
+                    entry_status: s,
+                    pokes: vec![(LANE_ADDR, f)],
+                });
+            }
         }
     }
     out
@@ -179,19 +186,21 @@ fn fonly_nightly() -> Vec<SweepCase> {
 
 fn lit_nightly() -> Vec<SweepCase> {
     let mut cases = lit_cases();
-    cases.extend(stride_cases(false));
+    cases.extend(stride_cases(true));
     cases
 }
 
 fn daw_cases() -> Vec<SweepCase> {
     let mut out = Vec::new();
     for &w in &[0x00u8, 0x09, 0x0A, 0x10, 0x99, 0x9A, 0xA0, 0xFF] {
-        for &s in DAW_STATUS {
-            out.push(SweepCase {
-                entry_w: w,
-                entry_status: s,
-                pokes: Vec::new(),
-            });
+        for &f in &[0x00u8, 0xFF] {
+            for &s in DAW_STATUS {
+                out.push(SweepCase {
+                    entry_w: w,
+                    entry_status: s,
+                    pokes: vec![(LANE_ADDR, f)],
+                });
+            }
         }
     }
     out
@@ -199,13 +208,16 @@ fn daw_cases() -> Vec<SweepCase> {
 
 fn daw_nightly() -> Vec<SweepCase> {
     let mut cases = daw_cases();
-    for w in 0..=255u16 {
-        for &s in DAW_STATUS {
-            cases.push(SweepCase {
-                entry_w: w as u8,
-                entry_status: s,
-                pokes: Vec::new(),
-            });
+    for i in 0..32u16 {
+        let w = (i * 8 + 3) as u8;
+        for &f in &[0x00u8, 0xFF] {
+            for &s in DAW_STATUS {
+                cases.push(SweepCase {
+                    entry_w: w,
+                    entry_status: s,
+                    pokes: vec![(LANE_ADDR, f)],
+                });
+            }
         }
     }
     cases
@@ -214,18 +226,17 @@ fn daw_nightly() -> Vec<SweepCase> {
 /// Rig canary: `MOVLW` overwrites `W` unconditionally, so any harness
 /// breakage (assemble, emit, parse, compare) fails this lane first.
 fn canary_cases() -> Vec<SweepCase> {
-    vec![
-        SweepCase {
-            entry_w: 0x00,
-            entry_status: 0x00,
-            pokes: Vec::new(),
-        },
-        SweepCase {
-            entry_w: 0xFF,
-            entry_status: 0x01,
-            pokes: Vec::new(),
-        },
-    ]
+    let mut out = Vec::new();
+    for &(w, s) in &[(0x00u8, 0x00u8), (0xFF, 0x01)] {
+        for &f in &[0x00u8, 0xFF] {
+            out.push(SweepCase {
+                entry_w: w,
+                entry_status: s,
+                pokes: vec![(LANE_ADDR, f)],
+            });
+        }
+    }
+    out
 }
 
 macro_rules! lane {
@@ -454,6 +465,13 @@ pub fn build_sweep_18(items: &[SweepItem]) -> Batch {
         for line in &it.candidate {
             assert!(!line.contains(':'), "sweep lanes are label-free single ops");
         }
+        // An unpoked watch reads sim-poison in-tree against hardware
+        // POR on silicon: every lane must poke what it watches.
+        assert!(
+            it.case.pokes.iter().any(|&(a, _)| a == LANE_ADDR),
+            "sweep lane {} leaves its watch unpoked",
+            it.lane
+        );
         for &(addr, val) in &it.case.pokes {
             src.push_str(&format!("movlw 0x{val:02X}\n"));
             if addr < 0x80 || addr >= PIC18_SFR_FLOOR {
@@ -620,6 +638,11 @@ pub fn build_sweep_14(items: &[SweepItem]) -> Batch {
         for line in &it.candidate {
             assert!(!line.contains(':'), "sweep lanes are label-free single ops");
         }
+        assert!(
+            it.case.pokes.iter().any(|&(a, _)| a == LANE_ADDR),
+            "sweep lane {} leaves its watch unpoked",
+            it.lane
+        );
         sel_bank(&mut src, &mut cur, 0);
         for &(addr, val) in &it.case.pokes {
             assert!(addr < 0x80, "sweep pokes stay in bank 0");
