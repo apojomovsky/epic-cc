@@ -98,7 +98,9 @@ while [ "$i" -lt "$NCHUNKS" ]; do
   else
     HEX_ARG="build/epiccc/mdb-oracle.hex"
   fi
-  if ! hal_mdb "$HEX_ARG" PIC18F4550 5000 "$EXTRA_MDB" "$OUT/mdb.log"; then
+  DEVICE="$(cat "$OUT/device.txt")"
+  [ -n "$DEVICE" ] || { echo "mdb-oracle: chunk $i: empty device.txt" >&2; exit 1; }
+  if ! hal_mdb "$HEX_ARG" "$DEVICE" 5000 "$EXTRA_MDB" "$OUT/mdb.log"; then
     echo "mdb-oracle: chunk $i: mdb session failed, see $OUT/mdb.log" >&2
     tail -20 "$OUT/mdb.log" >&2
     exit 1

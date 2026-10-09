@@ -46,6 +46,7 @@ one-line index entry here, e.g.:
 - ADR-046: Flash-resident C++ vtables via runtime `TBLRD` on PIC18 (shared flash-pointer provenance in `iselcore`, other backends panic), 2026-10-03
 - ADR-047: Outline matching stays exact-text under frame renumbering (cross-frame coincidences are inherently layout-sensitive; #853 unblocked), 2026-10-08
 - ADR-048: PIC18 ISR context save narrows to the reachable clobber set (text scan, exact-line filter, loud on drift; shared stub rejected), 2026-10-08
+- ADR-049: Opcode-level MPLAB SIM sweep in four shards (one lane per ALU opcode, lane-tagged mismatch logs, banked PIC14 table; per-op jobs and per-core jobs rejected), 2026-10-09
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 
