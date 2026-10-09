@@ -2655,6 +2655,222 @@ fn fuses_nonvolatile_reloads_across_unrelated_store() {
         "reloaded pair fused:\n{text}"
     );
 }
+/// A fused pair drops the removed call's operand reloads at every width:
+/// each non-volatile reload loads a slot nothing reads anymore, so it has
+/// no observable effect. The divide-side loads stay live on the fused call.
+#[test]
+fn drops_dead_reloads_after_fusion() {
+    for (ty, combined, slot) in [
+        ("i8", "__udivmod_u8", "__udivmod_rem_u8"),
+        ("i16", "__udivmod_u16", "__udivmod_rem_u16"),
+        ("i32", "__udivmod_u32", "__udivmod_rem_u32"),
+    ] {
+        let m = parse(&format!(
+            "global a {ty}\nglobal b {ty}\nglobal q {ty}\nglobal m {ty}\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load {ty} @a\n\
+                 %2 = load {ty} @b\n\
+                 %3 = udiv {ty} %1 %2\n\
+                 store {ty} %3 @q\n\
+                 %4 = load {ty} @a\n\
+                 %5 = load {ty} @b\n\
+                 %6 = urem {ty} %4 %5\n\
+                 store {ty} %6 @m\n\
+                 ret void\n",
+        ));
+        let text = ir::serialize(&legalize(m));
+        assert!(
+            text.contains(&format!("@{combined}({ty} %1, {ty} %2)"))
+                && text.contains(&format!("%6 = load volatile {ty} @{slot}")),
+            "{ty}: reloaded pair fused:\n{text}"
+        );
+        assert!(
+            !text.contains("%4 = load") && !text.contains("%5 = load"),
+            "{ty}: dead reloads dropped:\n{text}"
+        );
+        assert!(
+            text.contains("%1 = load") && text.contains("%2 = load"),
+            "{ty}: live divide loads kept:\n{text}"
+        );
+    }
+}
+/// Shared divide-side operands keep their loads: the fused call still reads
+/// them, so they are live. Only the removed call's private reloads may go.
+#[test]
+fn keeps_shared_operand_loads_after_fusion() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %6 = urem i16 %1 %2\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(i16 %1, i16 %2)")
+            && text.contains("%1 = load i16 @a")
+            && text.contains("%2 = load i16 @b"),
+        "shared loads kept on the fused call:\n{text}"
+    );
+}
+/// A reload used anywhere beyond the removed call stays: its value is still
+/// observed, so only the truly private sibling drops.
+#[test]
+fn keeps_reload_used_elsewhere_after_fusion() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal extra i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %4 = load i16 @a\n\
+             %5 = load i16 @b\n\
+             %6 = urem i16 %4 %5\n\
+             store i16 %6 @m\n\
+             store i16 %4 @extra\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(i16 %1, i16 %2)"),
+        "pair fused:\n{text}"
+    );
+    assert!(
+        text.contains("%4 = load i16 @a") && !text.contains("%5 = load"),
+        "used reload kept, private sibling dropped:\n{text}"
+    );
+}
+/// A reload of an address-taken global stays even when the removed call was
+/// its only reader: the address may reach a writer the scan cannot see.
+#[test]
+fn keeps_address_taken_reload_after_fusion() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %4 = load i16 @a\n\
+             %5 = load i16 @b\n\
+             %6 = urem i16 %4 %5\n\
+             store i16 %6 @m\n\
+             %7 = gep @a +0\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(i16 %1, i16 %2)"),
+        "pair fused:\n{text}"
+    );
+    assert!(
+        text.contains("%4 = load i16 @a") && !text.contains("%5 = load"),
+        "taken reload kept, untaken sibling dropped:\n{text}"
+    );
+}
+/// Two chained remainders on reloaded operands fuse onto one call and drop
+/// both reloads once: each candidate records once, so the sweep never drops
+/// the same index twice.
+#[test]
+fn drops_dead_reloads_for_chained_remainders() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal m2 i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %4 = load i16 @a\n\
+             %5 = load i16 @b\n\
+             %6 = urem i16 %4 %5\n\
+             store i16 %6 @m\n\
+             %7 = urem i16 %4 %5\n\
+             store i16 %7 @m2\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(")
+            && text.contains("%6 = load volatile i16 @__udivmod_rem_u16")
+            && text.contains("%7 = load volatile i16 @__udivmod_rem_u16"),
+        "both remainders fused:\n{text}"
+    );
+    assert!(
+        !text.contains("%4 = load") && !text.contains("%5 = load"),
+        "dead reloads dropped once:\n{text}"
+    );
+}
+/// A reload read from a successor block stays: the liveness scan covers the
+/// whole function, so a cross-block use keeps the load even though the
+/// fused block itself no longer reads it.
+#[test]
+fn keeps_reload_used_in_successor_block_after_fusion() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal extra i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %4 = load i16 @a\n\
+             %5 = load i16 @b\n\
+             %6 = urem i16 %4 %5\n\
+             store i16 %6 @m\n\
+             br next\n\
+           block next:\n\
+             store i16 %4 @extra\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(i16 %1, i16 %2)"),
+        "pair fused:\n{text}"
+    );
+    assert!(
+        text.contains("%4 = load i16 @a") && !text.contains("%5 = load"),
+        "cross-block reload kept, private sibling dropped:\n{text}"
+    );
+}
+/// An address leaked as a stored global value keeps the reload too: the
+/// escape guard covers every operand position, not just `gep` bases.
+#[test]
+fn keeps_reload_leaked_as_store_value_after_fusion() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal extra i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %4 = load i16 @a\n\
+             %5 = load i16 @b\n\
+             %6 = urem i16 %4 %5\n\
+             store i16 %6 @m\n\
+             store i16 @a @extra\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(i16 %1, i16 %2)"),
+        "pair fused:\n{text}"
+    );
+    assert!(
+        text.contains("%4 = load i16 @a") && !text.contains("%5 = load"),
+        "leaked reload kept, untaken sibling dropped:\n{text}"
+    );
+}
 
 /// One volatile load pair shared by both operations fuses: a single read
 /// has one value, however it was obtained.

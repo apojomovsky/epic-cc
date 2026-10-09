@@ -1530,23 +1530,109 @@ fn divmod_rem_width(func: &str) -> Option<(Ty, &'static str)> {
         _ => None,
     }
 }
+/// Globals whose address escapes into a pointer or an operand: a `gep`
+/// base or a `Val::Global` in any operand position. Direct `load`/`store`
+/// pointers are plain accesses, not escapes. The fusion reload drop keeps
+/// loads of these globals, since the address may reach an unseen writer.
+fn addr_taken(funcs: &[Func]) -> HashSet<String> {
+    fn mark(v: &Val, out: &mut HashSet<String>) {
+        if let Val::Global(g) = v {
+            out.insert(g.clone());
+        }
+    }
+    let mut out: HashSet<String> = HashSet::new();
+    for f in funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                match inst {
+                    Inst::Load(_) => {}
+                    Inst::Store(s) => mark(&s.val, &mut out),
+                    Inst::Bin(b) => {
+                        mark(&b.a, &mut out);
+                        mark(&b.b, &mut out);
+                    }
+                    Inst::Ret(Some((_, v)), _) => mark(v, &mut out),
+                    Inst::Ret(None, _) => {}
+                    Inst::Zext(z) => mark(&z.val, &mut out),
+                    Inst::Sext(x) => mark(&x.val, &mut out),
+                    Inst::Trunc(t) => mark(&t.val, &mut out),
+                    Inst::IntToPtr(p) => mark(&p.val, &mut out),
+                    Inst::Icmp(c) => {
+                        mark(&c.a, &mut out);
+                        mark(&c.b, &mut out);
+                    }
+                    Inst::Select(s) => {
+                        mark(&s.cond, &mut out);
+                        mark(&s.a, &mut out);
+                        mark(&s.b, &mut out);
+                    }
+                    Inst::Call(c) => {
+                        for a in &c.args {
+                            mark(&a.val, &mut out);
+                        }
+                    }
+                    Inst::Br(_) => {}
+                    Inst::BrCond(b) => mark(&b.cond, &mut out),
+                    Inst::Switch(s) => mark(&s.val, &mut out),
+                    Inst::Phi(p) => {
+                        for (v, _) in &p.incoming {
+                            mark(v, &mut out);
+                        }
+                    }
+                    Inst::Gep(g) => {
+                        if let GepBase::Global(n) = &g.base {
+                            out.insert(n.clone());
+                        }
+                    }
+                    Inst::Alloca(_) | Inst::VaArg(_) | Inst::VaStart(_) => {}
+                    Inst::Memcpy(mc) => {
+                        mark(&mc.dst, &mut out);
+                        mark(&mc.src, &mut out);
+                    }
+                    Inst::Freeze(f) => mark(&f.val, &mut out),
+                    Inst::FloatBin(b) => {
+                        mark(&b.a, &mut out);
+                        mark(&b.b, &mut out);
+                    }
+                    Inst::Fcmp(c) => {
+                        mark(&c.a, &mut out);
+                        mark(&c.b, &mut out);
+                    }
+                    Inst::FloatConv(c) => mark(&c.val, &mut out),
+                    Inst::Asm(a) => {
+                        for op in &a.operands {
+                            if let Some(g) = op.ptr.strip_prefix('@') {
+                                out.insert(g.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
 /// Fuse a same-block `udiv`/`urem` or `sdiv`/`srem` pair on identical
 /// operands into one combined divide call (epic-cc#895, signed half
-/// epic-cc#981). Every divide routine already computes both halves and
-/// discards one, so the fused shape runs the loop once: quotient to
-/// retval, remainder spilled to the slot the old remainder site loads.
-/// Identity is one shared SSA value or two non-volatile loads of one
-/// global (volatile reads may differ); no call, opaque write, or
-/// operand-global store may sit between the pair.
+/// epic-cc#981). The routines compute both halves, so the fused shape runs
+/// the loop once: quotient to retval, remainder spilled to the slot the old
+/// remainder site loads. Identity is one shared SSA value or two
+/// non-volatile loads of one global; no call, opaque write, or
+/// operand-global store may sit between the pair. A remainder-side reload
+/// nothing else reads drops with the call.
 fn fuse_divmod_pairs(funcs: &mut [Func], globals: &mut Vec<Global>, used: &mut Vec<String>) {
     // A remainder slot shadowed by any user global never fuses: reusing it
     // would alias the user's variable even at the same type.
     let blocked = |slot: &str| globals.iter().any(|g| g.name == slot);
+    let taken = addr_taken(funcs);
     // One entry per combined routine fused: signed and unsigned share
     // widths but not slots, so the width alone cannot key this list.
     let mut fused: Vec<(Ty, String, String)> = Vec::new();
     for f in funcs.iter_mut() {
-        for b in f.blocks.iter_mut() {
+        // Remainder-side proving loads a fuse may orphan: (block, index).
+        // Dropped after the scan when nothing else reads them.
+        let mut dead: Vec<(usize, usize)> = Vec::new();
+        for (bi, b) in f.blocks.iter_mut().enumerate() {
             // Same-block loads resolving an operand to its global: reg ->
             // (def index, global). Volatile loads never resolve: two reads
             // of one volatile global may return different values (MMIO, or
@@ -1687,10 +1773,55 @@ fn fuse_divmod_pairs(funcs: &mut [Func], globals: &mut Vec<Global>, used: &mut V
                     volatile: true,
                     loc: mloc,
                 });
+                // Remainder-side proving loads may now be dead: each loads
+                // a slot only the removed call read. The sweep below drops
+                // the ones nothing else uses.
+                for d in ea.into_iter().chain(eb) {
+                    if !dead.contains(&(bi, d)) {
+                        dead.push((bi, d));
+                    }
+                }
                 // Rescan from the same divide: a second remainder below
                 // the first fuses onto the same call. Each fuse removes a
                 // call, so the loop still terminates.
             }
+        }
+        // Drop the orphaned reloads: a candidate goes when it is still a
+        // same-block non-volatile load, its global's address never escapes,
+        // and its slot has no other def or use left in the function. The
+        // removed call is already gone, so any remaining use keeps it.
+        let mut drop: Vec<(usize, usize)> = Vec::new();
+        for (bi, idx) in dead {
+            let (dst, glob) = match f.blocks.get(bi).and_then(|b| b.insts.get(idx)) {
+                Some(Inst::Load(l)) if !l.volatile => match l.ptr.strip_prefix('@') {
+                    Some(g) => (l.dst.clone(), g.to_string()),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if taken.contains(&glob) {
+                continue;
+            }
+            let mut defs = 0;
+            let mut uses = 0;
+            for (bj, b) in f.blocks.iter().enumerate() {
+                for (ii, inst) in b.insts.iter().enumerate() {
+                    if inst_dst(inst) == Some(dst.as_str()) {
+                        defs += 1;
+                    }
+                    if (bj, ii) != (bi, idx) && inst_reads(inst).iter().any(|r| r == &dst) {
+                        uses += 1;
+                    }
+                }
+            }
+            if defs == 1 && uses == 0 {
+                drop.push((bi, idx));
+            }
+        }
+        drop.sort();
+        drop.dedup();
+        for (bi, idx) in drop.into_iter().rev() {
+            f.blocks[bi].insts.remove(idx);
         }
     }
     for (w, combined, slot) in &fused {
