@@ -1234,6 +1234,7 @@ fn inline_u16_call_emits_three_partials_under_the_speed_profile() {
     ]);
     let opts = isel_pic18::Options {
         copy_loop: true,
+        divmod_fold: false,
         inline_mul16: true,
     };
     let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
@@ -1274,6 +1275,7 @@ fn inline_u16_with_a_banked_operand_keeps_the_call() {
     ]);
     let opts = isel_pic18::Options {
         copy_loop: true,
+        divmod_fold: false,
         inline_mul16: true,
     };
     let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
@@ -3808,6 +3810,7 @@ fn speed_profile_drains_long_copy_runs_straight() {
     let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
     let opts = isel_pic18::Options {
         copy_loop: false,
+        divmod_fold: false,
         inline_mul16: false,
     };
     let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
