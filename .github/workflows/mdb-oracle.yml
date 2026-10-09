@@ -1,10 +1,11 @@
 name: mdb-oracle
 
-# MPLAB SIM execution oracle for superopt sequences (epic-cc#712): per-PR
-# pr tier on oracle-input changes, nightly sweep on schedule. Sessions run
-# in epic-hal's private toolchain image (same pull as its family-check).
-# Setup, not code: ghcr.io/<owner>/epic-hal-ci must grant this repo read
-# access, else the pull 401s.
+# MPLAB SIM execution oracle for superopt sequences (epic-cc#712): PR tier
+# runs only on oracle-input changes (sim, asm, superopt, the oracle script
+# and this workflow); isel-pic18 changes ride the nightly sweep below.
+# Sessions run in epic-hal's private toolchain image (same pull as its
+# family-check). Setup, not code: ghcr.io/<owner>/epic-hal-ci must grant
+# this repo read access, else the pull 401s.
 
 on:
   pull_request:
@@ -12,9 +13,7 @@ on:
       - crates/superopt/**
       - crates/sim/**
       - crates/asm/**
-      - crates/isel-pic18/**
       - scripts/mdb-oracle.sh
-      - Makefile
       - .github/workflows/mdb-oracle.yml
   schedule:
     - cron: "0 4 * * *"
