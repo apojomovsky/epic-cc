@@ -337,6 +337,22 @@ struct Gen<'m> {
     /// read-modify-write into its own home, phi-folded or same-homed.
     phi_fold: HashMap<String, String>,
     inplace_bins: HashSet<String>,
+    /// Const-phis threaded through W (epic-cc#825). Holds a phi dst
+    /// whose block has no other phi, every incoming is a one-byte
+    /// constant, and the only use is a direct-global store right after
+    /// the phis: each edge emits just `MOVLW`, the store one `MOVWF`.
+    const_w_phis: HashSet<String>,
+    /// Load bytes riding W into an adjacent const binop (epic-cc#825).
+    /// Holds a single-use one-byte load dst feeding a const-operand
+    /// `Add`/`And`/`Or`/`Xor` (or const-left `Sub`) in the next slot:
+    /// the load leaves the byte in W and the binop consumes it with a
+    /// literal op, skipping the temp stage.
+    bin_w_srcs: HashSet<String>,
+    /// Binop producers computing into their load operand's slot
+    /// (epic-cc#825). Maps a single-use const `Add`/`Sub` feeding a
+    /// `PLUSW` store to the single-use load temp it must accumulate
+    /// into, so the staged result temp disappears.
+    rmw_fwd: HashMap<String, String>,
     /// Value folds from the shared per-function pre-scan (epic-cc#863):
     /// loads whose byte never stages to a slot. `alloc` drops those
     /// slots; the load arm skips them and consumers read the source.
@@ -1513,6 +1529,332 @@ impl<'m> Gen<'m> {
         }
         (fwd, consumed)
     }
+    /// Const-producer pre-scan (epic-cc#825): a block with exactly one
+    /// phi, one byte wide, every incoming a constant, consumed only by
+    /// a direct-global store that follows the phis; or a `select` over
+    /// two constants consumed by the next instruction, a direct-global
+    /// store. Edges and arms leave the byte in W (`MOVLW` only) and the
+    /// store writes it (`MOVWF`), saving the per-arm slot write plus
+    /// the final copy. W survives the edge (copies, then a branch) and
+    /// the ISR preserves it, so the single-phi block keeps the threaded
+    /// copy last by construction.
+    fn find_const_w_phis(g: &Gen, f: &Func) -> HashSet<String> {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+        for b in &f.blocks {
+            let mut targets: Vec<&str> = Vec::new();
+            match b.insts.last() {
+                Some(Inst::Br(br)) => targets.push(&br.target),
+                Some(Inst::BrCond(bc)) => {
+                    targets.push(&bc.t);
+                    targets.push(&bc.f);
+                }
+                Some(Inst::Switch(sw)) => {
+                    for (_, l) in &sw.cases {
+                        targets.push(l);
+                    }
+                    targets.push(&sw.default);
+                }
+                _ => {}
+            }
+            for t in targets {
+                preds.entry(t).or_default().push(b.label.as_str());
+            }
+        }
+        let mut out = HashSet::new();
+        for b in &f.blocks {
+            let mut phis = b.insts.iter().filter_map(|i| match i {
+                Inst::Phi(p) => Some(p),
+                _ => None,
+            });
+            let Some(p) = phis.next() else { continue };
+            if phis.next().is_some() || p.ptr || p.ty.bytes() != 1 {
+                continue;
+            }
+            if p.incoming.is_empty() || p.incoming.iter().any(|(v, _)| !matches!(v, Val::Const(_)))
+            {
+                continue;
+            }
+            if uses.get(&p.dst).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            if g.lane_consumed.contains(&p.dst) || g.bit_lanes.contains_key(&p.dst) {
+                continue;
+            }
+            if g.resolved.contains_key(&ssa_key(&f.name, &p.dst)) {
+                continue;
+            }
+            // Every CFG predecessor must supply the constant, or W
+            // would be garbage on the uncovered edge.
+            let mut froms: Vec<&str> = p.incoming.iter().map(|(_, fr)| fr.as_str()).collect();
+            froms.sort_unstable();
+            let mut ps: Vec<&str> = preds.get(b.label.as_str()).cloned().unwrap_or_default();
+            ps.sort_unstable();
+            ps.dedup();
+            if froms != ps {
+                continue;
+            }
+            let mut rest = b.insts.iter().filter(|i| !matches!(i, Inst::Phi(_)));
+            let Some(Inst::Store(s)) = rest.next() else {
+                continue;
+            };
+            if !matches!(&s.val, Val::Reg(r) if r == &p.dst) || s.ty.bytes() != 1 {
+                continue;
+            }
+            let Some(dg) = s.ptr.strip_prefix('@') else {
+                continue;
+            };
+            let Some(known) = g.m.globals.iter().find(|x| x.name == dg) else {
+                continue;
+            };
+            if known.is_const {
+                continue;
+            }
+            out.insert(p.dst.clone());
+        }
+        // A `select` over two constants feeding a direct-global store
+        // threads the same way: both arms `MOVLW`, the store `MOVWF`.
+        // Straight-line, so the store must be the next instruction;
+        // anything between could clobber W.
+        for b in &f.blocks {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                let Inst::Select(s) = inst else { continue };
+                if s.ptr || s.ty.bytes() != 1 || matches!(s.cond, Val::Const(_)) {
+                    continue;
+                }
+                if !matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_))) {
+                    continue;
+                }
+                if uses.get(&s.dst).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                if g.lane_consumed.contains(&s.dst) || g.bit_lanes.contains_key(&s.dst) {
+                    continue;
+                }
+                if g.resolved.contains_key(&ssa_key(&f.name, &s.dst)) {
+                    continue;
+                }
+                let Some(Inst::Store(st)) = b.insts.get(ii + 1) else {
+                    continue;
+                };
+                if !matches!(&st.val, Val::Reg(r) if r == &s.dst) || st.ty.bytes() != 1 {
+                    continue;
+                }
+                let Some(dg) = st.ptr.strip_prefix('@') else {
+                    continue;
+                };
+                let Some(known) = g.m.globals.iter().find(|x| x.name == dg) else {
+                    continue;
+                };
+                if known.is_const {
+                    continue;
+                }
+                out.insert(s.dst.clone());
+            }
+        }
+        out
+    }
+    /// W-operand pre-scan (epic-cc#825): a single-use one-byte load from
+    /// a RAM global immediately feeding a const-operand `Add`/`And`/`Or`
+    /// /`Xor` (either side) or a const-left `Sub`. The load leaves its
+    /// byte in W and the binop consumes it with a literal op, so the
+    /// temp stage plus the literal materialization disappear. Loads
+    /// already folded by the shared value folds stay out, so a dropped
+    /// slot is never read.
+    fn find_bin_w_srcs(g: &Gen, f: &Func) -> HashSet<String> {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut out = HashSet::new();
+        for b in &f.blocks {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                let Inst::Load(l) = inst else { continue };
+                if l.ty.bytes() != 1 || l.ptr_ty {
+                    continue;
+                }
+                let Some(gname) = l.ptr.strip_prefix('@') else {
+                    continue;
+                };
+                let Some(known) = g.m.globals.iter().find(|x| x.name == gname) else {
+                    continue;
+                };
+                if known.is_const {
+                    continue;
+                }
+                if uses.get(&l.dst).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                if g.lane_consumed.contains(&l.dst) || g.bit_lanes.contains_key(&l.dst) {
+                    continue;
+                }
+                if g.resolved.contains_key(&ssa_key(&f.name, &l.dst)) {
+                    continue;
+                }
+                if g.w_folds.loads.contains_key(&l.dst) {
+                    continue;
+                }
+                let Some(Inst::Bin(q)) = b.insts.get(ii + 1) else {
+                    continue;
+                };
+                if q.ty.bytes() != 1 {
+                    continue;
+                }
+                if g.lane_consumed.contains(&q.dst) || g.bit_lanes.contains_key(&q.dst) {
+                    continue;
+                }
+                if g.resolved.contains_key(&ssa_key(&f.name, &q.dst)) {
+                    continue;
+                }
+                let w_form = match (&q.a, &q.b) {
+                    (Val::Reg(x), Val::Const(_))
+                        if x == &l.dst
+                            && matches!(
+                                q.op,
+                                ir::BinOp::Add | ir::BinOp::And | ir::BinOp::Or | ir::BinOp::Xor
+                            ) =>
+                    {
+                        true
+                    }
+                    (Val::Const(_), Val::Reg(x))
+                        if x == &l.dst
+                            && matches!(
+                                q.op,
+                                ir::BinOp::Add
+                                    | ir::BinOp::And
+                                    | ir::BinOp::Or
+                                    | ir::BinOp::Xor
+                                    | ir::BinOp::Sub
+                            ) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+                if !w_form {
+                    continue;
+                }
+                out.insert(l.dst.clone());
+            }
+        }
+        out
+    }
+    /// In-place RMW pre-scan (epic-cc#825): a single-use const `Add`/`Sub`
+    /// immediately followed by the `PLUSW` store it feeds, whose value
+    /// operand is a single-use load temp. The binop accumulates into the
+    /// operand's slot with an in-place literal lane, so its own result
+    /// temp disappears. Adjacency is load-bearing: `alloc` ends the
+    /// operand's live range at the binop, so any gap def could be colored
+    /// into its slot.
+    /// Loads already riding W into their binop stay out; that fold wins
+    /// more on the same shape.
+    fn find_rmw_fwds(g: &Gen, f: &Func, bin_w: &HashSet<String>) -> HashMap<String, String> {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        for b in &f.blocks {
+            for (bi, inst) in b.insts.iter().enumerate() {
+                let Inst::Bin(q) = inst else { continue };
+                if !matches!(q.op, ir::BinOp::Add | ir::BinOp::Sub) {
+                    continue;
+                }
+                let n = q.ty.bytes();
+                if n != 1 && n != 2 && n != 4 {
+                    continue;
+                }
+                if g.lane_consumed.contains(&q.dst) || g.bit_lanes.contains_key(&q.dst) {
+                    continue;
+                }
+                if g.resolved.contains_key(&ssa_key(&f.name, &q.dst)) {
+                    continue;
+                }
+                if uses.get(&q.dst).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                let Some((lreg, _)) = Self::const_bin_reg(&q.op, &q.a, &q.b) else {
+                    continue;
+                };
+                if bin_w.contains(&lreg) {
+                    continue;
+                }
+                let Some(li) = b.insts[..bi].iter().rposition(|i| match i {
+                    Inst::Load(l) => &l.dst == &lreg,
+                    _ => false,
+                }) else {
+                    continue;
+                };
+                let Inst::Load(l) = &b.insts[li] else {
+                    continue;
+                };
+                if l.ty.bytes() != n || l.ptr_ty {
+                    continue;
+                }
+                if uses.get(&lreg).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                if g.lane_consumed.contains(&lreg) || g.bit_lanes.contains_key(&lreg) {
+                    continue;
+                }
+                if g.resolved.contains_key(&ssa_key(&f.name, &lreg)) {
+                    continue;
+                }
+                if g.w_folds.loads.contains_key(&lreg) {
+                    continue;
+                }
+                // The store must immediately follow the binop: `alloc`
+                // ends `lreg`'s live range at the binop, so any gap def
+                // could be colored into the operand slot and the renamed
+                // store would read the clobbered value.
+                let Some(Inst::Store(s)) = b.insts.get(bi + 1) else {
+                    continue;
+                };
+                if !matches!(&s.val, Val::Reg(x) if x == &q.dst) {
+                    continue;
+                }
+                if s.ty.bytes() != n {
+                    continue;
+                }
+                let ptr_val = if let Some(gname) = s.ptr.strip_prefix('@') {
+                    Val::Global(gname.to_string())
+                } else if let Some(r) = s.ptr.strip_prefix('%') {
+                    Val::Reg(r.to_string())
+                } else {
+                    continue;
+                };
+                if g.plusw_shape(&ptr_val).is_none() {
+                    continue;
+                }
+                out.insert(q.dst.clone(), lreg.clone());
+            }
+        }
+        out
+    }
     /// The register side of an `Add`/`Sub` against a constant: the value
     /// operand plus the literal. `Add` commutes, so a constant on either
     /// side qualifies; `k - a` keeps the `SUBLW` lowering and never folds.
@@ -1580,8 +1922,8 @@ impl<'m> Gen<'m> {
                 {
                     continue;
                 }
-                if Self::phi_backedge(f, &b.label, &qreg, r, n).is_some() {
-                    if Self::phi_tail_clean(g, f, b, qi, r, &qreg, n, &uses, &home_of) {
+                if let Some(header) = Self::phi_backedge(f, &b.label, &qreg, r, n) {
+                    if Self::phi_tail_clean(g, f, b, qi, r, &qreg, n, &header, &home_of) {
                         phi_fold.insert(r.clone(), qreg.clone());
                         inplace.insert(r.clone());
                     }
@@ -1949,10 +2291,13 @@ impl<'m> Gen<'m> {
 
     /// The backedge incoming of `preg`'s phi carrying this `Bin`'s result:
     /// some block holds `Phi dest == preg` at width `n` with exactly one
-    /// incoming of `%r` from `pred`. `None` when the result feeds no such
-    /// edge (the common case) or the shape is ambiguous.
-    fn phi_backedge(f: &Func, pred: &str, preg: &str, r: &str, n: u8) -> Option<()> {
-        let mut found = false;
+    /// The backedge incoming of `preg`'s phi carrying this `Bin`'s result:
+    /// some block holds `Phi dest == preg` at width `n` with exactly one
+    /// incoming of `%r` from `pred`. Returns that block's label, or `None`
+    /// when the result feeds no such edge (the common case) or the shape
+    /// is ambiguous.
+    fn phi_backedge(f: &Func, pred: &str, preg: &str, r: &str, n: u8) -> Option<String> {
+        let mut found: Option<String> = None;
         for h in &f.blocks {
             for inst in &h.insts {
                 let Inst::Phi(p) = inst else { continue };
@@ -1965,25 +2310,30 @@ impl<'m> Gen<'m> {
                     .filter(|(v, from)| matches!(v, Val::Reg(rr) if rr == r) && from == pred)
                     .count();
                 if hits == 1 {
-                    if found {
+                    if found.is_some() {
                         return None;
                     }
-                    found = true;
+                    found = Some(h.label.clone());
                 } else if hits > 1 {
                     return None;
                 }
             }
         }
-        found.then_some(())
+        found
     }
 
     /// Whether the tail from a folded `Bin` to its block's terminator can
     /// host the in-place update: every use of the result `%r` is an
     /// `Icmp` in this same tail (renamed to the phi reg at emission) or a
-    /// phi edge (renamed the same way), the operand `%p` is read nowhere
-    /// else, and the tail holds no call, return, switch, store-shaped
-    /// write, or address-taken read of either home. A writer between
-    /// (`Icmp`/`Load` results) must home outside the phi's lanes.
+    /// phi edge (renamed the same way). The phi operand `%p` may have
+    /// other readers: they all observe edge-synced values except reads
+    /// ordered after the folded write, which are the tail past the `Bin`
+    /// (only renamed `%r` readers may sit there), the blocks reachable
+    /// from `b` without passing the phi's block, and copies on `b`'s
+    /// outgoing edges. Each is rejected below. The tail holds no call,
+    /// return, switch, store-shaped write, or address-taken read of
+    /// either home. A writer between (`Icmp`/`Load` results) must home
+    /// outside the phi's lanes.
     #[allow(clippy::too_many_arguments)]
     fn phi_tail_clean(
         g: &Gen,
@@ -1993,10 +2343,50 @@ impl<'m> Gen<'m> {
         r: &str,
         preg: &str,
         n: u8,
-        uses: &HashMap<String, usize>,
+        header: &str,
         home_of: &dyn Fn(&str) -> Option<u16>,
     ) -> bool {
-        if uses.get(preg).copied().unwrap_or(0) != 1 {
+        let reads_preg = |inst: &Inst| ir::read_vals(inst).iter().any(|v| v.as_str() == preg);
+        // Blocks reachable from `b` without passing the phi's block:
+        // a `%p` read there would observe the folded value where the
+        // original saw the edge value. Reads in the phi's block see
+        // edge-synced values, and reads in `b` before the `Bin` run
+        // before the folded write.
+        let mut danger: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut stack: Vec<&str> = match b.insts.last() {
+            Some(Inst::Br(br)) => vec![br.target.as_str()],
+            Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+            Some(Inst::Switch(sw)) => sw
+                .cases
+                .iter()
+                .map(|(_, l)| l.as_str())
+                .chain(std::iter::once(sw.default.as_str()))
+                .collect(),
+            _ => vec![],
+        };
+        while let Some(l) = stack.pop() {
+            if l == header || !danger.insert(l) {
+                continue;
+            }
+            let Some(ob) = f.blocks.iter().find(|bb| bb.label == l) else {
+                continue;
+            };
+            match ob.insts.last() {
+                Some(Inst::Br(br)) => stack.push(br.target.as_str()),
+                Some(Inst::BrCond(bc)) => {
+                    stack.push(bc.t.as_str());
+                    stack.push(bc.f.as_str());
+                }
+                Some(Inst::Switch(sw)) => {
+                    for (_, s) in &sw.cases {
+                        stack.push(s.as_str());
+                    }
+                    stack.push(sw.default.as_str());
+                }
+                _ => {}
+            }
+        }
+        if danger.contains(b.label.as_str()) {
             return false;
         }
         let Some(sp) = g.addrs.get(&ssa_key(&f.name, preg)).copied() else {
@@ -2020,7 +2410,14 @@ impl<'m> Gen<'m> {
             if ob.label == b.label {
                 continue;
             }
+            // A `%p` read outside the phi's block is sound only when
+            // every path from the folded write reaches it through the
+            // phi's edge sync, which the danger set above excludes.
+            let preg_ok = ob.label == header || !danger.contains(ob.label.as_str());
             for inst in &ob.insts {
+                if !preg_ok && reads_preg(inst) {
+                    return false;
+                }
                 let nreads = reads_of(inst);
                 if nreads == 0 {
                     continue;
@@ -2045,17 +2442,20 @@ impl<'m> Gen<'m> {
             match inst {
                 Inst::Phi(_) => {
                     phi_reads += reads_of(inst);
+                    if reads_preg(inst) {
+                        return false;
+                    }
                 }
                 Inst::Icmp(c) => {
                     if g.lane_consumed.contains(&c.dst) || g.bit_lanes.contains_key(&c.dst) {
                         return false;
                     }
-                    if !disjoint(&c.dst) {
+                    if reads_preg(inst) || !disjoint(&c.dst) {
                         return false;
                     }
                 }
                 Inst::Load(l) => {
-                    if reads_of(inst) > 0 || !disjoint(&l.dst) {
+                    if reads_of(inst) > 0 || reads_preg(inst) || !disjoint(&l.dst) {
                         return false;
                     }
                     let overlap = match Self::static_base(g, &f.name, &l.ptr) {
@@ -2067,7 +2467,7 @@ impl<'m> Gen<'m> {
                     }
                 }
                 Inst::Br(_) | Inst::BrCond(_) => {
-                    if reads_of(inst) > 0 {
+                    if reads_of(inst) > 0 || reads_preg(inst) {
                         return false;
                     }
                 }
@@ -2077,9 +2477,10 @@ impl<'m> Gen<'m> {
         // Copies on `b`'s outgoing edges run after the folded write: any
         // of them homing inside the phi's lanes would clobber the folded
         // value before its next read. Only the folded self-copy may touch
-        // the lanes (it emits nothing). Reads need no check: `%p` has no
-        // other reader by the use count above, and renamed `%r` readers
-        // want the new value.
+        // the lanes (it emits nothing). A copy reading `%p` on these
+        // edges would observe the folded value where the original saw
+        // the edge value, so only the self-copy (carrying `%r`) may run
+        // here; renamed `%r` readers want the new value.
         let succs: Vec<&str> = match b.insts.last() {
             Some(Inst::Br(br)) => vec![br.target.as_str()],
             Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
@@ -2100,6 +2501,9 @@ impl<'m> Gen<'m> {
                 for (val, from) in &p.incoming {
                     if from != &b.label {
                         continue;
+                    }
+                    if matches!(val, Val::Reg(x) if x == preg) {
+                        return false;
                     }
                     let Some(da) = g.addrs.get(&ssa_key(&f.name, &p.dst)).copied() else {
                         return false;
@@ -3000,7 +3404,14 @@ impl<'m> Gen<'m> {
     /// completes the access through `PLUSW0` (0xFEB) in the same straight
     /// line: `FSR0`, `W`, and the index slot must not be touched between
     /// this setup and that access. (epic-cc#665)
-    fn emit_plusw_setup(&mut self, shape: &PluswShape, byte_off: u8) {
+    ///
+    /// `w_ready` skips the index reload: the caller guarantees `W`
+    /// already holds the index (a previous byte's setup in the same
+    /// access, with only `W`-preserving instructions between). The
+    /// drain below still runs first, so a non-empty buffer (whose loop
+    /// form would clobber `W`) defeats the skip.
+    fn emit_plusw_setup(&mut self, shape: &PluswShape, byte_off: u8, w_ready: bool) {
+        let drained = !self.pending_copies.is_empty();
         self.flush_copies();
         let static_part = shape.k.wrapping_add(u16::from(byte_off));
         let origin = Fsr0Origin::Absolute(shape.base);
@@ -3009,6 +3420,9 @@ impl<'m> Gen<'m> {
             self.emit(format!("    LFSR 0, 0x{lit:03X}"));
         }
         self.fsr0_holds = Some((origin, static_part));
+        if w_ready && !drained {
+            return;
+        }
         let (ia, iff) = self.operand(shape.idx_slot);
         self.emit(format!(
             "    MOVF 0x{iff:03X},W,{}",
@@ -3280,10 +3694,25 @@ impl<'m> Gen<'m> {
             return false;
         }
         let delta = target_off - cur_off;
-        // A nonzero delta costs `MOVLW`/`ADDWF`/`MOVLW`/`ADDWFC` (4
-        // words) against a fresh `LFSR` (2), so an absolute base never
-        // takes it. A slot-held pointer has no literal to seed from,
-        // so only it walks forward. (epic-cc#665)
+        // A one-byte step forward from an absolute base costs one `INCF`
+        // on `FSR0L` against a fresh two-word `LFSR`, so adjacent static
+        // parts (a 16-bit access's two bytes) step instead of reseeding.
+        // The low byte is compile-time known for an absolute base, so a
+        // low byte of `0xFF` (whose increment would carry into `FSR0H`)
+        // keeps the `LFSR`. Slot-held pointers have no literal base to
+        // test, so they keep the delta walk. (epic-cc#825)
+        if delta == 1 {
+            if let Fsr0Origin::Absolute(base) = origin {
+                if base.wrapping_add(cur_off) & 0xFF != 0xFF {
+                    self.emit("    INCF 0xFE9,F,A".to_string());
+                    return true;
+                }
+                return false;
+            }
+        }
+        // A longer delta still costs `MOVLW`/`ADDWF`/`MOVLW`/`ADDWFC`
+        // (4 words) against a fresh `LFSR` (2), so an absolute base
+        // never takes it. (epic-cc#665)
         if delta != 0 && matches!(origin, Fsr0Origin::Absolute(_)) {
             return false;
         }
@@ -4605,6 +5034,17 @@ impl<'m> Gen<'m> {
                         }
                     }
                 }
+                // A W-operand load (epic-cc#825): the adjacent const
+                // binop consumes the byte from W with a literal op, so
+                // the temp stage disappears. The slot survives for its
+                // address, but nothing writes or reads it.
+                if self.bin_w_srcs.contains(&l.dst) {
+                    let src = l.ptr.strip_prefix('@').unwrap_or_else(|| {
+                        panic!("isel-pic18: W-operand load through non-global {:?}", l.ptr)
+                    });
+                    self.emit_w_load(self.global_addr(src), false);
+                    return;
+                }
                 // An i1 global is real: clang's own -O1 GlobalOpt narrows an
                 // internal flag only ever written 0/1 down to `global i1`
                 // (epic-cc#462). i1 is one byte in the byte model, so the
@@ -4682,7 +5122,9 @@ impl<'m> Gen<'m> {
                 // `FSR0`/`W`. (epic-cc#665)
                 if let Some(shape) = self.plusw_shape(&ptr_val) {
                     for k in 0..n {
-                        self.emit_plusw_setup(&shape, k);
+                        // Later bytes reuse the index already in W:
+                        // only `W`-preserving instructions sit between.
+                        self.emit_plusw_setup(&shape, k, k != 0);
                         let d = dst + u16::from(k);
                         self.invalidate_fsr0_if_slot_written(d, 1);
                         self.emit(format!("    MOVFF 0xFEB, 0x{d:03X}"));
@@ -4784,8 +5226,25 @@ impl<'m> Gen<'m> {
                         return;
                     }
                 }
-                // Direct values cover the whole slot through one setup.
-                // Indirect bytes seed FSR0 once and walk POSTINC0 (same
+                // A W-threaded const phi (epic-cc#825): every incoming
+                // edge left its byte in W with a `MOVLW`, so the store
+                // is one `MOVWF` to the direct global.
+                if let Val::Reg(r) = &s.val {
+                    if self.const_w_phis.contains(r) {
+                        let dst = s.ptr.strip_prefix('@').unwrap_or_else(|| {
+                            panic!(
+                                "isel-pic18: const-W phi store through non-global {:?}",
+                                s.ptr
+                            )
+                        });
+                        let dst = self.global_addr(dst);
+                        self.invalidate_fsr0_if_slot_written(dst, 1);
+                        self.emit_w_store(dst);
+                        return;
+                    }
+                    // Direct values cover the whole slot through one setup.
+                    // Indirect bytes seed FSR0 once and walk POSTINC0 (same
+                }
                 // single-loop ordering contract as the Load arm above,
                 // epic-cc#471). Each source byte still materializes into
                 // W (literals directly, registers via MOVF) before the
@@ -4796,14 +5255,18 @@ impl<'m> Gen<'m> {
                 // collision ADR-009 item 4 feared). Only register values
                 // with a slot move directly; address-valued regs and
                 // constants keep the `INDF0` lowering. (epic-cc#665)
-                let val_slot = match &s.val {
-                    Val::Reg(r) => self.addrs.get(&ssa_key(self.cur_func, r)).copied(),
+                // An in-place RMW producer (epic-cc#825) accumulated
+                // into its load operand's slot: the store reads that
+                // slot, not the dead result temp.
+                let val_slot = match self.rmw_reg(&s.val) {
+                    Val::Reg(r) => self.addrs.get(&ssa_key(self.cur_func, &r)).copied(),
                     _ => None,
                 };
                 if let (Some(shape), Some(vslot)) = (self.plusw_shape(&ptr_val), val_slot) {
                     let n = s.ty.bytes();
                     for k in 0..n {
-                        self.emit_plusw_setup(&shape, k);
+                        // Later bytes reuse the index already in W.
+                        self.emit_plusw_setup(&shape, k, k != 0);
                         self.emit(format!("    MOVFF 0x{:03X}, 0xFEB", vslot + u16::from(k)));
                     }
                 } else {
@@ -4865,6 +5328,20 @@ impl<'m> Gen<'m> {
                             }
                         } else if self.inplace_bins.contains(&b.dst) {
                             self.emit_const_bin_inplace(&b.op, n, k, dst);
+                            return;
+                        } else if let Some(lreg) = self.rmw_fwd.get(&b.dst).cloned() {
+                            // An in-place RMW producer (epic-cc#825):
+                            // accumulate into the load operand's slot.
+                            // Anything else is scan drift: falling through
+                            // would compute into the dead temp while the
+                            // store reads the operand slot.
+                            if lreg != qreg {
+                                panic!(
+                                    "isel-pic18: RMW producer operand changed since the pre-scan"
+                                );
+                            }
+                            let home = self.slot_addr(self.cur_func, &lreg).direct();
+                            self.emit_const_bin_inplace(&b.op, n, k, home);
                             return;
                         }
                     }
@@ -5172,7 +5649,27 @@ impl<'m> Gen<'m> {
                     match b.op {
                         ir::BinOp::Add | ir::BinOp::And | ir::BinOp::Or | ir::BinOp::Xor => {
                             // Commutative: `k op x` == `x op k`, reuse the
-                            // normal path with swapped operands.
+                            // normal path with swapped operands. A W-held
+                            // RHS (epic-cc#825) is one literal op instead.
+                            if let Val::Reg(x) = &b.b {
+                                if self.bin_w_srcs.contains(x) {
+                                    if n != 1 {
+                                        panic!("isel-pic18: W-operand binop wider than one byte");
+                                    }
+                                    let mne = match b.op {
+                                        ir::BinOp::Add => "ADDLW",
+                                        ir::BinOp::And => "ANDLW",
+                                        ir::BinOp::Or => "IORLW",
+                                        ir::BinOp::Xor => "XORLW",
+                                        _ => {
+                                            panic!("isel-pic18: W-operand binop op not supported")
+                                        }
+                                    };
+                                    self.emit(format!("    {mne} 0x{:02X}", ((k & 0xFF) as u8)));
+                                    self.emit_w_store(dst);
+                                    return;
+                                }
+                            }
                             let swapped = ir::Bin {
                                 op: b.op,
                                 ty: b.ty,
@@ -5211,7 +5708,19 @@ impl<'m> Gen<'m> {
                             // borrow-aware chain. `C0` parks in flag bit (0x0000,0) of the
                             // reserved return region: the bit stays live-free across the `Bin`,
                             // so an interrupt mid-sequence cannot clobber a live local before
-                            // `COMF`/`ADDLW` overwrite `STATUS`.
+                            // `COMF`/`ADDLW` overwrite `STATUS`. A W-held
+                            // RHS (epic-cc#825) skips the reload: `SUBLW`
+                            // consumes W directly.
+                            if let Val::Reg(x) = &b.b {
+                                if self.bin_w_srcs.contains(x) {
+                                    if n != 1 {
+                                        panic!("isel-pic18: W-operand binop wider than one byte");
+                                    }
+                                    self.emit(format!("    SUBLW 0x{:02X}", (k & 0xFF) as u8));
+                                    self.emit_w_store(dst);
+                                    return;
+                                }
+                            }
                             let aa = self.val_addr(&b.b).direct();
                             let (aacc0, af0) = self.operand(aa);
                             let abank0 = if aacc0 == 0 { "A" } else { "B" };
@@ -5252,6 +5761,35 @@ impl<'m> Gen<'m> {
                     !matches!(b.a, Val::Const(_)),
                     "isel-pic18: const-LHS Bin (constant as the first operand) not yet supported  -  needs the isel::emit_sub_const_lhs-equivalent handling"
                 );
+                // A W-held operand (epic-cc#825): the adjacent load left
+                // the byte in W, so a one-byte const op is one literal
+                // op plus the result store. Anything else with a
+                // W-marked operand is scan drift and panics below.
+                if let Val::Reg(x) = &b.a {
+                    if self.bin_w_srcs.contains(x) {
+                        let Val::Const(k) = &b.b else {
+                            panic!("isel-pic18: W-operand binop without a const RHS");
+                        };
+                        if n != 1 {
+                            panic!("isel-pic18: W-operand binop wider than one byte");
+                        }
+                        let mne = match b.op {
+                            ir::BinOp::Add => "ADDLW",
+                            ir::BinOp::And => "ANDLW",
+                            ir::BinOp::Or => "IORLW",
+                            ir::BinOp::Xor => "XORLW",
+                            ir::BinOp::Sub => {
+                                panic!("isel-pic18: W-operand sub needs SUBWF, not a literal op")
+                            }
+                            _ => {
+                                panic!("isel-pic18: W-operand binop op not supported")
+                            }
+                        };
+                        self.emit(format!("    {mne} 0x{:02X}", ((*k & 0xFF) as u8)));
+                        self.emit_w_store(dst);
+                        return;
+                    }
+                }
                 for i in 0..n {
                     // SUBWF computes f - W; the IR's `sub a, b` is `a - b`,
                     // so `a` must be `f` and `b` must go into `W` first.
@@ -5545,8 +6083,23 @@ impl<'m> Gen<'m> {
                         self.emit_load_w(&s.cond, 0, true);
                     }
                     self.emit(format!("    BZ {l_else}")); // cond byte == 0 -> else
+                                                           // A W-threaded const select (epic-cc#825) leaves the
+                                                           // arm in W for the following store: `MOVLW` only.
+                                                           // Bytes resolve before any emission, so no closure
+                                                           // holds `self` across the branch lines below.
+                    let w_arms: Option<(u8, u8)> =
+                        if !addr_value && self.const_w_phis.contains(&s.dst) {
+                            let (Val::Const(ka), Val::Const(kb)) = (&s.a, &s.b) else {
+                                panic!("isel-pic18: W-only select arm without a constant")
+                            };
+                            Some(((*ka & 0xFF) as u8, (*kb & 0xFF) as u8))
+                        } else {
+                            None
+                        };
                     if addr_value {
                         self.emit_move_addr_to_slot(&s.a, dst);
+                    } else if let Some((ba, _)) = w_arms {
+                        self.emit(format!("    MOVLW 0x{ba:02X}"));
                     } else {
                         self.emit_move_val_to_slot(&s.a, s.ty, dst);
                     }
@@ -5554,6 +6107,8 @@ impl<'m> Gen<'m> {
                     self.emit_label(&l_else);
                     if addr_value {
                         self.emit_move_addr_to_slot(&s.b, dst);
+                    } else if let Some((_, bb)) = w_arms {
+                        self.emit(format!("    MOVLW 0x{bb:02X}"));
                     } else {
                         self.emit_move_val_to_slot(&s.b, s.ty, dst);
                     }
@@ -7414,6 +7969,18 @@ impl<'m> Gen<'m> {
         match v {
             Val::Reg(r) => match self.phi_fold.get(r) {
                 Some(p) => Val::Reg(p.clone()),
+                None => v.clone(),
+            },
+            _ => v.clone(),
+        }
+    }
+    /// An in-place RMW use reads the load operand's slot instead of the
+    /// folded result: both name the same new value once the `Bin`
+    /// accumulates into the operand's slot.
+    fn rmw_reg(&self, v: &Val) -> Val {
+        match v {
+            Val::Reg(r) => match self.rmw_fwd.get(r) {
+                Some(l) => Val::Reg(l.clone()),
                 None => v.clone(),
             },
             _ => v.clone(),
@@ -9646,7 +10213,7 @@ fn exit_bank(ends: &[Option<u8>]) -> Option<u8> {
 /// first (the edge defines each slot). A true cycle needs a temp
 /// register and panics: silent emission would miscompile.
 fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge: bool) {
-    let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
+    let pending: Vec<(u16, Option<u16>, Ty, Val, bool)> = copies
         .iter()
         .map(|(dst, ty, val)| {
             let da = g.slot_addr(g.cur_func, dst).direct();
@@ -9655,7 +10222,11 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
                 Val::Reg(r) => Some(g.slot_addr(g.cur_func, r).direct()),
                 _ => None,
             };
-            (da, src, *ty, val.clone())
+            // A W-threaded const-phi incoming (epic-cc#825) leaves its
+            // byte in W for the merge block's store: only the `MOVLW`
+            // emits. Every other const copy keeps the slot write.
+            let w_only = matches!(val, Val::Const(_)) && g.const_w_phis.contains(dst);
+            (da, src, *ty, val.clone(), w_only)
         })
         .collect();
     let n = pending.len();
@@ -9667,8 +10238,10 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
             if emitted[i] {
                 continue;
             }
-            let (da, src, ty, val) = &pending[i];
-            let blocked = if back_edge {
+            let (da, src, ty, val, w_only) = &pending[i];
+            let blocked = if *w_only {
+                false
+            } else if back_edge {
                 (0..n).any(|j| !emitted[j] && j != i && pending[j].1 == Some(*da))
             } else {
                 match src {
@@ -9677,7 +10250,14 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
                 }
             };
             if !blocked {
-                g.emit_move_val_to_slot(val, *ty, *da);
+                if *w_only {
+                    let Val::Const(k) = val else {
+                        panic!("isel-pic18: W-only phi copy without a constant")
+                    };
+                    g.emit(format!("    MOVLW 0x{:02X}", ((*k & 0xFF) as u8)));
+                } else {
+                    g.emit_move_val_to_slot(val, *ty, *da);
+                }
                 emitted[i] = true;
                 emitted_count += 1;
                 progress = true;
@@ -10766,6 +11346,9 @@ pub fn select_with_opts(
                 phi_fold: HashMap::new(),
                 inplace_bins: HashSet::new(),
                 store_consumed: HashSet::new(),
+                const_w_phis: HashSet::new(),
+                bin_w_srcs: HashSet::new(),
+                rmw_fwd: HashMap::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -10840,6 +11423,9 @@ pub fn select_with_opts(
             phi_fold: HashMap::new(),
             inplace_bins: HashSet::new(),
             store_consumed: HashSet::new(),
+            const_w_phis: HashSet::new(),
+            bin_w_srcs: HashSet::new(),
+            rmw_fwd: HashMap::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -10872,6 +11458,17 @@ pub fn select_with_opts(
         let (phi_fold, inplace_bins) = Gen::find_inplace_folds(&g, f);
         g.phi_fold = phi_fold;
         g.inplace_bins = inplace_bins;
+        // Const-phis threaded through W (epic-cc#825): all-constant
+        // incoming edges feeding one direct-global store. Runs with the
+        // other pre-scans; the copy and store arms read the set.
+        g.const_w_phis = Gen::find_const_w_phis(&g, f);
+        // W-operand loads and in-place RMW producers (epic-cc#825):
+        // single-use loads feeding adjacent const binops ride W, and
+        // single-use const increments feeding `PLUSW` stores accumulate
+        // into their load operand's slot. The RMW scan reads the W set
+        // so the two never claim one load.
+        g.bin_w_srcs = Gen::find_bin_w_srcs(&g, f);
+        g.rmw_fwd = Gen::find_rmw_fwds(&g, f, &g.bin_w_srcs);
         // `TBLPTR` walk marks for this function (epic-cc#778): dynamically
         // indexed const reads whose seed the run scan proved redundant.
         // Runs after every other scan since dst-home checks read them.
@@ -11535,6 +12132,9 @@ pub fn select_with_opts(
             phi_fold: HashMap::new(),
             inplace_bins: HashSet::new(),
             store_consumed: HashSet::new(),
+            const_w_phis: HashSet::new(),
+            bin_w_srcs: HashSet::new(),
+            rmw_fwd: HashMap::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -11916,6 +12516,9 @@ mod tests {
                 phi_fold: HashMap::new(),
                 inplace_bins: HashSet::new(),
                 store_consumed: HashSet::new(),
+                const_w_phis: HashSet::new(),
+                bin_w_srcs: HashSet::new(),
+                rmw_fwd: HashMap::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -11956,6 +12559,9 @@ mod tests {
                 phi_fold: HashMap::new(),
                 inplace_bins: HashSet::new(),
                 store_consumed: HashSet::new(),
+                const_w_phis: HashSet::new(),
+                bin_w_srcs: HashSet::new(),
+                rmw_fwd: HashMap::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -12011,6 +12617,9 @@ mod p3_gen_tests {
             phi_fold: HashMap::new(),
             inplace_bins: HashSet::new(),
             store_consumed: HashSet::new(),
+            const_w_phis: HashSet::new(),
+            bin_w_srcs: HashSet::new(),
+            rmw_fwd: HashMap::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),

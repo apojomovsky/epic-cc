@@ -9143,3 +9143,369 @@ fn inplace_sub_i32_literal_uses_read_modify_write_lanes() {
     assert!(main.contains("SUBWFB 0x021,F,A"), "main:\n{main}");
     assert!(!main.contains(",W,A"), "no staged W form:\n{main}");
 }
+
+#[test]
+fn const_phi_threads_each_arm_through_w_to_the_store() {
+    // All-constant i8 phi feeding one direct-global store: each edge
+    // leaves its byte in W (`MOVLW` only) and the store writes it
+    // (`MOVWF`), so the temp slot is never touched (epic-cc#825).
+    let m = parse(
+        "global c i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @c\n    br i1 %1 a b\n  block a:\n    br j\n  block b:\n    br j\n  block j:\n    %2 = phi i8 10 a 20 b\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("c", 0x10),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("out", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let a_section = block_section(&asm, "main_La");
+    let j_section = block_section(&asm, "main_Lj");
+    assert!(a_section.contains("MOVLW 0x0A"), "arm a:\n{a_section}");
+    assert!(
+        !a_section.contains("MOVWF 0x012"),
+        "arm a keeps no slot:\n{a_section}"
+    );
+    assert!(
+        j_section.contains("MOVWF 0x013,A"),
+        "merge stores W to out:\n{j_section}"
+    );
+    assert!(
+        !asm.contains("MOVWF 0x012"),
+        "dead temp slot never written:\n{asm}"
+    );
+    assert!(!asm.contains("MOVFF 0x012"), "no final temp copy:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (c, expect) in [(0u8, 20u8), (1, 10)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x10] = c;
+        p.run(200);
+        assert_eq!(p.ram()[0x13], expect, "const phi arm c={c}");
+    }
+}
+
+#[test]
+fn const_select_threads_each_arm_through_w_to_the_store() {
+    // `select` over two constants feeding one direct-global store:
+    // both arms `MOVLW`, the store `MOVWF` (epic-cc#825).
+    let m = parse(
+        "global c i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @c\n    %2 = icmp eq i8 %1, 0\n    %3 = select i1 %2 i8 2 i8 1\n    store i8 %3 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("c", 0x10),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+        ("main::3", 0x13),
+        ("out", 0x14),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    // `block_section` stops at the select's own tmp labels, so scope
+    // to everything from `main:` up to the next function instead.
+    let main = asm
+        .split("main:")
+        .nth(1)
+        .expect("main label")
+        .split("__start:")
+        .next()
+        .expect("main precedes __start");
+    assert!(main.contains("MOVLW 0x02"), "taken arm:\n{main}");
+    assert!(main.contains("MOVLW 0x01"), "else arm:\n{main}");
+    assert!(
+        main.contains("MOVWF 0x014,A"),
+        "store writes W to out:\n{main}"
+    );
+    assert!(
+        !main.contains("MOVWF 0x013"),
+        "dead temp slot never written:\n{main}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (c, expect) in [(0u8, 2u8), (7, 1)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x10] = c;
+        p.run(200);
+        assert_eq!(p.ram()[0x14], expect, "const select c={c}");
+    }
+}
+
+#[test]
+fn loop_phi_with_header_readers_folds_the_increment_in_place() {
+    // The phi operand has readers beyond the increment (the header's
+    // exit test), but they all observe edge-synced values: the latch
+    // increment computes into the phi's slot and the backedge copy
+    // degrades to a skipped self-copy (epic-cc#825).
+    let m = parse(
+        "global out i8\nfn main(void) ()\n\
+         block entry:\n\
+           br body\n\
+         block body:\n\
+           %2 = phi i8 0 entry %3 latch\n\
+           %4 = icmp eq i8 %2, 3\n\
+           br i1 %4 exit latch\n\
+         block latch:\n\
+           %3 = add i8 %2, 1\n\
+           br body\n\
+         block exit:\n\
+           store i8 %2 @out\n\
+           ret void\n",
+    );
+    let addrs = addrs(&[
+        ("out", 0x10),
+        ("main::2", 0x11),
+        ("main::3", 0x12),
+        ("main::4", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let latch = block_section(&asm, "main_Llatch");
+    assert!(
+        latch.contains("INCF 0x011,F,A"),
+        "increment computes into the phi slot:\n{latch}"
+    );
+    assert!(
+        !latch.contains("MOVWF 0x012"),
+        "no staged result temp:\n{latch}"
+    );
+    assert!(
+        !asm.contains("MOVFF 0x012, 0x011"),
+        "no backedge copy:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.run(500);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x10], 3, "exit stores the final count");
+}
+
+#[test]
+fn w_operand_load_skips_the_temp_stage() {
+    // A banked one-byte load immediately feeding a const `add`: the
+    // shared value folds stay out (banked source), so the load leaves
+    // its byte in W and the binop consumes it with `ADDLW` (epic-cc#825).
+    let m = parse(
+        "global g i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @g\n    %2 = add i8 %1, 5\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("g", 0x120),
+        ("out", 0x130),
+        ("main::1", 0x132),
+        ("main::2", 0x133),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("MOVF 0x020,W,B"),
+        "load leaves the byte in W:\n{main_asm}"
+    );
+    assert!(
+        main_asm.contains("ADDLW 0x05"),
+        "binop consumes W with a literal op:\n{main_asm}"
+    );
+    assert!(
+        !main_asm.contains("0x032"),
+        "load temp never staged:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (g, expect) in [(10u8, 15u8), (250, 255), (251, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x120] = g;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x130], expect, "w-operand add g={g}");
+    }
+}
+
+#[test]
+fn rmw_producer_accumulates_into_its_load_temp() {
+    // A 16-bit `PLUSW` load feeding a const `add` feeding a `PLUSW`
+    // store: the binop accumulates into the load temp with in-place
+    // lanes, so its own result temp disappears (epic-cc#825).
+    let m = parse(
+        "global ram i16\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +0 +1*%i\n\
+             %v = load i16 %p\n\
+             %w = add i16 %v, 7\n\
+             store i16 %w %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x122),
+        ("main::i", 0x123),
+        ("main::v", 0x124),
+        ("main::w", 0x126),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("ADDWF 0x024,F,B"),
+        "low lane accumulates into the load temp:\n{main_asm}"
+    );
+    assert!(
+        !main_asm.contains("0x026,") && !main_asm.contains("0x026 "),
+        "result temp never written:\n{main_asm}"
+    );
+    assert!(
+        main_asm.contains("MOVFF 0x124, 0xFEB"),
+        "store reads the load temp:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (lo, hi, elo, ehi) in [(10u8, 0u8, 17u8, 0u8), (250, 16, 1, 17)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x120] = lo;
+        p.ram_mut()[0x121] = hi;
+        p.ram_mut()[0x122] = 0;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x120], elo, "rmw low byte");
+        assert_eq!(p.ram()[0x121], ehi, "rmw high byte");
+    }
+}
+
+#[test]
+fn adjacent_plusw_static_parts_step_without_reseeding() {
+    // The two bytes of one 16-bit `PLUSW` access seed once: the second
+    // byte steps `FSR0L` instead of a fresh `LFSR`, and reuses the index
+    // already in W instead of reloading it (epic-cc#825).
+    let m = parse(
+        "global ram i16\n\
+         global idx i8\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +0 +1*%i\n\
+             %v = load i16 %p\n\
+             store i16 %v @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x122),
+        ("out", 0x130),
+        ("main::i", 0x123),
+        ("main::v", 0x124),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert_eq!(
+        main_asm.matches("LFSR 0,").count(),
+        1,
+        "one seed for both bytes:\n{main_asm}"
+    );
+    assert!(
+        main_asm.contains("INCF 0xFE9,F,A"),
+        "second byte steps FSR0L:\n{main_asm}"
+    );
+    assert_eq!(
+        main_asm.matches("MOVF 0x023,W,B").count(),
+        1,
+        "one index load for both bytes:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x120] = 0xAB;
+    p.ram_mut()[0x121] = 0xCD;
+    p.ram_mut()[0x122] = 0;
+    p.run(200);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x130], 0xAB, "stepped low byte");
+    assert_eq!(p.ram()[0x131], 0xCD, "stepped high byte");
+}
+
+#[test]
+fn rmw_gap_def_between_binop_and_store_stays_staged() {
+    // A live def between the producer and its store keeps the staged
+    // form: `alloc` ends the operand temp's live range at the binop,
+    // so the gap def could be colored into its slot (epic-cc#825).
+    let m = parse(
+        "global ram i16\n\
+         global idx i8\n\
+         global other i16\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +0 +1*%i\n\
+             %v = load i16 %p\n\
+             %w = add i16 %v, 7\n\
+             %g = load i16 @other\n\
+             store i16 %w %p\n\
+             store i16 %g @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x122),
+        ("other", 0x140),
+        ("out", 0x130),
+        ("main::i", 0x123),
+        ("main::v", 0x124),
+        ("main::w", 0x126),
+        ("main::g", 0x128),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("MOVWF 0x026"),
+        "result temp stays staged across the gap:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x120] = 10;
+    p.ram_mut()[0x121] = 0;
+    p.ram_mut()[0x122] = 0;
+    p.ram_mut()[0x140] = 0xBE;
+    p.ram_mut()[0x141] = 0xEF;
+    p.run(300);
+    assert!(p.halted());
+    assert_eq!(
+        p.ram()[0x120],
+        17,
+        "store reads the producer, not the gap def"
+    );
+    assert_eq!(p.ram()[0x130], 0xBE, "gap def survives");
+    assert_eq!(p.ram()[0x131], 0xEF, "gap def high byte survives");
+}
+
+#[test]
+fn w_operand_const_left_sub_consumes_w_with_sublw() {
+    // `255 - g` with a banked source: the load leaves its byte in W
+    // and the const-left `sub` consumes it with `SUBLW` (epic-cc#825).
+    let m = parse(
+        "global g i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @g\n    %2 = sub i8 -1, %1\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("g", 0x120),
+        ("out", 0x130),
+        ("main::1", 0x132),
+        ("main::2", 0x133),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("SUBLW 0xFF"),
+        "const-left sub consumes W:\n{main_asm}"
+    );
+    assert!(
+        !main_asm.contains("0x032"),
+        "load temp never staged:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (g, expect) in [(10u8, 245u8), (0, 255), (255, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x120] = g;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x130], expect, "255 - g for g={g}");
+    }
+}
