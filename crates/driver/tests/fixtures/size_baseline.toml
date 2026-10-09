@@ -48,7 +48,7 @@ ram_bytes = 25
 [[entry]]
 name = "bench-switch-18f4550"
 device = "18F4550"
-flash_words = 66
+flash_words = 58
 ram_bytes = 5
 
 [[entry]]
@@ -108,7 +108,7 @@ ram_bytes = 21
 [[entry]]
 name = "bench-struct-scan-18f4550"
 device = "18F4550"
-flash_words = 103
+flash_words = 92
 ram_bytes = 95
 
 [[entry]]
@@ -126,7 +126,7 @@ ram_bytes = 23
 [[entry]]
 name = "bench-branch-computed-18f4550"
 device = "18F4550"
-flash_words = 38
+flash_words = 35
 ram_bytes = 5
 
 [[entry]]
@@ -168,25 +168,25 @@ ram_bytes = 326
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 9030
+flash_words = 9003
 ram_bytes = 781
 
 [[entry]]
 name = "hal-pic18-control-demo-18f4550"
 device = "18F4550"
-flash_words = 9336
+flash_words = 9240
 ram_bytes = 963
 
 [[entry]]
 name = "hal-pic18-pid-18f4550"
 device = "18F4550"
-flash_words = 3176
+flash_words = 3169
 ram_bytes = 500
 
 [[entry]]
 name = "hal-pic18-bridge-demo-18f4550"
 device = "18F4550"
-flash_words = 12924
+flash_words = 12897
 ram_bytes = 1296
 
 [[entry]]
@@ -207,7 +207,7 @@ ram_bytes = 2
 name = "bench-struct-scan-18f4550"
 device = "18F4550"
 profile = "O2"
-flash_words = 125
+flash_words = 105
 ram_bytes = 95
 
 [[entry]]
@@ -228,5 +228,5 @@ ram_bytes = 339
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
 profile = "O2"
-flash_words = 10469
+flash_words = 10447
 ram_bytes = 818
