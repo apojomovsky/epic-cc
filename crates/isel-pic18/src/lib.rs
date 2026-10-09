@@ -353,6 +353,11 @@ struct Gen<'m> {
     /// `PLUSW` store to the single-use load temp it must accumulate
     /// into, so the staged result temp disappears.
     rmw_fwd: HashMap<String, String>,
+    /// Dead high lanes on byte-indexed walks (epic-cc#968). Holds a
+    /// multi-byte `Bin`/`Zext` dst every use of which reads lane 0
+    /// only (a `PLUSW` index, or a likewise marked consumer): the
+    /// arms emit lane 0 and skip the dead high writes.
+    narrow_lo: HashSet<String>,
     /// Value folds from the shared per-function pre-scan (epic-cc#863):
     /// loads whose byte never stages to a slot. `alloc` drops those
     /// slots; the load arm skips them and consumers read the source.
@@ -1854,6 +1859,141 @@ impl<'m> Gen<'m> {
             }
         }
         out
+    }
+    /// Dead high lanes on byte-indexed walks (epic-cc#968). A `zext`
+    /// from a narrower value, or a lane-wise `Add`/`Sub`/`And`/`Or`/`Xor`
+    /// over one, feeding only `PLUSW` indices reads just its low byte:
+    /// the setup loads `W` from the slot's low byte, so the `CLRF` and
+    /// `ADDWFC` high writes are dead and the arms emit lane 0 only.
+    /// Lane 0 needs no carry in, so it stays exact whatever the dead
+    /// high byte holds. Any wider read (icmp, call, store, non-`PLUSW`
+    /// address math, phi) unmarks, down to a shrink-only fixpoint.
+    fn find_narrow_lo(g: &Gen, f: &Func) -> HashSet<String> {
+        let lane_op = |op: &ir::BinOp| {
+            matches!(
+                op,
+                ir::BinOp::Add | ir::BinOp::Sub | ir::BinOp::And | ir::BinOp::Or | ir::BinOp::Xor
+            )
+        };
+        let mut marked: HashSet<String> = HashSet::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let dst = match inst {
+                    Inst::Bin(q) if lane_op(&q.op) && q.ty.bytes() >= 2 => &q.dst,
+                    Inst::Zext(z) if z.to.bytes() >= 2 => &z.dst,
+                    _ => continue,
+                };
+                if g.lane_consumed.contains(dst)
+                    || g.bit_lanes.contains_key(dst)
+                    || g.store_consumed.contains(dst)
+                    || g.store_fwd.contains_key(dst)
+                    || g.phi_fold.contains_key(dst)
+                    || g.phi_fold.values().any(|p| p == dst)
+                    || g.inplace_bins.contains(dst)
+                    || g.const_w_phis.contains(dst)
+                    || g.bin_w_srcs.contains(dst)
+                    || g.rmw_fwd.contains_key(dst)
+                    || g.rmw_fwd.values().any(|l| l == dst)
+                {
+                    continue;
+                }
+                marked.insert(dst.clone());
+            }
+        }
+        let key = |r: &str| iselcore::ssa_key(&f.name, r);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    match inst {
+                        Inst::Gep(gp) => {
+                            // Virtual, folded before codegen: the terms
+                            // re-emerge at each access below, so only the
+                            // base pointer value itself reads whole here.
+                            if let ir::GepBase::Reg(r) = &gp.base {
+                                if marked.remove(r) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        Inst::Load(l) => {
+                            Self::scan_ptr_terms(g, &key, &l.ptr, &mut marked, &mut changed);
+                        }
+                        Inst::Store(s) => {
+                            Self::scan_ptr_terms(g, &key, &s.ptr, &mut marked, &mut changed);
+                            if let Val::Reg(r) = &s.val {
+                                if marked.remove(r) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        Inst::Bin(q) => {
+                            let lo = lane_op(&q.op) && marked.contains(&q.dst);
+                            for v in [&q.a, &q.b] {
+                                if let Val::Reg(r) = v {
+                                    if !lo && marked.remove(r) {
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                        Inst::Zext(z) => {
+                            let lo = marked.contains(&z.dst);
+                            if let Val::Reg(r) = &z.val {
+                                if !lo && marked.remove(r) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        Inst::Trunc(t) => {
+                            if t.to.bytes() != 1 {
+                                if let Val::Reg(r) = &t.val {
+                                    if marked.remove(r) {
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            for r in ir::read_vals(inst) {
+                                if !r.is_empty() && marked.remove(&r) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        marked
+    }
+    /// One access's share of the narrowing scan: each resolved index
+    /// term reads lane 0 only on a `PLUSW` shape and whole on every
+    /// other address computation (which adds the full 16-bit index
+    /// into `FSR0`). The pointer reg itself is the virtual `Gep`'s
+    /// def, never a narrowable dst, so it needs no edge.
+    fn scan_ptr_terms(
+        g: &Gen,
+        key: &dyn Fn(&str) -> String,
+        ptr: &str,
+        marked: &mut HashSet<String>,
+        changed: &mut bool,
+    ) {
+        let Some(r) = ptr.strip_prefix('%') else {
+            return;
+        };
+        let Some((_, _, terms)) = g.resolved.get(&key(r)) else {
+            return;
+        };
+        if g.plusw_shape(&Val::Reg(r.to_string())).is_some() {
+            return;
+        }
+        for (_, t) in terms {
+            if marked.remove(t) {
+                *changed = true;
+            }
+        }
     }
     /// The register side of an `Add`/`Sub` against a constant: the value
     /// operand plus the literal. `Add` commutes, so a constant on either
@@ -5409,6 +5549,24 @@ impl<'m> Gen<'m> {
                     n == 1 || n == 2 || n == 4,
                     "isel-pic18: only i8/i16/i32 Bin ops implemented (n={n})"
                 );
+                // Dead high lanes on byte-indexed walks (epic-cc#968):
+                // the scan proved every use reads lane 0 only, and lane
+                // 0 of a lane-wise op needs no carry in, so one lane is
+                // the whole result. In-place accumulates below keep all
+                // lanes: their sets never intersect the scan's.
+                let lanes = if matches!(
+                    b.op,
+                    ir::BinOp::Add
+                        | ir::BinOp::Sub
+                        | ir::BinOp::And
+                        | ir::BinOp::Or
+                        | ir::BinOp::Xor
+                ) && self.narrow_lo.contains(&b.dst)
+                {
+                    1
+                } else {
+                    n
+                };
                 // the constant-count shifts: a const count inlines as a fixed
                 // RLCF/RRCF sequence; k == 0 is a plain copy; k >= width is
                 // LLVM poison and panics. A variable (reg) count must
@@ -5793,7 +5951,7 @@ impl<'m> Gen<'m> {
                             // the normal per-byte loop: emit the swapped bin
                             // directly here to avoid recursion.
                             let av = self.val_addr(&swapped.a).direct();
-                            for i in 0..n {
+                            for i in 0..lanes {
                                 self.emit_load_w(&swapped.b, i, false);
                                 let carry =
                                     i > 0 && matches!(swapped.op, ir::BinOp::Add | ir::BinOp::Sub);
@@ -5901,7 +6059,7 @@ impl<'m> Gen<'m> {
                         return;
                     }
                 }
-                for i in 0..n {
+                for i in 0..lanes {
                     // SUBWF computes f - W; the IR's `sub a, b` is `a - b`,
                     // so `a` must be `f` and `b` must go into `W` first.
                     self.emit_load_w(&b.b, i, false);
@@ -5976,6 +6134,15 @@ impl<'m> Gen<'m> {
                 );
                 let src = self.val_addr(&z.val).direct();
                 let dst = self.slot_addr(self.cur_func, &z.dst).direct();
+                // Dead high lanes (epic-cc#968): the scan proved only
+                // lane 0 is ever read, so the upper source copies and
+                // the zero fill are dead. One lane-0 copy is the whole
+                // result; it also reads only the source's lane 0, which
+                // is what the scan's operand edge assumes.
+                if self.narrow_lo.contains(&z.dst) {
+                    self.emit_copy_byte(src, dst);
+                    return;
+                }
                 for i in 0..z.from.bytes() {
                     self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
                 }
@@ -11460,6 +11627,7 @@ pub fn select_with_opts(
                 const_w_phis: HashSet::new(),
                 bin_w_srcs: HashSet::new(),
                 rmw_fwd: HashMap::new(),
+                narrow_lo: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -11537,6 +11705,7 @@ pub fn select_with_opts(
             const_w_phis: HashSet::new(),
             bin_w_srcs: HashSet::new(),
             rmw_fwd: HashMap::new(),
+            narrow_lo: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -11580,6 +11749,10 @@ pub fn select_with_opts(
         // so the two never claim one load.
         g.bin_w_srcs = Gen::find_bin_w_srcs(&g, f);
         g.rmw_fwd = Gen::find_rmw_fwds(&g, f, &g.bin_w_srcs);
+        // Dead high lanes on byte-indexed walks (epic-cc#968): runs
+        // after every other fold so producer claims stay disjoint, and
+        // after the value folds so `PLUSW` shapes see final slots.
+        g.narrow_lo = Gen::find_narrow_lo(&g, f);
         // `TBLPTR` walk marks for this function (epic-cc#778): dynamically
         // indexed const reads whose seed the run scan proved redundant.
         // Runs after every other scan since dst-home checks read them.
@@ -12246,6 +12419,7 @@ pub fn select_with_opts(
             const_w_phis: HashSet::new(),
             bin_w_srcs: HashSet::new(),
             rmw_fwd: HashMap::new(),
+            narrow_lo: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -12630,6 +12804,7 @@ mod tests {
                 const_w_phis: HashSet::new(),
                 bin_w_srcs: HashSet::new(),
                 rmw_fwd: HashMap::new(),
+                narrow_lo: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -12673,6 +12848,7 @@ mod tests {
                 const_w_phis: HashSet::new(),
                 bin_w_srcs: HashSet::new(),
                 rmw_fwd: HashMap::new(),
+                narrow_lo: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -12731,6 +12907,7 @@ mod p3_gen_tests {
             const_w_phis: HashSet::new(),
             bin_w_srcs: HashSet::new(),
             rmw_fwd: HashMap::new(),
+            narrow_lo: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),

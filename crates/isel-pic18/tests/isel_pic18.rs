@@ -1700,10 +1700,11 @@ fn i8_binop_dest_at_banked_address_routes_through_operand_with_bank_suffix() {
 
 #[test]
 fn i16_add_uses_addwfc_for_the_high_byte() {
-    let m = parse("global a i16\nglobal b i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = add i16 %1, %2\n    ret void\n");
+    let m = parse("global a i16\nglobal b i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = add i16 %1, %2\n    store i16 %3 @out\n    ret void\n");
     let addrs = addrs(&[
         ("a", 0x10),
         ("b", 0x12),
+        ("out", 0x1A),
         ("main::1", 0x14),
         ("main::2", 0x16),
         ("main::3", 0x18),
@@ -1722,16 +1723,17 @@ fn i16_add_uses_addwfc_for_the_high_byte() {
     p.ram_mut()[0x12] = 0x01;
     p.ram_mut()[0x13] = 0x00;
     p.run(200);
-    assert_eq!(p.ram()[0x18], 0x00);
-    assert_eq!(p.ram()[0x19], 0x01);
+    assert_eq!(p.ram()[0x1A], 0x00);
+    assert_eq!(p.ram()[0x1B], 0x01);
 }
 
 #[test]
 fn i16_sub_uses_subfwb_for_the_high_byte() {
-    let m = parse("global a i16\nglobal b i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = sub i16 %1, %2\n    ret void\n");
+    let m = parse("global a i16\nglobal b i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = sub i16 %1, %2\n    store i16 %3 @out\n    ret void\n");
     let addrs = addrs(&[
         ("a", 0x10),
         ("b", 0x12),
+        ("out", 0x1A),
         ("main::1", 0x14),
         ("main::2", 0x16),
         ("main::3", 0x18),
@@ -1746,19 +1748,20 @@ fn i16_sub_uses_subfwb_for_the_high_byte() {
     p.ram_mut()[0x12] = 0x01;
     p.ram_mut()[0x13] = 0x00;
     p.run(200);
-    assert_eq!(p.ram()[0x18], 0xFF);
-    assert_eq!(p.ram()[0x19], 0x00);
+    assert_eq!(p.ram()[0x1A], 0xFF);
+    assert_eq!(p.ram()[0x1B], 0x00);
 }
 
 #[test]
 fn i16_bitwise_ops_apply_independently_per_byte() {
     for (op, mne) in [("and", "ANDWF"), ("or", "IORWF"), ("xor", "XORWF")] {
         let m = parse(&format!(
-            "global a i16\nglobal b i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = {op} i16 %1, %2\n    ret void\n"
+            "global a i16\nglobal b i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = {op} i16 %1, %2\n    store i16 %3 @out\n    ret void\n"
         ));
         let addrs = addrs(&[
             ("a", 0x10),
             ("b", 0x12),
+            ("out", 0x1A),
             ("main::1", 0x14),
             ("main::2", 0x16),
             ("main::3", 0x18),
@@ -2381,16 +2384,21 @@ fn icmp_i16_const_lhs_is_rejected_not_silently_miscompiled() {
 
 #[test]
 fn zext_i8_to_i16_zero_fills_the_high_byte() {
-    let m = parse("global a i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = zext i8 %1 to i16\n    ret void\n");
-    let addrs = addrs(&[("a", 0x10), ("main::1", 0x11), ("main::2", 0x12)]);
+    let m = parse("global a i8\nglobal out i16\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = zext i8 %1 to i16\n    store i16 %2 @out\n    ret void\n");
+    let addrs = addrs(&[
+        ("a", 0x10),
+        ("out", 0x14),
+        ("main::1", 0x11),
+        ("main::2", 0x12),
+    ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
     step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x10] = 0xFF;
     p.run(50);
-    assert_eq!(p.ram()[0x12], 0xFF);
-    assert_eq!(p.ram()[0x13], 0x00);
+    assert_eq!(p.ram()[0x14], 0xFF);
+    assert_eq!(p.ram()[0x15], 0x00);
 }
 
 #[test]
@@ -3390,6 +3398,72 @@ fn a_byte_index_store_moves_through_plusw0() {
                 "plusw store at index {x} touches only lane {x}"
             );
         }
+    }
+}
+
+#[test]
+fn byte_index_zext_and_add_keep_only_the_low_lane() {
+    // A `zext` u8 index with a const `add` over it, feeding only
+    // `PLUSW` reads: the high fill (`CLRF`) and the high `ADDWFC`
+    // lane are dead, so only lane 0 emits. Simulated over every
+    // index whose +1 stays in bounds (epic-cc#968).
+    let m = parse(
+        "global ram i64\n\
+         global idx i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %e = zext i8 %i to i16\n\
+             %p = gep @ram +0 +1*%e\n\
+             %v = load i8 %p\n\
+             %a = add i16 %e, 1\n\
+             %q = gep @ram +0 +1*%a\n\
+             %w = load i8 %q\n\
+             %s = add i8 %v, %w\n\
+             store i8 %s @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x130),
+        ("out", 0x131),
+        ("main::i", 0x132),
+        ("main::e", 0x133),
+        ("main::v", 0x135),
+        ("main::a", 0x136),
+        ("main::w", 0x138),
+        ("main::s", 0x139),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.matches("MOVFF 0xFEB").count() == 2,
+        "both reads through PLUSW0 (0xFEB):\n{asm}"
+    );
+    assert!(
+        !main_asm.contains("ADDWFC"),
+        "dead high add lane must not emit:\n{asm}"
+    );
+    assert!(
+        !main_asm.contains("CLRF"),
+        "dead high zext fill must not emit:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..7u8 {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        for b in 0..8u8 {
+            p.ram_mut()[0x120 + b as usize] = 10 * b + 1;
+        }
+        p.ram_mut()[0x130] = x;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(
+            p.ram()[0x131],
+            (10 * x + 1).wrapping_add(10 * (x + 1) + 1),
+            "ram[x] + ram[x+1] at index {x}"
+        );
     }
 }
 

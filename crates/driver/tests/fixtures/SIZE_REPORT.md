@@ -3,9 +3,9 @@
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
 - Date (UTC): 2026-10-09
-- Commit: 2af9eb4
+- Commit: 5211a78
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
-- Menu-demo listing: 8991 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
+- Menu-demo listing: 8947 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
 ## Micro benches (flash / RAM)
 
@@ -15,7 +15,7 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | bench-wide-const | 18F4550 | 23 | 6 | = / = |
 | bench-zero-init | 18F4550 | 25 | 12 | = / = |
 | bench-struct-copy | 18F4550 | 35 | 45 | = / = |
-| bench-counted-copy | 18F4550 | 76 | 25 | (new) / (new) |
+| bench-counted-copy | 18F4550 | 76 | 25 | = / = |
 | bench-switch | 18F4550 | 58 | 5 | = / = |
 | bench-bool | 18F4550 | 35 | 4 | = / = |
 | bench-const-sub | 18F4550 | 25 | 5 | = / = |
@@ -28,7 +28,7 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | bench-u16-dec | 18F4550 | 67 | 21 | = / = |
 | bench-struct-scan | 18F4550 | 92 | 95 | = / = |
 | bench-struct-scan | 16F877A | 166 | 104 | = / = |
-| bench-plusw | 18F4550 | 40 | 23 | = / = |
+| bench-plusw | 18F4550 | 36 | 23 | = / = |
 | bench-branch-computed | 18F4550 | 35 | 5 | = / = |
 | bench-bitmask | 18F4550 | 52 | 14 | = / = |
 | bench-hoist | 18F4550 | 116 | 14 | = / = |
@@ -45,20 +45,20 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | hal-pic18-blink-18f4550 | 18F4550 | 313 | 30 | = / = |
 | hal-pic14e-blink-16f1937 | 16F1937 | 100 | 6 | = / = |
 | hal-pic16-encoder-full-16f877a | 16F877A | 5372 | 326 | = / = |
-| hal-pic18-menu-demo-18f4550 | 18F4550 | 9003 | 781 | = / = |
-| hal-pic18-control-demo-18f4550 | 18F4550 | 9240 | 963 | = / = |
-| hal-pic18-pid-18f4550 | 18F4550 | 3169 | 500 | = / = |
-| hal-pic18-bridge-demo-18f4550 | 18F4550 | 12897 | 1296 | = / = |
+| hal-pic18-menu-demo-18f4550 | 18F4550 | 8983 | 781 | = / = |
+| hal-pic18-control-demo-18f4550 | 18F4550 | 9194 | 963 | = / = |
+| hal-pic18-pid-18f4550 | 18F4550 | 3167 | 500 | = / = |
+| hal-pic18-bridge-demo-18f4550 | 18F4550 | 12888 | 1296 | = / = |
 
 ## Menu-demo clusters (listing words)
 
 | cluster | ours |
 |---|---|
-| menu_demo_init +7 folded | 1704 |
+| menu_demo_init +7 folded | 1683 |
 | redraw | 464 |
 | main | 367 |
 | EPIC_USART_Init | 327 |
-| epic_taskmgr_run +1 folded | 320 |
+| epic_taskmgr_run +1 folded | 319 |
 | redraw_status | 308 |
 | epic_dispatch_all_irqs_isr | 267 |
 | menu_demo_task_heartbeat +1 folded | 243 |
@@ -70,14 +70,14 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 
 Top profiler categories on the same listing:
 
-- `data-move`: 1403 (15.6%)
+- `data-move`: 1387 (15.5%)
 - `shared-code`: 1239 (13.8%)
-- `struct-copy-movff`: 1128 (12.5%)
-- `branch`: 758 (8.4%)
-- `scalar-alu`: 584 (6.5%)
+- `struct-copy-movff`: 1128 (12.6%)
+- `branch`: 758 (8.5%)
+- `scalar-alu`: 583 (6.5%)
 - `cond-branch`: 540 (6.0%)
-- `literal-load`: 483 (5.4%)
-- `slot-copy`: 388 (4.3%)
+- `literal-load`: 488 (5.5%)
+- `slot-copy`: 386 (4.3%)
 
 ## Regenerating
 
