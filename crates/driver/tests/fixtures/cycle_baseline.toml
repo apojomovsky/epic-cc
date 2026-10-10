@@ -441,16 +441,16 @@ ram_bytes = 10
 [[entry]]
 name = "speed-switch16-16f877a"
 device = "16F877A"
-cycles = 73
-flash_words = 102
+cycles = 71
+flash_words = 100
 ram_bytes = 11
 
 [[entry]]
 name = "speed-switch16-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 73
-flash_words = 102
+cycles = 71
+flash_words = 100
 ram_bytes = 11
 
 [[entry]]

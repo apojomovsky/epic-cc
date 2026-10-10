@@ -150,7 +150,7 @@ ram_bytes = 14
 [[entry]]
 name = "hal-pic16-blink-16f877a"
 device = "16F877A"
-flash_words = 462
+flash_words = 461
 ram_bytes = 44
 
 [[entry]]
@@ -168,7 +168,7 @@ ram_bytes = 6
 [[entry]]
 name = "hal-pic16-encoder-full-16f877a"
 device = "16F877A"
-flash_words = 5372
+flash_words = 5360
 ram_bytes = 326
 
 [[entry]]
