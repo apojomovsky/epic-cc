@@ -45,14 +45,13 @@ fn ticket_two_function_program_runs_correctly() {
         .output()
         .expect("run driver");
     let err = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(out.status.success(), "{err}");
-    assert!(!err.contains("internal compiler error"), "{err}");
-
-    let hex_text = std::fs::read_to_string(&hex).expect("read hex");
-    let map_text = std::fs::read_to_string(&map).expect("read map");
+    let hex_text = std::fs::read_to_string(&hex).unwrap_or_default();
+    let map_text = std::fs::read_to_string(&map).unwrap_or_default();
     for f in [&src, &hex, &map] {
         let _ = std::fs::remove_file(f);
     }
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("internal compiler error"), "{err}");
     let p_addr = map_addr(&map_text, "p");
 
     let mut sim = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex_text));
