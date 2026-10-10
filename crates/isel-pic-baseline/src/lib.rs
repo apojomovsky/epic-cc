@@ -40,7 +40,8 @@
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot,
+    flash_provenance, is_directive, resolve_pointers, ssa_key, Base, FlashProvenance,
+    PtrResolution, Slot,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -3344,9 +3345,9 @@ fn count_words(lines: &[String]) -> usize {
                 return false;
             }
             !(t.starts_with("org ")
-                || t.starts_with("list ")
-                || t.starts_with("radix ")
-                || t == "end")
+                || is_directive(t, "list")
+                || is_directive(t, "radix")
+                || is_directive(t, "end"))
         })
         .count()
 }
@@ -3416,7 +3417,7 @@ fn scan_asm(asm: &str, tables: &HashMap<String, usize>) -> AsmScan {
             cur_table = None;
             continue;
         }
-        if t == "end" {
+        if is_directive(t, "end") {
             break;
         }
         if t.ends_with(':') && !t.contains(' ') {
@@ -3429,7 +3430,7 @@ fn scan_asm(asm: &str, tables: &HashMap<String, usize>) -> AsmScan {
             };
             continue;
         }
-        if t.contains(" equ ") || t.starts_with("list ") || t.starts_with("radix ") {
+        if t.contains(" equ ") || is_directive(t, "list") || is_directive(t, "radix") {
             continue;
         }
         let nospace: String = t.chars().filter(|c| *c != ' ').collect();

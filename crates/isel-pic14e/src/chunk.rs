@@ -8,6 +8,7 @@ use super::word_size;
 use banking::SKIP_OPS;
 use device::Device;
 use ir::SrcLoc;
+use iselcore::is_directive;
 use std::collections::{HashMap, HashSet};
 
 /// Words a non-final chunk spends on its link: `MOVLW PAGE(next)`,
@@ -52,14 +53,14 @@ pub(crate) fn post_extents(banked: &str, func_names: &HashSet<&str>) -> HashMap<
     let mut cur: Option<(String, usize)> = None;
     for raw in banked.lines() {
         let line = code_of(raw);
-        if line.is_empty() || matches!(line.split_whitespace().next(), Some("list" | "radix")) {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
             org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             continue;
         }
-        if line == "end" {
+        if is_directive(line, "end") {
             break;
         }
         if let Some(l) = line.strip_suffix(':') {
