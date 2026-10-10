@@ -728,7 +728,10 @@ fn main() {
     // The fixed-region bytes the lowering can touch (epic-cc#837): same
     // post-legalize module isel sees, so the predicates in `fixed_uses`
     // read exactly what the backends lower.
-    let fixed_uses = driver::report::fixed_uses(&m, device.core);
+    // Reserves the PIC14E hold byte only when isel parks a byte in it.
+    let const_memcpy_hold = device.core == device::Core::Pic14e
+        && isel_pic14e::const_memcpy_parks_hold(device, &m, &addrs);
+    let fixed_uses = driver::report::fixed_uses(&m, device.core, const_memcpy_hold);
     eprint!(
         "{}",
         driver::report::render_size(&device, &layout, &fixed_uses, program_words.len())

@@ -917,3 +917,46 @@ fn i1_memory_c_runs_correctly() {
         gpasm_agrees(&asm, name);
     }
 }
+
+/// Truncated shift-add `__mul_u8`: a zero operand exits early and the
+/// product wraps mod 256.
+#[test]
+fn mul_edges_u8_wraps_and_exits_on_zero() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/mul_edges_u8.c");
+    assert!(asm.contains("__mul_u8"));
+    let a: [u8; 2] = [200, 0];
+    let b: [u8; 2] = [3, 77];
+    for i in 0..2 {
+        p.ram_mut()[globals["pa8"] as usize + i] = a[i];
+        p.ram_mut()[globals["pb8"] as usize + i] = b[i];
+    }
+    p.run(2_000_000);
+    assert!(p.halted());
+    for i in 0..2 {
+        let got = p.ram()[globals["pa8"] as usize + i];
+        assert_eq!(got, a[i].wrapping_mul(b[i]), "pa8[{i}]");
+    }
+    gpasm_agrees(&asm, "mul_edges_u8");
+}
+
+/// Truncated shift-add `__mul_u16`: 65535 * 2 wraps mod 65536, exercising
+/// the carry into a_hi and the operand swap.
+#[test]
+fn mul_edges_u16_wraps_mod_65536() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/mul_edges_u16.c");
+    assert!(asm.contains("__mul_u16"));
+    let (a, b): (u16, u16) = (65535, 2);
+    let pa = globals["pa16"] as usize;
+    let pb = globals["pb16"] as usize;
+    p.ram_mut()[pa] = a as u8;
+    p.ram_mut()[pa + 1] = (a >> 8) as u8;
+    p.ram_mut()[pb] = b as u8;
+    p.ram_mut()[pb + 1] = (b >> 8) as u8;
+    p.run(2_000_000);
+    assert!(p.halted());
+    let got = p.ram()[pa] as u16 | ((p.ram()[pa + 1] as u16) << 8);
+    assert_eq!(got, a.wrapping_mul(b));
+    gpasm_agrees(&asm, "mul_edges_u16");
+}

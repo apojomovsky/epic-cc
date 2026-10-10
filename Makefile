@@ -72,12 +72,18 @@ TARGET_CACHE_MOUNT ?= $(TARGET_CACHE)
 # read half-written fingerprints. The lock turns that into a queue.
 WITH_TARGET_LOCK := bash $(dir $(lastword $(MAKEFILE_LIST)))scripts/with-target-lock.sh
 GUARD_MAIN_CLONE := bash $(dir $(lastword $(MAKEFILE_LIST)))scripts/check-main-clone-build.sh
+# Docker forwards no host env beyond EPIC_CC_GIT_SHA, so a host-prefixed
+# SIZE/CYCLE_BASELINE_ONLY or UPDATE_* switch would vanish: the scope filter
+# is then dropped and the update rewrites every row. `-e NAME` forwards the
+# value when set, even if empty, matching native cargo.
 DOCKER_ARGS = --rm \
 	--user $$(id -u):$$(id -g) \
 	-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
 	-v $(CARGO_HOME_CACHE):/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
 	-v $(TARGET_CACHE_MOUNT):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
 	-e "EPIC_CC_GIT_SHA=$(EPIC_CC_GIT_SHA)" \
+	-e SIZE_BASELINE_ONLY -e CYCLE_BASELINE_ONLY \
+	-e UPDATE_SIZE_BASELINE -e UPDATE_CYCLE_BASELINE \
 	-v $(CURDIR):/workspace -w /workspace
 
 DOCKER_RUN = mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE_MOUNT) && $(WITH_TARGET_LOCK) $(TARGET_CACHE_MOUNT)/.build.lock docker run $(DOCKER_ARGS) $(LOCAL_IMAGE)

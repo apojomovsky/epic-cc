@@ -860,3 +860,63 @@ fn float_c_runs_correctly() {
     assert_eq!(p.ram()[globals["out3"] as usize + 3], 0x3E);
     assert!(p.halted());
 }
+
+#[test]
+fn mul_edges_c_wraps_and_exits_on_zero() {
+    // Zero operands take the early exit; products that overflow the result
+    // width wrap mod 256 (u8) and mod 65536 (u16). The u16 pairs include a
+    // short-a / long-b shape that takes the operand swap.
+    let (mut p, globals, asm, _locals) = compile_with_layout(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mul_edges.c"
+    ));
+    assert!(
+        asm.contains("__mul_u8"),
+        "fixture must reach the u8 routine"
+    );
+    assert!(
+        asm.contains("__mul_u16"),
+        "fixture must reach the u16 routine"
+    );
+
+    let pairs8: [(u8, u8); 6] = [(0, 200), (200, 0), (16, 16), (255, 255), (17, 15), (3, 85)];
+    let pairs16: [(u16, u16); 6] = [
+        (0, 0x1234),
+        (0x1234, 0),
+        (0x0100, 0x0100),
+        (0x00FF, 0xFFFF),
+        (0x0003, 0x1000),
+        (0x1234, 0x0056),
+    ];
+    for (i, &(a, b)) in pairs8.iter().enumerate() {
+        p.ram_mut()[globals["pa8"] as usize + i] = a;
+        p.ram_mut()[globals["pb8"] as usize + i] = b;
+    }
+    for (i, &(a, b)) in pairs16.iter().enumerate() {
+        let (pa, pb) = (
+            globals["pa16"] as usize + 2 * i,
+            globals["pb16"] as usize + 2 * i,
+        );
+        p.ram_mut()[pa] = a as u8;
+        p.ram_mut()[pa + 1] = (a >> 8) as u8;
+        p.ram_mut()[pb] = b as u8;
+        p.ram_mut()[pb + 1] = (b >> 8) as u8;
+    }
+    p.run(500_000);
+    assert!(p.halted());
+
+    for (i, &(a, b)) in pairs8.iter().enumerate() {
+        let want = a.wrapping_mul(b);
+        assert_eq!(
+            p.ram()[globals["po8"] as usize + i],
+            want,
+            "u8 {a} * {b} mod 256"
+        );
+    }
+    for (i, &(a, b)) in pairs16.iter().enumerate() {
+        let want = a.wrapping_mul(b);
+        let base = globals["po16"] as usize + 2 * i;
+        let got = u16::from(p.ram()[base]) | (u16::from(p.ram()[base + 1]) << 8);
+        assert_eq!(got, want, "u16 {a:#06x} * {b:#06x} mod 65536");
+    }
+}

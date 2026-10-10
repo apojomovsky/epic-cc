@@ -2380,61 +2380,38 @@ impl<'m> Gen<'m> {
         let scr = self.slot_addr(&name, "__scr").direct();
         self.emit(format!("{name}:"));
         match recipe {
-            // 8x8 -> 16 shift-add (AN526): t = a shifted left one bit per
-            // multiplier bit; for each set bit of bk, r += t. Store the low
-            // byte of the product (the i8 result).
+            // 8x8 -> 8 shift-add: the i8 result keeps only the low product
+            // byte, so the accumulate is mod 256. The running product is one
+            // scratch byte, the multiplicand shifts in its param slot, and the
+            // loop exits once the multiplier shifts out.
             "__mul_u8" => {
                 let a = self.slot_addr(&name, "a").direct();
                 let b = self.slot_addr(&name, "b").direct();
-                let (bk, cnt, r_lo, r_hi, t_lo, t_hi) =
-                    (scr, scr + 1, scr + 2, scr + 3, scr + 4, scr + 5);
+                let r = scr;
                 let l_loop = self.fresh_label();
                 let l_skip = self.fresh_label();
-                for r in [r_lo, r_hi, t_lo, t_hi] {
-                    self.emit_bank_select(r);
-                    self.emit(format!("    CLRF {}", self.fop(r)));
-                }
+                self.emit_bank_select(r);
+                self.emit(format!("    CLRF {}", self.fop(r))); // r = 0
+                self.emit(format!("{l_loop}:"));
+                self.emit_bank_select(b);
+                self.emit(format!("    BTFSS {}, 0", self.fop(b))); // test multiplier LSB
+                self.emit(format!("    GOTO {l_skip}"));
                 self.emit_bank_select(a);
                 self.emit(format!("    MOVF {}, W", self.fop(a)));
-                self.emit_bank_select(t_lo);
-                self.emit(format!("    MOVWF {}", self.fop(t_lo))); // t = a
-                self.emit_bank_select(b);
-                self.emit(format!("    MOVF {}, W", self.fop(b)));
-                self.emit_bank_select(bk);
-                self.emit(format!("    MOVWF {}", self.fop(bk))); // bk = b
-                self.emit("    MOVLW 0x08".to_string());
-                self.emit_bank_select(cnt);
-                self.emit(format!("    MOVWF {}", self.fop(cnt))); // cnt = 8
-                self.emit(format!("{l_loop}:"));
-                self.emit_bank_select(bk);
-                self.emit(format!("    BTFSS {}, 0", self.fop(bk))); // test multiplier LSB
-                self.emit(format!("    GOTO {l_skip}"));
-                self.emit_bank_select(t_lo);
-                self.emit(format!("    MOVF {}, W", self.fop(t_lo)));
-                self.emit_bank_select(r_lo);
-                self.emit(format!("    ADDWF {}, F", self.fop(r_lo)));
-                self.emit_bank_select(t_hi);
-                self.emit(format!("    MOVF {}, W", self.fop(t_hi)));
-                // The BTFSC/INCFSZ/ADDWF carry chain is atomic: no select
-                // may split it (a skip would land on the select). FSR
-                // already selects t_hi's bank from the MOVF above, and
-                // r_hi shares __scr's single-bank slot.
-                self.emit("    BTFSC STATUS, 0 ; C".to_string());
-                self.emit(format!("    INCFSZ {}, W", self.fop(t_hi))); // t_hi + carry; skip if wrapped
-                self.emit(format!("    ADDWF {}, F", self.fop(r_hi)));
+                self.emit_bank_select(r);
+                self.emit(format!("    ADDWF {}, F", self.fop(r))); // r += t, mod 256
                 self.emit(format!("{l_skip}:"));
                 self.emit("    BCF STATUS, 0 ; C".to_string());
-                self.emit_bank_select(t_lo);
-                self.emit(format!("    RLF {}, F", self.fop(t_lo)));
-                self.emit_bank_select(t_hi);
-                self.emit(format!("    RLF {}, F", self.fop(t_hi))); // t <<= 1
+                self.emit_bank_select(a);
+                self.emit(format!("    RLF {}, F", self.fop(a))); // t <<= 1, mod 256
                 self.emit("    BCF STATUS, 0 ; C".to_string());
-                self.emit_bank_select(bk);
-                self.emit(format!("    RRF {}, F", self.fop(bk))); // bk >>= 1
-                self.emit_bank_select(cnt);
-                self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
+                self.emit_bank_select(b);
+                self.emit(format!("    RRF {}, F", self.fop(b))); // bk >>= 1
+                self.emit(format!("    MOVF {}, F", self.fop(b))); // Z = (bk == 0)
+                self.emit("    BTFSS STATUS, 2 ; Z".to_string());
                 self.emit(format!("    GOTO {l_loop}"));
-                self.store_retval(r_lo, 2);
+                // Only the low byte is the i8 result, so a single store.
+                self.store_retval(r, 1);
                 self.emit("    RETLW 0x00".to_string());
             }
             // 8/8 restoring division (8 iterations): num <<= 1 (C = old
@@ -2500,74 +2477,77 @@ impl<'m> Gen<'m> {
                 }
                 self.emit("    RETLW 0x00".to_string());
             }
-            // 16x16 -> 32 shift-add, 16 iterations: t = a (32-bit, shifted
-            // left), for each set bit of bk, r += t across all 4 bytes with
-            // the incfsz carry idiom. Store the low 16 bits (the i16 result).
+            // 16x16 -> 16 shift-add: the i16 result keeps only the low half,
+            // so t and r are 16 bits (mod 65536) and shift in place in the
+            // param slots. Baseline has no ADDLW, so the carry into a_hi is
+            // folded through emit_add_w_carry, which leaves C intact. The
+            // loop exits once both multiplier bytes shift out.
             "__mul_u16" => {
                 let a = self.slot_addr(&name, "a").direct();
                 let b = self.slot_addr(&name, "b").direct();
-                let (bk_lo, bk_hi, cnt) = (scr, scr + 1, scr + 2);
-                let (r0, r1, r2, r3) = (scr + 3, scr + 4, scr + 5, scr + 6);
-                let (t0, t1, t2, t3) = (scr + 7, scr + 8, scr + 9, scr + 10);
+                let (a_lo, a_hi) = (a, a + 1);
+                let (bk_lo, bk_hi) = (b, b + 1);
+                let (r0, r1) = (scr, scr + 1);
                 let l_loop = self.fresh_label();
                 let l_skip = self.fresh_label();
-                for r in [r0, r1, r2, r3] {
-                    self.emit_bank_select(r);
-                    self.emit(format!("    CLRF {}", self.fop(r)));
-                }
-                for t in [t0, t1, t2, t3] {
-                    self.emit_bank_select(t);
-                    self.emit(format!("    CLRF {}", self.fop(t)));
-                }
-                self.emit_bank_select(a);
-                self.emit(format!("    MOVF {}, W", self.fop(a)));
-                self.emit_bank_select(t0);
-                self.emit(format!("    MOVWF {}", self.fop(t0)));
-                self.emit_bank_select(a + 1);
-                self.emit(format!("    MOVF {}, W", self.fop(a + 1)));
-                self.emit_bank_select(t1);
-                self.emit(format!("    MOVWF {}", self.fop(t1))); // t = a (32-bit, low 16)
-                self.emit_bank_select(b);
-                self.emit(format!("    MOVF {}, W", self.fop(b)));
-                self.emit_bank_select(bk_lo);
-                self.emit(format!("    MOVWF {}", self.fop(bk_lo)));
-                self.emit_bank_select(b + 1);
-                self.emit(format!("    MOVF {}, W", self.fop(b + 1)));
+                let l_noswap = self.fresh_label();
+                // Multiply commutes, but the loop runs bitlen(multiplier)
+                // passes: XOR-swap the slots when a_hi is zero and bk_hi is
+                // not, so the long operand is the one shifted.
+                self.emit_bank_select(a_hi);
+                self.emit(format!("    MOVF {}, W", self.fop(a_hi)));
+                self.emit("    BTFSS STATUS, 2 ; Z".to_string());
+                self.emit(format!("    GOTO {l_noswap}"));
                 self.emit_bank_select(bk_hi);
-                self.emit(format!("    MOVWF {}", self.fop(bk_hi))); // bk = b
-                self.emit("    MOVLW 0x10".to_string());
-                self.emit_bank_select(cnt);
-                self.emit(format!("    MOVWF {}", self.fop(cnt))); // cnt = 16
+                self.emit(format!("    MOVF {}, W", self.fop(bk_hi)));
+                self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+                self.emit(format!("    GOTO {l_noswap}"));
+                for (x, y) in [(a_lo, bk_lo), (a_hi, bk_hi)] {
+                    self.emit_bank_select(y);
+                    self.emit(format!("    MOVF {}, W", self.fop(y)));
+                    self.emit_bank_select(x);
+                    self.emit(format!("    XORWF {}, F", self.fop(x)));
+                    self.emit(format!("    MOVF {}, W", self.fop(x)));
+                    self.emit_bank_select(y);
+                    self.emit(format!("    XORWF {}, F", self.fop(y)));
+                    self.emit(format!("    MOVF {}, W", self.fop(y)));
+                    self.emit_bank_select(x);
+                    self.emit(format!("    XORWF {}, F", self.fop(x)));
+                }
+                self.emit(format!("{l_noswap}:"));
+                self.emit_bank_select(r0);
+                self.emit(format!("    CLRF {}", self.fop(r0)));
+                self.emit_bank_select(r1);
+                self.emit(format!("    CLRF {}", self.fop(r1))); // r = 0
                 self.emit(format!("{l_loop}:"));
                 self.emit_bank_select(bk_lo);
                 self.emit(format!("    BTFSS {}, 0", self.fop(bk_lo))); // test multiplier LSB
                 self.emit(format!("    GOTO {l_skip}"));
-                self.emit_bank_select(t0);
-                self.emit(format!("    MOVF {}, W", self.fop(t0)));
+                self.emit_bank_select(a_lo);
+                self.emit(format!("    MOVF {}, W", self.fop(a_lo)));
                 self.emit_bank_select(r0);
                 self.emit(format!("    ADDWF {}, F", self.fop(r0)));
-                for (ti, ri) in [(t1, r1), (t2, r2), (t3, r3)] {
-                    self.emit_bank_select(ti);
-                    self.emit(format!("    MOVF {}, W", self.fop(ti)));
-                    // Atomic carry chain (see __mul_u8): FSR already
-                    // selects the shared __scr bank, no reassertion inside.
-                    self.emit("    BTFSC STATUS, 0 ; C".to_string());
-                    self.emit(format!("    INCFSZ {}, W", self.fop(ti)));
-                    self.emit(format!("    ADDWF {}, F", self.fop(ri)));
-                }
+                self.emit_bank_select(a_hi);
+                self.emit(format!("    MOVF {}, W", self.fop(a_hi)));
+                self.emit_add_w_carry(); // W = a_hi + C, C preserved
+                self.emit_bank_select(r1);
+                self.emit(format!("    ADDWF {}, F", self.fop(r1)));
                 self.emit(format!("{l_skip}:"));
                 self.emit("    BCF STATUS, 0 ; C".to_string());
-                for t in [t0, t1, t2, t3] {
-                    self.emit_bank_select(t);
-                    self.emit(format!("    RLF {}, F", self.fop(t))); // t <<= 1
-                }
+                self.emit_bank_select(a_lo);
+                self.emit(format!("    RLF {}, F", self.fop(a_lo)));
+                self.emit_bank_select(a_hi);
+                self.emit(format!("    RLF {}, F", self.fop(a_hi))); // t <<= 1, mod 65536
                 self.emit("    BCF STATUS, 0 ; C".to_string());
                 self.emit_bank_select(bk_hi);
                 self.emit(format!("    RRF {}, F", self.fop(bk_hi)));
                 self.emit_bank_select(bk_lo);
                 self.emit(format!("    RRF {}, F", self.fop(bk_lo))); // bk >>= 1
-                self.emit_bank_select(cnt);
-                self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
+                self.emit_bank_select(bk_lo);
+                self.emit(format!("    MOVF {}, W", self.fop(bk_lo)));
+                self.emit_bank_select(bk_hi);
+                self.emit(format!("    IORWF {}, W", self.fop(bk_hi))); // Z = (bk == 0)
+                self.emit("    BTFSS STATUS, 2 ; Z".to_string());
                 self.emit(format!("    GOTO {l_loop}"));
                 self.store_retval(r0, 2);
                 self.emit("    RETLW 0x00".to_string());
