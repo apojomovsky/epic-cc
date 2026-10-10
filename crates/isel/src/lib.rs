@@ -804,14 +804,14 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// `W = RAM[ptr + byte_off]`: one byte of a pointer load or a memcpy
-    /// source. Direct bases read the plain file register; dynamic bases set
-    /// FSR first and read INDF; a const (flash) base reads via
-    /// `CALL __read_<name>` (the RETLW table leaves the byte in W). A table
-    /// larger than 255 bytes takes the 16-bit index path: the caller
-    /// splits the index into an in-chunk byte (W) and the chunk bit, then
-    /// CALLs `__read_<name>` (chunk 0) or `__read_<name>_hi` (chunk 1).
-    fn emit_ptr_load_byte(&mut self, ptr: &Val, byte_off: u8) {
+    /// Leaves `RAM[ptr + byte_off]` in W, or stores it to `dst` when given, in
+    /// which case W is not preserved (a const read's PCLATH restore clobbers it).
+    /// Direct bases read the file register; dynamic bases set FSR and read INDF; a
+    /// const (flash) base reads via `CALL __read_<name>`. A table over 255 bytes
+    /// takes the 16-bit index path: the caller splits the index into an in-chunk
+    /// byte (W) and the chunk bit, then CALLs `__read_<name>` (chunk 0) or
+    /// `__read_<name>_hi` (chunk 1).
+    fn emit_ptr_load_byte(&mut self, ptr: &Val, byte_off: u8, dst: Option<u16>) {
         match ptr {
             Val::Reg(r) => {
                 // Pool log variant (epic-cc#817): index-pair slots read
@@ -822,6 +822,7 @@ impl<'m> Gen<'m> {
                             (Base::Slot(s, _), _, _) if self.pool_slots.contains(&ssa_key(self.cur_func, &s))))
                 {
                     self.emit_pool_read(r, byte_off);
+                    self.store_byte_to(dst);
                     return;
                 }
                 if let (Base::Global(name), k, terms) = self.resolved_for(r) {
@@ -830,22 +831,12 @@ impl<'m> Gen<'m> {
                             // Large table: W = in-chunk index, hi bit in
                             // 0x70, branch to the right chunk entry.
                             self.emit_const_read_large(&name, k, &terms, byte_off);
+                            self.store_byte_to(dst);
                         } else {
                             // RETLW table read: W = index = k + Σ s×%reg + off.
-                            // The reader's input is W itself, so the set (whose
-                            // MOVLW clobbers W) goes BEFORE the index
-                            // computation; the index is computed into W after,
-                            // and nothing between touches PCLATH. The restore
-                            // right after the CALL saves the returned byte in
-                            // the fixed scratch (free at a const read) across
-                            // its own MOVLW, then reloads it into W.
-                            self.emit(format!("    MOVLW PAGE(__read_{name})"));
-                            self.emit("    MOVWF PCLATH".to_string());
-                            self.emit_ptr_index_w(k, &terms, byte_off);
-                            self.emit(format!("    CALL __read_{name}"));
-                            self.emit_w_store(self.scratch);
-                            self.emit_pclath_restore(&format!("__read_{name}"));
-                            self.emit_w_load(self.scratch);
+                            self.emit_small_const_read(&name, dst, |g| {
+                                g.emit_ptr_index_w(k, &terms, byte_off)
+                            });
                         }
                         return;
                     }
@@ -863,13 +854,9 @@ impl<'m> Gen<'m> {
                         "isel: constant index into large const table @{g} not supported (size {} > 255); only a single 16-bit reg index is",
                         self.global_size(g)
                     );
-                    self.emit(format!("    MOVLW PAGE(__read_{g})"));
-                    self.emit("    MOVWF PCLATH".to_string());
-                    self.emit(format!("    MOVLW 0x{byte_off:02X}"));
-                    self.emit(format!("    CALL __read_{g}"));
-                    self.emit_w_store(self.scratch);
-                    self.emit_pclath_restore(&format!("__read_{g}"));
-                    self.emit_w_load(self.scratch);
+                    self.emit_small_const_read(g, dst, |s| {
+                        s.emit(format!("    MOVLW 0x{byte_off:02X}"))
+                    });
                     return;
                 }
             }
@@ -878,6 +865,44 @@ impl<'m> Gen<'m> {
         match self.emit_ptr_setup(ptr, byte_off) {
             Addr::Direct(a) => self.emit(format!("    MOVF 0x{a:02X}, W")),
             Addr::Indirect => self.emit("    MOVF INDF, W".to_string()),
+        }
+        self.store_byte_to(dst);
+    }
+
+    /// Stores the byte held in W to `dst` when the caller asked for one.
+    fn store_byte_to(&mut self, dst: Option<u16>) {
+        if let Some(d) = dst {
+            self.emit_w_store(d);
+        }
+    }
+
+    /// One RETLW table read: `MOVLW PAGE(__read_<name>); MOVWF PCLATH`, then
+    /// `index` (leaves W = index), then `CALL`. The set goes BEFORE the index
+    /// because its MOVLW clobbers W. The restore right after the CALL is a
+    /// `MOVWF PCLATH` that also clobbers W, so the returned byte is stored
+    /// first when `dst` is set. Without one it parks in the fixed scratch
+    /// across the restore and reloads into W.
+    fn emit_small_const_read(
+        &mut self,
+        name: &str,
+        dst: Option<u16>,
+        index: impl FnOnce(&mut Self),
+    ) {
+        self.emit(format!("    MOVLW PAGE(__read_{name})"));
+        self.emit("    MOVWF PCLATH".to_string());
+        index(self);
+        self.emit(format!("    CALL __read_{name}"));
+        let target = format!("__read_{name}");
+        match dst {
+            Some(d) => {
+                self.emit_w_store(d);
+                self.emit_pclath_restore(&target);
+            }
+            None => {
+                self.emit_w_store(self.scratch);
+                self.emit_pclath_restore(&target);
+                self.emit_w_load(self.scratch);
+            }
         }
     }
 
@@ -2831,8 +2856,7 @@ impl<'m> Gen<'m> {
                     "isel: byval size mismatch for arg {i} of @{func}"
                 );
                 for b in 0..size {
-                    self.emit_ptr_load_byte(&arg.val, b);
-                    self.emit(format!("    MOVWF 0x{:02X}", pa + u16::from(b)));
+                    self.emit_ptr_load_byte(&arg.val, b, Some(pa + u16::from(b)));
                 }
             } else if arg.sret {
                 // sret: store the target address into the callee's sret param
@@ -3449,8 +3473,7 @@ impl<'m> Gen<'m> {
                         );
                     }
                     for k in 0..l.ty.bytes() {
-                        self.emit_ptr_load_byte(&ptr, k);
-                        self.emit_w_store(dst + u16::from(k));
+                        self.emit_ptr_load_byte(&ptr, k, Some(dst + u16::from(k)));
                     }
                 }
             }
@@ -3527,7 +3550,7 @@ impl<'m> Gen<'m> {
                     // itself may be a base+k+i expression), exactly like a
                     // per-byte load/store.
                     for i in 0..*n {
-                        self.emit_ptr_load_byte(&m.src, i);
+                        self.emit_ptr_load_byte(&m.src, i, None);
                         self.emit_ptr_store_w(&m.dst, i);
                     }
                 }

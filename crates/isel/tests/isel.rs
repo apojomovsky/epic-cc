@@ -5209,7 +5209,7 @@ fn same_page_const_read_skips_restore() {
     );
     // Same-page read: CALL, stash the byte, no restore, no reload.
     assert!(
-        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVWF 0x26"),
+        asm.contains("CALL __read_t\n    MOVWF 0x26"),
         "same-page read with no restore and no reload:\n{asm}"
     );
     assert!(
@@ -5478,17 +5478,17 @@ fn multi_page_module_runs_in_sim() {
         "same-page helper2 call elides the retval reload:\n{asm}"
     );
     assert!(
-        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVWF 0x34"),
+        asm.contains("CALL __read_t\n    MOVWF 0x34"),
         "same-page table read elides the park reload:\n{asm}"
     );
     // ...while main's cross-page calls (page 0 -> page 1) keep the
-    // restore after the retval copy, and the table park across it.
+    // restore after the retval copy; the table byte is stored ahead of it.
     assert!(
         asm.contains("CALL helper\n    MOVWF 0x27\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
         "cross-page helper call copies retval ahead of the restore:\n{asm}"
     );
     assert!(
-        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        asm.contains("CALL __read_t\n    MOVWF 0x2B\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
         "cross-page table read keeps the restore:\n{asm}"
     );
     // Hand-computed results (see the doc comment): helper returns
@@ -5697,7 +5697,7 @@ fn single_table_elision_drift_folded_by_window_align() {
     );
     // main's const read is cross-page (0 -> 1) and keeps its restore.
     assert!(
-        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        asm.contains("CALL __read_t\n    MOVWF 0x27\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
         "cross-page table read keeps the restore:\n{asm}"
     );
     // Load-bearing sim: the aligned table reads correctly (h0(x) = 0, so
@@ -10224,7 +10224,7 @@ fn const_reader_at_page_tail_pins_to_next_page() {
     // 0x7FF/0x800; re-tune the pad when call sequences change length.
     let ir_text = format!(
         "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n{}    ret void\n",
-        pad_body(675)
+        pad_body(676)
     );
     let m = module_with_globals(
         &ir_text,
