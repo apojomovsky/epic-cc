@@ -50,6 +50,12 @@ use iselcore::{
 };
 use std::collections::{HashMap, HashSet};
 
+mod chunk;
+use chunk::{
+    block_asm_labels, chunk_slice, insert_goto_sets, place_unit, plan_chunks, post_extents,
+    rewrite_restores, slice_banked_lines, CHUNK_LINK_WORDS,
+};
+
 /// Returns the recipe for a runtime routine name, or `None` for other names.
 /// Shares the routine set with `alloc` for bank rounding. An injected
 /// routine holds only a scratch alloca, so emitting it directly leaves an
@@ -197,10 +203,12 @@ impl<'m> Gen<'m> {
     /// preserve it. Pass A always emits for measurement. Pass B skips
     /// shrink-only elision pinned by `.org` pads.
     fn emit_pclath_restore(&mut self, target: &str) {
-        let same_page = match self.page_of {
-            Some(pages) => pages.get(target) == pages.get(self.cur_func),
-            None => false,
-        };
+        // An absent key is unknown, not equal: a split function has no
+        // `pages` entry, and its post-return PCLATH is its last chunk's page.
+        let same_page = matches!(
+            (self.page_of.and_then(|p| p.get(target)), self.page_of.and_then(|p| p.get(self.cur_func))),
+            (Some(a), Some(b)) if a == b
+        );
         if !same_page {
             self.emit(format!("    MOVLW PAGE({})", self.cur_func));
             self.emit("    MOVWF PCLATH".to_string());
@@ -957,7 +965,6 @@ impl<'m> Gen<'m> {
             g.emit(format!("    CALL {e}"));
             g.emit(format!("    MOVWF 0x{:02X}", g.scratch));
             g.emit_pclath_restore(&e);
-            g.emit(format!("    MOVF 0x{:02X}, W", g.scratch));
             g.emit(format!("    GOTO {l_done}"));
         };
         // Dispatches 3 or more chunks with descending threshold tests.
@@ -1009,7 +1016,6 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    CALL __read_{name}"));
                     self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
                     self.emit_pclath_restore(&format!("__read_{name}"));
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                     self.emit(format!("    GOTO {l_done}"));
                     self.emit(format!("{l_hi}:"));
                     self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
@@ -1018,11 +1024,13 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    CALL __read_{name}_hi"));
                     self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
                     self.emit_pclath_restore(&format!("__read_{name}_hi"));
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 } else {
                     emit_chain(self, &l_done);
                 }
+                // Every path leaves the byte in scratch. W is reloaded here,
+                // not carried into the join: a PCLATH pair before a GOTO clobbers W.
                 self.emit(format!("{l_done}:"));
+                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
             }
             [(scale, r)] => {
                 // Scales a multi-byte element index without a multiplier.
@@ -1081,7 +1089,6 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    CALL __read_{name}"));
                     self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
                     self.emit_pclath_restore(&format!("__read_{name}"));
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                     self.emit(format!("    GOTO {l_done}"));
                     self.emit(format!("{l_hi}:"));
                     self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
@@ -1090,11 +1097,11 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    CALL __read_{name}_hi"));
                     self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
                     self.emit_pclath_restore(&format!("__read_{name}_hi"));
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 } else {
                     emit_chain(self, &l_done);
                 }
                 self.emit(format!("{l_done}:"));
+                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
             }
             [] => panic!(
                 "isel: constant index into large const table @{name} not supported (size > 255); only a single 16-bit reg index is supported"
@@ -6079,7 +6086,19 @@ fn start_init_words(m: &Module, addrs: &HashMap<String, u16>) -> usize {
 /// overflow panics: the layout contract is closed. Covers `__start` and
 /// const readers the same way.
 pub fn verify_page_fit(m: &Module, asm: &str) {
+    verify_page_fit_split(m, asm, &HashMap::new());
+}
+
+/// `verify_page_fit` with split chunk entries as page-checked targets.
+/// `chunks` maps each split function to its entry labels in order. The
+/// first entry is the function label, already a target, so only the rest
+/// are added; each chunk then has to sit in one page.
+pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec<String>>) {
     let funcs: Vec<&str> = m.funcs.iter().map(|f| f.name.as_str()).collect();
+    let extra: Vec<String> = chunks
+        .values()
+        .flat_map(|entries| entries.iter().skip(1).cloned())
+        .collect();
     // Tracks reader entries as page-checked targets like functions.
     let mut readers: Vec<String> = Vec::new();
     for g in &m.globals {
@@ -6131,8 +6150,10 @@ pub fn verify_page_fit(m: &Module, asm: &str) {
         }
         if let Some(l) = line.strip_suffix(':') {
             let name = l.trim().to_string();
-            let is_target =
-                funcs.contains(&name.as_str()) || name == "__start" || readers.contains(&name);
+            let is_target = funcs.contains(&name.as_str())
+                || name == "__start"
+                || readers.contains(&name)
+                || extra.contains(&name);
             if is_target {
                 if let Some((prev, s)) = &cur {
                     check(prev, *s, org);
@@ -6761,13 +6782,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
 }
 
 /// Extends `select` with per-line source locations for the driver address
-/// table. Marks generated lines with `None`.
+/// table. Marks generated lines with `None`. The chunk map lists each split
+/// function's entries in chunk order, for `verify_page_fit_split`.
 pub fn select_with_locs(
     device: &Device,
     m: &Module,
     addrs: &HashMap<String, u16>,
     staged: &HashSet<String>,
-) -> (String, Vec<Option<SrcLoc>>) {
+) -> (String, Vec<Option<SrcLoc>>, HashMap<String, Vec<String>>) {
     let mut out: Vec<String> = Vec::new();
     let mut locs: Vec<Option<SrcLoc>> = Vec::new();
     // Emits the ISR first at the hardware vector: the vector is the entry,
@@ -6891,7 +6913,8 @@ pub fn select_with_locs(
     order.extend(m.funcs.iter().filter(|f| f.isr));
     order.extend(m.funcs.iter().filter(|f| !f.isr));
     let mut bodies: Vec<(String, usize)> = Vec::new();
-    let mut body_texts: Vec<String> = Vec::new();
+    let mut body_lines: Vec<Vec<String>> = Vec::new();
+    let mut body_locs: Vec<Vec<Option<SrcLoc>>> = Vec::new();
     {
         let mut tmp = 0u32;
         for f in &order {
@@ -6914,7 +6937,8 @@ pub fn select_with_locs(
             };
             emit_func_body(&mut g, f);
             bodies.push((f.name.clone(), word_size(&g.out)));
-            body_texts.push(g.out.join("\n"));
+            body_lines.push(g.out);
+            body_locs.push(g.locs);
         }
     }
     // Packs post-banking sizes, so BANKSEL growth cannot push a tail
@@ -6927,54 +6951,26 @@ pub fn select_with_locs(
         .flat_map(|e| e.split('\n'))
         .map(|l| l.to_string())
         .collect();
-    let mut measure: Vec<String> = vec![
-        "    org 0x0000".to_string(),
-        "    goto __start".to_string(),
-        "".to_string(),
-    ];
-    measure.extend(modasm_lines.iter().cloned());
-    if !has_isr {
-        let mut init: Vec<String> = Vec::new();
-        for g in &m.globals {
-            if addrs.contains_key(&g.name) && g.needs_ram_init() {
-                let base = addrs[&g.name];
-                for (i, b) in g.bytes.iter().enumerate() {
-                    if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
-                        init.push(format!("    MOVLW {}", ref_byte_operand(addrs, i, f, *a)));
-                    } else {
-                        init.push(format!("    MOVLW 0x{b:02X}"));
-                    }
-                    init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
-                }
-            }
-        }
-        let mut blk: Vec<String> = vec![
-            "__start:".to_string(),
-            "    MOVLW PAGE(main)".to_string(),
-            "    MOVWF PCLATH".to_string(),
-        ];
-        blk.extend(init);
-        blk.extend([
-            "    CALL main".to_string(),
-            "    SLEEP".to_string(),
+    // The banking measure for one set of body texts, in emission order.
+    let measure_of = |texts: &[String]| -> Vec<String> {
+        let mut measure: Vec<String> = vec![
+            "    org 0x0000".to_string(),
+            "    goto __start".to_string(),
             "".to_string(),
-        ]);
-        measure.extend(blk);
-    }
-    for (i, (name, _)) in bodies.iter().enumerate() {
-        measure.push(body_texts[i].clone());
-        if has_isr && name == isr_names[0] {
+        ];
+        measure.extend(modasm_lines.iter().cloned());
+        if !has_isr {
             let mut init: Vec<String> = Vec::new();
             for g in &m.globals {
                 if addrs.contains_key(&g.name) && g.needs_ram_init() {
                     let base = addrs[&g.name];
-                    for (idx, b) in g.bytes.iter().enumerate() {
-                        if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == idx) {
-                            init.push(format!("    MOVLW {}", ref_byte_operand(addrs, idx, f, *a)));
+                    for (i, b) in g.bytes.iter().enumerate() {
+                        if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
+                            init.push(format!("    MOVLW {}", ref_byte_operand(addrs, i, f, *a)));
                         } else {
                             init.push(format!("    MOVLW 0x{b:02X}"));
                         }
-                        init.push(format!("    MOVWF 0x{:02X}", base + idx as u16));
+                        init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
                     }
                 }
             }
@@ -6991,60 +6987,92 @@ pub fn select_with_locs(
             ]);
             measure.extend(blk);
         }
-    }
-    let banked = banking::assign_banks(device, &measure.join("\n"));
-    // Measures post-banking extents label to label with assembler
-    // semantics. Block labels stay inside the enclosing function, matching
-    // the page-fit check.
-    let func_names: HashSet<&str> = order.iter().map(|f| f.name.as_str()).collect();
-    let mut post: HashMap<String, usize> = HashMap::new();
-    {
-        let mut org = 0usize;
-        let mut cur: Option<(String, usize)> = None;
-        for raw in banked.lines() {
-            let line = raw.split(';').next().unwrap_or("").trim();
-            if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("org ") {
-                org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
-                continue;
-            }
-            if line.starts_with("end") {
-                break;
-            }
-            if let Some(l) = line.strip_suffix(':') {
-                let name = l.trim().to_string();
-                if func_names.contains(name.as_str()) || name == "__start" {
-                    if let Some((prev, s)) = &cur {
-                        post.insert(prev.clone(), org - s);
+        for (i, (name, _)) in bodies.iter().enumerate() {
+            measure.push(texts[i].clone());
+            if has_isr && name == isr_names[0] {
+                let mut init: Vec<String> = Vec::new();
+                for g in &m.globals {
+                    if addrs.contains_key(&g.name) && g.needs_ram_init() {
+                        let base = addrs[&g.name];
+                        for (idx, b) in g.bytes.iter().enumerate() {
+                            if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == idx) {
+                                init.push(format!(
+                                    "    MOVLW {}",
+                                    ref_byte_operand(addrs, idx, f, *a)
+                                ));
+                            } else {
+                                init.push(format!("    MOVLW 0x{b:02X}"));
+                            }
+                            init.push(format!("    MOVWF 0x{:02X}", base + idx as u16));
+                        }
                     }
-                    cur = Some((name, org));
                 }
-                continue;
+                let mut blk: Vec<String> = vec![
+                    "__start:".to_string(),
+                    "    MOVLW PAGE(main)".to_string(),
+                    "    MOVWF PCLATH".to_string(),
+                ];
+                blk.extend(init);
+                blk.extend([
+                    "    CALL main".to_string(),
+                    "    SLEEP".to_string(),
+                    "".to_string(),
+                ]);
+                measure.extend(blk);
             }
-            if line.contains(" equ ") {
-                continue;
-            }
-            if let Some(n) = line.strip_prefix(".align ") {
-                let n: usize = n.trim().parse().unwrap();
-                org = (org + n - 1) & !(n - 1);
-                continue;
-            }
-            if line.starts_with(".table ") {
-                continue;
-            }
-            org += 1;
         }
-        if let Some((prev, s)) = &cur {
-            post.insert(prev.clone(), org - s);
+        measure
+    };
+    let func_names: HashSet<&str> = order.iter().map(|f| f.name.as_str()).collect();
+    let func_by_name: HashMap<&str, &ir::Func> =
+        order.iter().map(|f| (f.name.as_str(), *f)).collect();
+    let raw_texts: Vec<String> = body_lines.iter().map(|l| l.join("\n")).collect();
+    let mut measure = measure_of(&raw_texts);
+    let mut banked = banking::assign_banks(device, &measure.join("\n"));
+    let mut post = post_extents(&banked, &func_names);
+    // A non-ISR, non-naked body past one page is cut into linked chunks
+    // (epic-cc#880). The ISR keeps page 0 whole, and naked bodies stay
+    // verbatim asm with no block structure to cut at.
+    let split_names: Vec<String> = order
+        .iter()
+        .filter(|f| !f.naked && !(has_isr && f.name == isr_names[0]) && post[&f.name] > 0x800)
+        .map(|f| f.name.clone())
+        .collect();
+    let mut split_plans: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+    if !split_names.is_empty() {
+        // Candidates are measured with the restore-set pairs pass B adds,
+        // so the planned chunk words hold after emission.
+        let mut texts = raw_texts;
+        for (i, f) in order.iter().enumerate() {
+            if split_names.contains(&f.name) {
+                let (lines, _) = insert_goto_sets(&body_lines[i], &body_locs[i]);
+                texts[i] = lines.join("\n");
+            }
+        }
+        measure = measure_of(&texts);
+        banked = banking::assign_banks(device, &measure.join("\n"));
+        post = post_extents(&banked, &func_names);
+        for f in order.iter().filter(|f| split_names.contains(&f.name)) {
+            let labels = block_asm_labels(f);
+            let lines = slice_banked_lines(&banked, &f.name, &func_names);
+            let plan = plan_chunks(&f.name, &labels, &lines);
+            if plan.len() < 2 {
+                panic!(
+                    "isel: function @{} of {} words planned as one chunk",
+                    f.name, post[&f.name]
+                );
+            }
+            split_plans.insert(f.name.clone(), plan);
         }
     }
     // Packs first-fit into the lowest page with room, reusing tails to use
     // fewer pages. Starts after the page-0 prefix with `__start` reachable
     // and the ISR pinned at the vector (epic-cc#207).
     let mut pages: HashMap<String, usize> = HashMap::new();
-    let mut pads: HashMap<String, usize> = HashMap::new();
+    // Keyed by (function, chunk): an unsplit function is chunk 0.
+    let mut pads: HashMap<(String, usize), usize> = HashMap::new();
+    // Placement order as (function, chunk, page).
+    let mut placed: Vec<(String, usize, usize)> = Vec::new();
     let init_words = start_init_words(m, addrs);
     let mut page_next: Vec<usize> = vec![if has_isr {
         4
@@ -7059,55 +7087,41 @@ pub fn select_with_locs(
                 "isel: isr @{name} of {size} words does not fit page 0 (0x004-0x7FF) with room for the reset __start"
             );
             pages.insert(name.clone(), 0);
-            pads.insert(name.clone(), 4);
+            pads.insert((name.clone(), 0), 4);
             // Counts the ISR body plus the following `__start` and init in
             // the page-0 budget (epic-cc#207).
             page_next[0] = 4 + size + 4 + init_words;
+            placed.push((name.clone(), 0, 0));
+        } else if let Some(plan) = split_plans.get(name) {
+            let last = plan.len() - 1;
+            for (k, (_, words)) in plan.iter().enumerate() {
+                // Non-final chunks carry their link words.
+                let unit = if k < last {
+                    *words + CHUNK_LINK_WORDS
+                } else {
+                    *words
+                };
+                let (page, start) = place_unit(device, name, unit, &mut page_next);
+                // Anchors page-aligned chunk starts with `.org`, as for
+                // whole functions below.
+                if start & 0x7FF == 0 {
+                    pads.insert((name.clone(), k), start);
+                }
+                placed.push((name.clone(), k, page));
+            }
         } else {
             if size > 0x800 {
                 panic!("isel: function @{name} of {size} words exceeds a 2048-word page (0x800)");
             }
-            // Places each function in the lowest fitting page tail.
-            let mut placed: Option<(usize, usize)> = None;
-            for (pi, next) in page_next.iter_mut().enumerate() {
-                if *next + size <= (pi + 1) * 0x800 {
-                    placed = Some((pi, *next));
-                    *next += size;
-                    break;
-                }
-            }
-            let (page, start) = match placed {
-                Some(p) => p,
-                None => {
-                    // Opens the next page when no tail fits. Enforces the
-                    // device flash bound there: overflow panics. Ceiling
-                    // division, not floor: a device narrower than one page
-                    // (PIC16F84's 1024 words, half of 0x800) still has
-                    // exactly one page, not zero -- floor division here
-                    // used to underflow computing `last_page` for such a
-                    // device (docs/39 D-1, epic-cc#398).
-                    let pi = page_next.len();
-                    let num_pages = device.flash_words.div_ceil(0x800);
-                    let last_page = num_pages - 1;
-                    if pi as u32 >= num_pages {
-                        panic!(
-                            "isel: function @{name} would start at 0x{:04X}, beyond page {last_page} (device flash is {:#06x} words)",
-                            pi * 0x800,
-                            device.flash_words
-                        );
-                    }
-                    let start = pi * 0x800;
-                    page_next.push(start + size);
-                    (pi, start)
-                }
-            };
+            let (page, start) = place_unit(device, name, size, &mut page_next);
             pages.insert(name.clone(), page);
             // Anchors page-aligned starts with `.org`: without it, pass-B
             // shrinkage slides the function below the boundary and its label
             // and tail disagree on the page.
             if start & 0x7FF == 0 {
-                pads.insert(name.clone(), start);
+                pads.insert((name.clone(), 0), start);
             }
+            placed.push((name.clone(), 0, page));
         }
     }
     // Maps const readers to post-call pages. Pins the section start, so the
@@ -7165,48 +7179,68 @@ pub fn select_with_locs(
     for (entry, page) in reader_pages(&consts, staged, &staged_len, table_start) {
         pages.insert(entry, page);
     }
-    // Pass B emits with pages known in page order. Skips same-page restores
-    // under pinned bases. Orders by page to keep addresses monotonic within
-    // each page.
-    let mut page_order: Vec<Vec<(&ir::Func, &str)>> = Vec::new();
-    for (f, (name, _)) in order.iter().zip(&bodies) {
-        let page = pages[name];
-        while page_order.len() <= page {
+    // Units reach each page in placement order, so addresses stay monotonic
+    // within a page.
+    let mut page_order: Vec<Vec<(&ir::Func, usize)>> = Vec::new();
+    for (name, k, page) in &placed {
+        while page_order.len() <= *page {
             page_order.push(Vec::new());
         }
-        page_order[page].push((*f, name.as_str()));
+        page_order[*page].push((func_by_name[name.as_str()], *k));
     }
     let section_start = {
         let mut tmp = 0u32;
         let mut addr_b: usize = if has_isr { 4 } else { 5 };
+        // A split function is emitted once, then cut into its chunks.
+        let mut split_cache: HashMap<&str, (Vec<String>, Vec<Option<SrcLoc>>)> = HashMap::new();
         for funcs_on_page in &page_order {
-            for (f, name) in funcs_on_page {
-                let mut g = Gen {
-                    m,
-                    addrs,
-                    device,
-                    staged: &staged,
-                    resolved: &resolved,
-                    prov: prov.clone(),
-                    scratch,
-                    retval_lo,
-                    cur_func: &f.name,
-                    tmp: &mut tmp,
-                    page_of: Some(&pages),
-                    w_holds: None,
-                    cur_loc: None,
-                    out: Vec::new(),
-                    locs: Vec::new(),
+            for (f, k) in funcs_on_page {
+                let name = f.name.as_str();
+                let plan = split_plans.get(name);
+                let fresh = !(plan.is_some() && split_cache.contains_key(name));
+                let (body, body_locs) = if fresh {
+                    let mut g = Gen {
+                        m,
+                        addrs,
+                        device,
+                        staged: &staged,
+                        resolved: &resolved,
+                        prov: prov.clone(),
+                        scratch,
+                        retval_lo,
+                        cur_func: &f.name,
+                        tmp: &mut tmp,
+                        page_of: Some(&pages),
+                        w_holds: None,
+                        cur_loc: None,
+                        out: Vec::new(),
+                        locs: Vec::new(),
+                    };
+                    emit_func_body(&mut g, f);
+                    (g.out, g.locs)
+                } else {
+                    (Vec::new(), Vec::new())
                 };
-                emit_func_body(&mut g, f);
-                if let Some(pad) = pads.get(*name) {
+                let (body, body_locs) = match plan {
+                    Some(plan) => {
+                        if fresh {
+                            let labels: Vec<String> = plan.iter().map(|(l, _)| l.clone()).collect();
+                            let lines = rewrite_restores(name, &labels, body);
+                            split_cache.insert(name, insert_goto_sets(&lines, &body_locs));
+                        }
+                        let (lines, locs) = &split_cache[name];
+                        chunk_slice(lines, locs, plan, *k)
+                    }
+                    None => (body, body_locs),
+                };
+                if let Some(pad) = pads.get(&(name.to_string(), *k)) {
                     out.push(format!("    org 0x{pad:04X}"));
                     locs.push(None);
                     addr_b = *pad;
                 }
-                addr_b += word_size(&g.out);
-                out.extend(g.out);
-                locs.extend(g.locs);
+                addr_b += word_size(&body);
+                out.extend(body);
+                locs.extend(body_locs);
                 if f.isr {
                     // Moves `__start` after the ISR within page 0, keeping it
                     // in reset reach.
@@ -7368,7 +7402,12 @@ pub fn select_with_locs(
     }
     out.push("    end".to_string());
     locs.push(None);
-    (out.join("\n"), locs)
+    // Keyed by split function; entries run in chunk order, first is the function.
+    let chunks: HashMap<String, Vec<String>> = split_plans
+        .iter()
+        .map(|(name, plan)| (name.clone(), plan.iter().map(|(l, _)| l.clone()).collect()))
+        .collect();
+    (out.join("\n"), locs, chunks)
 }
 
 /// Re-exports the address-map parser from `iselcore`. Keeps the backend
