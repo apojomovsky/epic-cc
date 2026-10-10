@@ -3279,3 +3279,34 @@ fn no_fuse_on_pic18_isr_spellings() {
     let text = ir::serialize(&legalize_pic18(m));
     assert!(!text.contains("__udivmod"), "isr pair fused:\n{text}");
 }
+
+/// epic-cc#927: post-LSR decimal loops (header selects into a blank self-loop,
+/// phi-free exit) collapse to `__udec_u16_rj5` calls, but only in pairs on pic18.
+#[test]
+fn shares_lsr_mangled_decimal_loops_on_pic18_only_in_pairs() {
+    use legalize::legalize_pic18;
+    let site = |name: &str| {
+        format!(
+            "fn {name}(void) ()\n  block pre:\n    %v0 = load volatile i16 @vin\n    br hd\n  block hd:\n    %ivp = phi ptr %sp latch %g pre\n    %cnt = phi i16 %cn latch 0 pre\n    %v = phi i16 %q latch %v0 pre\n    %g = gep @buf +15\n    %q = udiv i16 %v, 10\n    %m = mul i16 %q, 246\n    %s = add i16 %m, %v\n    %r = trunc i16 %s to i8\n    %d = or i8 %r, 48\n    store i8 %d %ivp\n    %lt10 = icmp ult i16 %v, 10\n    %lt4 = icmp ult i16 %cnt, 4\n    %sel = select i1 %lt10 i1 %lt4 i1 0\n    br i1 %sel blank latch\n  block blank:\n    %bp = phi ptr %bsp blank %ivp hd\n    %bc = phi i16 %bn blank %cnt hd\n    store i8 32 %bp\n    %bn = add i16 %bc, 1\n    %bsp = gep %bp +65535\n    %bd = icmp eq i16 %bn, 5\n    br i1 %bd exit blank\n  block latch:\n    %cn = add i16 %cnt, 1\n    %sp = gep %ivp +65535\n    %ld = icmp eq i16 %cn, 5\n    br i1 %ld exit hd\n  block exit:\n    ret void\n"
+        )
+    };
+    let header = "global buf i8\nglobal vin i16\n";
+    let pair = format!("{header}{}", site("a")) + &site("b");
+    let text = ir::serialize(&legalize_pic18(parse(&pair)));
+    assert_eq!(
+        text.matches("@__udec_u16_rj5").count(),
+        2,
+        "both post-LSR loops share the helper:\n{text}"
+    );
+    let lone = format!("{header}{}", site("a"));
+    let lone_text = ir::serialize(&legalize_pic18(parse(&lone)));
+    assert!(
+        !lone_text.contains("@__udec_u16_rj5"),
+        "a lone loop stays expanded:\n{lone_text}"
+    );
+    let plain = ir::serialize(&legalize(parse(&pair)));
+    assert!(
+        !plain.contains("@__udec_u16_rj5"),
+        "non-pic18 injects nothing:\n{plain}"
+    );
+}

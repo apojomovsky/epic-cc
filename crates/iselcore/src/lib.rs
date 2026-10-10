@@ -13,6 +13,17 @@ pub fn ssa_key(func: &str, name: &str) -> String {
     format!("{func}::{name}")
 }
 
+/// True when a comment-stripped, trimmed listing line is the bare directive
+/// `name`: exactly `name`, or `name` followed by whitespace. A label such as
+/// `endpoint:` or `listen: MOVLW 1` starts with a directive name but is not
+/// one; a bare prefix test on those lines drops real code.
+pub fn is_directive(line: &str, name: &str) -> bool {
+    line == name
+        || line
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with([' ', '\t']))
+}
+
 /// Where a local's bytes live. Only `Direct` is constructed: the `Frame`
 /// case stays reserved (docs/29 §2) so frame-pointer handling for
 /// recursion and reentrancy adds a case here and at `Slot`
@@ -1385,4 +1396,27 @@ pub fn flash_provenance(m: &Module) -> FlashProvenance {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_directive;
+
+    #[test]
+    fn bare_directive_matches_name_alone_or_followed_by_whitespace() {
+        assert!(is_directive("list", "list"));
+        assert!(is_directive("list p=16f877a", "list"));
+        assert!(is_directive("list\tp=16f877a", "list"));
+        assert!(is_directive("radix dec", "radix"));
+        assert!(is_directive("end", "end"));
+    }
+
+    #[test]
+    fn label_sharing_a_directive_prefix_is_not_a_directive() {
+        assert!(!is_directive("endpoint:", "end"));
+        assert!(!is_directive("listen: MOVLW 1", "list"));
+        assert!(!is_directive("listing", "list"));
+        assert!(!is_directive("radix_mode:", "radix"));
+        assert!(!is_directive("ending", "end"));
+    }
 }

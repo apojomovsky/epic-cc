@@ -41,8 +41,8 @@
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    find_value_folds, flash_provenance, log_pool_site, resolve_pointers, ssa_key, Base,
-    FlashProvenance, PtrResolution, Slot, LOG_POOL_CALLEE, LOG_POOL_VARIANT,
+    find_value_folds, flash_provenance, is_directive, log_pool_site, resolve_pointers, ssa_key,
+    Base, FlashProvenance, PtrResolution, Slot, LOG_POOL_CALLEE, LOG_POOL_VARIANT,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -8510,13 +8510,13 @@ fn line_is_word(raw: &str) -> bool {
     if line.is_empty() {
         return false;
     }
-    if line.starts_with("list") || line.starts_with("radix") {
+    if is_directive(line, "list") || is_directive(line, "radix") {
         return false;
     }
     if line.starts_with("org ") {
         return false;
     }
-    if line.starts_with("end") {
+    if is_directive(line, "end") {
         return false;
     }
     if line.ends_with(':') {
@@ -8682,7 +8682,7 @@ fn measure_fit_layout(asm: &str, targets: &HashSet<String>) -> FitLayout {
     };
     for raw in asm.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
@@ -8694,7 +8694,7 @@ fn measure_fit_layout(asm: &str, targets: &HashSet<String>) -> FitLayout {
             org = target;
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             break;
         }
         if let Some(l) = line.strip_suffix(':') {
@@ -8947,10 +8947,10 @@ fn measure_section_units(banked: &str) -> (HashMap<String, usize>, HashMap<Strin
     };
     for raw in banked.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             close(&mut cur, &mut stage, &mut reader);
             break;
         }
@@ -9024,7 +9024,7 @@ fn verify_section_model(places: &[ConstPlace], banked: &str) {
     };
     for raw in banked.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
@@ -9032,7 +9032,7 @@ fn verify_section_model(places: &[ConstPlace], banked: &str) {
             org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             close(&mut cur, &lens);
             break;
         }
@@ -9282,14 +9282,14 @@ fn measure_end_org(text: &str) -> usize {
     let mut org = 0usize;
     for raw in text.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
             org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             continue;
         }
-        if line.starts_with("end") || line.starts_with("__read_") {
+        if is_directive(line, "end") || line.starts_with("__read_") {
             break;
         }
         if line.strip_suffix(':').is_some() {
@@ -9842,14 +9842,14 @@ pub fn select_with_opts(
         let mut cur: Option<(String, usize)> = None;
         for raw in banked.lines() {
             let line = raw.split(';').next().unwrap_or("").trim();
-            if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+            if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
                 continue;
             }
             if let Some(rest) = line.strip_prefix("org ") {
                 org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
                 continue;
             }
-            if line.starts_with("end") {
+            if is_directive(line, "end") {
                 break;
             }
             if let Some(l) = line.strip_suffix(':') {
