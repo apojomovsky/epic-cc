@@ -114,6 +114,16 @@ be measured by implementation.
   with sim runs; the prize (7 words at honest loop cost) did not
   justify them, so the loop is priced from #486's landed shape
   instead, stated above.
+- Flash growth the listing does not explain: the listing counts
+  instructions, not the NOP words the assembler's PCL page fixup inserts
+  (`crates/asm/src/lib.rs`). A `.pcltbl` block that would straddle a
+  256-byte page is moved to the next page with NOPs at its `.pclalign`
+  anchor. On menu-demo `-Os`, HEAD against pre-#1013: real words -61,
+  pad words +71, all pads on pages 0x09 and 0x38. The attribution to the
+  PCL fixup is by elimination (the emitted asm has `.org` only at the
+  vectors), not a per-address map of each pad run to its anchor. A flash
+  delta can net real-word shrinkage against pad growth, so split the total
+  before reading it as codegen growth.
 
 ## Recommendation
 
