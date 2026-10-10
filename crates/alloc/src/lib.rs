@@ -1840,13 +1840,19 @@ fn home_args(
         .collect();
     // A def isel emits as compute-then-store to the dst slot. A call
     // result lands the same way (retval bytes to the dst slot on both
-    // cores), so chaining calls home too. Casts and freezes stay out:
-    // the coalescer already folds a dead-after one into its source slot,
-    // so homing only resurrects its copy at the param address.
+    // cores), so chaining calls home too. Trunc/Sext lower the same way
+    // and price a size win, so they home; Zext stays out (flat on -Os,
+    // grows one O2 row) and freezes stay out (the coalescer already
+    // folds a dead-after one, so homing only resurrects its copy).
     let homable = |inst: &Inst| -> bool {
         matches!(
             inst,
-            Inst::Load(_) | Inst::Bin(_) | Inst::Icmp(_) | Inst::Call(_)
+            Inst::Load(_)
+                | Inst::Bin(_)
+                | Inst::Icmp(_)
+                | Inst::Call(_)
+                | Inst::Trunc(_)
+                | Inst::Sext(_)
         ) || matches!(inst, Inst::Select(s) if !s.ptr)
     };
     // One writer per param slot at a time (epic-cc#830 review): sibling
