@@ -2842,7 +2842,21 @@ fn allocate_inner(
                                         }
                                     }
                                     ir::Val::Reg(r) => {
-                                        if let Some(base) = find_const_base(r) {
+                                        // A select of two arms on one const base has no GEP
+                                        // chain, so fall back to the resolved base (epic-cc#1026).
+                                        let base = find_const_base(r).or_else(|| {
+                                            match resolved.get(&ssa_key(&f.name, r)) {
+                                                Some((Base::Global(cg), _, _))
+                                                    if m.globals.iter().any(|gl| {
+                                                        gl.name == *cg && gl.is_const
+                                                    }) =>
+                                                {
+                                                    Some(cg.to_string())
+                                                }
+                                                _ => None,
+                                            }
+                                        });
+                                        if let Some(base) = base {
                                             if let Some(gl) =
                                                 m.globals.iter().find(|gl| gl.name == base)
                                             {
@@ -3311,13 +3325,16 @@ fn allocate_inner(
                                 ),
                                 ir::Val::Const(_) => false,
                             };
+                            if !hits {
+                                continue;
+                            }
                             let routed = i == 0
                                 && iselcore::log_pool_site(
                                     m, &resolved, &pooled, &f.name, &c.func, &c.args, &c.callees,
                                 );
                             let escapes = !c.callees.is_empty()
                                 || iselcore::callee_reads_param(m, &c.func, i);
-                            if hits && !routed && escapes {
+                            if !routed && escapes {
                                 return true;
                             }
                         }

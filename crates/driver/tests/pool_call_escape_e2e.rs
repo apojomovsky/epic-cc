@@ -83,13 +83,18 @@ fn pooled_printf_format_matches_unpooled() {
 
 #[test]
 fn pooled_strlen_consumer_matches_unpooled() {
-    // consume() passes its pointer to strlen, which reads the bytes: the
-    // direct-only literals keep their staged RAM copy, so g_sink matches.
-    let f = "tests/fixtures/pool_addrs_mixed.c";
-    let (halted, base) = run(f, "strlen_base", &[], &["g_sink"], 200_000);
+    // Each measure() call writes its own global, so both the direct arg and
+    // the select-merged arg are observed (epic-cc#1026).
+    let f = "tests/fixtures/pool_call_escape_strlen.c";
+    let g = ["g_len_a", "g_len_b"];
+    let (halted, base) = run(f, "strlen_base", &[], &g, 200_000);
     assert!(halted, "unpooled build must halt");
-    assert_eq!(base, [19], "strlen of mixed[0..] payload");
-    let (halted, pooled) = run(f, "strlen_pool", &["--const-pool"], &["g_sink"], 200_000);
+    assert_eq!(
+        base,
+        [11, 5],
+        "unpooled build: strlen(txt), strlen(txt + 6)"
+    );
+    let (halted, pooled) = run(f, "strlen_pool", &["--const-pool"], &g, 200_000);
     assert!(halted, "--const-pool build must halt");
     assert_eq!(pooled, base, "--const-pool build");
 }

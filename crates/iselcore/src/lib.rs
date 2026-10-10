@@ -1132,6 +1132,10 @@ pub fn callee_reads_param(m: &Module, callee: &str, idx: usize) -> bool {
         return true;
     }
     let name = p.name.strip_prefix('%').unwrap_or(&p.name);
+    // A body-less definition is a declaration, so its reads are unknown.
+    if f.blocks.is_empty() {
+        return true;
+    }
     f.blocks
         .iter()
         .any(|b| b.insts.iter().any(|i| reads_reg(i, name)))
