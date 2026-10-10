@@ -82,9 +82,12 @@ fn pool_addrs_gate_copies_and_rewrite_addresses() {
         asm.contains("LOW(__const_pool"),
         "direct const args materialize pool addresses:\n{asm}"
     );
+    // consume() hands its pointer to strlen, which reads the bytes, so the
+    // literals stage a RAM copy (epic-cc#1026); the mixed const keeps its own.
+    let staged_names = staged(&map);
     assert!(
-        staged(&map).is_empty() && !gs.contains(&"__const_stage"),
-        "nothing stages once copies gate: {map}"
+        staged_names.len() == 2 && staged_names.iter().all(|s| s.starts_with(".str")),
+        "strlen-read literals stage their RAM copies: {staged_names:?}"
     );
 }
 

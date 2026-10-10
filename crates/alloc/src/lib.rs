@@ -2842,7 +2842,21 @@ fn allocate_inner(
                                         }
                                     }
                                     ir::Val::Reg(r) => {
-                                        if let Some(base) = find_const_base(r) {
+                                        // A select of two arms on one const base has no GEP
+                                        // chain, so fall back to the resolved base (epic-cc#1026).
+                                        let base = find_const_base(r).or_else(|| {
+                                            match resolved.get(&ssa_key(&f.name, r)) {
+                                                Some((Base::Global(cg), _, _))
+                                                    if m.globals.iter().any(|gl| {
+                                                        gl.name == *cg && gl.is_const
+                                                    }) =>
+                                                {
+                                                    Some(cg.to_string())
+                                                }
+                                                _ => None,
+                                            }
+                                        });
+                                        if let Some(base) = base {
                                             if let Some(gl) =
                                                 m.globals.iter().find(|gl| gl.name == base)
                                             {
@@ -3295,6 +3309,37 @@ fn allocate_inner(
         let ram_use = |g: &str| -> bool {
             if const_byval.contains(g) || const_phi.contains(g) {
                 return true;
+            }
+            // A pointer escapes into a callee that may read it (epic-cc#1026),
+            // then needs RAM semantics. Routed log fmt args read via the pool.
+            for f in &m.funcs {
+                for b in &f.blocks {
+                    for inst in &b.insts {
+                        let ir::Inst::Call(c) = inst else { continue };
+                        for (i, arg) in c.args.iter().enumerate().filter(|(_, a)| a.ty.is_none()) {
+                            let hits = match &arg.val {
+                                ir::Val::Global(n) => n.as_str() == g,
+                                ir::Val::Reg(r) => matches!(
+                                    resolved.get(&ssa_key(&f.name, r)),
+                                    Some((Base::Global(cg), _, _)) if cg.as_str() == g
+                                ),
+                                ir::Val::Const(_) => false,
+                            };
+                            if !hits {
+                                continue;
+                            }
+                            let routed = i == 0
+                                && iselcore::log_pool_site(
+                                    m, &resolved, &pooled, &f.name, &c.func, &c.args, &c.callees,
+                                );
+                            let escapes = !c.callees.is_empty()
+                                || iselcore::callee_reads_param(m, &c.func, i);
+                            if !routed && escapes {
+                                return true;
+                            }
+                        }
+                    }
+                }
             }
             if const_sel.contains(g) {
                 // A select arm stays RAM unless every selecting use
