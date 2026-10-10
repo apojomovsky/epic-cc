@@ -10676,7 +10676,7 @@ mod dead_pclath_tests {
 
     #[test]
     fn label_between_restore_and_next_set_keeps_pair() {
-        // A branch can enter at the second set, so the first set is live.
+        // The label breaks the adjacent-set match, so the pair is conservatively kept.
         let src = [
             "    MOVLW 0x00",
             "    MOVWF PCLATH",
