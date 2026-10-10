@@ -117,7 +117,9 @@ already-built clang layer from GHCR, not a recompile. Because the base image
 and the LLVM tarball are digest-pinned, the clang layer only needs a real
 rebuild (locally or in CI) when the Dockerfile or a pin changes.
 
-The warm job rides out Docker Hub rate limits by retrying only that failure (`scripts/warm-toolchain-cache.sh`): GitHub-hosted runners share an egress IP, so pulls from other jobs on that IP can exhaust the anonymous hourly budget.
+The warm job rides out Docker Hub rate limits by retrying only that failure
+(`scripts/warm-toolchain-cache.sh`): GitHub-hosted runners share an egress IP,
+so pulls from other jobs on that IP can exhaust the anonymous hourly budget.
 
 `make image` is idempotent: the tag itself carries the `Dockerfile` plus
 UID/GID hash, so a present tag means an up to date image and a missing
