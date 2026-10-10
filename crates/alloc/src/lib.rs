@@ -613,10 +613,11 @@ fn frame_layout(
     // point interval, immediately reusable. A memory object spans the whole
     // function (its slot is a RAM region, live from entry to exit), so it
     // never aliases anything.
-    // The driver removes pure dead defs before alloc (LLVM dce, legalize), so
-    // the point interval above only ever covers effectful dead defs (calls,
-    // volatile loads, va_arg). isel does not DCE, so a pure dead def that
-    // reached here would still be emitted, in its own point-interval slot.
+
+    // Dead defs reaching alloc in the driver e2e suite are effectful only
+    // (calls, volatile loads, va_arg, memory objects). isel does not DCE, so
+    // a pure dead def reaching here would be emitted in its own slot.
+
     // A folded or forwarded producer (epic-cc#863) needs no slot: isel
     // reads the source or computes into the store destination, so no
     // interval enters coloring and no address leaves placement.
