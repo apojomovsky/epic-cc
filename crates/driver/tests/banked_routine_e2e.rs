@@ -67,7 +67,7 @@ fn routine_frame_lands_in_bank1() {
         .expect("__mul_u16::__scr");
     let a = *layout.locals.get("__mul_u16::a").expect("__mul_u16::a");
     let b = *layout.locals.get("__mul_u16::b").expect("__mul_u16::b");
-    // The whole frame (params + 14-byte scratch) must sit inside ONE bank,
+    // The whole frame (params + 2-byte scratch) must sit inside ONE bank,
     // any bank (issue #6): a straddle would need a BANKSEL inside the
     // skip-sensitive recipe loops. The helper's 120-byte frame pushes this
     // one to bank 1 or 2 depending on clang's exact def count.
@@ -75,7 +75,7 @@ fn routine_frame_lands_in_bank1() {
         scr >= 0x20,
         "routine frame must live in a GPR bank (got __scr at 0x{scr:03X})"
     );
-    let all = [a, b, scr, scr + 13];
+    let all = [a, b, scr, scr + 1];
     let bank = PIC16F877A
         .ram_banks
         .iter()

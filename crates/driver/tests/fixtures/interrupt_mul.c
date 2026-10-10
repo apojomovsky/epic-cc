@@ -2,7 +2,7 @@
 // reach the injected `__mul_u8` runtime routine.
 //
 // Before the routine-duplication fix there was exactly ONE `__mul_u8`, and
-// its frame (params `a`/`b` plus the 6-byte `__scr` working area) was shared
+// its frame (params `a`/`b` plus the 1-byte `__scr` working area) was shared
 // by both contexts. An interrupt taken while main was partway through the
 // shift-add loop re-entered that same frame, overwrote the multiplier,
 // counter and running product, and main resumed against the ISR's state.
