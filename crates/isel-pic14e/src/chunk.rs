@@ -150,7 +150,15 @@ pub(crate) fn insert_goto_sets(
                 .iter()
                 .rposition(|l| word_size(std::slice::from_ref(l)) > 0)
             {
-                Some(j) if is_skip(&out[j]) => j,
+                Some(j) if is_skip(&out[j]) => {
+                    // A label between the skip and the GOTO is a second entry that
+                    // would reach the GOTO with the pair skipped. Panic, don't guess.
+                    assert!(
+                        out[j + 1..].iter().all(|l| label_of(code_of(l)).is_none()),
+                        "isel: label between skip op and GOTO {target}; PCLATH set cannot guard both entries"
+                    );
+                    j
+                }
                 _ => out.len(),
             };
             let pair = [
