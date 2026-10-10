@@ -1840,13 +1840,19 @@ fn home_args(
         .collect();
     // A def isel emits as compute-then-store to the dst slot. A call
     // result lands the same way (retval bytes to the dst slot on both
-    // cores), so chaining calls home too. Casts and freezes stay out:
-    // the coalescer already folds a dead-after one into its source slot,
-    // so homing only resurrects its copy at the param address.
+    // cores), so chaining calls home too. Trunc/Sext lower the same way
+    // and price a size win, so they home; Zext stays out (flat on -Os,
+    // grows one O2 row) and freezes stay out (the coalescer already
+    // folds a dead-after one, so homing only resurrects its copy).
     let homable = |inst: &Inst| -> bool {
         matches!(
             inst,
-            Inst::Load(_) | Inst::Bin(_) | Inst::Icmp(_) | Inst::Call(_)
+            Inst::Load(_)
+                | Inst::Bin(_)
+                | Inst::Icmp(_)
+                | Inst::Call(_)
+                | Inst::Trunc(_)
+                | Inst::Sext(_)
         ) || matches!(inst, Inst::Select(s) if !s.ptr)
     };
     // One writer per param slot at a time (epic-cc#830 review): sibling
@@ -2138,15 +2144,41 @@ fn home_args(
             // A violation is one candidate's write landing between the
             // other's write and its call: the reader would see the
             // clobberer instead of its own value. `mine` owns the window,
-            // `theirs` is the intruder.
+            // `theirs` is the intruder. The intruder only clobbers along a
+            // path to the read that re-runs no `mine` write: a loop re-running
+            // the owner's def overwrites the intruder before the read (`visible`).
             let kw = writes(k);
+            let visible =
+                |t: (usize, usize), call: (usize, usize), mine: &[(usize, usize)]| -> bool {
+                    if t.0 == call.0 && t.1 <= call.1 {
+                        return !mine.iter().any(|m| m.0 == t.0 && m.1 > t.1 && m.1 < call.1);
+                    }
+                    if mine.iter().any(|m| m.0 == t.0 && m.1 > t.1) {
+                        return false;
+                    }
+                    let mut seen: HashSet<usize> = HashSet::new();
+                    let mut stack = succ.get(&t.0).cloned().unwrap_or_default();
+                    while let Some(b) = stack.pop() {
+                        if b == call.0 {
+                            if !mine.iter().any(|m| m.0 == b && m.1 < call.1) {
+                                return true;
+                            }
+                            continue;
+                        }
+                        if mine.iter().any(|m| m.0 == b) || !seen.insert(b) {
+                            continue;
+                        }
+                        stack.extend(succ.get(&b).cloned().unwrap_or_default());
+                    }
+                    false
+                };
             let clobbered = |mine: &[(usize, usize)],
                              theirs: &[(usize, usize)],
                              call: (usize, usize)|
              -> bool {
                 theirs
                     .iter()
-                    .any(|t| mine.iter().any(|m| reaches(*m, *t)) && reaches(*t, call))
+                    .any(|t| mine.iter().any(|m| reaches(*m, *t)) && visible(*t, call, mine))
             };
             if clobbered(&kw, &cw, k.call) || clobbered(&cw, &kw, c.call) {
                 continue 'cand;

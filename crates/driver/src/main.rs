@@ -546,8 +546,9 @@ fn main() {
     let mut addrs: HashMap<String, u16> = HashMap::new();
     addrs.extend(layout.globals.iter().map(|(k, &v)| (k.clone(), v)));
     addrs.extend(layout.locals.iter().map(|(k, &v)| (k.clone(), v)));
-    // Cross-page chunk entries (epic-cc#841): filled by the PIC14 arm
-    // below, empty for every other core; the page-fit check reads it.
+    // Cross-page chunk entries (epic-cc#841, epic-cc#880): filled by the
+    // PIC14 and PIC14E arms below, empty for every other core; the
+    // page-fit check reads it.
     let mut chunks: HashMap<String, Vec<String>> = HashMap::new();
     let (asm, mut locs) = match device.core {
         device::Core::Pic14 => {
@@ -593,7 +594,10 @@ fn main() {
             )
         }
         device::Core::Pic14e => {
-            isel_pic14e::select_with_locs(device, &m, &addrs, &layout.staged_consts)
+            let (asm, locs, c) =
+                isel_pic14e::select_with_locs(device, &m, &addrs, &layout.staged_consts);
+            chunks = c;
+            (asm, locs)
         }
         device::Core::PicBaseline => isel_pic_baseline::select_with_locs(device, &m, &addrs),
     };
@@ -626,7 +630,7 @@ fn main() {
             if device.core == device::Core::Pic14 {
                 isel::verify_page_fit_split(&m, &asm, &chunks);
             } else {
-                isel_pic14e::verify_page_fit(&m, &asm);
+                isel_pic14e::verify_page_fit_split(&m, &asm, &chunks);
             }
             asm
         }
