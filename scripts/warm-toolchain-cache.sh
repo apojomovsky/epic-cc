@@ -1,16 +1,8 @@
 #!/usr/bin/env bash
-# Builds the ci target into the GHCR registry cache for the warm-toolchain-cache
-# job (.github/workflows/toolchain-cache.yml).
-#
-# Docker Hub allows 100 anonymous manifest GETs per hour per IP (HEAD requests
-# are not counted, measured 2026-10-10), and GitHub-hosted runners share egress
-# IPs, so the ubuntu base pull can return 429 until the window frees. Only that
-# failure is retried: any other build error is real and fails at once. A retry
-# reuses the layers already in the cache, so it costs little.
-#
-# The loop lives here, not inline in the workflow, so it runs (and can be
-# exercised with a stub docker) on its own.
-#
+# Warms the GHCR registry cache for toolchain-cache.yml. Docker Hub's anonymous
+# limit (100 GETs per IP per hour, HEADs uncounted) can 429 the ubuntu base pull
+# on shared runner IPs, so only that failure is retried, sleeping about 52 min
+# in total to outlast one window. Other errors fail at once.
 # Usage: CACHE_REF=ghcr.io/<owner>/<repo>-toolchain bash scripts/warm-toolchain-cache.sh
 set -uo pipefail
 
