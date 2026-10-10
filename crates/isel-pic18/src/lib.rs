@@ -349,14 +349,29 @@ struct Gen<'m> {
     /// literal op, skipping the temp stage.
     bin_w_srcs: HashSet<String>,
     /// Binop producers computing into their load operand's slot
-    /// (epic-cc#825). Maps a single-use const `Add`/`Sub` feeding a
-    /// `PLUSW` store to the single-use load temp it must accumulate
-    /// into, so the staged result temp disappears.
+    /// (epic-cc#825, INDF stores by epic-cc#969). Maps a single-use const
+    /// `Add`/`Sub` feeding an indirect store to the single-use load temp
+    /// it must accumulate into, so the staged result temp disappears.
     rmw_fwd: HashMap<String, String>,
+    /// Single-use truncs read straight from their source slot (epic-cc#978).
+    /// Maps a folded trunc dst to its source slot address: the trunc arm
+    /// skips the temp stage and call-arg setup reads the source instead.
+    /// The temp slot stays allocated but untouched, like a store-folded
+    /// producer's (epic-cc#723).
+    trunc_fwd: HashMap<String, u16>,
+    /// Single-use zexts homed into the retval region (epic-cc#978). The
+    /// zext arm writes the retval bytes directly and the ret arm skips
+    /// the W round trip, mirroring the homed-call skip (epic-cc#738).
+    zext_ret: HashSet<String>,
     /// Value folds from the shared per-function pre-scan (epic-cc#863):
     /// loads whose byte never stages to a slot. `alloc` drops those
     /// slots; the load arm skips them and consumers read the source.
     w_folds: iselcore::ValueFolds,
+    /// Flash bytes forwarded through `TABLAT` (epic-cc#977). Holds a
+    /// single-use one-byte flash-load dst feeding a dynamic store in
+    /// the same block with a clean span: the load arm skips the temp
+    /// staging copy and the store arm reads `TABLAT` directly.
+    tablat_fwd: HashSet<String>,
     out: Vec<String>,
     /// One source location per emitted line, index-aligned with `out`.
     /// `None` marks a compiler-generated line (no source instruction).
@@ -1529,6 +1544,445 @@ impl<'m> Gen<'m> {
         }
         (fwd, consumed)
     }
+    /// Span test for the copy-forwarding pre-scans (epic-cc#978): the same
+    /// no-memory-behavior span epic-cc#723 folds under. The folded read
+    /// moves to the consumer, so nothing between producer and consumer
+    /// may touch memory, call out, or end the block.
+    fn fwd_span_clean(insts: &[Inst]) -> bool {
+        insts.iter().all(|i| match i {
+            Inst::Call(_)
+            | Inst::Asm(_)
+            | Inst::Store(_)
+            | Inst::Memcpy(_)
+            | Inst::VaStart(_)
+            | Inst::VaArg(_)
+            | Inst::Load(_)
+            | Inst::Br(_)
+            | Inst::BrCond(_)
+            | Inst::Switch(_)
+            | Inst::Ret(_, _) => false,
+            _ => true,
+        })
+    }
+
+    /// Whether `r`'s slot holds its value wherever a consumer reads it.
+    /// False when any fold or lane skips staging it, when it is a folded
+    /// pointer, or when its defining instruction stages nothing. Copy
+    /// sources must read live slots, so anything here fails the fold
+    /// instead of risking a stale read.
+    fn copy_src_staged(g: &Gen, f: &Func, r: &str) -> bool {
+        if g.w_folds.unplaced().contains(r)
+            || g.store_fwd.contains_key(r)
+            || g.lane_consumed.contains(r)
+            || g.bit_lanes.contains_key(r)
+            || g.bin_w_srcs.contains(r)
+            || g.rmw_fwd.contains_key(r)
+            || g.phi_fold.contains_key(r)
+            || g.inplace_bins.contains(r)
+            || g.const_w_phis.contains(r)
+            || g.trunc_fwd.contains_key(r)
+            || g.zext_ret.contains(r)
+            || g.resolved.contains_key(&ssa_key(&f.name, r))
+        {
+            return false;
+        }
+        f.blocks.iter().flat_map(|b| &b.insts).any(|i| match i {
+            Inst::Load(l) => l.dst == r,
+            Inst::Bin(q) => q.dst == r,
+            Inst::Call(c) => c.dst.as_deref() == Some(r),
+            Inst::Icmp(c) => c.dst == r,
+            Inst::Zext(z) => z.dst == r,
+            Inst::Sext(s) => s.dst == r,
+            Inst::Trunc(t) => t.dst == r,
+            Inst::Freeze(fr) => fr.dst == r,
+            Inst::Select(s) => s.dst == r,
+            Inst::Phi(p) => p.dst == r,
+            _ => false,
+        })
+    }
+
+    /// Per-function trunc-to-call-arg pre-scan (epic-cc#978): a single-use
+    /// same-block `Trunc` feeding one scalar call arg lets arg setup read
+    /// the source slot, and the trunc temp never stages. The narrowed
+    /// div-rem tail (a divide result truncated into `__mul_u8`) is the
+    /// motivating shape: two `MOVFF`s where one does.
+    fn find_trunc_fwds(g: &Gen, f: &Func) -> HashMap<String, u16> {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut fwd: HashMap<String, u16> = HashMap::new();
+        for b in &f.blocks {
+            for (ci, inst) in b.insts.iter().enumerate() {
+                let Inst::Call(c) = inst else { continue };
+                if !c.callees.is_empty() {
+                    continue;
+                }
+                // An inlined narrow multiply reads its operand slots
+                // directly, bypassing arg setup: a folded temp would read
+                // stale there, so exactly those calls stay unfolded. The
+                // call-path multiply keeps its arg setup and still folds.
+                if g.inline_mul_plan(c).is_some() {
+                    continue;
+                }
+                let Some(callee) = g.m.funcs.iter().find(|x| x.name == c.func) else {
+                    continue;
+                };
+                if c.args.len() > callee.params.len() {
+                    continue;
+                }
+                if c.args
+                    .iter()
+                    .any(|a| a.ty.is_none() || a.byval.is_some() || a.sret)
+                {
+                    continue;
+                }
+                // Every arg's home slot: arg setup writes homes in order,
+                // so a folded source overlapping another arg's home stays
+                // staged instead of risking a setup-order clobber.
+                let mut homes: Vec<(u32, u32)> = Vec::with_capacity(c.args.len());
+                let mut known = true;
+                for (j, a) in c.args.iter().enumerate() {
+                    let Some(pa) = g.addrs.get(&ssa_key(&c.func, &callee.params[j].name)) else {
+                        known = false;
+                        break;
+                    };
+                    let w = u32::from(a.ty.expect("gated scalar above").bytes());
+                    homes.push((u32::from(*pa), w));
+                }
+                if !known {
+                    continue;
+                }
+                for (k, arg) in c.args.iter().enumerate() {
+                    let Val::Reg(r) = &arg.val else { continue };
+                    if uses.get(r).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    if g.lane_consumed.contains(r) {
+                        continue;
+                    }
+                    let Some(pi) = b.insts[..ci]
+                        .iter()
+                        .rposition(|i| matches!(i, Inst::Trunc(t) if t.dst == *r))
+                    else {
+                        continue;
+                    };
+                    let Inst::Trunc(t) = &b.insts[pi] else {
+                        continue;
+                    };
+                    // A trunc to i1 masks its source byte: the consumer
+                    // must read the masked temp, never the source.
+                    if t.to == Ty::I1 {
+                        continue;
+                    }
+                    let n = u32::from(t.to.bytes());
+                    if u32::from(arg.ty.expect("gated scalar above").bytes()) != n {
+                        continue;
+                    }
+                    let Val::Reg(q) = &t.val else { continue };
+                    if !Self::copy_src_staged(g, f, q) {
+                        continue;
+                    }
+                    let Some(src) = g.addrs.get(&ssa_key(&f.name, q)).copied() else {
+                        continue;
+                    };
+                    if !Self::fwd_span_clean(&b.insts[pi + 1..ci]) {
+                        continue;
+                    }
+                    let (slo, shi) = (u32::from(src), u32::from(src) + n);
+                    let mut ok = true;
+                    for (j, (hpa, hw)) in homes.iter().enumerate() {
+                        let disjoint = hpa + hw <= slo || shi <= *hpa;
+                        if disjoint {
+                            continue;
+                        }
+                        // Our own home reading our own source is the
+                        // self-copy the copy arms already skip.
+                        if j != k || *hpa != slo || *hw != n {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    fwd.insert(r.clone(), src);
+                }
+            }
+        }
+        fwd
+    }
+
+    /// Per-function zext-to-ret pre-scan (epic-cc#978): a single-use
+    /// same-block `Zext` feeding `ret` computes straight into the retval
+    /// bytes, and the ret skips its W round trip. The i1-to-i16 boolean
+    /// return is the motivating shape: one `MOVFF` plus `CLRF` where a
+    /// temp stage and two reload-store pairs were.
+    fn find_zext_rets(g: &Gen, f: &Func) -> HashSet<String> {
+        if f.isr {
+            return HashSet::new();
+        }
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut homed: HashSet<String> = HashSet::new();
+        for b in &f.blocks {
+            for (si, inst) in b.insts.iter().enumerate() {
+                let Inst::Ret(Some((ty, v)), _) = inst else {
+                    continue;
+                };
+                let Val::Reg(r) = v else { continue };
+                if uses.get(r).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                if g.lane_consumed.contains(r) {
+                    continue;
+                }
+                let Some(pi) = b.insts[..si]
+                    .iter()
+                    .rposition(|i| matches!(i, Inst::Zext(z) if z.dst == *r))
+                else {
+                    continue;
+                };
+                let Inst::Zext(z) = &b.insts[pi] else {
+                    continue;
+                };
+                if z.to.bytes() != ty.bytes() {
+                    continue;
+                }
+                let Val::Reg(q) = &z.val else { continue };
+                if !Self::copy_src_staged(g, f, q) {
+                    continue;
+                }
+                if g.addrs.get(&ssa_key(&f.name, q)).is_none() {
+                    continue;
+                }
+                if !Self::fwd_span_clean(&b.insts[pi + 1..si]) {
+                    continue;
+                }
+                homed.insert(r.clone());
+            }
+        }
+        homed
+    }
+
+    /// Per-function load-to-zext folds (epic-cc#978): a single-use
+    /// same-block `Load` from a RAM global feeding a `Zext` reads the
+    /// global at the zext, and the temp never stages. Same single-read
+    /// predicate the shared scan proves for ALU operands (epic-cc#863),
+    /// without its access-bank gate: the zext reads through `MOVFF`,
+    /// which carries the full address, so a banked source folds at the
+    /// same word cost. The caller inserts them after every other scan
+    /// so those prove undisturbed.
+    fn find_load_zext_folds(g: &Gen, f: &Func) -> Vec<(String, String)> {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut folds: Vec<(String, String)> = Vec::new();
+        for b in &f.blocks {
+            for (ci, inst) in b.insts.iter().enumerate() {
+                let Inst::Zext(z) = inst else { continue };
+                let Val::Reg(r) = &z.val else { continue };
+                if uses.get(r).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                let Some(pi) = b.insts[..ci]
+                    .iter()
+                    .rposition(|i| matches!(i, Inst::Load(l) if l.dst == *r))
+                else {
+                    continue;
+                };
+                let Inst::Load(l) = &b.insts[pi] else {
+                    continue;
+                };
+                if l.ptr_ty || l.ty.bytes() != z.from.bytes() {
+                    continue;
+                }
+                let Some(src) = l.ptr.strip_prefix('@') else {
+                    continue;
+                };
+                let Some(known) = g.m.globals.iter().find(|x| x.name == src) else {
+                    continue;
+                };
+                if known.is_const {
+                    continue;
+                }
+                if g.resolved.contains_key(&ssa_key(&f.name, r)) {
+                    continue;
+                }
+                if g.w_folds.loads.contains_key(r) {
+                    continue;
+                }
+                if g.lane_consumed.contains(r) || g.lane_consumed.contains(&z.dst) {
+                    continue;
+                }
+                if matches!(b.insts.get(pi + 1), Some(Inst::Icmp(_))) {
+                    continue;
+                }
+                // The gap predicate the shared scan folds under: pure
+                // lane copies with no memory behavior (epic-cc#863).
+                if !b.insts[pi + 1..ci].iter().all(|i| {
+                    matches!(
+                        i,
+                        Inst::Zext(_)
+                            | Inst::Sext(_)
+                            | Inst::Trunc(_)
+                            | Inst::Freeze(_)
+                            | Inst::Select(_)
+                            | Inst::Gep(_)
+                            | Inst::IntToPtr(_)
+                            | Inst::Alloca(_)
+                            | Inst::Phi(_)
+                    )
+                }) {
+                    continue;
+                }
+                folds.push((r.clone(), src.to_string()));
+            }
+        }
+        folds
+    }
+    /// Static `const_base_of` for pre-scans: whether `ptr` resolves to a
+    /// `const` (flash) global, without touching emitter state.
+    fn const_base_in(g: &Gen, func: &str, ptr: &Val) -> Option<(String, u16, Vec<(u16, String)>)> {
+        match ptr {
+            Val::Global(name) if g.global_is_const(name) => Some((name.clone(), 0, Vec::new())),
+            Val::Reg(r) => match g.resolved.get(&ssa_key(func, r)) {
+                Some((Base::Global(name), k, terms)) if g.global_is_const(name) => {
+                    Some((name.clone(), *k, terms.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    /// Per-function TABLAT-forward pre-scan (epic-cc#977): a single-use
+    /// same-block flash byte load feeding a dynamic store leaves its
+    /// byte in `TABLAT` for the store to read directly. The mirror of
+    /// #723, which folds producers into static destinations and
+    /// excludes flash loads; here the dynamic destination is the point.
+    /// The #723 span rule keeps `TBLRD` and calls out of the span and
+    /// the ISR saves `TABLAT`, so nothing disturbs the staged byte.
+    /// Single-byte only: wider pairs stage per byte on both sides.
+    fn find_tablat_forwards(g: &Gen, f: &Func) -> HashSet<String> {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut fwd: HashSet<String> = HashSet::new();
+        for b in &f.blocks {
+            for (si, inst) in b.insts.iter().enumerate() {
+                let Inst::Store(s) = inst else { continue };
+                let Val::Reg(r) = &s.val else { continue };
+                if uses.get(r).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                if s.ty.bytes() != 1 || !s.ptr.starts_with('%') {
+                    continue;
+                }
+                if Self::static_base(g, &f.name, &s.ptr).is_some() {
+                    continue;
+                }
+                let ptr_val = Val::Reg(s.ptr[1..].to_string());
+                if Self::const_base_in(g, &f.name, &ptr_val).is_some() {
+                    continue;
+                }
+                if let Val::Reg(pr) = &ptr_val {
+                    let pkey = ssa_key(&f.name, pr);
+                    if g.prov.flash.contains(&pkey) || g.prov.mixed.contains(&pkey) {
+                        continue;
+                    }
+                }
+                if g.lane_consumed.contains(r) || g.bit_lanes.contains_key(r) {
+                    continue;
+                }
+                if g.w_folds.loads.contains_key(r) || g.bin_w_srcs.contains(r) {
+                    continue;
+                }
+                if g.store_fwd.contains_key(r) || g.store_consumed.contains(r) {
+                    continue;
+                }
+                let Some(pi) = b.insts[..si].iter().rposition(|i| match i {
+                    Inst::Load(l) => &l.dst == r,
+                    _ => false,
+                }) else {
+                    continue;
+                };
+                let Inst::Load(l) = &b.insts[pi] else {
+                    continue;
+                };
+                if l.ty.bytes() != 1 || l.ptr_ty {
+                    continue;
+                }
+                let load_ptr = if let Some(gb) = l.ptr.strip_prefix('@') {
+                    Val::Global(gb.to_string())
+                } else if let Some(rr) = l.ptr.strip_prefix('%') {
+                    Val::Reg(rr.to_string())
+                } else {
+                    continue;
+                };
+                let Some((_table, _k, terms)) = Self::const_base_in(g, &f.name, &load_ptr) else {
+                    continue;
+                };
+                if terms.len() > 1 {
+                    continue;
+                }
+                // Same span rule as #723: the folded byte is staged
+                // earlier, so the span holds no memory behavior at all.
+                // In particular no second load may stage `TABLAT` and no
+                // call may run code that reads flash.
+                let span_clean = b.insts[pi + 1..si].iter().all(|i| match i {
+                    Inst::Call(_)
+                    | Inst::Asm(_)
+                    | Inst::Store(_)
+                    | Inst::Memcpy(_)
+                    | Inst::VaStart(_)
+                    | Inst::VaArg(_)
+                    | Inst::Load(_)
+                    | Inst::Br(_)
+                    | Inst::BrCond(_)
+                    | Inst::Switch(_)
+                    | Inst::Ret(_, _) => false,
+                    _ => true,
+                });
+                if !span_clean {
+                    continue;
+                }
+                fwd.insert(r.clone());
+            }
+        }
+        fwd
+    }
     /// Const-producer pre-scan (epic-cc#825): a block with exactly one
     /// phi, one byte wide, every incoming a constant, consumed only by
     /// a direct-global store that follows the phis; or a `select` over
@@ -1756,13 +2210,14 @@ impl<'m> Gen<'m> {
         }
         out
     }
-    /// In-place RMW pre-scan (epic-cc#825): a single-use const `Add`/`Sub`
-    /// immediately followed by the `PLUSW` store it feeds, whose value
-    /// operand is a single-use load temp. The binop accumulates into the
-    /// operand's slot with an in-place literal lane, so its own result
-    /// temp disappears. Adjacency is load-bearing: `alloc` ends the
-    /// operand's live range at the binop, so any gap def could be colored
-    /// into its slot.
+    /// In-place RMW pre-scan (epic-cc#825, INDF stores by epic-cc#969): a
+    /// single-use const `Add`/`Sub` immediately followed by the indirect
+    /// store it feeds (`PLUSW` or `INDF`/`POSTINC` destination), whose
+    /// value operand is a single-use load temp. The binop accumulates
+    /// into the operand's slot with an in-place literal lane, so its own
+    /// result temp disappears. Adjacency is load-bearing: `alloc` ends
+    /// the operand's live range at the binop, so any gap def could be
+    /// colored into its slot.
     /// Loads already riding W into their binop stay out; that fold wins
     /// more on the same shape.
     fn find_rmw_fwds(g: &Gen, f: &Func, bin_w: &HashSet<String>) -> HashMap<String, String> {
@@ -1847,13 +2302,40 @@ impl<'m> Gen<'m> {
                 } else {
                     continue;
                 };
-                if g.plusw_shape(&ptr_val).is_none() {
+                if g.plusw_shape(&ptr_val).is_none() && !Self::store_is_indirect(g, f, &ptr_val) {
                     continue;
                 }
                 out.insert(q.dst.clone(), lreg.clone());
             }
         }
         out
+    }
+    /// Whether an RMW-candidate store pointer resolves to an indirect
+    /// destination (`INDF`/`POSTINC` on FSR0), mirroring `emit_ptr_setup`'s
+    /// `Direct`/`Indirect` decision without emitting. A direct global
+    /// stays direct; a register pointer is indirect unless it folds to a
+    /// plain global address with no dynamic terms. Unresolved pointers
+    /// stay out: the store arm would reject them the same way.
+    /// (epic-cc#969)
+    fn store_is_indirect(g: &Gen, f: &Func, ptr_val: &Val) -> bool {
+        let Val::Reg(r) = ptr_val else {
+            return false;
+        };
+        let Some((base, _k, terms)) = g.resolved.get(&ssa_key(&f.name, r)) else {
+            return false;
+        };
+        match base {
+            Base::Global(_) => !terms.is_empty(),
+            Base::Slot(sname, indirect) => {
+                if *indirect {
+                    return true;
+                }
+                if f.params.iter().any(|p| p.name == *sname && p.ptr) {
+                    return true;
+                }
+                !terms.is_empty()
+            }
+        }
     }
     /// The register side of an `Add`/`Sub` against a constant: the value
     /// operand plus the literal. `Add` commutes, so a constant on either
@@ -2698,11 +3180,14 @@ impl<'m> Gen<'m> {
     }
     fn val_addr(&self, v: &Val) -> Slot {
         match v {
-            // A directly folded load (epic-cc#863) reads its source
-            // global: the slot is gone, so every reader resolves here.
-            Val::Reg(r) => match self.w_folds.loads.get(r) {
-                Some(iselcore::LoadFold::Direct(g)) => Slot::Direct(self.global_addr(g)),
-                _ => self.slot_addr(self.cur_func, r),
+            // A copy-forwarded trunc (epic-cc#978) reads its source slot:
+            // the temp never stages, so every reader resolves here.
+            Val::Reg(r) => match self.trunc_fwd.get(r) {
+                Some(src) => Slot::Direct(*src),
+                None => match self.w_folds.loads.get(r) {
+                    Some(iselcore::LoadFold::Direct(g)) => Slot::Direct(self.global_addr(g)),
+                    _ => self.slot_addr(self.cur_func, r),
+                },
             },
             Val::Global(g) => Slot::Direct(
                 *self
@@ -5194,6 +5679,18 @@ impl<'m> Gen<'m> {
                 // (RAM globals, allocas, sret slots, dynamic pointers)
                 // keeps the integer-spine/pointer-lowering FSR/INDF path.
                 if let Some((table, k, terms)) = self.const_base_of(&ptr_val) {
+                    // A TABLAT-forwarded byte (epic-cc#977) stays in
+                    // TABLAT for its dynamic store: seed and read, skip
+                    // the temp staging copy. Same seed and walk as the
+                    // staged path below, minus the copy.
+                    if self.tablat_fwd.contains(&l.dst) {
+                        self.emit_tblptr_setup_shared(&table, k, &terms, 0);
+                        self.emit("    TBLRD*+".to_string());
+                        if terms.is_empty() {
+                            self.note_tblptr_walked(&table, k);
+                        }
+                        return;
+                    }
                     for kk in 0..l.ty.bytes() {
                         self.emit_const_load_byte(&table, k, &terms, kk, dst + u16::from(kk));
                     }
@@ -5373,6 +5870,33 @@ impl<'m> Gen<'m> {
                     Val::Reg(r) => self.addrs.get(&ssa_key(self.cur_func, &r)).copied(),
                     _ => None,
                 };
+                // A TABLAT-forwarded byte (epic-cc#977): the const-load
+                // arm left it in TABLAT, so read it directly once the
+                // setup below lands. The scan proves a single byte, a
+                // dynamic destination, and a span nothing disturbs.
+                if let Val::Reg(r) = &s.val {
+                    if self.tablat_fwd.contains(r) {
+                        assert_eq!(
+                            s.ty.bytes(),
+                            1,
+                            "isel-pic18: TABLAT forward is single-byte only"
+                        );
+                        if let (Some(shape), Some(_)) = (self.plusw_shape(&ptr_val), val_slot) {
+                            self.emit_plusw_setup(&shape, 0, false);
+                            self.emit("    MOVFF 0xFF5, 0xFEB".to_string());
+                            return;
+                        }
+                        match self.emit_ptr_setup(&ptr_val, 0) {
+                            Addr::Direct(_) => panic!(
+                                "isel-pic18: TABLAT-forwarded store has a static destination"
+                            ),
+                            Addr::Indirect => {
+                                self.emit("    MOVFF 0xFF5, 0xFEF".to_string());
+                            }
+                        }
+                        return;
+                    }
+                }
                 if let (Some(shape), Some(vslot)) = (self.plusw_shape(&ptr_val), val_slot) {
                     let n = s.ty.bytes();
                     for k in 0..n {
@@ -5385,8 +5909,12 @@ impl<'m> Gen<'m> {
                         Addr::Direct(dst) => self.emit_move_val_to_slot(&s.val, s.ty, dst),
                         Addr::Indirect => {
                             let n = s.ty.bytes();
+                            // An in-place RMW producer (epic-cc#969) lives
+                            // in its load operand's slot, not the dead
+                            // result temp the store names.
+                            let val = self.rmw_reg(&s.val);
                             for k in 0..n {
-                                self.emit_load_w(&s.val, k, false);
+                                self.emit_load_w(&val, k, false);
                                 let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
                                 self.emit(format!("    MOVWF 0x{reg:03X},A"));
                             }
@@ -5975,7 +6503,13 @@ impl<'m> Gen<'m> {
                     "isel-pic18: zext must not narrow"
                 );
                 let src = self.val_addr(&z.val).direct();
-                let dst = self.slot_addr(self.cur_func, &z.dst).direct();
+                // A retval-homed zext (epic-cc#978) computes into the return
+                // bytes directly; the ret arm skips its reload below.
+                let dst = if self.zext_ret.contains(&z.dst) {
+                    self.retval_lo
+                } else {
+                    self.slot_addr(self.cur_func, &z.dst).direct()
+                };
                 for i in 0..z.from.bytes() {
                     self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
                 }
@@ -6113,6 +6647,11 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Trunc(t) => {
+                // A copy-forwarded trunc (epic-cc#978) never stages: the
+                // call-arg setup reads the source slot instead.
+                if self.trunc_fwd.contains_key(&t.dst) {
+                    return;
+                }
                 // Same const-source hazard as `Inst::Zext`, see its comment.
                 assert!(
                     !matches!(t.val, Val::Const(_)),
@@ -7439,6 +7978,15 @@ impl<'m> Gen<'m> {
             self.emit_copy_byte(src + u16::from(i), self.retval_lo + u16::from(i));
         }
     }
+    /// Spill a fused divide's remainder half to its global slot, which the
+    /// fused remainder site loads. `MOVFF` like the retval copy above, so
+    /// no `MOVLB` can land inside a skip-sensitive frame sequence.
+    fn store_rem_slot(&mut self, rem: u16, bytes: u8, slot: &str) {
+        let base = self.global_addr(slot);
+        for i in 0..bytes {
+            self.emit_copy_byte(rem + u16::from(i), base + u16::from(i));
+        }
+    }
 
     /// Two's-complement negate of a `bytes`-byte value in place: `COMF`
     /// every byte, then `INCF` the low byte, and each higher byte
@@ -7749,6 +8297,31 @@ impl<'m> Gen<'m> {
         } else {
             self.store_retval(scr, den_bytes);
         }
+        self.emit("    RETURN".to_string());
+    }
+    /// The fused divide recipe (epic-cc#982): one restoring-division loop,
+    /// remainder spilled to the fusion slot, quotient to retval. Same
+    /// layout as `emit_divmod`, same fold under the speed profile.
+    fn emit_udivmod(&mut self, name: &str, den_bytes: u8, scr: u16) {
+        let num = self.slot_addr(name, "num").direct();
+        let den = self.slot_addr(name, "den").direct();
+        let rem_bytes = den_bytes.max(2);
+        self.emit_divmod_loop(
+            num,
+            den,
+            scr,
+            scr + u16::from(rem_bytes),
+            den_bytes,
+            rem_bytes,
+            self.divmod_fold,
+        );
+        let slot = match den_bytes {
+            1 => "__udivmod_rem_u8",
+            2 => "__udivmod_rem_u16",
+            _ => "__udivmod_rem_u32",
+        };
+        self.store_rem_slot(scr, den_bytes, slot);
+        self.store_retval(num, den_bytes);
         self.emit("    RETURN".to_string());
     }
 
@@ -10011,10 +10584,13 @@ impl<'m> Gen<'m> {
             "__mul_u32" => self.emit_hw_mul(name, 4, scr),
             "__udiv_u8" => self.emit_divmod(name, 1, scr, true),
             "__urem_u8" => self.emit_divmod(name, 1, scr, false),
+            "__udivmod_u8" => self.emit_udivmod(name, 1, scr),
             "__udiv_u16" => self.emit_divmod(name, 2, scr, true),
             "__urem_u16" => self.emit_divmod(name, 2, scr, false),
+            "__udivmod_u16" => self.emit_udivmod(name, 2, scr),
             "__udiv_u32" => self.emit_divmod(name, 4, scr, true),
             "__urem_u32" => self.emit_divmod(name, 4, scr, false),
+            "__udivmod_u32" => self.emit_udivmod(name, 4, scr),
             "__udec_u32" => self.emit_udec_u32(name, scr),
             "__udec_u16_5" => self.emit_udec_u16_5(name, scr),
             "__sdiv_i8" => self.emit_sdivmod(name, 1, scr, true),
@@ -11460,6 +12036,9 @@ pub fn select_with_opts(
                 const_w_phis: HashSet::new(),
                 bin_w_srcs: HashSet::new(),
                 rmw_fwd: HashMap::new(),
+                trunc_fwd: HashMap::new(),
+                zext_ret: HashSet::new(),
+                tablat_fwd: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -11537,6 +12116,9 @@ pub fn select_with_opts(
             const_w_phis: HashSet::new(),
             bin_w_srcs: HashSet::new(),
             rmw_fwd: HashMap::new(),
+            trunc_fwd: HashMap::new(),
+            zext_ret: HashSet::new(),
+            tablat_fwd: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -11580,10 +12162,24 @@ pub fn select_with_opts(
         // so the two never claim one load.
         g.bin_w_srcs = Gen::find_bin_w_srcs(&g, f);
         g.rmw_fwd = Gen::find_rmw_fwds(&g, f, &g.bin_w_srcs);
+        // TABLAT-forwarded bytes for this function (epic-cc#977): runs
+        // after the W and RMW scans so no load is claimed twice.
+        g.tablat_fwd = Gen::find_tablat_forwards(&g, f);
         // `TBLPTR` walk marks for this function (epic-cc#778): dynamically
         // indexed const reads whose seed the run scan proved redundant.
         // Runs after every other scan since dst-home checks read them.
         g.tblptr_walk = Gen::find_tblptr_walks(&g, f);
+        // Copy-forwarding folds for this function (epic-cc#978): truncs
+        // into call args, zexts into rets, loads into zexts. Runs last:
+        // source checks read every earlier scan, and the load folds land
+        // in the shared map after its other readers proved undisturbed.
+        g.trunc_fwd = Gen::find_trunc_fwds(&g, f);
+        g.zext_ret = Gen::find_zext_rets(&g, f);
+        for (r, src) in Gen::find_load_zext_folds(&g, f) {
+            if !g.w_folds.loads.contains_key(&r) {
+                g.w_folds.loads.insert(r, iselcore::LoadFold::Direct(src));
+            }
+        }
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
         // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
@@ -12162,7 +12758,12 @@ pub fn select_with_opts(
                         _ => None,
                     };
                     for i in 0..ty.bytes() {
-                        if home == Some(g.retval_lo) {
+                        // A retval-homed zext (epic-cc#978) already wrote
+                        // these bytes: skipping keeps its MOVFF plus CLRF
+                        // instead of a W round trip through a dead temp.
+                        if home == Some(g.retval_lo)
+                            || matches!(v, Val::Reg(r) if g.zext_ret.contains(r))
+                        {
                             continue;
                         }
                         g.emit_load_w(v, i, false);
@@ -12246,6 +12847,9 @@ pub fn select_with_opts(
             const_w_phis: HashSet::new(),
             bin_w_srcs: HashSet::new(),
             rmw_fwd: HashMap::new(),
+            trunc_fwd: HashMap::new(),
+            zext_ret: HashSet::new(),
+            tablat_fwd: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -12630,6 +13234,9 @@ mod tests {
                 const_w_phis: HashSet::new(),
                 bin_w_srcs: HashSet::new(),
                 rmw_fwd: HashMap::new(),
+                trunc_fwd: HashMap::new(),
+                zext_ret: HashSet::new(),
+                tablat_fwd: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -12673,8 +13280,11 @@ mod tests {
                 const_w_phis: HashSet::new(),
                 bin_w_srcs: HashSet::new(),
                 rmw_fwd: HashMap::new(),
+                tablat_fwd: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
+                trunc_fwd: HashMap::new(),
+                zext_ret: HashSet::new(),
                 locs: Vec::new(),
             };
             g.fresh_label()
@@ -12731,9 +13341,12 @@ mod p3_gen_tests {
             const_w_phis: HashSet::new(),
             bin_w_srcs: HashSet::new(),
             rmw_fwd: HashMap::new(),
+            tablat_fwd: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
+            trunc_fwd: HashMap::new(),
+            zext_ret: HashSet::new(),
         }
     }
 

@@ -617,8 +617,8 @@ impl Pic14 {
                 self.write_d(d, f, r);
             }
             0x0B => {
-                let r = self.read_f(f).wrapping_sub(1); // DECFSZ
-                self.set_z(r);
+                // DECFSZ skips on the result but leaves STATUS alone.
+                let r = self.read_f(f).wrapping_sub(1);
                 self.write_d(d, f, r);
                 if r == 0 {
                     return pc + 2;
@@ -630,8 +630,8 @@ impl Pic14 {
                 self.write_d(d, f, r);
             }
             0x0F => {
-                let r = self.read_f(f).wrapping_add(1); // INCFSZ
-                self.set_z(r);
+                // INCFSZ skips on the result but leaves STATUS alone.
+                let r = self.read_f(f).wrapping_add(1);
                 self.write_d(d, f, r);
                 if r == 0 {
                     return pc + 2;
@@ -1287,8 +1287,8 @@ impl Pic14e {
                 self.write_d(d, f, r);
             }
             0x0B => {
-                let r = self.read_f(f).wrapping_sub(1); // DECFSZ
-                self.set_z(r);
+                // DECFSZ skips on the result but leaves STATUS alone.
+                let r = self.read_f(f).wrapping_sub(1);
                 self.write_d(d, f, r);
                 if r == 0 {
                     return pc + 2;
@@ -1300,8 +1300,8 @@ impl Pic14e {
                 self.write_d(d, f, r);
             }
             0x0F => {
-                let r = self.read_f(f).wrapping_add(1); // INCFSZ
-                self.set_z(r);
+                // INCFSZ skips on the result but leaves STATUS alone.
+                let r = self.read_f(f).wrapping_add(1);
                 self.write_d(d, f, r);
                 if r == 0 {
                     return pc + 2;
@@ -2436,9 +2436,9 @@ impl Pic18 {
                 self.write_d_at(d, op, r);
             }
             0x4C00 => {
-                // DCFSNZ: f - 1, skip if NOT zero
+                // DCFSNZ: f - 1, skip if NOT zero. Like its DECFSZ and
+                // INCFSZ siblings it leaves STATUS alone.
                 let r = self.read_phys(op).wrapping_sub(1);
-                self.set_zn(r);
                 self.write_d_at(d, op, r);
                 if r != 0 {
                     return self.skip_pc(pc + 2);

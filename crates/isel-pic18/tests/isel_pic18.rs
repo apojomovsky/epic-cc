@@ -1306,6 +1306,128 @@ fn udiv_u16_recipe_emits_restoring_loop() {
     assert_eq!(asm.matches("DECFSZ").count(), 1, "loop counter:\n{asm}");
 }
 
+/// The fused u16 divide runs the plain restoring loop once, then spills
+/// the remainder to the fusion slot and the quotient to retval: one
+/// `MOVFF` pair each, so no `MOVLB` can land in a skip-sensitive frame.
+#[test]
+fn udivmod_u16_recipe_spills_remainder_and_returns_quotient() {
+    let m = parse(
+        "global __udivmod_rem_u16 i16\n\
+         fn __udivmod_u16(i16) (num=i16, den=i16)\n  block entry:\n    %__scr = alloca 7\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = call i16 @__udivmod_u16(i16 50000, i16 137)\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("__udivmod_rem_u16", 0x50),
+        ("__udivmod_u16::num", 0x20),
+        ("__udivmod_u16::den", 0x22),
+        ("__udivmod_u16::__scr", 0x30),
+        ("main::1", 0x40),
+    ]);
+    for fold in [false, true] {
+        let opts = isel_pic18::Options {
+            copy_loop: true,
+            divmod_fold: fold,
+            inline_mul16: false,
+        };
+        let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+        assert_eq!(
+            asm.matches("RLCF").count(),
+            4,
+            "same restoring loop as the plain divide (fold={fold}):\n{asm}"
+        );
+        assert!(
+            asm.contains("MOVFF 0x030, 0x050") && asm.contains("MOVFF 0x031, 0x051"),
+            "remainder spill to the fusion slot (fold={fold}):\n{asm}"
+        );
+        assert!(
+            asm.contains("MOVFF 0x020, 0x000") && asm.contains("MOVFF 0x021, 0x001"),
+            "quotient to retval, as usual (fold={fold}):\n{asm}"
+        );
+    }
+}
+
+/// Fused divides return both halves: the quotient through the call, the
+/// remainder through the spill slot. Each case asserts both, so a spill
+/// to the wrong address or width fails here.
+#[test]
+fn udivmod_routines_simulate_quotient_and_remainder() {
+    // (routine, slot, x bytes, y bytes, quotient bytes, remainder bytes)
+    let cases: &[(&str, &str, &[u8], &[u8], &[u8], &[u8])] = &[
+        (
+            "__udivmod_u8",
+            "__udivmod_rem_u8",
+            &[200],
+            &[3],
+            &[66],
+            &[2],
+        ),
+        ("__udivmod_u8", "__udivmod_rem_u8", &[7], &[200], &[0], &[7]),
+        (
+            "__udivmod_u16",
+            "__udivmod_rem_u16",
+            &[0x50, 0xC3],
+            &[0x89, 0x00],
+            &[0x6C, 0x01],
+            &[0x84, 0x00],
+        ),
+        (
+            "__udivmod_u32",
+            "__udivmod_rem_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[0x00, 0x01, 0x00, 0x00],
+            &[0x56, 0x34, 0x12, 0x00],
+            &[0x78, 0x00, 0x00, 0x00],
+        ),
+    ];
+    for (name, slot, x, y, want_q, want_r) in cases {
+        let w = want_q.len();
+        let ret = match w {
+            1 => "i8",
+            2 => "i16",
+            _ => "i32",
+        };
+        let m = parse(&format!(
+            "global a {ret}\nglobal b {ret}\nglobal q {ret}\nglobal m {ret}\nglobal {slot} {ret}\n\
+             fn {name}({ret}) (num={ret}, den={ret})\n  block entry:\n    %__scr = alloca 10\n    ret {ret} 0\n\
+             fn main(void) ()\n  block entry:\n    %1 = load {ret} @a\n    %2 = load {ret} @b\n\
+               %3 = call {ret} @{name}({ret} %1, {ret} %2)\n    store {ret} %3 @q\n\
+               %4 = load {ret} @{slot}\n    store {ret} %4 @m\n    ret void\n"
+        ));
+        let (ga, gb, gq, gm, gs) = (0x10, 0x14, 0x18, 0x1C, 0x50);
+        let addrs = addrs(&[
+            ("a", ga),
+            ("b", gb),
+            ("q", gq),
+            ("m", gm),
+            (slot, gs),
+            (&format!("{name}::num"), 0x20),
+            (&format!("{name}::den"), 0x24),
+            (&format!("{name}::__scr"), 0x30),
+            ("main::1", 0x40),
+            ("main::2", 0x44),
+            ("main::3", 0x48),
+            ("main::4", 0x4C),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        let words = asm::assemble_pic18(&asm);
+        let start = start_steps(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start);
+        for (i, b) in x.iter().enumerate() {
+            p.ram_mut()[ga as usize + i] = *b;
+        }
+        for (i, b) in y.iter().enumerate() {
+            p.ram_mut()[gb as usize + i] = *b;
+        }
+        p.run(20_000);
+        assert!(p.halted(), "{name} must halt");
+        let got_q: Vec<u8> = (0..w).map(|i| p.ram()[gq as usize + i]).collect();
+        assert_eq!(&got_q[..], *want_q, "{name}({x:?}, {y:?}) quotient");
+        let got_r: Vec<u8> = (0..w).map(|i| p.ram()[gm as usize + i]).collect();
+        assert_eq!(&got_r[..], *want_r, "{name}({x:?}, {y:?}) remainder");
+    }
+}
+
 #[test]
 fn load_and_store_i16_copy_both_bytes_low_then_high() {
     // Two stores keep the loaded value multi-use, off the single-use
@@ -9171,6 +9293,113 @@ fn phi_folded_i16_increment_with_earlier_index_uses_folds_in_place() {
 }
 
 #[test]
+fn tablat_staged_byte_forwards_directly_to_plusw_store() {
+    // A flash byte copied to an indexed RAM slot stages through a
+    // dead temp today: `MOVFF TABLAT,T` then `MOVFF T,PLUSW0`. The
+    // byte stays in TABLAT instead and the store reads it directly,
+    // saving both words (epic-cc#977). Simulated over every index.
+    let m = with_bytes(
+        parse(
+            "const lit i8\n\
+             global buf i64\n\
+             global idx i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i8 @idx\n\
+                 %gp = gep @lit +0 +1*%i\n\
+                 %v = load i8 %gp\n\
+                 %gq = gep @buf +0 +1*%i\n\
+                 store i8 %v %gq\n\
+                 ret void\n",
+        ),
+        "lit",
+        &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+    );
+    let addrs = addrs(&[
+        ("buf", 0x120),
+        ("idx", 0x130),
+        ("main::i", 0x131),
+        ("main::v", 0x132),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("MOVFF 0xFF5, 0xFEB"),
+        "store must read TABLAT directly:\n{main_asm}"
+    );
+    assert!(
+        !main_asm.contains("0x132,"),
+        "dead temp must go unwritten:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..8u8 {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x130] = x;
+        p.run(200);
+        assert!(p.halted(), "program must halt (index={x})");
+        assert_eq!(
+            p.ram()[0x120 + usize::from(x)],
+            0x11 + 0x11 * x,
+            "copied byte (index={x})"
+        );
+    }
+}
+
+#[test]
+fn tablat_staged_byte_forwards_directly_to_indirect_store() {
+    // Same fold through a non-PLUSW dynamic destination (a scale-2
+    // index keeps the small-array shape shut): the store seeds FSR0
+    // then reads TABLAT into INDF0, no temp stage (epic-cc#977).
+    let m = with_bytes(
+        parse(
+            "const lit i8\n\
+             global ram i64\n\
+             global idx i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i8 @idx\n\
+                 %gp = gep @lit +0 +1*%i\n\
+                 %v = load i8 %gp\n\
+                 %gq = gep @ram +0 +2*%i\n\
+                 store i8 %v %gq\n\
+                 ret void\n",
+        ),
+        "lit",
+        &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x130),
+        ("main::i", 0x131),
+        ("main::v", 0x132),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("MOVFF 0xFF5, 0xFEF"),
+        "store must read TABLAT into INDF0:\n{main_asm}"
+    );
+    assert!(
+        !main_asm.contains("0x132,"),
+        "dead temp must go unwritten:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..4u8 {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x130] = x;
+        p.run(200);
+        assert!(p.halted(), "program must halt (index={x})");
+        assert_eq!(
+            p.ram()[0x120 + usize::from(2 * x)],
+            0x11 + 0x11 * x,
+            "copied byte (index={x})"
+        );
+    }
+}
+
+#[test]
 fn phi_folded_i16_increment_with_split_header_and_latch_folds() {
     // The increment may sit in a latch block apart from the header
     // holding the phi. The backedge phi reads the result, so the same
@@ -9563,6 +9792,60 @@ fn rmw_producer_accumulates_into_its_load_temp() {
 }
 
 #[test]
+fn indf_rmw_producer_accumulates_into_its_load_temp() {
+    // A 16-bit `INDF` load feeding a const `add` feeding an `INDF`
+    // store: the binop accumulates into the load temp with in-place
+    // lanes, so its own result temp disappears (epic-cc#969). The
+    // scale-2 index keeps the access off the `PLUSW` shape, so both
+    // sides walk `POSTINC0`/`INDF0`.
+    let m = parse(
+        "global ram i16\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +0 +2*%i\n\
+             %v = load i16 %p\n\
+             %w = add i16 %v, 7\n\
+             store i16 %w %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x122),
+        ("main::i", 0x123),
+        ("main::v", 0x124),
+        ("main::w", 0x126),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("ADDWF 0x024,F,B"),
+        "low lane accumulates into the load temp:\n{main_asm}"
+    );
+    assert!(
+        !main_asm.contains("0x026,") && !main_asm.contains("0x026 "),
+        "result temp never written:\n{main_asm}"
+    );
+    assert!(
+        main_asm.contains("MOVF 0x024,W,B"),
+        "store reads the load temp:\n{main_asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (lo, hi, elo, ehi) in [(10u8, 0u8, 17u8, 0u8), (250, 16, 1, 17)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x120] = lo;
+        p.ram_mut()[0x121] = hi;
+        p.ram_mut()[0x122] = 0;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x120], elo, "rmw low byte");
+        assert_eq!(p.ram()[0x121], ehi, "rmw high byte");
+    }
+}
+
+#[test]
 fn adjacent_plusw_static_parts_step_without_reseeding() {
     // The two bytes of one 16-bit `PLUSW` access seed once: the second
     // byte steps `FSR0L` instead of a fresh `LFSR`, and reuses the index
@@ -9702,4 +9985,258 @@ fn w_operand_const_left_sub_consumes_w_with_sublw() {
         assert!(p.halted());
         assert_eq!(p.ram()[0x130], expect, "255 - g for g={g}");
     }
+}
+
+/// Copy-forwarded trunc into a call arg (epic-cc#978): a single-use
+/// `trunc` feeding one scalar call arg never stages; arg setup reads
+/// the source slot, so one `MOVFF` replaces the trunc stage plus copy.
+#[test]
+fn trunc_into_call_arg_reads_the_source_slot() {
+    let m = parse(
+        "global a i16\n\
+         fn callee(i8) (p=i8, q=i8)\n  block entry:\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %t = trunc i16 %1 to i8\n\
+           %3 = call i8 @callee(i8 %t, i8 5)\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("callee::p", 0x30),
+        ("callee::q", 0x31),
+        ("main::1", 0x40),
+        ("main::t", 0x42),
+        ("main::3", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("CALL callee"), "call kept:\n{asm}");
+    assert!(
+        asm.contains("MOVFF 0x040, 0x030"),
+        "arg reads the trunc source:\n{asm}"
+    );
+    assert!(!asm.contains("0x042"), "trunc temp never staged:\n{asm}");
+}
+
+/// An earlier arg home overlapping the trunc source keeps the fold off
+/// (epic-cc#978): arg setup writes homes in order, so the source would
+/// be clobbered before our arg reads it.
+#[test]
+fn trunc_into_call_arg_with_overlapping_home_stays_staged() {
+    let m = parse(
+        "global a i16\n\
+         fn callee(i8) (p=i8, q=i8)\n  block entry:\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %t = trunc i16 %1 to i8\n\
+           %3 = call i8 @callee(i8 5, i8 %t)\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("callee::p", 0x40),
+        ("callee::q", 0x31),
+        ("main::1", 0x40),
+        ("main::t", 0x42),
+        ("main::3", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x040, 0x042"),
+        "trunc stages its temp:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0x042, 0x031"),
+        "arg reads the temp:\n{asm}"
+    );
+}
+
+/// A trunc with two uses stays staged (epic-cc#978).
+#[test]
+fn multi_use_trunc_into_call_arg_stays_staged() {
+    let m = parse(
+        "global a i16\nglobal r i8\n\
+         fn callee(i8) (p=i8, q=i8)\n  block entry:\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %t = trunc i16 %1 to i8\n\
+           %3 = call i8 @callee(i8 %t, i8 5)\n    store i8 %t @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("r", 0x22),
+        ("callee::p", 0x30),
+        ("callee::q", 0x31),
+        ("main::1", 0x40),
+        ("main::t", 0x42),
+        ("main::3", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x040, 0x042"),
+        "trunc stages its temp:\n{asm}"
+    );
+}
+
+/// Copy-forwarded load into a zext (epic-cc#978): a single-use `load`
+/// from an access-bank global feeding a `zext` never stages; the zext
+/// reads the global, so one `MOVFF` replaces the load stage plus copy.
+#[test]
+fn load_into_zext_reads_the_global() {
+    let m = parse(
+        "global g i8\nglobal r i16\nfn main(void) ()\n  block entry:\n    %1 = load i8 @g\n\
+           %2 = zext i8 %1 to i16\n    store i16 %2 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("g", 0x20),
+        ("r", 0x24),
+        ("main::1", 0x40),
+        ("main::2", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x020, 0x042"),
+        "zext reads the global:\n{asm}"
+    );
+    assert!(!asm.contains("0x040"), "load temp never staged:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (g, expect) in [(0u8, 0u16), (1, 1), (0xFF, 0xFF)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20] = g;
+        p.run(200);
+        assert!(p.halted());
+        let got = u16::from(p.ram()[0x24]) | (u16::from(p.ram()[0x25]) << 8);
+        assert_eq!(got, expect, "zero-extended store for g={g}");
+    }
+}
+
+/// A load with two uses stays staged (epic-cc#978).
+#[test]
+fn multi_use_load_into_zext_stays_staged() {
+    let m = parse(
+        "global g i8\nglobal r i16\nglobal s i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @g\n\
+           %2 = zext i8 %1 to i16\n    store i16 %2 @r\n    store i8 %1 @s\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("g", 0x20),
+        ("r", 0x24),
+        ("s", 0x26),
+        ("main::1", 0x40),
+        ("main::2", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("0x040"), "load temp staged:\n{asm}");
+}
+
+/// Retval-homed zext (epic-cc#978): a single-use `zext` feeding `ret`
+/// computes into the return bytes, and the ret skips its W round trip.
+/// One `MOVFF` plus `CLRF` where a temp stage and two reload-store
+/// pairs were.
+#[test]
+fn zext_into_ret_writes_retval_directly() {
+    let m = parse(
+        "fn main(i16) (x=i8, y=i8)\n  block entry:\n    %c = icmp eq i8 %x, %y\n\
+           %z = zext i1 %c to i16\n    ret i16 %z\n",
+    );
+    let addrs = addrs(&[
+        ("main::x", 0x40),
+        ("main::y", 0x41),
+        ("main::c", 0x42),
+        ("main::z", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x042, 0x000"),
+        "zext writes retval lo:\n{asm}"
+    );
+    assert!(asm.contains("CLRF 0x001"), "zext clears retval hi:\n{asm}");
+    assert!(!asm.contains("0x043"), "zext temp never staged:\n{asm}");
+    assert!(!asm.contains("MOVWF 0x000"), "no W round trip:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (x, y, expect) in [(7u8, 7u8, 1u16), (7, 8, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x40] = x;
+        p.ram_mut()[0x41] = y;
+        p.run(200);
+        assert!(p.halted());
+        let got = u16::from(p.ram()[0x000]) | (u16::from(p.ram()[0x001]) << 8);
+        assert_eq!(got, expect, "boolean return for x={x} y={y}");
+    }
+}
+
+/// A zext with two uses keeps its temp and round trip (epic-cc#978).
+#[test]
+fn multi_use_zext_into_ret_stays_staged() {
+    let m = parse(
+        "global r i16\nfn main(i16) (x=i8, y=i8)\n  block entry:\n    %c = icmp eq i8 %x, %y\n\
+           %z = zext i1 %c to i16\n    store i16 %z @r\n    ret i16 %z\n",
+    );
+    let addrs = addrs(&[
+        ("r", 0x24),
+        ("main::x", 0x40),
+        ("main::y", 0x41),
+        ("main::c", 0x42),
+        ("main::z", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("0x043"), "zext temp staged:\n{asm}");
+    assert!(asm.contains("MOVWF 0x000"), "ret round trip kept:\n{asm}");
+}
+
+/// A store between trunc and call keeps the fold off (epic-cc#978): the
+/// folded read would move past a memory op, so the temp stays staged.
+#[test]
+fn store_between_trunc_and_call_stays_staged() {
+    let m = parse(
+        "global a i16\nglobal flag i8\n\
+         fn callee(i8) (p=i8, q=i8)\n  block entry:\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %t = trunc i16 %1 to i8\n\
+           store i8 0 @flag\n    %3 = call i8 @callee(i8 %t, i8 5)\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("flag", 0x22),
+        ("callee::p", 0x30),
+        ("callee::q", 0x31),
+        ("main::1", 0x40),
+        ("main::t", 0x42),
+        ("main::3", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x040, 0x042"),
+        "trunc stages its temp:\n{asm}"
+    );
+}
+
+/// A store between load and zext keeps the fold off (epic-cc#978).
+#[test]
+fn store_between_load_and_zext_stays_staged() {
+    let m = parse(
+        "global g i8\nglobal r i16\nglobal flag i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @g\n\
+           store i8 0 @flag\n    %2 = zext i8 %1 to i16\n    store i16 %2 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("g", 0x20),
+        ("r", 0x24),
+        ("flag", 0x26),
+        ("main::1", 0x40),
+        ("main::2", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("0x040"), "load temp staged:\n{asm}");
+}
+
+/// A store between zext and ret keeps the fold off (epic-cc#978).
+#[test]
+fn store_between_zext_and_ret_stays_staged() {
+    let m = parse(
+        "global flag i8\nglobal r i16\nfn main(i16) (x=i8, y=i8)\n  block entry:\n    %c = icmp eq i8 %x, %y\n\
+           %z = zext i1 %c to i16\n    store i8 0 @flag\n    ret i16 %z\n",
+    );
+    let addrs = addrs(&[
+        ("flag", 0x22),
+        ("r", 0x24),
+        ("main::x", 0x40),
+        ("main::y", 0x41),
+        ("main::c", 0x42),
+        ("main::z", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("0x043"), "zext temp staged:\n{asm}");
+    assert!(asm.contains("MOVWF 0x000"), "ret round trip kept:\n{asm}");
 }

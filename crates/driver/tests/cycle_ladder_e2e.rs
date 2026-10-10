@@ -246,8 +246,11 @@ fn cases() -> Vec<Case> {
         ("speed-mul-u16", "speed-mul-u16.c"),
         ("speed-mul-u32", "speed-mul-u32.c"),
         ("speed-divmod-u8", "speed-divmod-u8.c"),
+        ("speed-divmod-i8", "speed-divmod-i8.c"),
         ("speed-divmod-u16", "speed-divmod-u16.c"),
+        ("speed-divmod-i16", "speed-divmod-i16.c"),
         ("speed-divmod-u32", "speed-divmod-u32.c"),
+        ("speed-divmod-i32", "speed-divmod-i32.c"),
         ("speed-shift", "speed-shift.c"),
         ("speed-memcpy-32", "speed-memcpy-32.c"),
         ("speed-memset-32", "speed-memset-32.c"),
@@ -462,10 +465,19 @@ fn expected_results(name: &str) -> Vec<(&'static str, Vec<u8>)> {
     match stem {
         // 200/13 = 15 rem 5.
         "speed-divmod-u8" => vec![("q", vec![15]), ("m", vec![5])],
+        // -100/13 = -7 rem -9.
+        "speed-divmod-i8" => vec![("q", vec![249]), ("m", vec![247])],
         // 50000/137 = 364 rem 132; q needs both bytes (0x016C).
         "speed-divmod-u16" => vec![("q", vec![108, 1]), ("m", vec![132, 0])],
+        // -30000/137 = -218 rem -134 (0xFF26, 0xFF7A).
+        "speed-divmod-i16" => vec![("q", vec![38, 255]), ("m", vec![122, 255])],
         // 3000000000/1234567 = 2430 rem 2190.
         "speed-divmod-u32" => vec![("q", vec![126, 9, 0, 0]), ("m", vec![142, 8, 0, 0])],
+        // -123456789/256 = -482253 rem -21.
+        "speed-divmod-i32" => vec![
+            ("q", vec![51, 164, 248, 255]),
+            ("m", vec![235, 255, 255, 255]),
+        ],
         // 37*29 = 1073, low byte 49.
         "speed-mul-u8" => vec![("r", vec![49])],
         // 0x1234*37 = 0xA184.
