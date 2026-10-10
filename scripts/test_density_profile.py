@@ -181,6 +181,17 @@ class AttributionTest(unittest.TestCase):
         self.assertEqual(summary["functions"]["delta"], 2)
         self.assertEqual(items[0].mnemonic, "MOVLW")
 
+    def test_labels_sharing_a_directive_prefix_are_not_swallowed(self):
+        # `listen:` and `radix_tbl:` start with `list`/`radix`; a bare-prefix
+        # match drops the label and folds its words into the previous function.
+        listing = PIC18_HEADER + (
+            "f:\n    RETURN\nlisten:\n    MOVLW 0x01\n    RETURN\nradix_tbl:\n    NOP\n"
+        )
+        _, summary = profile(listing)
+        self.assertEqual(summary["functions"]["f"], 1)
+        self.assertEqual(summary["functions"]["listen"], 2)
+        self.assertEqual(summary["functions"]["radix_tbl"], 1)
+
     def test_equ_and_markers_take_no_words(self):
         listing = PIC18_HEADER + (
             "INTCON equ 0xFF2\neps:\n    .pclalign\n    .pcltbl tmp1 64\n    RETURN\n"
