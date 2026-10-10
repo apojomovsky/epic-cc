@@ -578,7 +578,7 @@ impl Gen {
     /// bank (skip-sensitive recipe loops; alloc rounds a straddling frame into
     /// the next bank). The budget is the 0x70 bound with the routine frames:
     ///   u8 mul/div/rem/shift: 3, u16 shift: 6, u16 div/rem: 8,
-    ///   u32 shift: 12, u32 div/rem: 12, u16 mul: 18, u32 mul: 22.
+    ///   u32 shift: 12, u32 div/rem: 12, u16 mul: 6, u32 mul: 22.
     ///
     /// Globals end: the fixed inputs plus checksum u8 end at 0x29; `arr[8]`
     /// adds 8 and the even-aligned struct adds 8 (epic-cc#6).
@@ -1082,7 +1082,7 @@ impl Gen {
         };
         let (cost, routine) = match (w, op) {
             (_, SignedBin::Mul) => match w {
-                8 => (8, 18),
+                8 => (8, 6),
                 16 => (14, 22),
                 _ => (16, 22),
             },

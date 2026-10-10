@@ -2,13 +2,12 @@
 //! non-zero GPR bank compiles through the whole driver pipeline and runs
 //! correctly.
 //!
-//! Layout (see fixtures/banked_routine.c): `out` u16 at 0x20, `g[30]` (60
-//! bytes) at 0x22..0x5D, so the root frame starts at 0x5E. The noinline
-//! helper `mul30` carries ~120 bytes of i16 SSA defs (volatile loads +
-//! adds), pushing its physical frame end well past the bank-0/1 gap;
-//! `__mul_u16`'s frame is derived at that end, so it sits entirely inside
-//! a single non-zero bank. Before issue #6 the isel assert rejected any
-//! routine slot > 0x7F with a loud panic.
+//! Layout (see fixtures/banked_routine.c): `g[30]` (60 bytes) at 0x20-0x5B,
+//! `out` u16 at 0x5C-0x5D, and a 60-byte `pad` global that never fits a
+//! bank-0 gap, so it lands in bank 1. That pushes the noinline helper
+//! `mul30` and `__mul_u16`'s frame (derived at the helper's physical end)
+//! into a higher bank, so the frame sits entirely inside one non-zero bank.
+//! Before issue #6 the isel assert rejected any routine slot > 0x7F with a loud panic.
 //!
 //! Acceptance: (a) the routine frame lies wholly inside one GPR bank, and
 //! (b) the driver's HEX runs to halt with `out == 0x0CB7` (sum 1..30 =
@@ -69,8 +68,8 @@ fn routine_frame_lands_in_bank1() {
     let b = *layout.locals.get("__mul_u16::b").expect("__mul_u16::b");
     // The whole frame (params + 2-byte scratch) must sit inside ONE bank,
     // any bank (issue #6): a straddle would need a BANKSEL inside the
-    // skip-sensitive recipe loops. The helper's 120-byte frame pushes this
-    // one to bank 1 or 2 depending on clang's exact def count.
+    // skip-sensitive recipe loops. The 60-byte `pad` fixture global moves the
+    // frame into bank 1 (see fixtures/banked_routine.c).
     assert!(
         scr >= 0x20,
         "routine frame must live in a GPR bank (got __scr at 0x{scr:03X})"
