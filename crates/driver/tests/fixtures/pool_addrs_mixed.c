@@ -1,10 +1,8 @@
 // Pool addresses and copy gating (epic-cc#816): the direct-arg string
 // shape mirrors the encoder-sim log strings, plus one const used both
-// directly and through a dynamic index. With `--const-pool` the direct
-// consts keep no RAM copy and materialize as pool addresses, while the
-// mixed const keeps its copy. The consumer reads no bytes itself (a
-// byte loop here would inline and LSR-chase over the literals, a RAM
-// use until epic-cc#811); the sim behavior proof lands in #817.
+// directly and through a dynamic index. With `--const-pool` the mixed
+// const keeps its RAM copy. `consume` hands its pointer to strlen, which
+// reads the bytes, so the direct literals stage RAM copies too (epic-cc#1026).
 #include <stdint.h>
 #include <string.h>
 
