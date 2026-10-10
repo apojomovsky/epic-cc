@@ -126,31 +126,31 @@ ram_bytes = 15
 [[entry]]
 name = "speed-divmod-i8-18f4550"
 device = "18F4550"
-cycles = 692
-flash_words = 172
+cycles = 684
+flash_words = 166
 ram_bytes = 24
 
 [[entry]]
 name = "speed-divmod-i8-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 668
-flash_words = 183
+cycles = 660
+flash_words = 175
 ram_bytes = 24
 
 [[entry]]
 name = "speed-divmod-i8-16f877a"
 device = "16F877A"
-cycles = 842
-flash_words = 200
+cycles = 826
+flash_words = 184
 ram_bytes = 24
 
 [[entry]]
 name = "speed-divmod-i8-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 842
-flash_words = 200
+cycles = 826
+flash_words = 184
 ram_bytes = 24
 
 [[entry]]
@@ -501,46 +501,46 @@ ram_bytes = 23
 [[entry]]
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
-cycles = 2643
-flash_words = 136
+cycles = 2633
+flash_words = 134
 ram_bytes = 33
 
 [[entry]]
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 2130
-flash_words = 258
+cycles = 2120
+flash_words = 256
 ram_bytes = 33
 
 [[entry]]
 name = "speed-pid-step-18f4550"
 device = "18F4550"
-cycles = 353
-flash_words = 235
+cycles = 297
+flash_words = 236
 ram_bytes = 53
 
 [[entry]]
 name = "speed-pid-step-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 289
-flash_words = 251
+cycles = 281
+flash_words = 243
 ram_bytes = 53
 
 [[entry]]
 name = "speed-pid-step-16f877a"
 device = "16F877A"
-cycles = 1281
-flash_words = 378
+cycles = 1265
+flash_words = 362
 ram_bytes = 53
 
 [[entry]]
 name = "speed-pid-step-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 1281
-flash_words = 378
+cycles = 1265
+flash_words = 362
 ram_bytes = 53
 
 [[entry]]
