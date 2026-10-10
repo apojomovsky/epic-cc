@@ -8620,6 +8620,47 @@ impl<'m> Gen<'m> {
         self.emit("    RETURN".to_string());
     }
 
+    /// The backward LSR-form digit writer (epic-cc#927): the 5 bytes ending
+    /// at `buf`, right-justified and space-padded. A zero remainder after the
+    /// first digit prints a space, matching the inlined loop it replaces.
+    /// Scratch: `den`@0-1, `rem`@2-3, `dcnt`@4, `iter`@5.
+    fn emit_udec_u16_rj5(&mut self, name: &str, scr: u16) {
+        let num = self.slot_addr(name, "num").direct();
+        let buf = self.slot_addr(name, "buf").direct();
+        let (den, rem, dcnt, iter) = (scr, scr + 2, scr + 4, scr + 5);
+        // FSR0 = buf (the last digit's address); POSTDEC0 (0xFED) walks down.
+        self.emit_copy_byte(buf, 0xFE9);
+        self.emit_copy_byte(buf + 1, 0xFEA);
+        self.emit("    MOVLW 0x0A".to_string());
+        self.emit_banked("MOVWF", den, "");
+        self.emit_banked("CLRF", den + 1, "");
+        self.emit("    MOVLW 0x05".to_string());
+        self.emit_banked("MOVWF", iter, "");
+        let l_digits = self.fresh_label();
+        let l_divide = self.fresh_label();
+        let l_next = self.fresh_label();
+        self.emit_label(&l_digits);
+        // The first digit always prints; later ones are spaces once the value is 0.
+        self.emit_banked("MOVF", iter, ",W");
+        self.emit("    XORLW 0x05".to_string());
+        self.emit(format!("    BZ {l_divide}"));
+        self.emit_banked("MOVF", num, ",W");
+        self.emit_banked("IORWF", num + 1, ",W");
+        self.emit(format!("    BNZ {l_divide}"));
+        self.emit("    MOVLW 0x20".to_string());
+        self.emit_banked("MOVWF", 0xFED, "");
+        self.emit(format!("    BRA {l_next}"));
+        self.emit_label(&l_divide);
+        self.emit_divmod_loop(num, den, rem, dcnt, 2, 2, false);
+        self.emit_banked("MOVF", rem, ",W");
+        self.emit("    IORLW 0x30".to_string());
+        self.emit_banked("MOVWF", 0xFED, "");
+        self.emit_label(&l_next);
+        self.emit_banked("DECFSZ", iter, ",F");
+        self.emit(format!("    BRA {l_digits}"));
+        self.emit("    RETURN".to_string());
+    }
+
     /// The signed div/mod wrapper: abs both operands in place in the param
     /// slots (unsigned abs, INT_MIN safe), run the unsigned divmod with
     /// `rem` at `__scr[1..]` and the counter after it (byte 0 holds the
@@ -10805,6 +10846,7 @@ impl<'m> Gen<'m> {
             "__udivmod_u32" => self.emit_udivmod(name, 4, scr),
             "__udec_u32" => self.emit_udec_u32(name, scr),
             "__udec_u16_5" => self.emit_udec_u16_5(name, scr),
+            "__udec_u16_rj5" => self.emit_udec_u16_rj5(name, scr),
             "__sdiv_i8" => self.emit_sdivmod(name, 1, scr, true),
             "__srem_i8" => self.emit_sdivmod(name, 1, scr, false),
             "__sdiv_i16" => self.emit_sdivmod(name, 2, scr, true),

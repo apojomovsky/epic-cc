@@ -47,8 +47,8 @@ use std::collections::{HashMap, HashSet};
 
 use ir::{
     Alloca, Bin, BinOp, Block, Br, Call, CallArg, FBinOp, FloatConvOp, Func, Gep, GepBase, Global,
-    Icmp, Inst, IntToPtr, Load, MemLen, Module, Param, Phi, Select, Sext, SrcLoc, Trunc, Ty, Val,
-    Zext,
+    Icmp, Inst, IntToPtr, Load, MemLen, Module, Param, Phi, Select, Sext, SrcLoc, Store, Trunc, Ty,
+    Val, Zext,
 };
 /// Whole-module lowering: scalar ops that need runtime support become calls
 /// to injected routine functions (see module docs).
@@ -88,6 +88,12 @@ fn legalize_inner(m: Module, pic18: bool) -> Module {
     } else {
         (m, false)
     };
+    // The post-LSR decimal loops share on two or more sites (epic-cc#927).
+    let (m, lsr) = if pic18 {
+        share_lsr_decimal_loops(m)
+    } else {
+        (m, false)
+    };
     let mut m = narrow_div_rem_tails(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
@@ -96,6 +102,9 @@ fn legalize_inner(m: Module, pic18: bool) -> Module {
     }
     if bench {
         used.push("__udec_u16_5".to_string());
+    }
+    if lsr {
+        used.push("__udec_u16_rj5".to_string());
     }
     // Fresh SSA names for the fcmp materialization intermediates (the call
     // dst and the icmp temps), seeded with every name the module defines so
@@ -498,6 +507,463 @@ fn share_bench_loops(m: Module) -> (Module, bool) {
     )
 }
 
+/// One post-LSR 5-digit decimal loop (epic-cc#927): the header, the blank
+/// fill self-loop, and the latch that the rewrite drops, plus the
+/// preheader that becomes the call.
+struct LsrDecimalSite {
+    pre: usize,
+    region: [usize; 3],
+    hl: String,
+    v0: Val,
+    buf: String,
+    exit: String,
+    udiv_loc: Option<SrcLoc>,
+    br_loc: Option<SrcLoc>,
+}
+
+/// Registers defined by a loop block, or `None` on an instruction the
+/// shape never has (a load or call could hide a use, so the site is skipped).
+fn lsr_block_defs(insts: &[Inst]) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for inst in insts {
+        match inst {
+            Inst::Phi(p) => out.push(p.dst.clone()),
+            Inst::Bin(b) => out.push(b.dst.clone()),
+            Inst::Icmp(c) => out.push(c.dst.clone()),
+            Inst::Select(s) => out.push(s.dst.clone()),
+            Inst::Gep(g) => out.push(g.dst.clone()),
+            Inst::Trunc(t) => out.push(t.dst.clone()),
+            Inst::Zext(z) => out.push(z.dst.clone()),
+            Inst::Store(_) | Inst::Br(_) | Inst::BrCond(_) => {}
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Matches the exact post-LSR shape of a 5-digit decimal loop: header
+/// (digit + blank test), blank-fill self-loop, latch (count to 5). The
+/// store pointer must phi-arm from the preheader as a `gep @buf +15` and
+/// step by -1 in the latch. Any deviation keeps the loop: the helper is
+/// only correct for this shape, and the differential sim pins it.
+fn find_lsr_decimal_sites(f: &Func) -> Vec<LsrDecimalSite> {
+    let blocks = &f.blocks;
+    let preds = block_preds(f);
+    let uses = block_uses(f);
+    let idx: HashMap<&str, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label.as_str(), i))
+        .collect();
+    // The phi arm incoming from block `l`, if any.
+    let arm = |ph: &Phi, l: &str| -> Option<Val> {
+        ph.incoming
+            .iter()
+            .find(|(_, lab)| lab == l)
+            .map(|(v, _)| v.clone())
+    };
+    let mut sites = Vec::new();
+    for h in 0..blocks.len() {
+        let hl = blocks[h].label.as_str();
+        let hinsts = &blocks[h].insts;
+        // Header: true enters the blank fill, false the latch.
+        let Some(Inst::BrCond(hbr)) = hinsts.last() else {
+            continue;
+        };
+        let (Some(&b), Some(&l)) = (idx.get(hbr.t.as_str()), idx.get(hbr.f.as_str())) else {
+            continue;
+        };
+        if b == h || l == h || b == l {
+            continue;
+        }
+        // Exactly the latch and one preheader enter the header.
+        if preds[h].len() != 2 || !preds[h].contains(&l) {
+            continue;
+        }
+        let Some(&pre) = preds[h].iter().find(|&&p| p != l) else {
+            continue;
+        };
+        let pl = blocks[pre].label.as_str();
+        let bl = blocks[b].label.as_str();
+        let ll = blocks[l].label.as_str();
+        let Some(Inst::Br(pbr)) = blocks[pre].insts.last() else {
+            continue;
+        };
+        if pbr.target != hl {
+            continue;
+        }
+        // Latch: exit on count 5, else back to the header.
+        let lins = &blocks[l].insts;
+        let Some(Inst::BrCond(lbr)) = lins.last() else {
+            continue;
+        };
+        if lbr.f != hl {
+            continue;
+        }
+        let exit = lbr.t.clone();
+        let Some(&ei) = idx.get(exit.as_str()) else {
+            continue;
+        };
+        if [h, b, l, pre].contains(&ei)
+            || blocks[ei].insts.iter().any(|i| matches!(i, Inst::Phi(_)))
+        {
+            continue;
+        }
+        // Blank fill: a self-loop that stores spaces until the count hits 5.
+        let bins_ = &blocks[b].insts;
+        let Some(Inst::BrCond(bbr)) = bins_.last() else {
+            continue;
+        };
+        if bbr.t != exit || bbr.f != bl {
+            continue;
+        }
+        // An outside edge into the blank fill or latch would dangle once the rewrite drops them.
+        if preds[b].iter().any(|&p| p != h && p != b) || preds[l].iter().any(|&p| p != h) {
+            continue;
+        }
+        let blank_space = bins_
+            .iter()
+            .any(|i| matches!(i, Inst::Store(st) if st.val == Val::Const(32)));
+        let blank_five = bins_
+            .iter()
+            .any(|i| matches!(i, Inst::Icmp(ic) if ic.pred == "eq" && ic.b == Val::Const(5)));
+        if !blank_space || !blank_five {
+            continue;
+        }
+        // The rewrite drops the blank and latch blocks, so their only stores may be the space fill.
+        let fill_only = bins_.iter().all(|i| match i {
+            Inst::Store(st) => st.val == Val::Const(32) && st.ty == Ty::I8 && !st.volatile,
+            _ => true,
+        });
+        let latch_quiet = !lins.iter().any(|i| matches!(i, Inst::Store(_)));
+        if !fill_only || !latch_quiet {
+            continue;
+        }
+        // The value phi is the one the header's udiv 10 divides.
+        let bins: Vec<&Bin> = hinsts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Bin(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        let i16_phis: Vec<&Phi> = hinsts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Phi(p) if !p.ptr && p.ty == Ty::I16 => Some(p),
+                _ => None,
+            })
+            .collect();
+        let commutes =
+            |b: &Bin, x: &Val, y: &Val| (b.a == *x && b.b == *y) || (b.a == *y && b.b == *x);
+        let Some(udiv) = bins
+            .iter()
+            .find(|b| b.op == BinOp::UDiv && b.ty == Ty::I16 && b.b == Val::Const(10))
+        else {
+            continue;
+        };
+        let Val::Reg(v) = udiv.a.clone() else {
+            continue;
+        };
+        let q = udiv.dst.clone();
+        let qv = Val::Reg(q.clone());
+        let Some(vphi) = i16_phis.iter().find(|p| p.dst == v) else {
+            continue;
+        };
+        let Some(vinit) = arm(vphi, pl) else {
+            continue;
+        };
+        if arm(vphi, ll) != Some(qv.clone()) {
+            continue;
+        }
+        let Some(cphi) = i16_phis
+            .iter()
+            .find(|p| p.dst != v && arm(p, pl) == Some(Val::Const(0)))
+        else {
+            continue;
+        };
+        let cnt = cphi.dst.clone();
+        let Some(Val::Reg(n1)) = arm(cphi, ll) else {
+            continue;
+        };
+        // Digit: q*246 + v, truncated, or 48. The -10 mod 256 digit form.
+        let Some(mul) = bins
+            .iter()
+            .find(|b| b.op == BinOp::Mul && b.ty == Ty::I16 && commutes(b, &qv, &Val::Const(246)))
+        else {
+            continue;
+        };
+        let neg = Val::Reg(mul.dst.clone());
+        let Some(add) = bins.iter().find(|b| {
+            b.op == BinOp::Add && b.ty == Ty::I16 && commutes(b, &neg, &Val::Reg(v.clone()))
+        }) else {
+            continue;
+        };
+        let sum = Val::Reg(add.dst.clone());
+        let Some(tr) = hinsts.iter().find_map(|i| match i {
+            Inst::Trunc(t) if t.val == sum => Some(t),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if tr.from != Ty::I16 || tr.to != Ty::I8 {
+            continue;
+        }
+        let Some(orb) = bins.iter().find(|b| {
+            b.op == BinOp::Or
+                && b.ty == Ty::I8
+                && commutes(b, &Val::Reg(tr.dst.clone()), &Val::Const(48))
+        }) else {
+            continue;
+        };
+        let digit = Val::Reg(orb.dst.clone());
+        // The digit store goes through the pointer phi that arms from the
+        // preheader as `gep @buf +15`, stepping -1 in the latch.
+        let stores: Vec<&Store> = hinsts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Store(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        let [st] = stores.as_slice() else {
+            continue;
+        };
+        if st.ty != Ty::I8 || st.val != digit || st.volatile {
+            continue;
+        }
+        let pp = st.ptr.strip_prefix('%').unwrap_or(&st.ptr).to_string();
+        let Some(pph) = hinsts.iter().find_map(|i| match i {
+            Inst::Phi(p) if p.ptr && p.dst == pp => Some(p),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some(Val::Reg(g15)) = arm(pph, pl) else {
+            continue;
+        };
+        let Some(Val::Reg(pnext)) = arm(pph, ll) else {
+            continue;
+        };
+        let Some(gep15) = hinsts.iter().find_map(|i| match i {
+            Inst::Gep(g) if g.dst == g15 => Some(g),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let GepBase::Global(buf) = &gep15.base else {
+            continue;
+        };
+        if gep15.k != 15 || !gep15.terms.is_empty() {
+            continue;
+        }
+        let step_ok = lins.iter().any(|i| match i {
+            Inst::Gep(g) => {
+                g.dst == pnext
+                    && g.base == GepBase::Reg(pp.clone())
+                    && g.k == 65535
+                    && g.terms.is_empty()
+            }
+            _ => false,
+        });
+        if !step_ok {
+            continue;
+        }
+        // Count: add 1 in the latch, exit on count+1 == 5.
+        let Some(bump) = lins.iter().find_map(|i| match i {
+            Inst::Bin(b)
+                if b.op == BinOp::Add
+                    && b.ty == Ty::I16
+                    && commutes(b, &Val::Reg(cnt.clone()), &Val::Const(1)) =>
+            {
+                Some(b)
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        if bump.dst != n1 {
+            continue;
+        }
+        let Some(ic5) = lins.iter().find_map(|i| match i {
+            Inst::Icmp(c)
+                if c.pred == "eq"
+                    && c.ty == Ty::I16
+                    && c.a == Val::Reg(n1.clone())
+                    && c.b == Val::Const(5) =>
+            {
+                Some(c)
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        if lbr.cond != Val::Reg(ic5.dst.clone()) {
+            continue;
+        }
+        // The header's blank test: v < 10 && count < 4, selected into the branch.
+        let Some(cv) = hinsts.iter().find_map(|i| match i {
+            Inst::Icmp(c)
+                if c.pred == "ult"
+                    && c.ty == Ty::I16
+                    && c.a == Val::Reg(v.clone())
+                    && c.b == Val::Const(10) =>
+            {
+                Some(c)
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some(cc) = hinsts.iter().find_map(|i| match i {
+            Inst::Icmp(c)
+                if c.pred == "ult"
+                    && c.ty == Ty::I16
+                    && c.a == Val::Reg(cnt.clone())
+                    && c.b == Val::Const(4) =>
+            {
+                Some(c)
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some(sel) = hinsts.iter().find_map(|i| match i {
+            Inst::Select(s)
+                if !s.ptr
+                    && s.cond == Val::Reg(cv.dst.clone())
+                    && s.a == Val::Reg(cc.dst.clone())
+                    && s.b == Val::Const(0) =>
+            {
+                Some(s)
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        if hbr.cond != Val::Reg(sel.dst.clone()) {
+            continue;
+        }
+        // Loop-locality: every register the three blocks define dies inside
+        // them, so dropping the blocks cannot strand a use.
+        let region = [h, b, l];
+        let mut defs = Vec::new();
+        let mut shaped = true;
+        for &r in &region {
+            match lsr_block_defs(&blocks[r].insts) {
+                Some(d) => defs.extend(d),
+                None => shaped = false,
+            }
+        }
+        if !shaped
+            || !defs.iter().all(|d| {
+                uses.get(d)
+                    .is_none_or(|us| us.iter().all(|i| region.contains(i)))
+            })
+        {
+            continue;
+        }
+        sites.push(LsrDecimalSite {
+            pre,
+            region,
+            hl: hl.to_string(),
+            v0: vinit,
+            buf: buf.clone(),
+            exit,
+            udiv_loc: udiv.loc.clone(),
+            br_loc: hbr.loc.clone(),
+        });
+    }
+    sites
+}
+
+/// Rewrites every post-LSR decimal loop into a void `__udec_u16_rj5` call
+/// (epic-cc#927). The helper replaces each loop with a shared routine, so
+/// it pays off only across sites: a single site would keep the helper's
+/// flash on top of the loop it removes. Gated on two or more sites.
+fn share_lsr_decimal_loops(m: Module) -> (Module, bool) {
+    let mut detected: Vec<Vec<LsrDecimalSite>> = Vec::new();
+    let mut total = 0;
+    for f in &m.funcs {
+        let sites = find_lsr_decimal_sites(f);
+        total += sites.len();
+        detected.push(sites);
+    }
+    if total < 2 {
+        return (m, false);
+    }
+    let mut funcs = Vec::with_capacity(m.funcs.len());
+    for (f, sites) in m.funcs.into_iter().zip(detected) {
+        let mut blocks = f.blocks;
+        let mut dropped = vec![false; blocks.len()];
+        for site in sites {
+            // A fresh GEP per site: the parser's phi-arm GEP is defined in the
+            // header, which this rewrite removes, so it cannot be reused.
+            let end = format!("__rj5_end_{}", site.hl);
+            let pre = &mut blocks[site.pre];
+            pre.insts.pop();
+            pre.insts.push(Inst::Gep(Gep {
+                dst: end.clone(),
+                base: GepBase::Global(site.buf),
+                k: 15,
+                terms: Vec::new(),
+                loc: None,
+            }));
+            pre.insts.push(Inst::Call(Call {
+                dst: None,
+                ty: None,
+                func: "__udec_u16_rj5".to_string(),
+                args: vec![
+                    CallArg {
+                        ty: Some(Ty::I16),
+                        val: site.v0,
+                        byval: None,
+                        sret: false,
+                    },
+                    CallArg {
+                        ty: None,
+                        val: Val::Reg(end),
+                        byval: None,
+                        sret: false,
+                    },
+                ],
+                callees: Vec::new(),
+                loc: site.udiv_loc,
+            }));
+            pre.insts.push(Inst::Br(Br {
+                target: site.exit,
+                loc: site.br_loc,
+            }));
+            for r in site.region {
+                dropped[r] = true;
+            }
+        }
+        let blocks = blocks
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !dropped[*i])
+            .map(|(_, b)| b)
+            .collect();
+        funcs.push(Func {
+            name: f.name,
+            ret: f.ret,
+            params: f.params,
+            blocks,
+            isr: f.isr,
+            irq_priority: f.irq_priority,
+            naked: f.naked,
+            variadic: f.variadic,
+        });
+    }
+    (
+        Module {
+            globals: m.globals,
+            funcs,
+            module_asm: m.module_asm,
+        },
+        true,
+    )
+}
 /// One decimal-loop header matched for sharing: the call arguments plus
 /// the exit edge and source locations the rewritten block keeps.
 struct DecimalSite {
@@ -4819,10 +5285,26 @@ fn routine_func(name: &str) -> Func {
             ],
             7,
         ),
+        // Same backward digit writer as the post-LSR loop it replaces; 6
+        // scratch bytes (den, rem, dcnt, iter), nothing returned.
+        "__udec_u16_rj5" => (
+            Ty::I8, // placeholder: the Func ret is forced to None below.
+            vec![
+                param("num", 2),
+                Param {
+                    name: "buf".into(),
+                    width: 2,
+                    byval: None,
+                    sret: false,
+                    ptr: true,
+                },
+            ],
+            6,
+        ),
         other => panic!("legalize: unknown runtime routine {other}"),
     };
     // The counted helper returns nothing: its Func carries no ret.
-    let ret = if name == "__udec_u16_5" {
+    let ret = if name == "__udec_u16_5" || name == "__udec_u16_rj5" {
         None
     } else {
         Some(ret)
