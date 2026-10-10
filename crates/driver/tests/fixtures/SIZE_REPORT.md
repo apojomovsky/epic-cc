@@ -3,7 +3,7 @@
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
 - Date (UTC): 2026-10-10
-- Commit: 392c7e5
+- Commit: ef9aedd
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
 - Menu-demo listing: 8909 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
@@ -45,11 +45,11 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | hal-pic16-blink-16f877a | 16F877A | 462 | 44 | = / = |
 | hal-pic18-blink-18f4550 | 18F4550 | 313 | 30 | = / = |
 | hal-pic14e-blink-16f1937 | 16F1937 | 100 | 6 | = / = |
-| hal-pic16-encoder-full-16f877a | 16F877A | 5372 | 326 | = / = |
+| hal-pic16-encoder-full-16f877a | 16F877A | 5360 | 326 | = / = |
 | hal-pic18-menu-demo-18f4550 | 18F4550 | 8992 | 781 | = / = |
 | hal-pic18-control-demo-18f4550 | 18F4550 | 9171 | 963 | = / = |
-| hal-pic18-pid-18f4550 | 18F4550 | 3157 | 500 | = / = |
-| hal-pic18-bridge-demo-18f4550 | 18F4550 | 12806 | 1296 | = / = |
+| hal-pic18-pid-18f4550 | 18F4550 | 3151 | 500 | = / = |
+| hal-pic18-bridge-demo-18f4550 | 18F4550 | 12800 | 1296 | = / = |
 
 ## Menu-demo clusters (listing words)
 
@@ -71,14 +71,14 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 
 Top profiler categories on the same listing:
 
-- `data-move`: 1385 (15.5%)
+- `data-move`: 1386 (15.6%)
 - `shared-code`: 1239 (13.9%)
-- `struct-copy-movff`: 1106 (12.4%)
+- `struct-copy-movff`: 1102 (12.4%)
 - `branch`: 760 (8.5%)
 - `scalar-alu`: 581 (6.5%)
 - `cond-branch`: 540 (6.1%)
 - `literal-load`: 488 (5.5%)
-- `slot-copy`: 396 (4.4%)
+- `slot-copy`: 398 (4.5%)
 
 ## Regenerating
 
