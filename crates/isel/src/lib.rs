@@ -839,12 +839,18 @@ impl<'m> Gen<'m> {
                             // right after the CALL saves the returned byte in
                             // the fixed scratch (free at a const read) across
                             // its own MOVLW, then reloads it into W.
-                            self.emit(format!("    MOVLW PAGE(__read_{name})"));
+                            // A pooled member reads its chunk's table at the
+                            // member's offset (epic-cc#913): no table of its own.
+                            let (table, k) = match self.pool_lit(&name) {
+                                Some((chunk, off)) => (chunk, k.wrapping_add(off)),
+                                None => (name.clone(), k),
+                            };
+                            self.emit(format!("    MOVLW PAGE(__read_{table})"));
                             self.emit("    MOVWF PCLATH".to_string());
                             self.emit_ptr_index_w(k, &terms, byte_off);
-                            self.emit(format!("    CALL __read_{name}"));
+                            self.emit(format!("    CALL __read_{table}"));
                             self.emit_w_store(self.scratch);
-                            self.emit_pclath_restore(&format!("__read_{name}"));
+                            self.emit_pclath_restore(&format!("__read_{table}"));
                             self.emit_w_load(self.scratch);
                         }
                         return;
@@ -863,12 +869,18 @@ impl<'m> Gen<'m> {
                         "isel: constant index into large const table @{g} not supported (size {} > 255); only a single 16-bit reg index is",
                         self.global_size(g)
                     );
-                    self.emit(format!("    MOVLW PAGE(__read_{g})"));
+                    // A pooled member reads its chunk's table at the member's
+                    // offset (epic-cc#913); a gated const has no table of its own.
+                    let (table, idx) = match self.pool_lit(g) {
+                        Some((chunk, off)) => (chunk, off),
+                        None => (g.clone(), 0),
+                    };
+                    self.emit(format!("    MOVLW PAGE(__read_{table})"));
                     self.emit("    MOVWF PCLATH".to_string());
-                    self.emit(format!("    MOVLW 0x{byte_off:02X}"));
-                    self.emit(format!("    CALL __read_{g}"));
+                    self.emit_ptr_index_w(idx, &[], byte_off);
+                    self.emit(format!("    CALL __read_{table}"));
                     self.emit_w_store(self.scratch);
-                    self.emit_pclath_restore(&format!("__read_{g}"));
+                    self.emit_pclath_restore(&format!("__read_{table}"));
                     self.emit_w_load(self.scratch);
                     return;
                 }
@@ -4655,7 +4667,7 @@ impl<'m> Gen<'m> {
             // slots (unsigned abs, INT_MIN safe), run the unsigned divmod,
             // negate the quotient if the signs differed (bit0) / the
             // remainder if the dividend was negative (bit1).
-            "__sdiv_i8" | "__srem_i8" => {
+            "__sdiv_i8" | "__srem_i8" | "__sdivmod_i8" => {
                 let num = self.slot_addr(name, "num").direct();
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, den, scr, scr + 4], name);
@@ -4717,6 +4729,23 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    INCF 0x{num:02X}, F"));
                     self.emit(format!("{l_store}:"));
                     self.store_retval(num, 1);
+                } else if recipe == "__sdivmod_i8" {
+                    // Fused pair: negate both halves in place, spill the
+                    // remainder, return the quotient. The loop above is
+                    // shared verbatim, so lone ops emit as before.
+                    let l_rem = self.fresh_label();
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 0"));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.emit(format!("    COMF 0x{num:02X}, F"));
+                    self.emit(format!("    INCF 0x{num:02X}, F"));
+                    self.emit(format!("{l_store}:"));
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
+                    self.emit(format!("    GOTO {l_rem}"));
+                    self.emit(format!("    COMF 0x{rem_lo:02X}, F"));
+                    self.emit(format!("    INCF 0x{rem_lo:02X}, F"));
+                    self.emit(format!("{l_rem}:"));
+                    self.store_rem_slot(rem_lo, 1, "__sdivmod_rem_i8");
+                    self.store_retval(num, 1);
                 } else {
                     self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
                     self.emit(format!("    GOTO {l_store}"));
@@ -4729,7 +4758,7 @@ impl<'m> Gen<'m> {
             }
             // Signed 16-bit wrappers: same structure, 16-bit abs/negate and
             // the 16-bit divmod with the incfsz borrow idiom.
-            "__sdiv_i16" | "__srem_i16" => {
+            "__sdiv_i16" | "__srem_i16" | "__sdivmod_i16" => {
                 let num = self.slot_addr(name, "num").direct();
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 1, den, den + 1, scr, scr + 6], name);
@@ -4788,6 +4817,20 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    GOTO {l_store}"));
                     self.neg16_in_place(num); // -quotient
                     self.emit(format!("{l_store}:"));
+                    self.store_retval(num, 2);
+                } else if recipe == "__sdivmod_i16" {
+                    // Fused pair: negate both halves in place, spill the
+                    // remainder, return the quotient.
+                    let l_rem = self.fresh_label();
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 0"));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.neg16_in_place(num); // -quotient
+                    self.emit(format!("{l_store}:"));
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
+                    self.emit(format!("    GOTO {l_rem}"));
+                    self.neg16_in_place(rem_lo); // -remainder
+                    self.emit(format!("{l_rem}:"));
+                    self.store_rem_slot(rem_lo, 2, "__sdivmod_rem_i16");
                     self.store_retval(num, 2);
                 } else {
                     self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
@@ -4881,7 +4924,7 @@ impl<'m> Gen<'m> {
             // itself, deterministic), run the unsigned divmod, negate the
             // quotient if the signs differed (bit0 = num<0 XOR den<0) / the
             // remainder if the dividend was negative (bit1).
-            "__sdiv_i32" | "__srem_i32" => {
+            "__sdiv_i32" | "__srem_i32" | "__sdivmod_i32" => {
                 let num = self.slot_addr(name, "num").direct();
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 3, den, den + 3, scr, scr + 11], name);
@@ -4912,6 +4955,20 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    GOTO {l_store}"));
                     self.neg32_in_place(num); // -quotient
                     self.emit(format!("{l_store}:"));
+                    self.store_retval(num, 4);
+                } else if recipe == "__sdivmod_i32" {
+                    // Fused pair: negate both halves in place, spill the
+                    // remainder, return the quotient.
+                    let l_rem = self.fresh_label();
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 0"));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.neg32_in_place(num); // -quotient
+                    self.emit(format!("{l_store}:"));
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
+                    self.emit(format!("    GOTO {l_rem}"));
+                    self.neg32_in_place(rem); // -remainder
+                    self.emit(format!("{l_rem}:"));
+                    self.store_rem_slot(rem, 4, "__sdivmod_rem_i32");
                     self.store_retval(num, 4);
                 } else {
                     self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
@@ -7449,11 +7506,12 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
         match recipe {
             "__mul_u8" | "__mul_u16" | "__mul_u32" | "__udiv_u8" | "__urem_u8" | "__udivmod_u8"
             | "__udiv_u16" | "__urem_u16" | "__udivmod_u16" | "__udiv_u32" | "__urem_u32"
-            | "__udivmod_u32" | "__sdiv_i8" | "__srem_i8" | "__sdiv_i16" | "__srem_i16"
-            | "__sdiv_i32" | "__srem_i32" | "__shl_u8" | "__lshr_u8" | "__ashr_i8"
-            | "__shl_u16" | "__lshr_u16" | "__ashr_i16" | "__shl_u32" | "__lshr_u32"
-            | "__ashr_i32" | "__add_f32" | "__sub_f32" | "__mul_f32" | "__div_f32"
-            | "__cmp_f32" | "__uitofp_f32" | "__sitofp_f32" | "__fptoui_f32" | "__fptosi_f32" => {}
+            | "__udivmod_u32" | "__sdiv_i8" | "__srem_i8" | "__sdivmod_i8" | "__sdiv_i16"
+            | "__srem_i16" | "__sdivmod_i16" | "__sdiv_i32" | "__srem_i32" | "__sdivmod_i32"
+            | "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16" | "__lshr_u16"
+            | "__ashr_i16" | "__shl_u32" | "__lshr_u32" | "__ashr_i32" | "__add_f32"
+            | "__sub_f32" | "__mul_f32" | "__div_f32" | "__cmp_f32" | "__uitofp_f32"
+            | "__sitofp_f32" | "__fptoui_f32" | "__fptosi_f32" => {}
             other => panic!("isel: unknown runtime routine @{other}"),
         }
         g.emit_routine();
@@ -10034,6 +10092,9 @@ pub fn select_with_opts(
             .globals
             .iter()
             .filter(|g| g.is_const && !addrs.contains_key(&g.name))
+            // Fully gated pooled consts are read only through their chunk, so
+            // their own table, reader and stage slot would be dead bytes (epic-cc#913).
+            .filter(|g| !(pool.contains(&g.name) && !staged.contains(&g.name)))
             .collect();
         // Pooled chunks table exactly like per-const tables from here on:
         // reader pages, chunking, the collision guard, and both emission

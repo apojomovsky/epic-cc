@@ -133,6 +133,22 @@ fn dcfsnz_skips_when_result_is_not_zero() {
 }
 
 #[test]
+fn dcfsnz_leaves_status_alone() {
+    // MOVWF 0xFD8,A seeds STATUS; DCFSNZ 0x20,F,A is 0x4E20. The
+    // no-flag sweep caught the sim writing Z/N here; silicon does not.
+    let words = vec![0x0E1F, 0x6ED8, 0x0E02, 0x6E20, 0x4E20, 0x0000];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 1);
+    assert_eq!(p.ram()[0xFD8], 0x1F);
+    let words = vec![0x0E00, 0x6ED8, 0x0E01, 0x6E20, 0x4E20, 0x0000];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0);
+    assert_eq!(p.ram()[0xFD8], 0x00);
+}
+
+#[test]
 fn incf_increments_and_sets_flags() {
     let words = vec![0x0EFF, 0x6E20, 0x2A20]; // MOVLW 0xFF; MOVWF 0x20,A; INCF 0x20,F,A
     let mut p = Pic18::new(words);

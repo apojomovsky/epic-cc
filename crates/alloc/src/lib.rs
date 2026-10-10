@@ -3820,6 +3820,8 @@ fn def_width(inst: &Inst, resolved: &PtrResolution, fname: &str) -> Option<(Stri
         // va_arg defines the read argument's dst, sized by its type.
         Inst::VaArg(v) => Some((v.dst.clone(), v.ty.bytes())),
         // Float: binops/conv casts define an f32 (4-byte) dst; fcmp an i1.
+        // Only reached by direct `allocate` callers on raw IR: the driver legalizes
+        // first, so these widths size the dst slot only when legalize is skipped.
         Inst::FloatBin(b) => Some((b.dst.clone(), 4)),
         Inst::Fcmp(c) => Some((c.dst.clone(), 1)),
         Inst::FloatConv(c) => Some((c.dst.clone(), c.to.bytes())),

@@ -3145,100 +3145,95 @@ impl<'m> Gen<'m> {
                 };
                 self.emit_shift_body(bytes, op, scr);
             }
-            // 8x8 -> 16 shift-add (AN526): t = a shifted left one bit per
-            // multiplier bit; for each set bit of bk, r += t. Store the low
-            // byte of the product (the i8 result).
+            // 8x8 -> 8 shift-add: the i8 result keeps only the low product
+            // byte, so the accumulate is mod 256 and the high bytes are
+            // dead. The running product lives in one scratch byte, the
+            // multiplicand shifts in its param slot, and the loop exits
+            // once the multiplier shifts out (RRF leaves Z alone, so MOVF
+            // tests it). Param slots are call-owned: shifts and signed
+            // wrappers already reuse them the same way.
             "__mul_u8" => {
                 let a = self.slot_addr(name, "a").direct();
                 let b = self.slot_addr(name, "b").direct();
-                self.assert_bank0(&[a, b, scr, scr + 5], name);
-                let (bk, cnt, r_lo, r_hi, t_lo, t_hi) =
-                    (scr, scr + 1, scr + 2, scr + 3, scr + 4, scr + 5);
+                self.assert_bank0(&[a, b, scr], name);
+                let r = scr;
                 let l_loop = self.fresh_label();
                 let l_skip = self.fresh_label();
-                for r in [r_lo, r_hi, t_lo, t_hi] {
-                    self.emit(format!("    CLRF 0x{r:02X}"));
-                }
-                self.emit(format!("    MOVF 0x{a:02X}, W"));
-                self.emit(format!("    MOVWF 0x{t_lo:02X}")); // t = a
-                self.emit(format!("    MOVF 0x{b:02X}, W"));
-                self.emit(format!("    MOVWF 0x{bk:02X}")); // bk = b
-                self.emit("    MOVLW 0x08".to_string());
-                self.emit(format!("    MOVWF 0x{cnt:02X}")); // cnt = 8
+                self.emit(format!("    CLRF 0x{r:02X}")); // r = 0
                 self.emit(format!("{l_loop}:"));
-                self.emit(format!("    BTFSS 0x{bk:02X}, 0")); // test multiplier LSB
+                self.emit(format!("    BTFSS 0x{b:02X}, 0")); // test multiplier LSB
                 self.emit(format!("    GOTO {l_skip}"));
-                self.emit(format!("    MOVF 0x{t_lo:02X}, W"));
-                self.emit(format!("    ADDWF 0x{r_lo:02X}, F"));
-                self.emit(format!("    MOVF 0x{t_hi:02X}, W"));
-                self.emit("    BTFSC STATUS, 0".to_string());
-                self.emit(format!("    INCFSZ 0x{t_hi:02X}, W")); // t_hi + carry; skip if wrapped
-                self.emit(format!("    ADDWF 0x{r_hi:02X}, F"));
+                self.emit(format!("    MOVF 0x{a:02X}, W"));
+                self.emit(format!("    ADDWF 0x{r:02X}, F")); // r += t, mod 256
                 self.emit(format!("{l_skip}:"));
                 self.emit("    BCF STATUS, 0".to_string());
-                self.emit(format!("    RLF 0x{t_lo:02X}, F"));
-                self.emit(format!("    RLF 0x{t_hi:02X}, F")); // t <<= 1
+                self.emit(format!("    RLF 0x{a:02X}, F")); // t <<= 1, mod 256
                 self.emit("    BCF STATUS, 0".to_string());
-                self.emit(format!("    RRF 0x{bk:02X}, F")); // bk >>= 1
-                self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
+                self.emit(format!("    RRF 0x{b:02X}, F")); // bk >>= 1
+                self.emit(format!("    MOVF 0x{b:02X}, F")); // Z = (bk == 0)
+                self.emit("    BTFSS STATUS, 2".to_string());
                 self.emit(format!("    GOTO {l_loop}"));
-                self.store_retval(r_lo, 2);
+                // One byte, not two: the declared result is i8, so the
+                // high product byte is dead. Storing only the low byte
+                // also leaves it in W for the caller's return-value copy.
+                self.store_retval(r, 1);
                 self.emit("    RETURN".to_string());
             }
-            // 16x16 -> 32 shift-add, 16 iterations: t = a (32-bit, shifted
-            // left), for each set bit of bk, r += t across all 4 bytes with
-            // the incfsz carry idiom. Store the low 16 bits (the i16 result).
+            // 16x16 -> 16 shift-add: the i16 result keeps only the low half,
+            // so t and r are 16 bits (mod 65536) and shift in place in the
+            // param slots. The loop exits once both multiplier bytes shift
+            // out (IORWF sets Z on the combined remainder). When the short
+            // operand arrived in `a`, the slots are XOR-swapped so the long
+            // one is shifted as the multiplicand, cutting loop passes.
             "__mul_u16" => {
                 let a = self.slot_addr(name, "a").direct();
                 let b = self.slot_addr(name, "b").direct();
-                self.assert_bank0(&[a, a + 1, b, b + 1, scr, scr + 10], name);
-                let (bk_lo, bk_hi, cnt) = (scr, scr + 1, scr + 2);
-                let (r0, r1, r2, r3) = (scr + 3, scr + 4, scr + 5, scr + 6);
-                let (t0, t1, t2, t3) = (scr + 7, scr + 8, scr + 9, scr + 10);
+                self.assert_bank0(&[a, a + 1, b, b + 1, scr, scr + 1], name);
+                let (r0, r1) = (scr, scr + 1);
+                let (a_lo, a_hi) = (a, a + 1);
+                let (bk_lo, bk_hi) = (b, b + 1);
                 let l_loop = self.fresh_label();
                 let l_skip = self.fresh_label();
-                for r in [r0, r1, r2, r3] {
-                    self.emit(format!("    CLRF 0x{r:02X}"));
+                let l_noswap = self.fresh_label();
+                // Multiply commutes, but the loop runs bitlen(multiplier)
+                // passes: exchange the slots (XOR swap, no temp) when a_hi
+                // is zero and bk_hi is not, so the long operand is shifted.
+                self.emit(format!("    MOVF 0x{a_hi:02X}, W"));
+                self.emit("    BTFSS STATUS, 2".to_string());
+                self.emit(format!("    GOTO {l_noswap}"));
+                self.emit(format!("    MOVF 0x{bk_hi:02X}, W"));
+                self.emit("    BTFSC STATUS, 2".to_string());
+                self.emit(format!("    GOTO {l_noswap}"));
+                for (x, y) in [(a_lo, bk_lo), (a_hi, bk_hi)] {
+                    self.emit(format!("    MOVF 0x{y:02X}, W"));
+                    self.emit(format!("    XORWF 0x{x:02X}, F"));
+                    self.emit(format!("    MOVF 0x{x:02X}, W"));
+                    self.emit(format!("    XORWF 0x{y:02X}, F"));
+                    self.emit(format!("    MOVF 0x{y:02X}, W"));
+                    self.emit(format!("    XORWF 0x{x:02X}, F"));
                 }
-                for t in [t0, t1, t2, t3] {
-                    self.emit(format!("    CLRF 0x{t:02X}"));
-                }
-                self.emit(format!("    MOVF 0x{a:02X}, W"));
-                self.emit(format!("    MOVWF 0x{t0:02X}"));
-                self.emit(format!("    MOVF 0x{:02X}, W", a + 1));
-                self.emit(format!("    MOVWF 0x{t1:02X}")); // t = a (32-bit, low 16)
-                self.emit(format!("    MOVF 0x{b:02X}, W"));
-                self.emit(format!("    MOVWF 0x{bk_lo:02X}"));
-                self.emit(format!("    MOVF 0x{:02X}, W", b + 1));
-                self.emit(format!("    MOVWF 0x{bk_hi:02X}")); // bk = b
-                self.emit("    MOVLW 0x10".to_string());
-                self.emit(format!("    MOVWF 0x{cnt:02X}")); // cnt = 16
+                self.emit(format!("{l_noswap}:"));
+                self.emit(format!("    CLRF 0x{r0:02X}"));
+                self.emit(format!("    CLRF 0x{r1:02X}")); // r = 0
                 self.emit(format!("{l_loop}:"));
                 self.emit(format!("    BTFSS 0x{bk_lo:02X}, 0")); // test multiplier LSB
                 self.emit(format!("    GOTO {l_skip}"));
-                self.emit(format!("    MOVF 0x{t0:02X}, W"));
+                self.emit(format!("    MOVF 0x{a_lo:02X}, W"));
                 self.emit(format!("    ADDWF 0x{r0:02X}, F"));
-                self.emit(format!("    MOVF 0x{t1:02X}, W"));
+                self.emit(format!("    MOVF 0x{a_hi:02X}, W"));
                 self.emit("    BTFSC STATUS, 0".to_string());
-                self.emit(format!("    INCFSZ 0x{t1:02X}, W"));
+                self.emit(format!("    INCFSZ 0x{a_hi:02X}, W")); // a_hi + carry; W target, slot kept
                 self.emit(format!("    ADDWF 0x{r1:02X}, F"));
-                self.emit(format!("    MOVF 0x{t2:02X}, W"));
-                self.emit("    BTFSC STATUS, 0".to_string());
-                self.emit(format!("    INCFSZ 0x{t2:02X}, W"));
-                self.emit(format!("    ADDWF 0x{r2:02X}, F"));
-                self.emit(format!("    MOVF 0x{t3:02X}, W"));
-                self.emit("    BTFSC STATUS, 0".to_string());
-                self.emit(format!("    INCFSZ 0x{t3:02X}, W"));
-                self.emit(format!("    ADDWF 0x{r3:02X}, F"));
                 self.emit(format!("{l_skip}:"));
                 self.emit("    BCF STATUS, 0".to_string());
-                for t in [t0, t1, t2, t3] {
-                    self.emit(format!("    RLF 0x{t:02X}, F")); // t <<= 1
-                }
+                self.emit(format!("    RLF 0x{a_lo:02X}, F"));
+                self.emit(format!("    RLF 0x{a_hi:02X}, F")); // t <<= 1, mod 65536
                 self.emit("    BCF STATUS, 0".to_string());
                 self.emit(format!("    RRF 0x{bk_hi:02X}, F"));
                 self.emit(format!("    RRF 0x{bk_lo:02X}, F")); // bk >>= 1
-                self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
+                self.emit(format!("    MOVF 0x{bk_lo:02X}, W"));
+                self.emit(format!("    IORWF 0x{bk_hi:02X}, W")); // Z = (bk == 0)
+                self.emit("    BTFSS STATUS, 2".to_string());
                 self.emit(format!("    GOTO {l_loop}"));
                 self.store_retval(r0, 2);
                 self.emit("    RETURN".to_string());
@@ -3349,7 +3344,7 @@ impl<'m> Gen<'m> {
             // slots (unsigned abs, INT_MIN safe), run the unsigned divmod,
             // negate the quotient if the signs differed (bit0) / the
             // remainder if the dividend was negative (bit1).
-            "__sdiv_i8" | "__srem_i8" => {
+            "__sdiv_i8" | "__srem_i8" | "__sdivmod_i8" => {
                 let num = self.slot_addr(name, "num").direct();
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, den, scr, scr + 4], name);
@@ -3411,6 +3406,22 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    INCF 0x{num:02X}, F"));
                     self.emit(format!("{l_store}:"));
                     self.store_retval(num, 1);
+                } else if recipe == "__sdivmod_i8" {
+                    // Fused pair: negate both halves in place, spill the
+                    // remainder, return the quotient.
+                    let l_rem = self.fresh_label();
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 0"));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.emit(format!("    COMF 0x{num:02X}, F"));
+                    self.emit(format!("    INCF 0x{num:02X}, F"));
+                    self.emit(format!("{l_store}:"));
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
+                    self.emit(format!("    GOTO {l_rem}"));
+                    self.emit(format!("    COMF 0x{rem_lo:02X}, F"));
+                    self.emit(format!("    INCF 0x{rem_lo:02X}, F"));
+                    self.emit(format!("{l_rem}:"));
+                    self.store_rem_slot(rem_lo, 1, "__sdivmod_rem_i8");
+                    self.store_retval(num, 1);
                 } else {
                     self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
                     self.emit(format!("    GOTO {l_store}"));
@@ -3423,7 +3434,7 @@ impl<'m> Gen<'m> {
             }
             // Signed 16-bit wrappers: same structure, 16-bit abs/negate and
             // the 16-bit divmod with the incfsz borrow idiom.
-            "__sdiv_i16" | "__srem_i16" => {
+            "__sdiv_i16" | "__srem_i16" | "__sdivmod_i16" => {
                 let num = self.slot_addr(name, "num").direct();
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 1, den, den + 1, scr, scr + 6], name);
@@ -3482,6 +3493,20 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    GOTO {l_store}"));
                     self.neg16_in_place(num); // -quotient
                     self.emit(format!("{l_store}:"));
+                    self.store_retval(num, 2);
+                } else if recipe == "__sdivmod_i16" {
+                    // Fused pair: negate both halves in place, spill the
+                    // remainder, return the quotient.
+                    let l_rem = self.fresh_label();
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 0"));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.neg16_in_place(num); // -quotient
+                    self.emit(format!("{l_store}:"));
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
+                    self.emit(format!("    GOTO {l_rem}"));
+                    self.neg16_in_place(rem_lo); // -remainder
+                    self.emit(format!("{l_rem}:"));
+                    self.store_rem_slot(rem_lo, 2, "__sdivmod_rem_i16");
                     self.store_retval(num, 2);
                 } else {
                     self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
@@ -3569,7 +3594,7 @@ impl<'m> Gen<'m> {
             // itself, deterministic), run the unsigned divmod, negate the
             // quotient if the signs differed (bit0 = num<0 XOR den<0) / the
             // remainder if the dividend was negative (bit1).
-            "__sdiv_i32" | "__srem_i32" => {
+            "__sdiv_i32" | "__srem_i32" | "__sdivmod_i32" => {
                 let num = self.slot_addr(name, "num").direct();
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 3, den, den + 3, scr, scr + 11], name);
@@ -3600,6 +3625,20 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    GOTO {l_store}"));
                     self.neg32_in_place(num); // -quotient
                     self.emit(format!("{l_store}:"));
+                    self.store_retval(num, 4);
+                } else if recipe == "__sdivmod_i32" {
+                    // Fused pair: negate both halves in place, spill the
+                    // remainder, return the quotient.
+                    let l_rem = self.fresh_label();
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 0"));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.neg32_in_place(num); // -quotient
+                    self.emit(format!("{l_store}:"));
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
+                    self.emit(format!("    GOTO {l_rem}"));
+                    self.neg32_in_place(rem); // -remainder
+                    self.emit(format!("{l_rem}:"));
+                    self.store_rem_slot(rem, 4, "__sdivmod_rem_i32");
                     self.store_retval(num, 4);
                 } else {
                     self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
@@ -5714,11 +5753,12 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
         match recipe {
             "__mul_u8" | "__mul_u16" | "__mul_u32" | "__udiv_u8" | "__urem_u8" | "__udivmod_u8"
             | "__udiv_u16" | "__urem_u16" | "__udivmod_u16" | "__udiv_u32" | "__urem_u32"
-            | "__udivmod_u32" | "__sdiv_i8" | "__srem_i8" | "__sdiv_i16" | "__srem_i16"
-            | "__sdiv_i32" | "__srem_i32" | "__shl_u8" | "__lshr_u8" | "__ashr_i8"
-            | "__shl_u16" | "__lshr_u16" | "__ashr_i16" | "__shl_u32" | "__lshr_u32"
-            | "__ashr_i32" | "__add_f32" | "__sub_f32" | "__mul_f32" | "__div_f32"
-            | "__cmp_f32" | "__uitofp_f32" | "__sitofp_f32" | "__fptoui_f32" | "__fptosi_f32" => {}
+            | "__udivmod_u32" | "__sdiv_i8" | "__srem_i8" | "__sdivmod_i8" | "__sdiv_i16"
+            | "__srem_i16" | "__sdivmod_i16" | "__sdiv_i32" | "__srem_i32" | "__sdivmod_i32"
+            | "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16" | "__lshr_u16"
+            | "__ashr_i16" | "__shl_u32" | "__lshr_u32" | "__ashr_i32" | "__add_f32"
+            | "__sub_f32" | "__mul_f32" | "__div_f32" | "__cmp_f32" | "__uitofp_f32"
+            | "__sitofp_f32" | "__fptoui_f32" | "__fptosi_f32" => {}
             other => panic!("isel: unknown runtime routine @{other}"),
         }
         g.emit_routine();
@@ -6666,6 +6706,48 @@ fn measure_end_org(text: &str) -> usize {
         org += 1;
     }
     org
+}
+
+/// Reports whether a constant-length memcpy in `m` parks its byte in the
+/// hold register (0x7F), which happens exactly when its destination setup
+/// is indirect. Reads the same `Gen` predicate `select_with_locs` emits
+/// with, so `addrs` must be the map that emit uses.
+pub fn const_memcpy_parks_hold(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> bool {
+    let resolved = resolve_pointers(m);
+    let prov = flash_provenance(m);
+    let staged = HashSet::new();
+    let mut tmp = 0u32;
+    for f in &m.funcs {
+        let g = Gen {
+            m,
+            addrs,
+            device,
+            staged: &staged,
+            resolved: &resolved,
+            prov: prov.clone(),
+            scratch: 0,
+            retval_lo: 0,
+            cur_func: &f.name,
+            tmp: &mut tmp,
+            page_of: None,
+            w_holds: None,
+            cur_loc: None,
+            out: Vec::new(),
+            locs: Vec::new(),
+        };
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Memcpy(c) = inst {
+                    if matches!(c.len, MemLen::Const(n) if n > 0)
+                        && g.ptr_setup_is_indirect(&c.dst, 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Selects instructions for the whole module into PIC14 assembly text.

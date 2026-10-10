@@ -320,9 +320,9 @@ fn bin_scratch(bin: &Bin) -> bool {
 /// PIC14E differs twice: every equality fold stores scratch, and its
 /// FSR setups keep the fast shape for empty term lists. Its constant
 /// memcpy parks the byte in the hold byte across an indirect
-/// destination setup; indirectness needs alloc addresses, so any
-/// constant memcpy counts there.
-pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
+/// destination setup. `const_memcpy_hold` reports whether any constant
+/// memcpy has one; only alloc addresses decide that, so the caller asks isel.
+pub fn fixed_uses(module: &Module, core: device::Core, const_memcpy_hold: bool) -> FixedUses {
     let mut retval: u8 = 0;
     let mut flag = false;
     let mut delay: u8 = 0;
@@ -415,11 +415,9 @@ pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
                         } else if let Some(res) = &resolved {
                             // A constant length unrolls into per-byte
                             // load/store shapes over the same machinery.
-                            // PIC14E also parks the byte in the hold byte
-                            // across an indirect destination setup; the
-                            // setup decision needs alloc addresses, so
-                            // every constant copy counts there.
-                            if core == device::Core::Pic14e {
+                            // PIC14E also parks the byte across an indirect
+                            // destination setup, which the caller reports.
+                            if core == device::Core::Pic14e && const_memcpy_hold {
                                 memcpy_hold = true;
                             }
                             scratch |= ptr_scratch(module, res, &f.name, core, &m.src, true);
@@ -794,9 +792,9 @@ mod tests {
     #[test]
     fn empty_program_touches_no_fixed_bytes() {
         let m = void_main(vec![]);
-        let u18 = fixed_uses(&m, pic18());
+        let u18 = fixed_uses(&m, pic18(), false);
         assert_eq!((u18.retval_bytes, u18.flag), (0, false));
-        let u14 = fixed_uses(&m, pic14());
+        let u14 = fixed_uses(&m, pic14(), false);
         assert_eq!((u14.retval_bytes, u14.flag), (0, false));
         assert!(!u14.scratch);
         assert!(!u14.memcpy_park);
@@ -815,8 +813,8 @@ mod tests {
         });
         let ret = Inst::Ret(Some((Ty::I16, Val::Reg("r".to_string()))), None);
         let m = void_main(vec![call, ret]);
-        assert_eq!(fixed_uses(&m, pic18()).retval_bytes, 2);
-        assert_eq!(fixed_uses(&m, pic14()).retval_bytes, 2);
+        assert_eq!(fixed_uses(&m, pic18(), false).retval_bytes, 2);
+        assert_eq!(fixed_uses(&m, pic14(), false).retval_bytes, 2);
     }
 
     #[test]
@@ -830,9 +828,9 @@ mod tests {
             loc: None,
         });
         let m = void_main(vec![sub]);
-        assert!(fixed_uses(&m, pic18()).flag);
-        assert_eq!(fixed_uses(&m, pic18()).retval_bytes, 0);
-        assert!(!fixed_uses(&m, pic14()).flag);
+        assert!(fixed_uses(&m, pic18(), false).flag);
+        assert_eq!(fixed_uses(&m, pic18(), false).retval_bytes, 0);
+        assert!(!fixed_uses(&m, pic14(), false).flag);
     }
 
     #[test]
@@ -845,7 +843,7 @@ mod tests {
             b: Val::Reg("x".to_string()),
             loc: None,
         });
-        assert!(!fixed_uses(&void_main(vec![sub]), pic18()).flag);
+        assert!(!fixed_uses(&void_main(vec![sub]), pic18(), false).flag);
     }
 
     #[test]
@@ -856,14 +854,20 @@ mod tests {
             len: MemLen::Reg(Val::Reg("n".to_string())),
             loc: None,
         });
-        assert_eq!(fixed_uses(&void_main(vec![reg]), pic14()).retval_bytes, 2);
+        assert_eq!(
+            fixed_uses(&void_main(vec![reg]), pic14(), false).retval_bytes,
+            2
+        );
         let fixed = Inst::Memcpy(Memcpy {
             dst: Val::Reg("d".to_string()),
             src: Val::Reg("s".to_string()),
             len: MemLen::Const(4),
             loc: None,
         });
-        assert_eq!(fixed_uses(&void_main(vec![fixed]), pic14()).retval_bytes, 0);
+        assert_eq!(
+            fixed_uses(&void_main(vec![fixed]), pic14(), false).retval_bytes,
+            0
+        );
     }
 
     #[test]
@@ -877,10 +881,13 @@ mod tests {
             loc: None,
         });
         assert_eq!(
-            fixed_uses(&void_main(vec![cmp.clone()]), pic14()).retval_bytes,
+            fixed_uses(&void_main(vec![cmp.clone()]), pic14(), false).retval_bytes,
             1
         );
-        assert_eq!(fixed_uses(&void_main(vec![cmp]), pic18()).retval_bytes, 0);
+        assert_eq!(
+            fixed_uses(&void_main(vec![cmp]), pic18(), false).retval_bytes,
+            0
+        );
         let unsigned = Inst::Icmp(Icmp {
             dst: "c".to_string(),
             pred: "ult".to_string(),
@@ -890,7 +897,7 @@ mod tests {
             loc: None,
         });
         assert_eq!(
-            fixed_uses(&void_main(vec![unsigned]), pic14()).retval_bytes,
+            fixed_uses(&void_main(vec![unsigned]), pic14(), false).retval_bytes,
             0
         );
     }
@@ -910,8 +917,8 @@ mod tests {
             funcs: vec![],
             module_asm: vec![],
         };
-        assert_eq!(fixed_uses(&m, pic14()).retval_bytes, 1);
-        assert_eq!(fixed_uses(&m, pic18()).retval_bytes, 0);
+        assert_eq!(fixed_uses(&m, pic14(), false).retval_bytes, 1);
+        assert_eq!(fixed_uses(&m, pic18(), false).retval_bytes, 0);
     }
 
     #[test]
@@ -932,8 +939,8 @@ mod tests {
         let m = void_main(vec![delay]);
         let plan = iselcore::delay::plan_delay(1000);
         let depth = plan.nests.iter().map(Vec::len).max().unwrap_or(0) as u8;
-        assert_eq!(fixed_uses(&m, pic18()).retval_bytes, depth);
-        assert_eq!(fixed_uses(&m, pic14()).retval_bytes, depth);
+        assert_eq!(fixed_uses(&m, pic18(), false).retval_bytes, depth);
+        assert_eq!(fixed_uses(&m, pic14(), false).retval_bytes, depth);
     }
 
     fn bin_op(op: BinOp, ty: Ty, a: Val, b: Val) -> Inst {
@@ -961,17 +968,17 @@ mod tests {
     #[test]
     fn narrow_alu_skips_pic14_scratch() {
         let add = bin_op(BinOp::Add, Ty::I8, Val::Reg("x".to_string()), Val::Const(1));
-        let u = fixed_uses(&void_main(vec![add]), pic14());
+        let u = fixed_uses(&void_main(vec![add]), pic14(), false);
         assert!(!u.scratch);
         let sub8 = bin_op(BinOp::Sub, Ty::I8, Val::Const(7), Val::Reg("x".to_string()));
-        assert!(!fixed_uses(&void_main(vec![sub8]), pic14()).scratch);
+        assert!(!fixed_uses(&void_main(vec![sub8]), pic14(), false).scratch);
         let sub16 = bin_op(
             BinOp::Sub,
             Ty::I16,
             Val::Reg("x".to_string()),
             Val::Reg("y".to_string()),
         );
-        assert!(!fixed_uses(&void_main(vec![sub16]), pic14()).scratch);
+        assert!(!fixed_uses(&void_main(vec![sub16]), pic14(), false).scratch);
     }
 
     #[test]
@@ -982,15 +989,15 @@ mod tests {
             Val::Reg("x".to_string()),
             Val::Reg("y".to_string()),
         );
-        assert!(fixed_uses(&void_main(vec![add32.clone()]), pic14()).scratch);
-        assert!(fixed_uses(&void_main(vec![add32]), pic14e()).scratch);
+        assert!(fixed_uses(&void_main(vec![add32.clone()]), pic14(), false).scratch);
+        assert!(fixed_uses(&void_main(vec![add32]), pic14e(), false).scratch);
         let sub16 = bin_op(
             BinOp::Sub,
             Ty::I16,
             Val::Const(7),
             Val::Reg("x".to_string()),
         );
-        assert!(fixed_uses(&void_main(vec![sub16]), pic14()).scratch);
+        assert!(fixed_uses(&void_main(vec![sub16]), pic14(), false).scratch);
     }
 
     #[test]
@@ -1001,15 +1008,15 @@ mod tests {
             Val::Reg("x".to_string()),
             Val::Reg("y".to_string()),
         );
-        assert!(fixed_uses(&void_main(vec![wide]), pic14()).scratch);
+        assert!(fixed_uses(&void_main(vec![wide]), pic14(), false).scratch);
         let narrow = icmp_op(
             "eq",
             Ty::I8,
             Val::Reg("x".to_string()),
             Val::Reg("y".to_string()),
         );
-        assert!(!fixed_uses(&void_main(vec![narrow.clone()]), pic14()).scratch);
-        assert!(fixed_uses(&void_main(vec![narrow]), pic14e()).scratch);
+        assert!(!fixed_uses(&void_main(vec![narrow.clone()]), pic14(), false).scratch);
+        assert!(fixed_uses(&void_main(vec![narrow]), pic14e(), false).scratch);
     }
 
     #[test]
@@ -1017,18 +1024,18 @@ mod tests {
         let reg = || Val::Reg("x".to_string());
         // Unsigned reg-reg chain without equality folds in place.
         let ult = icmp_op("ult", Ty::I16, reg(), Val::Reg("y".to_string()));
-        assert!(!fixed_uses(&void_main(vec![ult]), pic14()).scratch);
+        assert!(!fixed_uses(&void_main(vec![ult]), pic14(), false).scratch);
         // Equality-needing, signed, and const-byte chains spill.
         let ugt = icmp_op("ugt", Ty::I16, reg(), Val::Reg("y".to_string()));
-        assert!(fixed_uses(&void_main(vec![ugt]), pic14()).scratch);
+        assert!(fixed_uses(&void_main(vec![ugt]), pic14(), false).scratch);
         let slt = icmp_op("slt", Ty::I16, reg(), Val::Reg("y".to_string()));
-        assert!(fixed_uses(&void_main(vec![slt]), pic14()).scratch);
+        assert!(fixed_uses(&void_main(vec![slt]), pic14(), false).scratch);
         let const_rhs = icmp_op("ult", Ty::I16, reg(), Val::Const(9));
-        assert!(fixed_uses(&void_main(vec![const_rhs]), pic14()).scratch);
+        assert!(fixed_uses(&void_main(vec![const_rhs]), pic14(), false).scratch);
         let signed8 = icmp_op("slt", Ty::I8, reg(), Val::Reg("y".to_string()));
-        assert!(fixed_uses(&void_main(vec![signed8]), pic14()).scratch);
+        assert!(fixed_uses(&void_main(vec![signed8]), pic14(), false).scratch);
         let unsigned8 = icmp_op("ult", Ty::I8, reg(), Val::Reg("y".to_string()));
-        assert!(!fixed_uses(&void_main(vec![unsigned8]), pic14()).scratch);
+        assert!(!fixed_uses(&void_main(vec![unsigned8]), pic14(), false).scratch);
     }
 
     fn table_module(is_const: bool, terms: Vec<(u16, String)>) -> Module {
@@ -1063,21 +1070,21 @@ mod tests {
 
     #[test]
     fn const_table_load_touches_scratch() {
-        assert!(fixed_uses(&table_module(true, vec![]), pic14()).scratch);
-        assert!(fixed_uses(&table_module(true, vec![]), pic14e()).scratch);
-        assert!(!fixed_uses(&table_module(false, vec![]), pic14()).scratch);
+        assert!(fixed_uses(&table_module(true, vec![]), pic14(), false).scratch);
+        assert!(fixed_uses(&table_module(true, vec![]), pic14e(), false).scratch);
+        assert!(!fixed_uses(&table_module(false, vec![]), pic14(), false).scratch);
     }
 
     #[test]
     fn general_index_sum_touches_scratch() {
         // One scale-1 term keeps the fast FSR shape on both cores.
         let fast = table_module(false, vec![(1, "i".to_string())]);
-        assert!(!fixed_uses(&fast, pic14()).scratch);
-        assert!(!fixed_uses(&fast, pic14e()).scratch);
+        assert!(!fixed_uses(&fast, pic14(), false).scratch);
+        assert!(!fixed_uses(&fast, pic14e(), false).scratch);
         // Two terms accumulate through scratch.
         let slow = table_module(false, vec![(1, "i".to_string()), (1, "j".to_string())]);
-        assert!(fixed_uses(&slow, pic14()).scratch);
-        assert!(fixed_uses(&slow, pic14e()).scratch);
+        assert!(fixed_uses(&slow, pic14(), false).scratch);
+        assert!(fixed_uses(&slow, pic14e(), false).scratch);
     }
 
     #[test]
@@ -1088,7 +1095,7 @@ mod tests {
             len: MemLen::Reg(Val::Reg("n".to_string())),
             loc: None,
         });
-        let u = fixed_uses(&void_main(vec![reg]), pic14());
+        let u = fixed_uses(&void_main(vec![reg]), pic14(), false);
         assert!(u.memcpy_park);
         assert!(u.scratch);
         // Plain globals take the empty term list: PIC14 still
@@ -1099,28 +1106,29 @@ mod tests {
             len: MemLen::Reg(Val::Reg("n".to_string())),
             loc: None,
         });
-        let u14 = fixed_uses(&void_main(vec![global.clone()]), pic14());
+        let u14 = fixed_uses(&void_main(vec![global.clone()]), pic14(), false);
         assert!(u14.memcpy_park);
         assert!(u14.scratch);
-        let u14e = fixed_uses(&void_main(vec![global]), pic14e());
+        let u14e = fixed_uses(&void_main(vec![global]), pic14e(), false);
         assert!(u14e.memcpy_park);
         assert!(!u14e.scratch);
     }
 
     #[test]
-    fn const_memcpy_holds_on_pic14e_only() {
+    fn const_memcpy_holds_only_when_isel_parks() {
         let copy = Inst::Memcpy(Memcpy {
             dst: Val::Global("d".to_string()),
             src: Val::Global("s".to_string()),
             len: MemLen::Const(4),
             loc: None,
         });
-        let u14 = fixed_uses(&void_main(vec![copy.clone()]), pic14());
-        assert!(!u14.memcpy_park);
+        let u14 = fixed_uses(&void_main(vec![copy.clone()]), pic14(), true);
         assert!(!u14.memcpy_hold);
-        let u14e = fixed_uses(&void_main(vec![copy]), pic14e());
-        assert!(!u14e.memcpy_park);
-        assert!(u14e.memcpy_hold);
+        let direct = fixed_uses(&void_main(vec![copy.clone()]), pic14e(), false);
+        assert!(!direct.memcpy_hold);
+        let indirect = fixed_uses(&void_main(vec![copy]), pic14e(), true);
+        assert!(indirect.memcpy_hold);
+        assert!(!indirect.memcpy_park);
     }
 
     fn slot_chain_terms(terms: Vec<(u16, String)>) -> Module {
@@ -1156,11 +1164,11 @@ mod tests {
     fn store_term_shapes_match_load_shapes() {
         let mut fast = slot_chain_terms(vec![(1, "i".to_string())]);
         with_store(&mut fast);
-        assert!(!fixed_uses(&fast, pic14()).scratch);
+        assert!(!fixed_uses(&fast, pic14(), false).scratch);
         let mut slow = slot_chain_terms(vec![(1, "i".to_string()), (1, "j".to_string())]);
         with_store(&mut slow);
-        assert!(fixed_uses(&slow, pic14()).scratch);
-        assert!(fixed_uses(&slow, pic14e()).scratch);
+        assert!(fixed_uses(&slow, pic14(), false).scratch);
+        assert!(fixed_uses(&slow, pic14e(), false).scratch);
     }
 
     #[test]
@@ -1192,8 +1200,8 @@ mod tests {
                 loc: None,
             }),
         ]);
-        assert!(fixed_uses(&m, pic14()).scratch);
-        assert!(!fixed_uses(&m, pic14e()).scratch);
+        assert!(fixed_uses(&m, pic14(), false).scratch);
+        assert!(!fixed_uses(&m, pic14e(), false).scratch);
     }
 
     #[test]
@@ -1221,7 +1229,7 @@ mod tests {
             refs: vec![],
             addr: None,
         });
-        assert!(fixed_uses(&m, pic14()).scratch);
+        assert!(fixed_uses(&m, pic14(), false).scratch);
         m.funcs.push(Func {
             name: iselcore::LOG_POOL_CALLEE.to_string(),
             ret: None,
@@ -1232,6 +1240,6 @@ mod tests {
             naked: false,
             variadic: false,
         });
-        assert!(fixed_uses(&m, pic14()).scratch);
+        assert!(fixed_uses(&m, pic14(), false).scratch);
     }
 }

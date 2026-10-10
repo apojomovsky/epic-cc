@@ -484,6 +484,56 @@ class CategorizationTest(unittest.TestCase):
         self.assertEqual(cats["sfr-context-save"], 4)
         self.assertEqual(cats["struct-copy-movff"], 4)
 
+    def test_an_fsr_seed_triple_is_an_indirect_seed_not_a_context_save(self):
+        # `MOVFF slot,FSR0L; MOVFF slot+1,FSR0H; MOVFF INDF0,dst` is a
+        # pointer read after inlining, repeated per loop trip in
+        # console_rx_byte, not an ISR save.
+        listing = PIC18_HEADER + (
+            "f:\n    MOVFF 0x049, 0xFE9\n    MOVFF 0x04A, 0xFEA\n"
+            "    MOVFF 0xFEF, 0x075\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["indirect-seed"], 6)
+        self.assertNotIn("sfr-context-save", cats)
+
+    def test_fsr1_seeds_and_postinc_walks_are_indirect_seeds(self):
+        listing = PIC18_HEADER + (
+            "f:\n    MOVFF 0x054, 0xFE1\n    MOVFF 0x055, 0xFE2\n"
+            "    MOVF 0xFE6,W,A\n"
+            "g:\n    MOVFF 0xFEE, 0x058\n    MOVFF 0xFEF, 0x059\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["indirect-seed"], 8)
+        self.assertNotIn("sfr-context-save", cats)
+
+    def test_peripheral_sfr_runs_stay_context_saves(self):
+        # INDF-fed TXREG writes and STATUS/BSR saves are peripheral and
+        # ISR traffic, not pointer staging.
+        listing = PIC18_HEADER + (
+            "f:\n    MOVFF 0xFEF, 0x058\n    MOVFF 0x058, 0xFAF\n"
+            "    MOVFF 0xFD8, 0x009\n    MOVFF 0xFE0, 0x00A\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["sfr-context-save"], 8)
+        self.assertNotIn("indirect-seed", cats)
+
+    def test_flash_string_staging_lands_outside_context_save(self):
+        # TBLPTR setup plus TABLAT/PLUSW0 moves around a shared copy
+        # loop never reaches the context-save bucket.
+        listing = PIC18_HEADER + (
+            "f:\n    MOVLW LOW(s)\n    MOVWF 0xF6,A\n    MOVLW HIGH(s)\n"
+            "    MOVWF 0xF7,A\n    MOVLW UPPER(s)\n    MOVWF 0xF8,A\n"
+            "    CALL __pa13\n    MOVFF 0xFF5, 0x05D\n"
+            "    MOVF 0x053,W,A\n    MOVFF 0x05D, 0xFEB\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertNotIn("sfr-context-save", cats)
+        # The table address stages as one wide constant, the TABLAT
+        # move as a flash read, the PLUSW0 move as indirect access.
+        self.assertEqual(cats["wide-const-materialization"], 6)
+        self.assertEqual(cats["flash-access"], 2)
+        self.assertEqual(cats["indirect-access"], 2)
+
     def test_pic14_status_bits_are_not_read_on_pic18(self):
         # 0x003 is STATUS on PIC14 and an ordinary ISR save slot on PIC18.
         listing = PIC18_HEADER + (
