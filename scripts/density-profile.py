@@ -546,8 +546,8 @@ def match_peripheral_sfr_move(items, i, cfg):
     """
     if cfg.family != "pic18":
         return 0
-    span = _movff_run(items, i, cfg)[0]
-    return span if span and _touches_non_save_sfr(items, i, span) else 0
+    span, sfr = _movff_run(items, i, cfg)
+    return span if sfr and _touches_non_save_sfr(items, i, span) else 0
 
 
 def match_struct_copy(items, i, cfg):
@@ -978,9 +978,9 @@ _FSR_REGS = frozenset(
 )
 _FLASH_REGS = frozenset({0xFF3, 0xFF4, 0xFF5, 0xFF6, 0xFF7, 0xFF8})
 
-# Registers the ISR entry stub and FSR staging save (FSR, PROD/TABLAT/TBLPTR
-# shadows, STATUS, BSR, PCLATH, PCLATU). Named rather than an address cutoff
-# so INTCON and other core-range peripherals never read as saves.
+# The entry stub's saves (FSR, PROD/TABLAT/TBLPTR shadows, STATUS, BSR, PCLATH,
+# PCLATU) unioned with the indirect-register set the backend emits MOVFF through.
+# Named rather than an address cutoff so INTCON and other core-range peripherals never read as saves.
 _ISR_SAVE_REGS = _FSR_REGS | _FLASH_REGS | frozenset({0xFD8, 0xFE0, 0xFFA, 0xFFB})
 
 

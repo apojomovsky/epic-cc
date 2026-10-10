@@ -535,6 +535,27 @@ class CategorizationTest(unittest.TestCase):
         self.assertEqual(cats["peripheral-sfr-move"], 4)
         self.assertNotIn("sfr-context-save", cats)
 
+    def test_a_struct_copy_with_one_sfr_operand_stays_a_struct_copy(self):
+        # Only a run that is SFR-only in every move is device I/O; a GPR
+        # aggregate copy that happens to touch one SFR is still a struct copy.
+        listing = PIC18_HEADER + (
+            "f:\n    MOVFF 0x040, 0x050\n    MOVFF 0x041, 0x051\n"
+            "    MOVFF 0x042, 0xFAF\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["struct-copy-movff"], 6)
+        self.assertNotIn("peripheral-sfr-move", cats)
+
+    def test_a_mixed_save_and_peripheral_run_is_priced_as_peripheral(self):
+        # Deliberate: one peripheral move claims the whole SFR run, so the
+        # save move in it is priced as I/O (disclosed in ADR-048).
+        listing = PIC18_HEADER + (
+            "f:\n    MOVFF 0xFD8, 0x009\n    MOVFF 0x00A, 0xFAF\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["peripheral-sfr-move"], 4)
+        self.assertNotIn("sfr-context-save", cats)
+
     def test_intcon_is_not_mistaken_for_a_context_save(self):
         # INTCON (0xFF2) is core-range but outside the entry stub's save set,
         # so the save set is named, not an address cutoff.
