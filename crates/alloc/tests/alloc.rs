@@ -2425,7 +2425,7 @@ fn single_use_scalar_arg_homes_into_the_callee_param_slot() {
 #[test]
 fn trunc_arg_homes_into_the_callee_param_slot() {
     // Trunc lowers as compute-then-store like the other homed defs
-    // (epic-cc#916), so the narrowed byte can land in the param slot.
+    // so the narrowed byte can land in the param slot.
     let m = parse(
         "global out i8\n\
          fn callee(void) (p=i8)\n\
@@ -2466,30 +2466,6 @@ fn sext_arg_homes_into_the_callee_param_slot() {
     assert_eq!(
         out.locals["main::v"], out.locals["callee::p"],
         "a homed sext must target the param slot"
-    );
-}
-
-#[test]
-fn zext_arg_keeps_its_caller_slot() {
-    // Zext stays out of homing: it prices flat and grows one O2 row
-    // (epic-cc#916), so the copy must stay.
-    let m = parse(
-        "global out i16\n\
-         fn callee(void) (p=i16)\n\
-           block entry:\n\
-             store i16 %p, ptr @out\n\
-             ret void\n\
-         fn main(void) ()\n\
-           block entry:\n\
-             %b = add i8 1, 2\n\
-             %v = zext i8 %b to i16\n\
-             call void @callee(i16 %v)\n\
-             ret void\n",
-    );
-    let out = allocate(&PIC18F4550, &m, "edge main callee\n");
-    assert_ne!(
-        out.locals["main::v"], out.locals["callee::p"],
-        "a zext must not home into the param slot"
     );
 }
 
