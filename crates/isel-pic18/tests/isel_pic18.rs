@@ -10349,3 +10349,23 @@ fn gep_value_escape_keeps_index_terms_whole() {
         "escaped index term must keep its high lane:\n{asm}"
     );
 }
+
+#[test]
+fn zext_returned_as_i16_keeps_its_high_byte() {
+    let m = parse(
+        "global a i8\nglobal out i16\nfn get() i16 ()\n  block entry:\n    %1 = load i8 @a\n    %2 = zext i8 %1 to i16\n    ret i16 %2\nfn main(void) ()\n  block entry:\n    %3 = call i16 @get()\n    store i16 %3 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x120),
+        ("out", 0x121),
+        ("get::1", 0x122),
+        ("get::2", 0x123),
+        ("main::3", 0x124),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let get = asm.split("main:").next().unwrap_or(&asm);
+    assert!(
+        get.contains("MOVFF 0x120, 0x000") && get.contains("CLRF 0x001,A"),
+        "returned zext must write its high return byte:\n{asm}"
+    );
+}
