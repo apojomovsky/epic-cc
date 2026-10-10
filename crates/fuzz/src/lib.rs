@@ -2567,12 +2567,12 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
                 asm::assemble_file_to_hex(device, &asm)
             }
             device::Core::Pic14e => {
-                let (asm, _) =
+                let (asm, _, chunks) =
                     isel_pic14e::select_with_locs(device, &m, &addrs, &layout.staged_consts);
                 let asm = schedule::schedule(device, &asm);
                 let asm = banking::assign_banks(device, &asm);
                 let asm = peephole::optimize(&asm);
-                isel_pic14e::verify_page_fit(&m, &asm);
+                isel_pic14e::verify_page_fit_split(&m, &asm, &chunks);
                 asm::assemble_file_to_hex(device, &asm)
             }
             device::Core::PicBaseline => {
