@@ -267,6 +267,10 @@ struct Gen<'m> {
     /// runtime routines). `emit` records it on the line it pushes, so the
     /// parallel `locs` vector stays index-aligned with `out`.
     cur_loc: Option<SrcLoc>,
+    /// Set per instruction: this call and the next IR instruction in its block
+    /// are both direct calls. The next call's PCLATH set runs before any PCLATH
+    /// read, so this call's post-call restore is dead.
+    call_follows: bool,
     out: Vec<String>,
     /// One source location per emitted line, index-aligned with `out`.
     /// `None` marks a compiler-generated line (no source instruction).
@@ -3352,7 +3356,11 @@ impl<'m> Gen<'m> {
                 self.emit_w_store(da + u16::from(i));
             }
         }
-        self.emit_pclath_restore(func);
+        // The next direct call sets PCLATH before any PCLATH read, so this restore is dead.
+        // Split members keep it: a split caller may CALL from any chunk (see emit_pclath_restore).
+        if !self.call_follows || self.split.contains(func) || self.split.contains(self.cur_func) {
+            self.emit_pclath_restore(func);
+        }
     }
 
     /// `dst = call %fp(args)` through a function pointer: an inline
@@ -7478,6 +7486,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         deferred_uses: 0,
         z_rel: None,
         cur_loc: None,
+        call_follows: false,
         out: Vec::new(),
         locs: Vec::new(),
     };
@@ -7642,7 +7651,10 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
         }
         let mut terminator = None;
         let collapse = find_bit_test_collapse(g, &f.name, b, &phi_copies);
-        for i in &b.insts {
+        // Same route as `emit_inst` into `emit_call` (`_delay` is inlined, an unresolved
+        // callee takes the trap loop): the trap's `GOTO` sets no PCLATH, so it may not follow.
+        let direct_call = |g: &Gen, n: &Inst| matches!(n, Inst::Call(c) if c.callees.is_empty() && c.func != "_delay" && g.is_function(&c.func));
+        for (idx, i) in b.insts.iter().enumerate() {
             match i {
                 Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
                 Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(..) => terminator = Some(i),
@@ -7653,6 +7665,8 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
                         _ => false,
                     };
                     if !skipped {
+                        g.call_follows = direct_call(g, i)
+                            && b.insts.get(idx + 1).is_some_and(|n| direct_call(g, n));
                         g.emit_inst(i);
                     }
                 }
@@ -9715,6 +9729,7 @@ pub fn select_with_opts(
                 deferred_uses: 0,
                 z_rel: None,
                 cur_loc: None,
+                call_follows: false,
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -9946,6 +9961,7 @@ pub fn select_with_opts(
                     deferred_uses: 0,
                     z_rel: None,
                     cur_loc: None,
+                    call_follows: false,
                     out: Vec::new(),
                     locs: Vec::new(),
                 };
@@ -10274,6 +10290,7 @@ pub fn select_with_opts(
                                 deferred_uses: 0,
                                 z_rel: None,
                                 cur_loc: None,
+                                call_follows: false,
                                 out: Vec::new(),
                                 locs: Vec::new(),
                             };

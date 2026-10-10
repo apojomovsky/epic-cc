@@ -5143,6 +5143,59 @@ fn same_page_call_skips_restore() {
 }
 
 #[test]
+fn consecutive_direct_calls_skip_intermediate_restore() {
+    // main fills page 0 so helper and helper2 land on page 1. helper's post-call
+    // restore is dropped because the next direct call sets PCLATH before any
+    // PCLATH read. helper2's restore stays: the branch to `nxt` reads PCLATH.
+    let body = pad_body(676);
+    let m = parse(&format!(
+        "global in i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n{body}\
+           %1 = load i8 @in\n    %2 = call i8 @helper(i8 %1)\n    %3 = call i8 @helper2(i8 %2)\n    br nxt\n  block nxt:\n    store i8 %3 @out\n    ret void\n\
+         fn helper(i8) (x)\n  block entry:\n    %r = add i8 %x, 1\n    ret i8 %r\n\
+         fn helper2(i8) (x)\n  block entry:\n    %r = add i8 %x, 2\n    ret i8 %r\n"
+    ));
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::a", 0x25),
+        ("main::1", 0x26),
+        ("main::2", 0x27),
+        ("main::3", 0x28),
+        ("helper::x", 0x2A),
+        ("helper::r", 0x2B),
+        ("helper2::x", 0x2C),
+        ("helper2::r", 0x2D),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    let between = asm
+        .split("CALL helper\n")
+        .nth(1)
+        .and_then(|s| s.split("MOVLW PAGE(helper2)\n").next())
+        .unwrap_or_else(|| panic!("both calls must be emitted:\n{asm}"));
+    assert!(
+        between.contains("MOVWF"),
+        "result and argument copies expected between the calls:\n{asm}"
+    );
+    assert!(
+        !between.contains("PCLATH"),
+        "restore between consecutive direct calls must be elided:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW PAGE(helper2)\n    MOVWF PCLATH\n    CALL helper2\n"),
+        "next call sets its own page:\n{asm}"
+    );
+    // Two `MOVLW PAGE(main)`: __start's set before CALL main, and the restore after
+    // helper2. Pre-change code also restored after helper, giving three; one would
+    // mean helper shares main's page, so the elision is unexercised.
+    assert_eq!(
+        asm.matches("MOVLW PAGE(main)").count(),
+        2,
+        "main must be on page 0 with helper on page 1:\n{asm}"
+    );
+}
+
+#[test]
 fn multibyte_call_copy_elides_hi_load() {
     // The copy runs high byte first, so the hi load elides (W holds the
     // last retval byte) and only the lo load emits. 0x00FF + 1 = 0x0100
