@@ -6708,6 +6708,48 @@ fn measure_end_org(text: &str) -> usize {
     org
 }
 
+/// Reports whether a constant-length memcpy in `m` parks its byte in the
+/// hold register (0x7F), which happens exactly when its destination setup
+/// is indirect. Reads the same `Gen` predicate `select_with_locs` emits
+/// with, so `addrs` must be the map that emit uses.
+pub fn const_memcpy_parks_hold(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> bool {
+    let resolved = resolve_pointers(m);
+    let prov = flash_provenance(m);
+    let staged = HashSet::new();
+    let mut tmp = 0u32;
+    for f in &m.funcs {
+        let g = Gen {
+            m,
+            addrs,
+            device,
+            staged: &staged,
+            resolved: &resolved,
+            prov: prov.clone(),
+            scratch: 0,
+            retval_lo: 0,
+            cur_func: &f.name,
+            tmp: &mut tmp,
+            page_of: None,
+            w_holds: None,
+            cur_loc: None,
+            out: Vec::new(),
+            locs: Vec::new(),
+        };
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Memcpy(c) = inst {
+                    if matches!(c.len, MemLen::Const(n) if n > 0)
+                        && g.ptr_setup_is_indirect(&c.dst, 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Selects instructions for the whole module into PIC14 assembly text.
 /// Reads every address from the caller map with no slot allocation.
 /// Keeps scratch and retval bytes in fixed common RAM with no banking.
