@@ -88,6 +88,12 @@ crossing a page boundary needs `PCLATH` management.
 **Consequence:** a second dataflow pass, analogous to but distinct from banking, minimising
 `PAGESEL`/`PCLATH` writes. A published heuristic exists; see [`02-prior-art.md`](02-prior-art.md) §5.
 
+The codegen restores `PCLATH` to the caller's page after each call that crosses a page, so that
+the caller's intra-function `GOTO`s run on the right page. The restore is skipped when the next IR
+instruction is itself a resolvable direct call: that call sets `PCLATH` for its own target before
+any `GOTO` reads it. Unresolved callees, `_delay`, and split functions keep the restore, since their
+trap path (`GOTO` to self) reads `PCLATH` without setting it.
+
 ### 6. A single indirect pointer
 
 Indirect addressing goes through exactly one register pair: `FSR` (8-bit offset) with `IRP`
