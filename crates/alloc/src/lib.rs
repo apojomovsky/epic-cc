@@ -2138,9 +2138,9 @@ fn home_args(
             // A violation is one candidate's write landing between the
             // other's write and its call: the reader would see the
             // clobberer instead of its own value. `mine` owns the window,
-            // `theirs` is the intruder. A back-edge path only clobbers if
-            // it re-runs no `mine` write before the read: a loop re-executes
-            // the owner's def, which overwrites the intruder.
+            // `theirs` is the intruder. The intruder only clobbers along a
+            // path to the read that re-runs no `mine` write: a loop re-running
+            // the owner's def overwrites the intruder before the read (`visible`).
             let kw = writes(k);
             let visible =
                 |t: (usize, usize), call: (usize, usize), mine: &[(usize, usize)]| -> bool {

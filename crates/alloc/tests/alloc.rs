@@ -2511,6 +2511,69 @@ fn width_mismatched_arg_keeps_its_caller_slot() {
 }
 
 #[test]
+fn loop_writers_home_into_a_shared_param_slot() {
+    // Each writer runs once per outer iteration, in order, so the other's
+    // def re-runs before every read. The loop-blind clobber check kept the
+    // first writer and rejected the second (epic-cc#917).
+    let m = parse(
+        "global out i8\n\
+         fn put(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br label %top\n\
+           block top:\n\
+             %x = add i8 1, 2\n\
+             call void @put(i8 %x)\n\
+             br label %mid\n\
+           block mid:\n\
+             %y = add i8 3, 4\n\
+             call void @put(i8 %y)\n\
+             br i1 1, label %top, label %done\n\
+           block done:\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main put\n");
+    let p = out.locals["put::p"];
+    assert!(
+        p == out.locals["main::y"],
+        "the second loop writer must home into the shared param slot"
+    );
+}
+
+#[test]
+fn same_block_intruder_after_the_read_keeps_the_owner_out_of_the_slot() {
+    // Soundness pin, also passes on the old check: `%t` is written after
+    // `%m` is read in `top`, and the loop re-enters `top` to read `%m`
+    // again, so a shared slot would hand that read `%t`'s previous value.
+    let m = parse(
+        "global out i8\n\
+         fn put(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %m = add i8 1, 2\n\
+             br label %top\n\
+           block top:\n\
+             call void @put(i8 %m)\n\
+             %t = add i8 3, 4\n\
+             call void @put(i8 %t)\n\
+             br i1 1, label %top, label %done\n\
+           block done:\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main put\n");
+    assert_ne!(
+        out.locals["put::p"], out.locals["main::m"],
+        "an owner read must not share a slot with an intruder write that reaches it again"
+    );
+}
+
+#[test]
 fn chained_call_result_stays_in_the_retval_region() {
     // A chained call result stays in the retval bytes (epic-cc#738) instead
     // of homing into the param slot: the site copy reads it there, so the
