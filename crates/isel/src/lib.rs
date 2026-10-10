@@ -267,6 +267,10 @@ struct Gen<'m> {
     /// runtime routines). `emit` records it on the line it pushes, so the
     /// parallel `locs` vector stays index-aligned with `out`.
     cur_loc: Option<SrcLoc>,
+    /// Set per instruction: this call and the next IR instruction in its block
+    /// are both direct calls. The next call's PCLATH set runs before any PCLATH
+    /// read, so this call's post-call restore is dead.
+    call_follows: bool,
     out: Vec<String>,
     /// One source location per emitted line, index-aligned with `out`.
     /// `None` marks a compiler-generated line (no source instruction).
@@ -804,14 +808,14 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// `W = RAM[ptr + byte_off]`: one byte of a pointer load or a memcpy
-    /// source. Direct bases read the plain file register; dynamic bases set
-    /// FSR first and read INDF; a const (flash) base reads via
-    /// `CALL __read_<name>` (the RETLW table leaves the byte in W). A table
-    /// larger than 255 bytes takes the 16-bit index path: the caller
-    /// splits the index into an in-chunk byte (W) and the chunk bit, then
-    /// CALLs `__read_<name>` (chunk 0) or `__read_<name>_hi` (chunk 1).
-    fn emit_ptr_load_byte(&mut self, ptr: &Val, byte_off: u8) {
+    /// Leaves `RAM[ptr + byte_off]` in W, or stores it to `dst` when given, in
+    /// which case W is not preserved (a const read's PCLATH restore clobbers it).
+    /// Direct bases read the file register; dynamic bases set FSR and read INDF; a
+    /// const (flash) base reads via `CALL __read_<name>`. A table over 255 bytes
+    /// takes the 16-bit index path: the caller splits the index into an in-chunk
+    /// byte (W) and the chunk bit, then CALLs `__read_<name>` (chunk 0) or
+    /// `__read_<name>_hi` (chunk 1).
+    fn emit_ptr_load_byte(&mut self, ptr: &Val, byte_off: u8, dst: Option<u16>) {
         match ptr {
             Val::Reg(r) => {
                 // Pool log variant (epic-cc#817): index-pair slots read
@@ -822,6 +826,7 @@ impl<'m> Gen<'m> {
                             (Base::Slot(s, _), _, _) if self.pool_slots.contains(&ssa_key(self.cur_func, &s))))
                 {
                     self.emit_pool_read(r, byte_off);
+                    self.store_byte_to(dst);
                     return;
                 }
                 if let (Base::Global(name), k, terms) = self.resolved_for(r) {
@@ -830,28 +835,16 @@ impl<'m> Gen<'m> {
                             // Large table: W = in-chunk index, hi bit in
                             // 0x70, branch to the right chunk entry.
                             self.emit_const_read_large(&name, k, &terms, byte_off);
+                            self.store_byte_to(dst);
                         } else {
                             // RETLW table read: W = index = k + Σ s×%reg + off.
-                            // The reader's input is W itself, so the set (whose
-                            // MOVLW clobbers W) goes BEFORE the index
-                            // computation; the index is computed into W after,
-                            // and nothing between touches PCLATH. The restore
-                            // right after the CALL saves the returned byte in
-                            // the fixed scratch (free at a const read) across
-                            // its own MOVLW, then reloads it into W.
-                            // A pooled member reads its chunk's table at the
-                            // member's offset (epic-cc#913): no table of its own.
                             let (table, k) = match self.pool_lit(&name) {
                                 Some((chunk, off)) => (chunk, k.wrapping_add(off)),
                                 None => (name.clone(), k),
                             };
-                            self.emit(format!("    MOVLW PAGE(__read_{table})"));
-                            self.emit("    MOVWF PCLATH".to_string());
-                            self.emit_ptr_index_w(k, &terms, byte_off);
-                            self.emit(format!("    CALL __read_{table}"));
-                            self.emit_w_store(self.scratch);
-                            self.emit_pclath_restore(&format!("__read_{table}"));
-                            self.emit_w_load(self.scratch);
+                            self.emit_small_const_read(&table, dst, |g| {
+                                g.emit_ptr_index_w(k, &terms, byte_off)
+                            });
                         }
                         return;
                     }
@@ -875,13 +868,9 @@ impl<'m> Gen<'m> {
                         Some((chunk, off)) => (chunk, off),
                         None => (g.clone(), 0),
                     };
-                    self.emit(format!("    MOVLW PAGE(__read_{table})"));
-                    self.emit("    MOVWF PCLATH".to_string());
-                    self.emit_ptr_index_w(idx, &[], byte_off);
-                    self.emit(format!("    CALL __read_{table}"));
-                    self.emit_w_store(self.scratch);
-                    self.emit_pclath_restore(&format!("__read_{table}"));
-                    self.emit_w_load(self.scratch);
+                    self.emit_small_const_read(&table, dst, |s| {
+                        s.emit_ptr_index_w(idx, &[], byte_off)
+                    });
                     return;
                 }
             }
@@ -890,6 +879,44 @@ impl<'m> Gen<'m> {
         match self.emit_ptr_setup(ptr, byte_off) {
             Addr::Direct(a) => self.emit(format!("    MOVF 0x{a:02X}, W")),
             Addr::Indirect => self.emit("    MOVF INDF, W".to_string()),
+        }
+        self.store_byte_to(dst);
+    }
+
+    /// Stores the byte held in W to `dst` when the caller asked for one.
+    fn store_byte_to(&mut self, dst: Option<u16>) {
+        if let Some(d) = dst {
+            self.emit_w_store(d);
+        }
+    }
+
+    /// One RETLW table read: `MOVLW PAGE(__read_<name>); MOVWF PCLATH`, then
+    /// `index` (leaves W = index), then `CALL`. The set goes BEFORE the index
+    /// because its MOVLW clobbers W. The restore right after the CALL is a
+    /// `MOVWF PCLATH` that also clobbers W, so the returned byte is stored
+    /// first when `dst` is set. Without one it parks in the fixed scratch
+    /// across the restore and reloads into W.
+    fn emit_small_const_read(
+        &mut self,
+        name: &str,
+        dst: Option<u16>,
+        index: impl FnOnce(&mut Self),
+    ) {
+        self.emit(format!("    MOVLW PAGE(__read_{name})"));
+        self.emit("    MOVWF PCLATH".to_string());
+        index(self);
+        self.emit(format!("    CALL __read_{name}"));
+        let target = format!("__read_{name}");
+        match dst {
+            Some(d) => {
+                self.emit_w_store(d);
+                self.emit_pclath_restore(&target);
+            }
+            None => {
+                self.emit_w_store(self.scratch);
+                self.emit_pclath_restore(&target);
+                self.emit_w_load(self.scratch);
+            }
         }
     }
 
@@ -2843,8 +2870,7 @@ impl<'m> Gen<'m> {
                     "isel: byval size mismatch for arg {i} of @{func}"
                 );
                 for b in 0..size {
-                    self.emit_ptr_load_byte(&arg.val, b);
-                    self.emit(format!("    MOVWF 0x{:02X}", pa + u16::from(b)));
+                    self.emit_ptr_load_byte(&arg.val, b, Some(pa + u16::from(b)));
                 }
             } else if arg.sret {
                 // sret: store the target address into the callee's sret param
@@ -3330,7 +3356,11 @@ impl<'m> Gen<'m> {
                 self.emit_w_store(da + u16::from(i));
             }
         }
-        self.emit_pclath_restore(func);
+        // The next direct call sets PCLATH before any PCLATH read, so this restore is dead.
+        // Split members keep it: a split caller may CALL from any chunk (see emit_pclath_restore).
+        if !self.call_follows || self.split.contains(func) || self.split.contains(self.cur_func) {
+            self.emit_pclath_restore(func);
+        }
     }
 
     /// `dst = call %fp(args)` through a function pointer: an inline
@@ -3461,8 +3491,7 @@ impl<'m> Gen<'m> {
                         );
                     }
                     for k in 0..l.ty.bytes() {
-                        self.emit_ptr_load_byte(&ptr, k);
-                        self.emit_w_store(dst + u16::from(k));
+                        self.emit_ptr_load_byte(&ptr, k, Some(dst + u16::from(k)));
                     }
                 }
             }
@@ -3539,7 +3568,7 @@ impl<'m> Gen<'m> {
                     // itself may be a base+k+i expression), exactly like a
                     // per-byte load/store.
                     for i in 0..*n {
-                        self.emit_ptr_load_byte(&m.src, i);
+                        self.emit_ptr_load_byte(&m.src, i, None);
                         self.emit_ptr_store_w(&m.dst, i);
                     }
                 }
@@ -7457,6 +7486,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         deferred_uses: 0,
         z_rel: None,
         cur_loc: None,
+        call_follows: false,
         out: Vec::new(),
         locs: Vec::new(),
     };
@@ -7621,7 +7651,10 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
         }
         let mut terminator = None;
         let collapse = find_bit_test_collapse(g, &f.name, b, &phi_copies);
-        for i in &b.insts {
+        // Same route as `emit_inst` into `emit_call` (`_delay` is inlined, an unresolved
+        // callee takes the trap loop): the trap's `GOTO` sets no PCLATH, so it may not follow.
+        let direct_call = |g: &Gen, n: &Inst| matches!(n, Inst::Call(c) if c.callees.is_empty() && c.func != "_delay" && g.is_function(&c.func));
+        for (idx, i) in b.insts.iter().enumerate() {
             match i {
                 Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
                 Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(..) => terminator = Some(i),
@@ -7632,6 +7665,8 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
                         _ => false,
                     };
                     if !skipped {
+                        g.call_follows = direct_call(g, i)
+                            && b.insts.get(idx + 1).is_some_and(|n| direct_call(g, n));
                         g.emit_inst(i);
                     }
                 }
@@ -9694,6 +9729,7 @@ pub fn select_with_opts(
                 deferred_uses: 0,
                 z_rel: None,
                 cur_loc: None,
+                call_follows: false,
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -9925,6 +9961,7 @@ pub fn select_with_opts(
                     deferred_uses: 0,
                     z_rel: None,
                     cur_loc: None,
+                    call_follows: false,
                     out: Vec::new(),
                     locs: Vec::new(),
                 };
@@ -10253,6 +10290,7 @@ pub fn select_with_opts(
                                 deferred_uses: 0,
                                 z_rel: None,
                                 cur_loc: None,
+                                call_follows: false,
                                 out: Vec::new(),
                                 locs: Vec::new(),
                             };
