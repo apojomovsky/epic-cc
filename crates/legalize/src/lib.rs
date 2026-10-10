@@ -617,6 +617,10 @@ fn find_lsr_decimal_sites(f: &Func) -> Vec<LsrDecimalSite> {
         if bbr.t != exit || bbr.f != bl {
             continue;
         }
+        // An outside edge into the blank fill or latch would dangle once the rewrite drops them.
+        if preds[b].iter().any(|&p| p != h && p != b) || preds[l].iter().any(|&p| p != h) {
+            continue;
+        }
         let blank_space = bins_
             .iter()
             .any(|i| matches!(i, Inst::Store(st) if st.val == Val::Const(32)));
@@ -624,6 +628,15 @@ fn find_lsr_decimal_sites(f: &Func) -> Vec<LsrDecimalSite> {
             .iter()
             .any(|i| matches!(i, Inst::Icmp(ic) if ic.pred == "eq" && ic.b == Val::Const(5)));
         if !blank_space || !blank_five {
+            continue;
+        }
+        // The rewrite drops the blank and latch blocks, so their only stores may be the space fill.
+        let fill_only = bins_.iter().all(|i| match i {
+            Inst::Store(st) => st.val == Val::Const(32) && st.ty == Ty::I8 && !st.volatile,
+            _ => true,
+        });
+        let latch_quiet = !lins.iter().any(|i| matches!(i, Inst::Store(_)));
+        if !fill_only || !latch_quiet {
             continue;
         }
         // The value phi is the one the header's udiv 10 divides.
