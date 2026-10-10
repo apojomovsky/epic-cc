@@ -2402,7 +2402,15 @@ impl<'m> Gen<'m> {
                                 }
                             }
                             if escapes.contains(&gp.dst) {
-                                Self::scan_ptr_terms(g, &key, &gp.dst, &mut marked, &mut changed);
+                                // Not `scan_ptr_terms`: its PLUSW-shape exemption covers
+                                // only Load/Store access, not full-width materialization.
+                                if let Some((_, _, terms)) = g.resolved.get(&key(&gp.dst)) {
+                                    for (_, t) in terms {
+                                        if marked.remove(t) {
+                                            changed = true;
+                                        }
+                                    }
+                                }
                             }
                         }
                         Inst::Load(l) => {

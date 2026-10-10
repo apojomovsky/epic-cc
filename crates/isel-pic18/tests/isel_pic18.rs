@@ -10314,3 +10314,38 @@ fn store_between_zext_and_ret_stays_staged() {
     assert!(asm.contains("0x043"), "zext temp staged:\n{asm}");
     assert!(asm.contains("MOVWF 0x000"), "ret round trip kept:\n{asm}");
 }
+
+#[test]
+fn gep_value_escape_keeps_index_terms_whole() {
+    // `%p` is read by a pointer `select` with a different base, so it
+    // materializes from its dynamic term `%e` at full width. `%e` must keep
+    // its zero-filled high lane (epic-cc#968).
+    let m = parse(
+        "global ram i64\n\
+         global pv i16\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %e = zext i8 %i to i16\n\
+             %p = gep @ram +0 +1*%e\n\
+             store ptr %p @pv\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x130),
+        ("pv", 0x137),
+        ("out", 0x131),
+        ("main::i", 0x132),
+        ("main::e", 0x133),
+        ("main::l", 0x135),
+        ("main::v", 0x136),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("CLRF 0x034,B"),
+        "escaped index term must keep its high lane:\n{asm}"
+    );
+}
