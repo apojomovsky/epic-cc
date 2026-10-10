@@ -2356,6 +2356,35 @@ impl<'m> Gen<'m> {
             }
         }
         let key = |r: &str| iselcore::ssa_key(&f.name, r);
+        let mut geps: HashSet<String> = HashSet::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Gep(gp) = inst {
+                    geps.insert(gp.dst.clone());
+                }
+            }
+        }
+        // A Gep value read by anything but a Load/Store pointer is materialized
+        // from (base, k, terms) at full width, so its terms must read whole.
+        let mut escapes: HashSet<String> = HashSet::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    let r: &str = &r;
+                    if !geps.contains(r) {
+                        continue;
+                    }
+                    let ptr_only = match inst {
+                        Inst::Load(_) => true,
+                        Inst::Store(s) => !matches!(&s.val, Val::Reg(v) if v == r),
+                        _ => false,
+                    };
+                    if !ptr_only {
+                        escapes.insert(r.to_string());
+                    }
+                }
+            }
+        }
         let mut changed = true;
         while changed {
             changed = false;
@@ -2363,13 +2392,17 @@ impl<'m> Gen<'m> {
                 for inst in &b.insts {
                     match inst {
                         Inst::Gep(gp) => {
-                            // Virtual, folded before codegen: the terms
-                            // re-emerge at each access below, so only the
-                            // base pointer value itself reads whole here.
+                            // Virtual, folded before codegen: the terms re-emerge at
+                            // each Load/Store pointer access (scanned below). A Gep
+                            // value read elsewhere is materialized from its terms at
+                            // full width, so those terms read whole.
                             if let ir::GepBase::Reg(r) = &gp.base {
                                 if marked.remove(r) {
                                     changed = true;
                                 }
+                            }
+                            if escapes.contains(&gp.dst) {
+                                Self::scan_ptr_terms(g, &key, &gp.dst, &mut marked, &mut changed);
                             }
                         }
                         Inst::Load(l) => {
