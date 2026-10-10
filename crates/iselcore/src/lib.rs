@@ -1118,6 +1118,25 @@ fn reads_reg(inst: &Inst, reg: &str) -> bool {
         .any(|v| v.strip_prefix('%').unwrap_or(v) == reg)
 }
 
+/// Whether a pointer passed as arg `idx` to direct call `callee` may be
+/// dereferenced by the callee (epic-cc#1026). Declared-only callees, byval
+/// params, and any read of the param in the body count as reads.
+pub fn callee_reads_param(m: &Module, callee: &str, idx: usize) -> bool {
+    let Some(f) = m.funcs.iter().find(|f| f.name == callee) else {
+        return true;
+    };
+    let Some(p) = f.params.get(idx) else {
+        return true;
+    };
+    if p.byval.is_some() {
+        return true;
+    }
+    let name = p.name.strip_prefix('%').unwrap_or(&p.name);
+    f.blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| reads_reg(i, name)))
+}
+
 /// Flash-pointer provenance for C++ vtable dispatch (epic-cc#832).
 /// `flash` holds regs proven to carry a vtable (flash) address: `load
 /// ptr` results read wholly from vptr fields, closed under all-flash
