@@ -2603,6 +2603,88 @@ fn fuses_matching_divmod_pair() {
     );
 }
 
+/// Clang's `-O1` rewrites `x % y` as `x - (x / y) * y` for non-volatile
+/// operands. The product call must not survive: the pair fuses as if the
+/// source had written `%`.
+#[test]
+fn fuses_rem_idiom_product_pair() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %5 = mul i16 %3 %2\n\
+             %6 = sub i16 %1 %5\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(i16 %1, i16 %2)"),
+        "divide became the combined call:\n{text}"
+    );
+    assert!(
+        text.contains("%6 = load volatile i16 @__udivmod_rem_u16"),
+        "subtract became the remainder slot load:\n{text}"
+    );
+    assert!(
+        !text.contains("__mul_u16"),
+        "product routine dropped:\n{text}"
+    );
+}
+
+/// Signed clang idiom: `srem` spelled as `sub(x, mul(sdiv(x, y), y))`.
+#[test]
+fn fuses_signed_rem_idiom_product_pair() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = sdiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %5 = mul i16 %3 %2\n\
+             %6 = sub i16 %1 %5\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__sdivmod_i16(i16 %1, i16 %2)"),
+        "signed divide became the combined call:\n{text}"
+    );
+    assert!(
+        !text.contains("__mul_u16"),
+        "product routine dropped:\n{text}"
+    );
+}
+
+/// A product with a second reader is not the rem idiom: nothing is rewritten.
+#[test]
+fn keeps_product_with_another_reader() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %5 = mul i16 %3 %2\n\
+             %6 = sub i16 %1 %5\n\
+             store i16 %6 @m\n\
+             store i16 %5 @q\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("@__mul_u16("), "shared product kept:\n{text}");
+    assert!(!text.contains("__udivmod"), "nothing fused:\n{text}");
+}
+
 /// Reloaded volatile globals never fuse: two reads of one volatile global
 /// may return different values (MMIO, or an ISR-shared flag changed
 /// between them), so the second pair is not provably the first.

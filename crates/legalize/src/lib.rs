@@ -180,6 +180,8 @@ fn legalize_inner(m: Module, pic18: bool) -> Module {
     // Div/mod fusion runs after the ISR split so the call spellings already
     // name their context: only main-context pairs fuse (see the function).
     // Both entries fuse now that isel-pic18 owns combined recipes.
+    // Runs after the ISR split: ISR spellings never match the base names here.
+    recover_rem_idiom(&mut funcs, &mut used);
     fuse_divmod_pairs(&mut funcs, &mut m.globals, &mut used);
     for name in &used {
         funcs.push(routine_func(name));
@@ -2078,6 +2080,132 @@ fn addr_taken(funcs: &[Func]) -> HashSet<String> {
     }
     out
 }
+/// Routine spellings for the `x - (x / y) * y` shape: the divide, the
+/// product's `__mul` routine, and the remainder that replaces the product.
+fn rem_idiom_routines(div: &str) -> Option<(Ty, &'static str, &'static str)> {
+    match div {
+        "__udiv_u8" => Some((Ty::I8, "__mul_u8", "__urem_u8")),
+        "__udiv_u16" => Some((Ty::I16, "__mul_u16", "__urem_u16")),
+        "__udiv_u32" => Some((Ty::I32, "__mul_u32", "__urem_u32")),
+        "__sdiv_i8" => Some((Ty::I8, "__mul_u8", "__srem_i8")),
+        "__sdiv_i16" => Some((Ty::I16, "__mul_u16", "__srem_i16")),
+        "__sdiv_i32" => Some((Ty::I32, "__mul_u32", "__srem_i32")),
+        _ => None,
+    }
+}
+
+/// Clang's `-O1` DivRemPairs rewrites `x % y` as `x - (x / y) * y` when the
+/// divide dominates with identical operands (the msp430 proxy target has no
+/// div/rem op), and legalize lowers the product to a `__mul` call, so no
+/// remainder call reaches `fuse_divmod_pairs`. This puts the `__urem`/`__srem`
+/// call in the product's place and drops the subtract. Operand identity is
+/// exact SSA equality; the product must be the block's next call and the
+/// subtract its only reader.
+fn recover_rem_idiom(funcs: &mut [Func], used: &mut Vec<String>) {
+    let mut dropped: Vec<&'static str> = Vec::new();
+    for f in funcs.iter_mut() {
+        let mut reads: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in inst_reads(inst) {
+                    *reads.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        for b in f.blocks.iter_mut() {
+            let mut sub_at: Vec<usize> = Vec::new();
+            for i in 0..b.insts.len() {
+                let Inst::Call(div) = &b.insts[i] else {
+                    continue;
+                };
+                let Some((w, mul_fn, rem_fn)) = rem_idiom_routines(&div.func) else {
+                    continue;
+                };
+                if div.args.len() != 2 {
+                    continue;
+                }
+                let Some(q) = div.dst.clone() else {
+                    continue;
+                };
+                let (qa, qb) = (div.args[0].val.clone(), div.args[1].val.clone());
+                let Some(j) = (i + 1..b.insts.len()).find(|&k| matches!(b.insts[k], Inst::Call(_)))
+                else {
+                    continue;
+                };
+                let Inst::Call(mul) = &b.insts[j] else {
+                    continue;
+                };
+                if mul.func != mul_fn || mul.args.len() != 2 {
+                    continue;
+                }
+                let Some(m) = mul.dst.clone() else {
+                    continue;
+                };
+                let is_q = |v: &Val| *v == Val::Reg(q.clone());
+                let product = (is_q(&mul.args[0].val) && mul.args[1].val == qb)
+                    || (is_q(&mul.args[1].val) && mul.args[0].val == qb);
+                if !product || reads.get(&m) != Some(&1) {
+                    continue;
+                }
+                let Some(k) =
+                    (j + 1..b.insts.len()).find(|&k| inst_reads(&b.insts[k]).contains(&m))
+                else {
+                    continue;
+                };
+                let Inst::Bin(sub) = &b.insts[k] else {
+                    continue;
+                };
+                if sub.op != BinOp::Sub
+                    || sub.ty != w
+                    || sub.a != qa
+                    || sub.b != Val::Reg(m.clone())
+                {
+                    continue;
+                }
+                let rem = Call {
+                    dst: Some(sub.dst.clone()),
+                    ty: Some(w),
+                    func: rem_fn.to_string(),
+                    args: [qa, qb]
+                        .into_iter()
+                        .map(|val| CallArg {
+                            ty: Some(w),
+                            val,
+                            byval: None,
+                            sret: false,
+                        })
+                        .collect(),
+                    callees: Vec::new(),
+                    loc: sub.loc.clone(),
+                };
+                b.insts[j] = Inst::Call(rem);
+                sub_at.push(k);
+                dropped.push(mul_fn);
+                if !used.iter().any(|u| u == rem_fn) {
+                    used.push(rem_fn.to_string());
+                }
+            }
+            sub_at.sort_unstable();
+            for k in sub_at.into_iter().rev() {
+                b.insts.remove(k);
+            }
+        }
+    }
+    // A product routine no call reaches any more is not emitted.
+    if !dropped.is_empty() {
+        let called: HashSet<&str> = funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|inst| match inst {
+                Inst::Call(c) => Some(c.func.as_str()),
+                _ => None,
+            })
+            .collect();
+        used.retain(|u| !dropped.iter().any(|d| *d == u.as_str()) || called.contains(u.as_str()));
+    }
+}
+
 /// Fuse a same-block `udiv`/`urem` or `sdiv`/`srem` pair on identical
 /// operands into one combined divide call (epic-cc#895, signed half
 /// epic-cc#981). The routines compute both halves, so the fused shape runs
