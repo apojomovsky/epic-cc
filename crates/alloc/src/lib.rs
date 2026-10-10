@@ -2138,15 +2138,41 @@ fn home_args(
             // A violation is one candidate's write landing between the
             // other's write and its call: the reader would see the
             // clobberer instead of its own value. `mine` owns the window,
-            // `theirs` is the intruder.
+            // `theirs` is the intruder. A back-edge path only clobbers if
+            // it re-runs no `mine` write before the read: a loop re-executes
+            // the owner's def, which overwrites the intruder.
             let kw = writes(k);
+            let visible =
+                |t: (usize, usize), call: (usize, usize), mine: &[(usize, usize)]| -> bool {
+                    if t.0 == call.0 && t.1 <= call.1 {
+                        return !mine.iter().any(|m| m.0 == t.0 && m.1 > t.1 && m.1 < call.1);
+                    }
+                    if mine.iter().any(|m| m.0 == t.0 && m.1 > t.1) {
+                        return false;
+                    }
+                    let mut seen: HashSet<usize> = HashSet::new();
+                    let mut stack = succ.get(&t.0).cloned().unwrap_or_default();
+                    while let Some(b) = stack.pop() {
+                        if b == call.0 {
+                            if !mine.iter().any(|m| m.0 == b && m.1 < call.1) {
+                                return true;
+                            }
+                            continue;
+                        }
+                        if mine.iter().any(|m| m.0 == b) || !seen.insert(b) {
+                            continue;
+                        }
+                        stack.extend(succ.get(&b).cloned().unwrap_or_default());
+                    }
+                    false
+                };
             let clobbered = |mine: &[(usize, usize)],
                              theirs: &[(usize, usize)],
                              call: (usize, usize)|
              -> bool {
                 theirs
                     .iter()
-                    .any(|t| mine.iter().any(|m| reaches(*m, *t)) && reaches(*t, call))
+                    .any(|t| mine.iter().any(|m| reaches(*m, *t)) && visible(*t, call, mine))
             };
             if clobbered(&kw, &cw, k.call) || clobbered(&cw, &kw, c.call) {
                 continue 'cand;
