@@ -834,7 +834,11 @@ impl<'m> Gen<'m> {
                             self.store_byte_to(dst);
                         } else {
                             // RETLW table read: W = index = k + Σ s×%reg + off.
-                            self.emit_small_const_read(&name, dst, |g| {
+                            let (table, k) = match self.pool_lit(&name) {
+                                Some((chunk, off)) => (chunk, k.wrapping_add(off)),
+                                None => (name.clone(), k),
+                            };
+                            self.emit_small_const_read(&table, dst, |g| {
                                 g.emit_ptr_index_w(k, &terms, byte_off)
                             });
                         }
@@ -854,8 +858,14 @@ impl<'m> Gen<'m> {
                         "isel: constant index into large const table @{g} not supported (size {} > 255); only a single 16-bit reg index is",
                         self.global_size(g)
                     );
-                    self.emit_small_const_read(g, dst, |s| {
-                        s.emit(format!("    MOVLW 0x{byte_off:02X}"))
+                    // A pooled member reads its chunk's table at the member's
+                    // offset (epic-cc#913); a gated const has no table of its own.
+                    let (table, idx) = match self.pool_lit(g) {
+                        Some((chunk, off)) => (chunk, off),
+                        None => (g.clone(), 0),
+                    };
+                    self.emit_small_const_read(&table, dst, |s| {
+                        s.emit_ptr_index_w(idx, &[], byte_off)
                     });
                     return;
                 }
@@ -10103,6 +10113,9 @@ pub fn select_with_opts(
             .globals
             .iter()
             .filter(|g| g.is_const && !addrs.contains_key(&g.name))
+            // Fully gated pooled consts are read only through their chunk, so
+            // their own table, reader and stage slot would be dead bytes (epic-cc#913).
+            .filter(|g| !(pool.contains(&g.name) && !staged.contains(&g.name)))
             .collect();
         // Pooled chunks table exactly like per-const tables from here on:
         // reader pages, chunking, the collision guard, and both emission
