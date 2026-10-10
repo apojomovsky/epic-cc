@@ -10675,6 +10675,47 @@ mod dead_pclath_tests {
     }
 
     #[test]
+    fn label_between_restore_and_next_set_keeps_pair() {
+        // A branch can enter at the second set, so the first set is live.
+        let src = [
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "L1:",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn goto_between_restore_and_next_set_keeps_pair() {
+        let src = [
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    GOTO L1",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn label_before_dropped_pair_still_reaches_the_kept_set() {
+        let out = run(&[
+            "L1:",
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+            "    CALL g",
+        ]);
+        assert_eq!(
+            out,
+            ["L1:", "    MOVLW PAGE(f)", "    MOVWF PCLATH", "    CALL g"]
+        );
+    }
+
+    #[test]
     fn chain_of_three_collapses_to_the_last_set() {
         let out = run(&[
             "    MOVLW 0x01",
