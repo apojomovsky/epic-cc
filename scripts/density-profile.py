@@ -175,6 +175,7 @@ def word_table(family, asm_source=None):
 
 
 _LIST_DIRECTIVE = re.compile(r"\blist\s+p\s*=\s*(?P<part>[0-9a-z]+)", re.I)
+_DIRECTIVE_SKIP = re.compile(r"(list|radix)(\s|$)")
 _PART_FAMILY = re.compile(r"^(?:pic)?p?(10|12|14|16|18)[fl]")
 _LABEL = re.compile(r"^(?P<label>[A-Za-z_.$][A-Za-z0-9_.$]*)\s*:\s*(?P<rest>.*)$")
 _BACKEND_LABEL = re.compile(r"^(tmp\d+|__far_skip\d+)$")
@@ -273,7 +274,8 @@ def parse_listing(text, table):
         if not line:
             continue
         low = line.lower()
-        if low.startswith(("list", "radix")):
+        # Word boundary: `listen:` and `radix_tbl:` are labels, not directives.
+        if _DIRECTIVE_SKIP.match(low):
             continue
         if low == "end" or low.startswith("end "):
             break
