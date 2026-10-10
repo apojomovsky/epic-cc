@@ -517,16 +517,42 @@ class CategorizationTest(unittest.TestCase):
         self.assertEqual(cats["indirect-seed"], 8)
         self.assertNotIn("sfr-context-save", cats)
 
-    def test_peripheral_sfr_runs_stay_context_saves(self):
-        # INDF-fed TXREG writes and STATUS/BSR saves are peripheral and
-        # ISR traffic, not pointer staging.
+    def test_a_usart_register_write_run_is_a_peripheral_move(self):
+        # Baud-rate and transmit register writes are the program's own I/O,
+        # not an interrupt save.
         listing = PIC18_HEADER + (
-            "f:\n    MOVFF 0xFEF, 0x058\n    MOVFF 0x058, 0xFAF\n"
-            "    MOVFF 0xFD8, 0x009\n    MOVFF 0xFE0, 0x00A\n    RETURN\n"
+            "f:\n    MOVFF 0x040, 0xFAF\n    MOVFF 0x041, 0xFB0\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["peripheral-sfr-move"], 4)
+        self.assertNotIn("sfr-context-save", cats)
+
+    def test_an_adc_control_read_run_is_a_peripheral_move(self):
+        listing = PIC18_HEADER + (
+            "f:\n    MOVFF 0xFC2, 0x010\n    MOVFF 0xFC3, 0x011\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["peripheral-sfr-move"], 4)
+        self.assertNotIn("sfr-context-save", cats)
+
+    def test_intcon_is_not_mistaken_for_a_context_save(self):
+        # INTCON (0xFF2) is core-range but outside the entry stub's save set,
+        # so the save set is named, not an address cutoff.
+        listing = PIC18_HEADER + (
+            "f:\n    MOVFF 0xFF2, 0x010\n    MOVFF 0x011, 0xFF2\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["peripheral-sfr-move"], 4)
+        self.assertNotIn("sfr-context-save", cats)
+
+    def test_the_isr_entry_save_set_stays_a_context_save(self):
+        listing = PIC18_HEADER + (
+            "PIC18_IRQ_Handler:\n    MOVFF 0xFD8, 0x009\n    MOVFF 0xFE0, 0x00A\n"
+            "    MOVFF 0xFEA, 0x00B\n    MOVFF 0xFFA, 0x00C\n    RETURN\n"
         )
         cats = words_by_category(listing)
         self.assertEqual(cats["sfr-context-save"], 8)
-        self.assertNotIn("indirect-seed", cats)
+        self.assertNotIn("peripheral-sfr-move", cats)
 
     def test_flash_string_staging_lands_outside_context_save(self):
         # TBLPTR setup plus TABLAT/PLUSW0 moves around a shared copy
