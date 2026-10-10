@@ -7871,7 +7871,7 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
     if f.name == LOG_POOL_CALLEE && !g.pool_log && !g.pool.chunks.is_empty() {
         emit_log_pool_variant(g, f);
     }
-    // Dead PCLATH sets: a restore that the next const read overwrites unused.
+    // Dead PCLATH sets: a set pair that the next set overwrites before any read.
     drop_dead_pclath_sets(&mut g.out, &mut g.locs, body_start);
 }
 
@@ -7893,18 +7893,31 @@ fn is_pclath_set(out: &[String], k: usize) -> bool {
 
 /// Drops a PCLATH set that the next set overwrites before any use: a
 /// `MOVLW X; MOVWF PCLATH` pair directly followed by another such pair.
-/// Only lines at or after `start` are touched. A pair right after a skip
-/// stays: removing it would let the skip land on the next pair's `MOVLW`.
+/// Only lines at or after `start` are touched, and inline asm is skipped
+/// because its text is user-authored. A pair whose nearest preceding
+/// instruction is a skip stays: removing it would let the skip land on
+/// the next pair's `MOVLW`.
 fn drop_dead_pclath_sets(out: &mut Vec<String>, locs: &mut Vec<Option<SrcLoc>>, start: usize) {
     let mut drop = vec![false; out.len()];
+    let mut in_asm = false;
     for k in start..out.len() {
-        if is_pclath_set(out, k)
-            && is_pclath_set(out, k + 2)
-            && !(k > 0 && is_skip_line(&out[k - 1]))
-        {
-            drop[k] = true;
-            drop[k + 1] = true;
+        let t = out[k].trim_start();
+        if t.starts_with("; --- asm start ---") {
+            in_asm = true;
+            continue;
         }
+        if t.starts_with("; --- asm end ---") {
+            in_asm = false;
+            continue;
+        }
+        if in_asm || !is_pclath_set(out, k) || !is_pclath_set(out, k + 2) {
+            continue;
+        }
+        if prev_instruction(out, k).is_some_and(is_skip_line) {
+            continue;
+        }
+        drop[k] = true;
+        drop[k + 1] = true;
     }
     let mut idx = 0;
     out.retain(|_| {
@@ -7916,6 +7929,16 @@ fn drop_dead_pclath_sets(out: &mut Vec<String>, locs: &mut Vec<Option<SrcLoc>>, 
         idx += 1;
         !drop[idx - 1]
     });
+}
+
+/// The nearest line before `out[k]` that is an instruction. Blank lines,
+/// comments, and labels do not occupy an address, so a skip above them
+/// still targets the line below.
+fn prev_instruction(out: &[String], k: usize) -> Option<&str> {
+    out[..k].iter().rev().map(String::as_str).find(|l| {
+        let t = l.trim();
+        !(t.is_empty() || t.starts_with(';') || t.ends_with(':'))
+    })
 }
 
 /// Emit the dependency-ordered phi copies for one (pred -> merge) edge: a
@@ -10596,6 +10619,45 @@ mod dead_pclath_tests {
             "    MOVWF PCLATH",
             "    MOVLW PAGE(f)",
             "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn skip_separated_by_comment_keeps_pair() {
+        let src = [
+            "    BTFSC 0x20, 0",
+            "    ; note",
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn skip_separated_by_label_keeps_pair() {
+        let src = [
+            "    BTFSC 0x20, 0",
+            "L1:",
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn inline_asm_pairs_are_left_alone() {
+        let src = [
+            "; --- asm start ---",
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+            "; --- asm end ---",
         ];
         assert_eq!(run(&src), src);
     }

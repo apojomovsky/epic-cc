@@ -92,10 +92,10 @@ The codegen restores `PCLATH` to the caller's page after each call that crosses 
 the caller's intra-function `GOTO`s run on the right page. The restore is skipped when the next IR
 instruction is itself a resolvable direct call: that call sets `PCLATH` for its own target before
 any `GOTO` reads it. Unresolved callees, `_delay`, and split functions keep the restore, since their
-trap path (`GOTO` to self) reads `PCLATH` without setting it. A restore directly followed by
-another `MOVLW k; MOVWF PCLATH` set is dead (the next set overwrites it before any read), so
-`isel` drops it after emission. Pairs after a skip instruction stay, since the skip would land on
-the next `MOVLW`.
+trap path (`GOTO` to self) reads `PCLATH` without setting it. A `MOVLW k; MOVWF PCLATH` pair
+directly followed by another such set is dead (the next set overwrites `PCLATH` before any read),
+so `isel` drops it after emission. A pair right after a skip instruction stays, since removing it
+would move the skip's target. Inline asm is never rewritten.
 
 ### 6. A single indirect pointer
 
