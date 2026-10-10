@@ -201,7 +201,7 @@ fn skip_idioms_never_land_a_movlb_inside_a_recipe_skip_pair() {
     let mut addrs: HashMap<String, u16> = HashMap::new();
     addrs.extend(layout.globals.clone());
     addrs.extend(layout.locals.clone());
-    let (asm, locs) = select_with_locs(&PIC16F1937, &m, &addrs, &layout.staged_consts);
+    let (asm, locs, _) = select_with_locs(&PIC16F1937, &m, &addrs, &layout.staged_consts);
     let (asm, _) = schedule::schedule_with_locs(&PIC16F1937, &asm, &locs);
     let (asm, _) = banking::assign_banks_with_locs(&PIC16F1937, &asm, &[]);
     let asm = optimize(&asm);
