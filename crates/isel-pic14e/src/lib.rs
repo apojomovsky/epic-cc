@@ -6044,13 +6044,13 @@ fn word_size(lines: &[String]) -> usize {
             if line.is_empty() {
                 return false;
             }
-            if line.starts_with("list") || line.starts_with("radix") {
+            if matches!(line.split_whitespace().next(), Some("list" | "radix")) {
                 return false;
             }
             if line.starts_with("org ") {
                 return false;
             }
-            if line.starts_with("end") {
+            if line == "end" {
                 return false;
             }
             if line.ends_with(':') {
@@ -6133,7 +6133,7 @@ pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec
     };
     for raw in asm.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || matches!(line.split_whitespace().next(), Some("list" | "radix")) {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
@@ -6145,7 +6145,7 @@ pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec
             org = target;
             continue;
         }
-        if line.starts_with("end") {
+        if line == "end" {
             break;
         }
         if let Some(l) = line.strip_suffix(':') {
@@ -6349,10 +6349,10 @@ fn measure_section_units(banked: &str) -> (HashMap<String, usize>, HashMap<Strin
     };
     for raw in banked.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || matches!(line.split_whitespace().next(), Some("list" | "radix")) {
             continue;
         }
-        if line.starts_with("end") {
+        if line == "end" {
             close(&mut cur, &mut stage, &mut reader);
             break;
         }
@@ -6426,7 +6426,7 @@ fn verify_section_model(places: &[ConstPlace], banked: &str) {
     };
     for raw in banked.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || matches!(line.split_whitespace().next(), Some("list" | "radix")) {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
@@ -6434,7 +6434,7 @@ fn verify_section_model(places: &[ConstPlace], banked: &str) {
             org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             continue;
         }
-        if line.starts_with("end") {
+        if line == "end" {
             close(&mut cur, &lens);
             break;
         }
@@ -6700,14 +6700,14 @@ fn measure_end_org(text: &str) -> usize {
     let mut org = 0usize;
     for raw in text.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || matches!(line.split_whitespace().next(), Some("list" | "radix")) {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
             org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             continue;
         }
-        if line.starts_with("end") || line.starts_with("__read_") {
+        if line == "end" || line.starts_with("__read_") {
             break;
         }
         if line.strip_suffix(':').is_some() {

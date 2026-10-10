@@ -52,14 +52,14 @@ pub(crate) fn post_extents(banked: &str, func_names: &HashSet<&str>) -> HashMap<
     let mut cur: Option<(String, usize)> = None;
     for raw in banked.lines() {
         let line = code_of(raw);
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || matches!(line.split_whitespace().next(), Some("list" | "radix")) {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
             org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             continue;
         }
-        if line.starts_with("end") {
+        if line == "end" {
             break;
         }
         if let Some(l) = line.strip_suffix(':') {

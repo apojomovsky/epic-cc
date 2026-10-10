@@ -85,14 +85,14 @@ pub fn line_rows(asm: &str, locs: &[Option<SrcLoc>]) -> Vec<LineRow> {
         let line = raw.split(';').next().unwrap_or("").trim();
         let loc = locs.get(li).cloned().flatten();
         li += 1;
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || matches!(line.split_whitespace().next(), Some("list" | "radix")) {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
             org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             continue;
         }
-        if line.starts_with("end") {
+        if line == "end" {
             break;
         }
         if line.ends_with(':') || line.contains(" equ ") || line.starts_with(".table ") {
