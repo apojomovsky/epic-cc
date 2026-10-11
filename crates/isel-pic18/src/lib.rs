@@ -3375,20 +3375,29 @@ impl<'m> Gen<'m> {
                     _ => self.slot_addr(self.cur_func, r),
                 },
             },
-            Val::Global(g) => Slot::Direct(
-                *self
-                    .addrs
-                    .get(g)
-                    .unwrap_or_else(|| panic!("isel-pic18: no address for @{g}")),
-            ),
+            Val::Global(g) => Slot::Direct(self.global_addr(g)),
             Val::Const(k) => Slot::Direct((*k & 0xFF) as u16),
         }
     }
     fn global_addr(&self, name: &str) -> u16 {
-        *self
-            .addrs
-            .get(name)
-            .unwrap_or_else(|| panic!("isel-pic18: no address for @{name}"))
+        match self.addrs.get(name) {
+            Some(a) => *a,
+            None => self.missing_global_addr(name),
+        }
+    }
+
+    /// Panics with a user error when `name` has no address. Alloc gives a
+    /// RAM copy only to consts of 255 bytes or fewer, so a larger flash
+    /// const with no address is a user error, not an internal invariant.
+    fn missing_global_addr(&self, name: &str) -> ! {
+        match self.m.globals.iter().find(|g| g.name == name) {
+            Some(g) if g.is_const && g.size > 255 => panic!(
+                "epic-cc: error: flash const {name} is {} bytes, over the 255-byte RAM copy \
+                 limit; {} needs its address, and only consts of 255 bytes or fewer get one.",
+                g.size, self.cur_func
+            ),
+            _ => panic!("isel-pic18: no address for @{name}"),
+        }
     }
 
     /// Whether `name` is a local object in the current function: an
