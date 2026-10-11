@@ -1542,6 +1542,17 @@ fn literal_ptr_reg_store_copies_via_movff() {
 }
 
 #[test]
+#[should_panic(expected = "store of a ROM address into RAM")]
+fn literal_ptr_store_of_flash_address_is_refused() {
+    // `*(const char *volatile *)0x200 = "PQ";`: the value is a const global, so
+    // the refusal must fire before the SFR branch asks for its RAM address.
+    let m = parse(
+        "const msg i8\nfn main(void) ()\n  block entry:\n    store i8 @msg 0x200\n    ret void\n",
+    );
+    let _ = select(&PIC18F4550, &m, &addrs(&[]), None);
+}
+
+#[test]
 fn w_staged_bin_result_stores_to_sfr_via_movwf() {
     // epic-cc#674: a Bin stages its result through W into a frame slot,
     // so the following SFR store finds W holding the source byte and

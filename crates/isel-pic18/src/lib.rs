@@ -6317,6 +6317,28 @@ impl<'m> Gen<'m> {
                         return;
                     }
                 }
+                // A ROM address has no RAM form: a later load through the stored
+                // slot reads RAM at that address, silently wrong. Refused until
+                // flash pointers can live in RAM (epic-cc#1101).
+                let stores_rom = match &s.val {
+                    Val::Global(g) => self.global_is_const(g),
+                    Val::Reg(r) => matches!(
+                        self.resolved.get(&ssa_key(self.cur_func, r)),
+                        Some((Base::Global(g), _, _)) if self.global_is_const(g)
+                    ),
+                    _ => false,
+                };
+                // A const destination is a ROM write: leave it to the const-base refusal below.
+                let dst_is_const = s
+                    .ptr
+                    .strip_prefix('@')
+                    .is_some_and(|g| self.global_is_const(g));
+                if stores_rom && !dst_is_const {
+                    panic!(
+                        "isel-pic18: store of a ROM address into RAM is not supported: {:?} (epic-cc#1101)",
+                        s.val
+                    );
+                }
                 // Same i1-in-memory story as the Load arm above (epic-cc#462);
                 // `trunc` normalizes an i1 byte to 0/1, so the stored byte
                 // keeps the convention every i1 consumer relies on.
@@ -6354,23 +6376,6 @@ impl<'m> Gen<'m> {
                 if self.const_base_of(&ptr_val).is_some() {
                     panic!(
                         "isel-pic18: ROM is not writable: store through const global {ptr_val:?}"
-                    );
-                }
-                // A ROM address has no RAM form: a later load through the stored
-                // slot reads RAM at that address, silently wrong. Refused until
-                // flash pointers can live in RAM (epic-cc#1101).
-                let stores_rom = match &s.val {
-                    Val::Global(g) => self.global_is_const(g),
-                    Val::Reg(r) => matches!(
-                        self.resolved.get(&ssa_key(self.cur_func, r)),
-                        Some((Base::Global(g), _, _)) if self.global_is_const(g)
-                    ),
-                    _ => false,
-                };
-                if stores_rom {
-                    panic!(
-                        "isel-pic18: store of a ROM address into RAM is not supported: {:?} (epic-cc#1101)",
-                        s.val
                     );
                 }
                 // A store through a flash-derived address is a write to ROM
