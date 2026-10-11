@@ -2130,56 +2130,6 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Shared AN526/divmod loop helpers for the routine recipes below.
-    /// One 16-iteration AN526 shift-add chunk over 4-byte r/t: test the
-    /// multiplier LSB, r += t with the INCFSZ carry idiom, t <<= 1 with
-    /// wraparound (high bits drop, i32 mul wraps), bk >>= 1. All files
-    /// share one `__scr` slot (single-bank by placement), and the
-    /// BTFSC/INCFSZ/ADDWF chains are atomic: selects never split them.
-    fn emit_mul32_loop(
-        &mut self,
-        l_loop: String,
-        l_skip: String,
-        bk_lo: u16,
-        bk_hi: u16,
-        cnt: u16,
-        r: [u16; 4],
-        t: [u16; 4],
-    ) {
-        self.emit(format!("{l_loop}:"));
-        self.emit_bank_select(bk_lo);
-        self.emit(format!("    BTFSS {}, 0", self.fop(bk_lo))); // test multiplier LSB
-        self.emit(format!("    GOTO {l_skip}"));
-        self.emit_bank_select(t[0]);
-        self.emit(format!("    MOVF {}, W", self.fop(t[0])));
-        self.emit_bank_select(r[0]);
-        self.emit(format!("    ADDWF {}, F", self.fop(r[0])));
-        for i in 1..4 {
-            self.emit_bank_select(t[i]);
-            self.emit(format!("    MOVF {}, W", self.fop(t[i])));
-            // Atomic carry chain like __mul_u16: FSR already selects
-            // the shared __scr bank, no reassertion inside (a skip
-            // would land on the select and run the add with W = 0).
-            self.emit("    BTFSC STATUS, 0 ; C".to_string());
-            self.emit(format!("    INCFSZ {}, W", self.fop(t[i])));
-            self.emit(format!("    ADDWF {}, F", self.fop(r[i])));
-        }
-        self.emit(format!("{l_skip}:"));
-        self.emit("    BCF STATUS, 0 ; C".to_string());
-        for t_i in t {
-            self.emit_bank_select(t_i);
-            self.emit(format!("    RLF {}, F", self.fop(t_i))); // t <<= 1 (wrapping)
-        }
-        self.emit("    BCF STATUS, 0 ; C".to_string());
-        self.emit_bank_select(bk_hi);
-        self.emit(format!("    RRF {}, F", self.fop(bk_hi)));
-        self.emit_bank_select(bk_lo);
-        self.emit(format!("    RRF {}, F", self.fop(bk_lo))); // bk >>= 1
-        self.emit_bank_select(cnt);
-        self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
-        self.emit(format!("    GOTO {l_loop}"));
-    }
-
     /// The 32-iteration restoring-division loop for i32 divmod: `num`
     /// shifts left (the quotient builds in its vacated bits), `rem`
     /// accumulates, `den` holds the denominator copy, `cnt` counts 32.
@@ -2552,58 +2502,90 @@ impl<'m> Gen<'m> {
                 self.store_retval(r0, 2);
                 self.emit("    RETLW 0x00".to_string());
             }
-            // 32x32 -> 32 shift-add as two 16-iteration chunks (bk reloaded
-            // from b's high half between chunks): the low 32 bits of the
-            // full product (the i32 result).
+            // 32x32 -> 32 shift-add with a zero exit. The multiplicand is
+            // copied into __scr (t) because the INCFSZ carry idiom needs r
+            // and t in one bank, which only the shared scratch guarantees
+            // on banked parts. The multiplier b is shifted in place, and
+            // the loop exits once its 4 bytes are zero. The i32 result is
+            // the low 32 bits, so the product wraps mod 2^32.
             "__mul_u32" => {
                 let a = self.slot_addr(&name, "a").direct();
                 let b = self.slot_addr(&name, "b").direct();
-                let (bk_lo, bk_hi, cnt) = (scr, scr + 1, scr + 2);
-                let r = [scr + 3, scr + 4, scr + 5, scr + 6];
-                let t = [scr + 7, scr + 8, scr + 9, scr + 10];
-                for i in 0..4 {
-                    self.emit_bank_select(r[i]);
-                    self.emit(format!("    CLRF {}", self.fop(r[i])));
-                    self.emit_bank_select(t[i]);
-                    self.emit(format!("    CLRF {}", self.fop(t[i])));
+                let r = [scr, scr + 1, scr + 2, scr + 3];
+                let t = [scr + 4, scr + 5, scr + 6, scr + 7];
+                let l_loop = self.fresh_label();
+                let l_skip = self.fresh_label();
+                let l_noswap = self.fresh_label();
+                // Multiply commutes, but the loop runs bitlen(multiplier)
+                // passes: XOR-swap the slots when a's top byte is zero and
+                // b's is not, so the long operand is the multiplicand.
+                self.emit_bank_select(a + 3);
+                self.emit(format!("    MOVF {}, W", self.fop(a + 3)));
+                self.emit("    BTFSS STATUS, 2 ; Z".to_string());
+                self.emit(format!("    GOTO {l_noswap}"));
+                self.emit_bank_select(b + 3);
+                self.emit(format!("    MOVF {}, W", self.fop(b + 3)));
+                self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+                self.emit(format!("    GOTO {l_noswap}"));
+                for i in 0..4u16 {
+                    let (x, y) = (a + i, b + i);
+                    self.emit_bank_select(y);
+                    self.emit(format!("    MOVF {}, W", self.fop(y)));
+                    self.emit_bank_select(x);
+                    self.emit(format!("    XORWF {}, F", self.fop(x)));
+                    self.emit(format!("    MOVF {}, W", self.fop(x)));
+                    self.emit_bank_select(y);
+                    self.emit(format!("    XORWF {}, F", self.fop(y)));
+                    self.emit(format!("    MOVF {}, W", self.fop(y)));
+                    self.emit_bank_select(x);
+                    self.emit(format!("    XORWF {}, F", self.fop(x)));
                 }
+                self.emit(format!("{l_noswap}:"));
                 for i in 0..4u16 {
                     self.emit_bank_select(a + i);
                     self.emit(format!("    MOVF {}, W", self.fop(a + i)));
                     self.emit_bank_select(t[usize::from(i)]);
                     self.emit(format!("    MOVWF {}", self.fop(t[usize::from(i)])));
-                    // t = a (32-bit)
+                    self.emit_bank_select(r[usize::from(i)]);
+                    self.emit(format!("    CLRF {}", self.fop(r[usize::from(i)])));
+                }
+                self.emit(format!("{l_loop}:"));
+                self.emit_bank_select(b);
+                self.emit(format!("    BTFSS {}, 0", self.fop(b))); // test multiplier LSB
+                self.emit(format!("    GOTO {l_skip}"));
+                self.emit_bank_select(t[0]);
+                self.emit(format!("    MOVF {}, W", self.fop(t[0])));
+                self.emit_bank_select(r[0]);
+                self.emit(format!("    ADDWF {}, F", self.fop(r[0])));
+                for i in 1..4usize {
+                    self.emit_bank_select(t[i]);
+                    self.emit(format!("    MOVF {}, W", self.fop(t[i])));
+                    // Atomic carry chain: t and r both sit in __scr's bank,
+                    // and a skip must not land on a bank select.
+                    self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                    self.emit(format!("    INCFSZ {}, W", self.fop(t[i])));
+                    self.emit(format!("    ADDWF {}, F", self.fop(r[i])));
+                }
+                self.emit(format!("{l_skip}:"));
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                for t_i in t {
+                    self.emit_bank_select(t_i);
+                    self.emit(format!("    RLF {}, F", self.fop(t_i))); // t <<= 1 (wrapping)
+                }
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                for i in (0..4u16).rev() {
+                    self.emit_bank_select(b + i);
+                    self.emit(format!("    RRF {}, F", self.fop(b + i))); // b >>= 1
                 }
                 self.emit_bank_select(b);
                 self.emit(format!("    MOVF {}, W", self.fop(b)));
-                self.emit_bank_select(bk_lo);
-                self.emit(format!("    MOVWF {}", self.fop(bk_lo)));
-                self.emit_bank_select(b + 1);
-                self.emit(format!("    MOVF {}, W", self.fop(b + 1)));
-                self.emit_bank_select(bk_hi);
-                self.emit(format!("    MOVWF {}", self.fop(bk_hi))); // bk = b low 16
-                self.emit("    MOVLW 0x10".to_string());
-                self.emit_bank_select(cnt);
-                self.emit(format!("    MOVWF {}", self.fop(cnt))); // cnt = 16
-                let l_loop1 = self.fresh_label();
-                let l_skip1 = self.fresh_label();
-                self.emit_mul32_loop(l_loop1, l_skip1, bk_lo, bk_hi, cnt, r, t);
-                // Reload bk from b's high half for the second 16 iterations.
-                self.emit_bank_select(b + 2);
-                self.emit(format!("    MOVF {}, W", self.fop(b + 2)));
-                self.emit_bank_select(bk_lo);
-                self.emit(format!("    MOVWF {}", self.fop(bk_lo)));
-                self.emit_bank_select(b + 3);
-                self.emit(format!("    MOVF {}, W", self.fop(b + 3)));
-                self.emit_bank_select(bk_hi);
-                self.emit(format!("    MOVWF {}", self.fop(bk_hi)));
-                self.emit("    MOVLW 0x10".to_string());
-                self.emit_bank_select(cnt);
-                self.emit(format!("    MOVWF {}", self.fop(cnt)));
-                let l_loop2 = self.fresh_label();
-                let l_skip2 = self.fresh_label();
-                self.emit_mul32_loop(l_loop2, l_skip2, bk_lo, bk_hi, cnt, r, t);
-                self.store_retval(scr + 3, 4);
+                for i in 1..4u16 {
+                    self.emit_bank_select(b + i);
+                    self.emit(format!("    IORWF {}, W", self.fop(b + i)));
+                }
+                self.emit("    BTFSS STATUS, 2 ; Z".to_string()); // Z = (b == 0)
+                self.emit(format!("    GOTO {l_loop}"));
+                self.store_retval(scr, 4);
                 self.emit("    RETLW 0x00".to_string());
             }
             // 32/32 restoring division (32 iterations): den copied into

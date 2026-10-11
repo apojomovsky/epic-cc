@@ -960,3 +960,38 @@ fn mul_edges_u16_wraps_mod_65536() {
     assert_eq!(got, a.wrapping_mul(b));
     gpasm_agrees(&asm, "mul_edges_u16");
 }
+
+/// Early-exit `__mul_u32` on the banked PIC16F505: zero multiplier, the
+/// short-a / long-b swap shape, a wrap mod 2^32, and all-ones. Runs on the
+/// 16F505 because the routine's scratch overflows the 12F509 layout; the
+/// gpasm oracle is 12F509-only, so this test does not call `gpasm_agrees`.
+#[test]
+fn mul_edges_u32_wraps_and_exits_on_zero() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) =
+        compile_asm_for(&device::PIC16F505, "tests/fixtures/mul_edges_u32.c");
+    assert!(asm.contains("__mul_u32"));
+    let pairs: [(u32, u32); 3] = [
+        (0, 0x1234_5678),
+        (0x0000_ABCD, 0x1234_5678),
+        (0xFFFF_FFFF, 0xFFFF_FFFF),
+    ];
+    for (i, &(a, b)) in pairs.iter().enumerate() {
+        for k in 0..4 {
+            p.ram_mut()[globals["pa32"] as usize + 4 * i + k] = (a >> (8 * k)) as u8;
+            p.ram_mut()[globals["pb32"] as usize + 4 * i + k] = (b >> (8 * k)) as u8;
+        }
+    }
+    p.run(2_000_000);
+    assert!(p.halted());
+    for (i, &(a, b)) in pairs.iter().enumerate() {
+        let base = globals["pa32"] as usize + 4 * i;
+        let got = u32::from_le_bytes([
+            p.ram()[base],
+            p.ram()[base + 1],
+            p.ram()[base + 2],
+            p.ram()[base + 3],
+        ]);
+        assert_eq!(got, a.wrapping_mul(b), "u32 {a:#010x} * {b:#010x} mod 2^32");
+    }
+}
