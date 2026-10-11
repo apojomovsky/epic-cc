@@ -4371,6 +4371,7 @@ impl<'m> Gen<'m> {
     /// reporting the resolved kinds. Bodies live in `emit_memcpy_body`
     /// so one seed can serve a whole walk. (epic-cc#492)
     fn emit_memcpy_setups(&mut self, mc: &ir::Memcpy, byte_off: u8) -> (McSrc, Addr) {
+        self.check_memcpy_flash_dst(&mc.dst);
         // Sets the source on FSR1 so the destination FSR0 setup cannot clobber
         // an indirect source (epic-cc#143); a flash source has no RAM
         // address and seeds `TBLPTR` instead.
@@ -4378,9 +4379,118 @@ impl<'m> Gen<'m> {
             self.emit_tblptr_setup_shared(&table, k, &terms, byte_off);
             return (McSrc::Tblrd, self.emit_ptr_setup(&mc.dst, byte_off));
         }
+        // A flash walk seeds `TBLPTR` from its slot and reads with `TBLRD*+`
+        // (epic-cc#1100). Any other shape that may hold a flash address panics:
+        // FSR1 would read RAM at a flash address.
+        if let Val::Reg(r) = &mc.src {
+            let key = ssa_key(self.cur_func, r);
+            if self.prov.flash.contains(&key) {
+                let (sname, k) = match self.resolved.get(&key) {
+                    Some((Base::Slot(sname, true), k, terms)) => {
+                        if !terms.is_empty() {
+                            panic!(
+                                "isel-pic18: memcpy from a runtime-indexed walk over flash pointer %{sname} is not supported (epic-cc#1091, epic-cc#1100)"
+                            );
+                        }
+                        (sname.clone(), *k)
+                    }
+                    _ => panic!(
+                        "isel-pic18: memcpy from flash pointer %{r} with no flash-walk slot is not supported (epic-cc#1100)"
+                    ),
+                };
+                let slot = self.slot_addr(self.cur_func, &sname).direct();
+                self.emit_flash_tblptr_seed(slot, k.wrapping_add(u16::from(byte_off)));
+                return (McSrc::Tblrd, self.emit_ptr_setup(&mc.dst, byte_off));
+            }
+            if self.prov.mixed.contains(&key) {
+                panic!(
+                    "isel-pic18: memcpy from maybe-flash address %{r} is not supported (a pointer joins flash and RAM; epic-cc#1100, epic-cc#1099)"
+                );
+            }
+            if let Some(sname) = self.maybe_flash_slot_under_index(&key) {
+                panic!(
+                    "isel-pic18: memcpy from a runtime-indexed walk over flash or maybe-flash pointer %{sname} is not supported (epic-cc#1100, epic-cc#1091, epic-cc#1099)"
+                );
+            }
+        }
         let src_direct = self.emit_memcpy_src_setup(&mc.src, byte_off);
         let dst = self.emit_ptr_setup(&mc.dst, byte_off);
         (src_direct.map_or(McSrc::Indirect, McSrc::Direct), dst)
+    }
+
+    /// Panics when a memcpy would write into ROM, whatever its source. The
+    /// Store arm panics on the same shapes (epic-cc#832, epic-cc#1099).
+    fn check_memcpy_flash_dst(&self, dst: &Val) {
+        if self.const_base_of(dst).is_some() {
+            panic!(
+                "isel-pic18: ROM is not writable: memcpy into const global {dst:?} (epic-cc#1100)"
+            );
+        }
+        if let Val::Reg(r) = dst {
+            let key = ssa_key(self.cur_func, r);
+            if self.prov.flash.contains(&key) || self.prov.mixed.contains(&key) {
+                panic!(
+                    "isel-pic18: ROM is not writable: memcpy into flash-derived address %{r} (epic-cc#1100)"
+                );
+            }
+            if let Some(sname) = self.maybe_flash_slot_under_index(&key) {
+                panic!(
+                    "isel-pic18: ROM is not writable: memcpy into runtime-indexed walk over flash or maybe-flash pointer %{sname} (epic-cc#1100, epic-cc#1099)"
+                );
+            }
+        }
+    }
+
+    /// True when a plain `memcpy` call touches flash: a source that may hold a
+    /// flash address (libc would read RAM there, epic-cc#1100), or a destination
+    /// that is ROM or may be flash (libc would write into ROM).
+    fn memcpy_call_from_flash(&self, c: &ir::Call) -> bool {
+        let (Some(dst), Some(src)) = (c.args.first(), c.args.get(1)) else {
+            return false;
+        };
+        let may_be_flash = |v: &Val| match v {
+            Val::Reg(r) => {
+                let key = ssa_key(self.cur_func, r);
+                self.prov.flash.contains(&key)
+                    || self.prov.mixed.contains(&key)
+                    || self.maybe_flash_slot_under_index(&key).is_some()
+            }
+            _ => false,
+        };
+        self.const_base_of(&dst.val).is_some() || may_be_flash(&dst.val) || may_be_flash(&src.val)
+    }
+
+    /// Lowers a memcpy call that touches flash as the constant-length `Memcpy`,
+    /// so a flash source reads through TBLRD and a ROM destination panics. A
+    /// runtime length panics: no flash walk of unknown length lowers yet.
+    fn emit_flash_memcpy_call(&mut self, c: &ir::Call) {
+        let [dst, src, len] = c.args.as_slice() else {
+            panic!(
+                "isel-pic18: memcpy call takes three arguments, got {}",
+                c.args.len()
+            );
+        };
+        self.check_memcpy_flash_dst(&dst.val);
+        let Val::Const(n) = len.val else {
+            panic!(
+                "isel-pic18: memcpy from a flash pointer with a runtime length is not supported (epic-cc#1100)"
+            );
+        };
+        let n = u8::try_from(n).unwrap_or_else(|_| {
+            panic!("isel-pic18: memcpy from a flash pointer with length outside 0..=255 is not supported (epic-cc#1100)")
+        });
+        let loc = self.cur_loc.clone();
+        self.emit_inst(&Inst::Memcpy(ir::Memcpy {
+            dst: dst.val.clone(),
+            src: src.val.clone(),
+            len: ir::MemLen::Const(n),
+            loc,
+        }));
+        if let Some(d) = &c.dst {
+            let ty = c.ty.expect("isel-pic18: valued call must carry a type");
+            let slot = self.slot_addr(self.cur_func, d).direct();
+            self.emit_move_val_to_slot(&dst.val, ty, slot);
+        }
     }
 
     /// Whether a const-source copy of `n` bytes should run as one loop
@@ -5198,14 +5308,11 @@ impl<'m> Gen<'m> {
         self.emit_copy_byte(0xFF5, dst); // TABLAT -> dst
     }
 
-    /// One flash-pointer byte read (epic-cc#832): `TBLPTR` seeds from the
-    /// two RAM bytes at `slot` (a vptr value: the 16-bit flash byte
-    /// address of a vtable slot) plus `byte_off`, then `TBLRD*` loads
-    /// `TABLAT` into `dst`. The static `TBLPTR` sharing does not apply:
-    /// the base is a runtime value, so every byte reseeds. Staging stays
-    /// sound the same way as the const path: each `emit` drains the
-    /// previous byte's staged `TABLAT` copy before the next seed runs.
-    fn emit_flash_ptr_load_byte(&mut self, slot: u16, byte_off: u16, dst: u16) {
+    /// Seed `TBLPTR` from the two RAM bytes at `slot` (a vptr value or a
+    /// flash-walk phi: a 16-bit flash byte address) plus `byte_off`, without
+    /// reading. The base is a runtime value, so the seed is never shared with
+    /// a static const read: `tblptr_holds` is cleared.
+    fn emit_flash_tblptr_seed(&mut self, slot: u16, byte_off: u16) {
         let (la, lf) = self.operand(slot);
         self.emit(format!(
             "    MOVF 0x{lf:03X},W,{}",
@@ -5224,20 +5331,34 @@ impl<'m> Gen<'m> {
                                                    // here is smaller still.
         self.emit("    CLRF 0xF8,A".to_string()); // TBLPTRU
         if byte_off != 0 {
+            let lo = byte_off & 0xFF;
             let hi = byte_off >> 8;
-            self.emit(format!("    MOVLW 0x{:02X}", byte_off & 0xFF));
+            // The resolver folds a gep displacement to u16, so bit 15 is the sign:
+            // a rewound walk slot (`p[-1]`) must sign-extend into TBLPTRU or the carry
+            // chain adds 64 KB. A positive displacement of 0x8000 or more reads as
+            // negative; telling them apart needs the resolver to carry a signed i32.
+            let top = if (byte_off as i16) < 0 { 0xFF } else { 0x00 };
+            self.emit(format!("    MOVLW 0x{lo:02X}"));
             self.emit("    ADDWF 0xF6,F,A".to_string());
             self.emit(format!("    MOVLW 0x{hi:02X}"));
             self.emit("    ADDWFC 0xF7,F,A".to_string());
-            if hi != 0 {
-                self.emit("    MOVLW 0x00".to_string());
+            // `W` still holds `hi`; reload only when the upper byte differs.
+            if top != hi {
+                self.emit(format!("    MOVLW 0x{top:02X}"));
             }
-            // `W` is zero here, so the upper byte consumes only the carry.
             self.emit("    ADDWFC 0xF8,F,A".to_string());
         }
+        self.tblptr_holds = None;
+    }
+
+    /// One flash-pointer byte read (epic-cc#832): seed `TBLPTR` from the
+    /// walk or vptr slot at `slot` plus `byte_off`, then `TBLRD*` loads
+    /// `TABLAT` into `dst`. Staging stays sound: each `emit` drains the
+    /// previous byte's staged `TABLAT` copy before the next seed runs.
+    fn emit_flash_ptr_load_byte(&mut self, slot: u16, byte_off: u16, dst: u16) {
+        self.emit_flash_tblptr_seed(slot, byte_off);
         self.emit("    TBLRD*".to_string());
         self.emit_copy_byte(0xFF5, dst); // TABLAT -> dst
-        self.tblptr_holds = None;
     }
 
     /// `_delay(cycles)` with a constant argument: an inline counted loop
@@ -7199,6 +7320,11 @@ impl<'m> Gen<'m> {
             Inst::Call(c) if c.func == "_delay" && c.callees.is_empty() => {
                 self.emit_delay(&c);
             }
+            Inst::Call(c)
+                if c.func == "memcpy" && c.callees.is_empty() && self.memcpy_call_from_flash(c) =>
+            {
+                self.emit_flash_memcpy_call(c);
+            }
             Inst::Call(c) => {
                 if !c.callees.is_empty() {
                     if let Some(set) = self.emitted_calls.as_mut() {
@@ -7323,6 +7449,7 @@ impl<'m> Gen<'m> {
                     }
                 }
                 ir::MemLen::Reg(_) => {
+                    self.check_memcpy_flash_dst(&mc.dst);
                     panic!("isel-pic18: dynamic-length memcpy not yet supported (P3 scope)")
                 }
             },
@@ -13787,6 +13914,85 @@ mod tests {
         };
         assert_eq!(l1, "tmp0");
         assert_eq!(l2, "tmp1", "a second Gen sharing the same backing counter must continue, not restart, the sequence");
+    }
+
+    /// Runs `select` over a loop whose destination phi joins RAM `buf` with a
+    /// flash walk, with `copy` as the memcpy in the loop body. The flash-walk
+    /// provenance pass that the ROM guard reads runs inside `select`.
+    fn select_maybe_flash_dst_loop(copy: &str) {
+        let text = format!(
+            r#"const .str i8
+global buf i8
+global sum i8
+global sent i8
+fn main(i16) ()
+  block 0:
+    br 1
+  block 1:
+    %__gep1 = gep @.str +1
+    %lsr.iv = phi ptr %scevgep 1 %__gep1 0
+    %d = phi ptr %lsr.iv 1 @buf 0
+    %2 = phi i8 %4 1 0 0
+    %scevgep1 = gep %lsr.iv +65535
+    {copy}
+    %3 = load i8 @buf
+    %4 = add i8 %3 %2
+    %5 = load i8 %lsr.iv
+    %6 = icmp eq i8 %5 0
+    %scevgep = gep %lsr.iv +1
+    br i1 %6 7 1
+  block 7:
+    store volatile i8 %4 @sum
+    store volatile i8 26 @sent
+    ret i16 0
+"#
+        );
+        let m = ir::parse(&text);
+        let names = [
+            "__gep1", "lsr.iv", "d", "2", "scevgep1", "3", "4", "5", "6", "scevgep",
+        ];
+        let mut addrs: HashMap<String, u16> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (ssa_key("main", n), 0x010 + 4 * i as u16))
+            .collect();
+        addrs.insert("buf".to_string(), 0x080);
+        addrs.insert("sum".to_string(), 0x082);
+        addrs.insert("sent".to_string(), 0x083);
+        let dev = device::resolve("p18f4550").expect("p18f4550 is a known part");
+        select(dev, &m, &addrs, None);
+    }
+
+    /// A flash-walk source copied into a destination that may be flash is
+    /// refused, the same as a store through that pointer.
+    #[test]
+    #[should_panic(expected = "ROM is not writable: memcpy into")]
+    fn memcpy_into_maybe_flash_dst_panics() {
+        select_maybe_flash_dst_loop("memcpy %d %scevgep1 16");
+    }
+
+    /// A RAM source does not make a flash destination safe: the copy still
+    /// writes ROM (epic-cc#1100).
+    #[test]
+    #[should_panic(expected = "ROM is not writable: memcpy into")]
+    fn memcpy_ram_source_into_maybe_flash_dst_panics() {
+        select_maybe_flash_dst_loop("memcpy %d @buf 16");
+    }
+
+    /// A plain `memcpy` call to a maybe-flash destination is lowered to the
+    /// guarded copy rather than libc, which would store into ROM.
+    #[test]
+    #[should_panic(expected = "ROM is not writable: memcpy into")]
+    fn plain_memcpy_call_into_maybe_flash_dst_panics() {
+        select_maybe_flash_dst_loop("call void @memcpy(%d, @buf, 16)");
+    }
+
+    /// A runtime-length copy into a maybe-flash destination names the ROM
+    /// write, not the dynamic-length limit (epic-cc#1100).
+    #[test]
+    #[should_panic(expected = "ROM is not writable: memcpy into")]
+    fn memcpy_runtime_len_into_maybe_flash_dst_panics() {
+        select_maybe_flash_dst_loop("memcpy %d @buf %2");
     }
 }
 
