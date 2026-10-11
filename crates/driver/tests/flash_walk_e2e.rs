@@ -128,14 +128,17 @@ fn flash_walk_runtime_index_store_is_rejected_on_p18() {
     );
 }
 
-/// Two runtime indices stacked on a walk phi are not served yet (epic-cc#1101):
-/// refuse with the multi-index diagnostic, never a wrong TBLPTR.
+/// Two runtime indices stacked on a walk phi each add to TBLPTR (epic-cc#1116):
+/// `p` advances 3 times, `q = p + 1`, so `q[2]` is the 7th byte of the literal ('A').
 #[test]
-fn flash_walk_two_runtime_indices_is_rejected_on_p18() {
-    expect_p18_rejection(
-        "tests/fixtures/flash_walk_two_index.c",
-        "several runtime indices",
+fn flash_walk_two_runtime_indices_reads_program_memory_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_two_index.c");
+    assert_eq!(
+        ram[map_addr(&map, "out")],
+        b'A',
+        "q[b] must add both runtime terms"
     );
+    assert!(halted);
 }
 
 /// Storing a ROM address into RAM has no RAM form: a later load through the
