@@ -151,6 +151,10 @@ fn flash_walk_store_of_rom_address_is_rejected_on_p18() {
         "tests/fixtures/flash_walk_store_address_const.c",
         "store of a ROM address into RAM",
     );
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_store_address_walk.c",
+        "store of a ROM address into RAM",
+    );
 }
 
 /// Compiles `fixture` for p18f4550 and asserts the driver refuses it with a
