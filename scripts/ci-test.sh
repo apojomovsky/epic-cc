@@ -18,11 +18,10 @@
 
 set -uo pipefail
 
-# The ladders run measure-only here and write their rows for the PR delta
-# gate (scripts/baseline_delta.py), which judges them against master's
-# baselines. PRs never edit the committed TOMLs; master regenerates them
-# after merge (.github/workflows/baseline-regen.yml). Local runs leave this
-# unset and assert against the committed baseline.
+# The ladders measure-only here and write their rows to BASELINE_ARTIFACT_DIR.
+# CI judges those rows with scripts/baseline_delta.py against master's
+# baselines; this script no longer asserts growth itself. PRs never edit the
+# committed TOMLs; master regeneration is pending (epic-cc#1087).
 export BASELINE_ARTIFACT_DIR="$PWD/scratch/baseline-artifacts"
 
 if ! command -v cargo >/dev/null 2>&1; then

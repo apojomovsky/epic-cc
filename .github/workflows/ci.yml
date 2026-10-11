@@ -220,8 +220,17 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
+          # The rules come from master, not from the PR: a PR cannot relax
+          # the thresholds it is judged by. The one exception is the PR that
+          # introduces the judge, where master has no copy to trust yet.
+          if git cat-file -e "$BASE_SHA:scripts/baseline_delta.py" 2>/dev/null; then
+            git show "$BASE_SHA:scripts/baseline_delta.py" > "$RUNNER_TEMP/baseline_delta.py"
+          else
+            cp scripts/baseline_delta.py "$RUNNER_TEMP/baseline_delta.py"
+          fi
+          git show "$BASE_SHA:scripts/add_device.py" > "$RUNNER_TEMP/add_device.py"
           printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
-          python3 scripts/baseline_delta.py --base-sha "$BASE_SHA" \
+          python3 "$RUNNER_TEMP/baseline_delta.py" --base-sha "$BASE_SHA" \
             --artifacts scratch/baseline-artifacts --pr-body "$RUNNER_TEMP/pr-body.md"
 
       - name: Publish delta summary

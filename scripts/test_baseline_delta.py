@@ -114,6 +114,34 @@ class JudgeTests(unittest.TestCase):
         self.assertFalse(bd.names_row("delta-ok: add@O2", "add"))
         self.assertTrue(bd.names_row("delta-ok: add", "add"))
 
+    def test_isr_latency_and_roundtrip_count_one_binary(self):
+        # Both rows come from one ISR binary: its flash shrink counts once, so
+        # a second binary's growth of 1 word leaves a net of 0, not a win.
+        base = [
+            cycle_row("speed-isr-a-latency", 80, flash=100),
+            cycle_row("speed-isr-a-roundtrip", 21, flash=100),
+            cycle_row("k", 50, flash=100),
+        ]
+        head = [
+            cycle_row("speed-isr-a-latency", 80, flash=99),
+            cycle_row("speed-isr-a-roundtrip", 21, flash=99),
+            cycle_row("k", 50, flash=101),
+        ]
+        r = run(base_cycle=base, head_cycle=head, body="delta-ok: k")
+        self.assertEqual(r["totals"]["flash_words"], 0)
+        self.assertFalse(r["net_win"])
+        self.assertEqual(r["verdict"], "hold")
+
+    def test_marker_does_not_match_across_a_line_break(self):
+        self.assertFalse(bd.names_row("delta-ok:\nadd", "add"))
+
+    def test_marker_accepts_crlf_line_endings(self):
+        self.assertTrue(bd.names_row("delta-ok: add\r\n", "add"))
+
+    def test_duplicate_ladder_row_is_an_error(self):
+        with self.assertRaises(ValueError):
+            run([size_row("add", 50), size_row("add", 40)], [size_row("add", 40)])
+
 
 if __name__ == "__main__":
     unittest.main()

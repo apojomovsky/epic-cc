@@ -20,7 +20,10 @@ import pathlib
 import re
 import subprocess
 import sys
-import tomllib
+
+# Same-directory import: CI runs the judge from a copy beside add_device.py.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from add_device import parse_toml  # noqa: E402
 
 BASELINE_PATHS = {
     "size": "crates/driver/tests/fixtures/size_baseline.toml",
@@ -33,6 +36,7 @@ METRICS = {
 }
 FLASH_WORDS_LIMIT = 8
 CYCLE_PERCENT_LIMIT = 1
+ISR_ROW = re.compile(r"^(speed-isr-.+)-(latency|roundtrip)((?:@O2)?)$")
 
 
 def entry_key(name, profile):
@@ -40,10 +44,18 @@ def entry_key(name, profile):
     return name if profile in (None, "Os") else f"{name}@{profile}"
 
 
+def binary_of(key):
+    m = ISR_ROW.match(key)
+    return m.group(1) + m.group(3) if m else key
+
+
 def index_entries(entries):
     out = {}
     for e in entries:
-        out[(entry_key(e["name"], e.get("profile")))] = e
+        key = entry_key(e["name"], e.get("profile"))
+        if key in out:
+            raise ValueError(f"duplicate ladder row {key}")
+        out[key] = e
     return out
 
 
@@ -56,6 +68,7 @@ def judge(base, head, pr_body):
     reasons = []
     rows = []
     totals = {m: 0 for ms in METRICS.values() for m in ms}
+    counted = set()
     regressions = []
     over_limit = []
 
@@ -73,7 +86,11 @@ def judge(base, head, pr_body):
             for metric in METRICS[ladder]:
                 bv, hv = b[metric], h[metric]
                 delta = hv - bv
-                totals[metric] += delta
+                # ISR latency and roundtrip rows are two readings of one binary.
+                binary = (ladder, binary_of(key), metric)
+                if metric == "cycles" or binary not in counted:
+                    counted.add(binary)
+                    totals[metric] += delta
                 if delta == 0:
                     continue
                 rows.append(
@@ -133,7 +150,7 @@ def judge(base, head, pr_body):
 def names_row(pr_body, key):
     # An explicit `delta-ok: <key>` line, not a substring: a prose mention
     # of the row must not pass the gate.
-    pattern = rf"^\s*delta-ok:\s*{re.escape(key)}\s*$"
+    pattern = rf"^[ \t]*delta-ok:[ \t]*{re.escape(key)}[ \t]*\r?$"
     return re.search(pattern, pr_body, re.MULTILINE) is not None
 
 
@@ -172,7 +189,9 @@ def read_master_baseline(base_sha, path):
     )
     if proc.returncode != 0:
         return None
-    return tomllib.loads(proc.stdout).get("entry", [])
+    entries = parse_toml(proc.stdout).get("entry", [])
+    # An empty table is no baseline: holding it keeps a wiped file from passing.
+    return entries or None
 
 
 def main(argv):
@@ -196,6 +215,8 @@ def main(argv):
             base[ladder] = master
         artifact = args.artifacts / ARTIFACT_FILES[ladder]
         head[ladder] = json.loads(artifact.read_text())
+        if not head[ladder]:
+            missing.append(f"{ladder}: artifact has no rows")
 
     result = judge(base, head, pr_body)
     if missing:
