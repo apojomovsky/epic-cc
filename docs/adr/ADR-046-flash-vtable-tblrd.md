@@ -41,8 +41,10 @@
   panics. Any memcpy whose destination is a const global, a flash-derived
   pointer, a `mixed` phi, or a runtime-indexed walk panics, whatever its
   source, as the Store arm does. A plain `memcpy` call with such a destination
-  or a flash source is lowered to the guarded copy. Open gap: a const-global
-  source to a plain call (`memcpy(buf, @table, n)`) still goes to libc. The
+  or a flash source is lowered to the guarded copy. A const-global or literal
+  source to a plain call reaches libc as the RAM copy the allocator gives every
+  const (`needs_ram_init`), so libc reads initialized bytes (checked on the
+  simulator). The
   resolver folds a displacement to `u16`, so a walk stepped back (`p[-1]`)
   sign-extends from bit 15; a positive offset of 0x8000 or more reads as
   negative until the resolver carries a signed `i32`.
