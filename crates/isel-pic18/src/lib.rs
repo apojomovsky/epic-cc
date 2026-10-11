@@ -12,7 +12,8 @@ use std::collections::{HashMap, HashSet};
 use device::Device;
 use ir::{Block, Func, Icmp, Inst, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot,
+    add_flash_walks, flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance,
+    PtrResolution, Slot,
 };
 
 /// The high Access Bank segment's start: every classic-mode PIC18's SFRs
@@ -3416,16 +3417,9 @@ impl<'m> Gen<'m> {
     /// A const that was copied to RAM (alloc placed it in `addrs`) is treated
     /// as RAM.
     fn global_is_const(&self, name: &str) -> bool {
-        if self.addrs.contains_key(name) {
-            return false;
-        }
-        self.m
-            .globals
-            .iter()
-            .find(|g| g.name == name)
-            .map(|g| g.is_const)
-            .unwrap_or(false)
+        is_flash_const_global(self.m, self.addrs, name)
     }
+
     /// Reports whether `name` is a function (a valid indirect-call target) rather
     /// than a RAM/const global. A function's address is a link-time label
     /// literal, materialized as LOW/HIGH bytes, never looked up in the
@@ -5197,7 +5191,7 @@ impl<'m> Gen<'m> {
     /// the base is a runtime value, so every byte reseeds. Staging stays
     /// sound the same way as the const path: each `emit` drains the
     /// previous byte's staged `TABLAT` copy before the next seed runs.
-    fn emit_flash_ptr_load_byte(&mut self, slot: u16, byte_off: u8, dst: u16) {
+    fn emit_flash_ptr_load_byte(&mut self, slot: u16, byte_off: u16, dst: u16) {
         let (la, lf) = self.operand(slot);
         self.emit(format!(
             "    MOVF 0x{lf:03X},W,{}",
@@ -5216,11 +5210,15 @@ impl<'m> Gen<'m> {
                                                    // here is smaller still.
         self.emit("    CLRF 0xF8,A".to_string()); // TBLPTRU
         if byte_off != 0 {
-            self.emit(format!("    MOVLW 0x{byte_off:02X}"));
+            let hi = byte_off >> 8;
+            self.emit(format!("    MOVLW 0x{:02X}", byte_off & 0xFF));
             self.emit("    ADDWF 0xF6,F,A".to_string());
-            self.emit("    MOVLW 0x00".to_string());
+            self.emit(format!("    MOVLW 0x{hi:02X}"));
             self.emit("    ADDWFC 0xF7,F,A".to_string());
-            // `W` still holds zero: the upper byte consumes only the carry.
+            if hi != 0 {
+                self.emit("    MOVLW 0x00".to_string());
+            }
+            // `W` is zero here, so the upper byte consumes only the carry.
             self.emit("    ADDWFC 0xF8,F,A".to_string());
         }
         self.emit("    TBLRD*".to_string());
@@ -6057,9 +6055,32 @@ impl<'m> Gen<'m> {
                 if let Val::Reg(r) = &ptr_val {
                     let key = ssa_key(self.cur_func, r);
                     if self.prov.flash.contains(&key) {
-                        let src = self.slot_addr(self.cur_func, r).direct();
+                        // A walk gep or a select that folds onto a walk phi has no
+                        // slot of its own: read through the phi's slot at the folded
+                        // constant offset. Dynamic terms over the phi have no TBLPTR
+                        // chain here, so refuse rather than read INDF0 at a flash address.
+                        let (src, k) = match self.resolved.get(&key) {
+                            Some((Base::Slot(sname, true), k, terms)) => {
+                                if !terms.is_empty() {
+                                    panic!(
+                                        "isel-pic18: load through a runtime-indexed walk over flash pointer %{sname} is not supported (epic-cc#1091)"
+                                    );
+                                }
+                                (self.slot_addr(self.cur_func, sname).direct(), *k)
+                            }
+                            // Only a non-slot base reaches here: const_base_of and
+                            // resolved_for already panic on a missing key. No slot holds
+                            // the flash address for it, so a fallback read would be wrong.
+                            _ => panic!(
+                                "isel-pic18: load through flash pointer %{r} with no flash-walk slot is not supported (epic-cc#1091)"
+                            ),
+                        };
                         for kk in 0..l.ty.bytes() {
-                            self.emit_flash_ptr_load_byte(src, kk, dst + u16::from(kk));
+                            self.emit_flash_ptr_load_byte(
+                                src,
+                                k.wrapping_add(u16::from(kk)),
+                                dst + u16::from(kk),
+                            );
                         }
                         return;
                     }
@@ -6067,6 +6088,18 @@ impl<'m> Gen<'m> {
                         panic!(
                             "isel-pic18: load through maybe-flash address %{r} is not supported (unserved vtable dispatch shape, epic-cc#832)"
                         );
+                    }
+                    // A runtime index over a walk phi needs `phi + scale*idx` seeded
+                    // from the phi slot, which only the table-label chain emits. Refuse
+                    // rather than read INDF0 at a flash address (epic-cc#1091).
+                    if let Some((Base::Slot(sname, true), _, terms)) = self.resolved.get(&key) {
+                        if !terms.is_empty()
+                            && self.prov.flash.contains(&ssa_key(self.cur_func, sname))
+                        {
+                            panic!(
+                                "isel-pic18: load through a runtime-indexed walk over flash pointer %{sname} is not supported (epic-cc#1091)"
+                            );
+                        }
                     }
                 }
                 // FSR0 seeds once (byte_off 0); indirect bytes walk
@@ -12237,6 +12270,12 @@ pub fn select_with_locs(
     )
 }
 
+/// Whether `name` is a `const` global that stays in flash. A const copied to
+/// RAM (alloc placed it in `addrs`) is RAM, so it is excluded.
+fn is_flash_const_global(m: &Module, addrs: &HashMap<String, u16>, name: &str) -> bool {
+    !addrs.contains_key(name) && m.globals.iter().any(|g| g.name == name && g.is_const)
+}
+
 /// `select_with_locs` with codegen options. The driver passes
 /// `copy_loop: false` under the speed profile, so long staged runs stay
 /// straight `MOVFF`s instead of trading cycles for flash (epic-cc#883).
@@ -12346,7 +12385,14 @@ pub fn select_with_opts(
     let resolved = resolve_pointers(m);
     // Flash-pointer provenance for C++ vtable dispatch, folded once up
     // front beside the pointer resolution (epic-cc#832).
-    let prov = flash_provenance(m);
+    let mut prov = flash_provenance(m);
+    // Phi/gep walks over a flash string have no RAM base, so their loads
+    // must TBLRD through the pointer's slot (epic-cc#1091). A RAM-copied
+    // const keeps the INDF path (`addrs`), and vtables stay with the
+    // vptr provenance above.
+    add_flash_walks(&mut prov, m, |n| {
+        !n.starts_with("_ZTV") && is_flash_const_global(m, addrs, n)
+    });
     // Priority ISRs (epic-cc#346): at most one handler per vector. A lone
     // handler of any priority keeps the P5 compatibility wiring (body at
     // the 0x0008 vector, fixed save block); a high/low pair uses priority
