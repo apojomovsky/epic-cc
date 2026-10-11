@@ -498,9 +498,8 @@ def match_indirect_seed(items, i, cfg):
 
     `MOVFF slot,FSR0L; MOVFF slot+1,FSR0H; MOVFF INDF0,dst` is how a
     pointer read lowers after inlining, repeated per loop trip. Every
-    move touches only an FSR or its shadow, which keeps ISR saves
-    (`STATUS`/`BSR`/`PROD`/`TABLAT`) and peripheral writes (`TXREG`,
-    `EECON`, `ADRES`) in `sfr-context-save` below.
+    move touches only an FSR or its shadow. Peripheral writes and ISR
+    saves are left to `peripheral-sfr-move` and `sfr-context-save` below.
     """
     if cfg.family != "pic18":
         return 0
@@ -514,18 +513,41 @@ def match_indirect_seed(items, i, cfg):
     return span
 
 
-def match_sfr_context_save(items, i, cfg):
-    """A `MOVFF` run where every move touches an SFR: a context save.
+def _touches_non_save_sfr(items, i, span):
+    """Whether any SFR operand in the run lies outside the ISR save set."""
+    return any(
+        a is not None and a >= PIC18_SFR_BASE and a not in _ISR_SAVE_REGS
+        for k in range(i, i + span)
+        for a in _movff_operands(items[k])
+    )
 
-    The interrupt entry stub shuttles STATUS/BSR/FSR/PROD and the scratch
-    slots around its dispatch call. Counting that as a struct copy points
-    the reader at an aggregate-copy fix, and the actual fix is a narrower
-    live set or a shared save stub.
+
+def match_sfr_context_save(items, i, cfg):
+    """A `MOVFF` run of ISR entry-stub saves: every SFR it touches is saved.
+
+    The interrupt stub shuttles STATUS/BSR/FSR/PROD and the scratch slots
+    around its dispatch call. A run that also touches a peripheral register
+    is device work, and is priced by `peripheral-sfr-move` instead.
     """
     if cfg.family != "pic18":
         return 0
     span, sfr = _movff_run(items, i, cfg)
-    return span if sfr else 0
+    if not span or not sfr or _touches_non_save_sfr(items, i, span):
+        return 0
+    return span
+
+
+def match_peripheral_sfr_move(items, i, cfg):
+    """A `MOVFF` run that reads or writes a peripheral register.
+
+    Touches an SFR outside `_ISR_SAVE_REGS`: USART baud and transmit, EEPROM
+    address and data, the ADC control read. That is the program's real I/O,
+    not a context save, so it is priced apart from the interrupt stub.
+    """
+    if cfg.family != "pic18":
+        return 0
+    span, sfr = _movff_run(items, i, cfg)
+    return span if sfr and _touches_non_save_sfr(items, i, span) else 0
 
 
 def match_struct_copy(items, i, cfg):
@@ -956,6 +978,11 @@ _FSR_REGS = frozenset(
 )
 _FLASH_REGS = frozenset({0xFF3, 0xFF4, 0xFF5, 0xFF6, 0xFF7, 0xFF8})
 
+# The entry stub's saves (FSR, PROD/TABLAT/TBLPTR shadows, STATUS, BSR, PCLATH,
+# PCLATU) unioned with the indirect-register set the backend emits MOVFF through.
+# Named rather than an address cutoff so INTCON and other core-range peripherals never read as saves.
+_ISR_SAVE_REGS = _FSR_REGS | _FLASH_REGS | frozenset({0xFD8, 0xFE0, 0xFFA, 0xFFB})
+
 
 def _reg_operand_addresses(item):
     """Every numeric operand that names a file register, resolving the
@@ -1091,6 +1118,7 @@ SINK_RULES = (
     Rule("dead-store-reload", match_dead_roundtrip),
     Rule("indirect-seed", match_indirect_seed),
     Rule("sfr-context-save", match_sfr_context_save),
+    Rule("peripheral-sfr-move", match_peripheral_sfr_move),
     Rule("struct-copy-movff", match_struct_copy),
     Rule("store-reload-gap", match_store_reload_gap),
     Rule("switch-jump-table", match_jump_table),

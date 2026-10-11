@@ -164,7 +164,7 @@ fn const_reader_at_page_tail_pins_to_next_page() {
     // straddling 0x7FF/0x800; re-tune the pad when call sequences change.
     let ir_text = format!(
         "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n{}    ret void\n",
-        pad_body(675)
+        pad_body(676)
     );
     let m = module_with_globals(
         &ir_text,
