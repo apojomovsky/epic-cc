@@ -142,9 +142,9 @@ fn parse_only_filter(valid: &[String]) -> Option<std::collections::HashSet<Strin
 /// the filter is skipped, not added. Returns rows to save plus updated and
 /// skipped report lines; updated lines carry old->new values for the PR body.
 ///
-/// Rows are keyed by `(name, profile)`: `-Os` rows keep the bare `name`
-/// key, `-O2` rows use `name@O2`, so the filter and the report tell the
-/// two profiles apart.
+/// Every row's baseline `name` is its key (`entry_key`): `-Os` rows keep the
+/// bare case name, `-O2` rows carry `name@O2`. Keys must be unique, since the
+/// overseer's baseline comparison keys rows by name.
 fn entry_key(name: &str, profile: &str) -> String {
     if profile == "Os" {
         name.to_string()
@@ -162,11 +162,11 @@ fn merge_baseline(
     let mut updated = Vec::new();
     let mut skipped = Vec::new();
     for m in measured {
-        let key = entry_key(&m.name, &m.profile);
+        let key = m.name.clone();
         let base = baseline
             .entry
             .iter()
-            .find(|e| e.name == m.name && e.profile == m.profile);
+            .find(|e| e.name == key && e.profile == m.profile);
         if filter.is_some_and(|f| !f.contains(&key)) {
             match base {
                 Some(b) => {
@@ -914,7 +914,7 @@ fn flash_and_ram_do_not_regress() {
         let base = baseline
             .entry
             .iter()
-            .find(|e| e.name == c.name && e.profile == "O2")
+            .find(|e| e.name == entry_key(c.name, "O2") && e.profile == "O2")
             .cloned();
         let key = entry_key(c.name, "O2");
         let gated = O2_BASELINED.contains(&c.name) || base.is_some();
@@ -929,7 +929,7 @@ fn flash_and_ram_do_not_regress() {
                 &mut failures,
             );
             measured_o2.push(BaselineEntry {
-                name: c.name.to_string(),
+                name: key.clone(),
                 device: c.device.to_string(),
                 profile: "O2".to_string(),
                 flash_words,
@@ -1204,7 +1204,7 @@ fn merge_baseline_keys_o2_rows_apart_from_os_rows() {
             ram_bytes: 10,
         },
         BaselineEntry {
-            name: "a".into(),
+            name: "a@O2".into(),
             device: "d".into(),
             profile: "O2".into(),
             flash_words: 120,
@@ -1219,4 +1219,27 @@ fn merge_baseline_keys_o2_rows_apart_from_os_rows() {
         "the O2 row reports under its profile key: {}",
         updated[0]
     );
+}
+
+#[test]
+fn baseline_row_names_are_unique() {
+    // The overseer's baseline comparison keys rows by name and fails closed
+    // on duplicates, so two rows sharing a name hold every PR that moves them.
+    let baseline = load_baseline();
+    let mut seen = std::collections::HashSet::new();
+    for e in &baseline.entry {
+        assert!(
+            seen.insert(e.name.clone()),
+            "duplicate baseline name {}",
+            e.name
+        );
+    }
+}
+
+#[test]
+fn case_names_are_unique() {
+    let mut seen = std::collections::HashSet::new();
+    for c in cases() {
+        assert!(seen.insert(c.name), "duplicate size case name {}", c.name);
+    }
 }
