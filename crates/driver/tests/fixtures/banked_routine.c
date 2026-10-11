@@ -1,11 +1,11 @@
 // Issue #6 acceptance: a runtime routine whose whole frame lands in a
 // non-zero GPR bank.
 //
-// Layout: `out` u16 at 0x20-0x21, `g[30]` (60 bytes) at 0x22-0x5D ->
-// end_of_globals 0x5E. main is lean (one i16 def); the noinline helper
-// `mul30` carries ~120 bytes of i16 defs (volatile loads + adds), pushing
-// its frame well past the bank-0/1 gap so that __mul_u16's frame, derived
-// at the helper's physical end, sits entirely inside a higher bank.
+// Layout: `g[30]` (60 bytes) at 0x20-0x5B, `out` u16 at 0x5C-0x5D. The
+// 60-byte `pad` (never read) fits no bank-0 gap, so it lands at 0xA0 in
+// bank 1 and pushes the noinline helper `mul30` and __mul_u16's frame
+// (derived at the helper's physical end) above the bank-0/1 gap, so the
+// frame sits entirely inside a higher bank.
 // Before issue #6 the isel assert rejected every slot > 0x7F with a loud
 // panic; now the routine frame lives in one non-zero bank and the banking
 // pass selects that bank around the recipe call without ever touching the
@@ -15,6 +15,7 @@
 // out = (465 * 7) & 0xFFFF = 3255 = 0x0CB7.
 volatile unsigned int out;
 volatile unsigned int g[30];
+volatile unsigned char pad[60];
 
 __attribute__((noinline)) unsigned int mul30(void) {
     unsigned int s = g[0];

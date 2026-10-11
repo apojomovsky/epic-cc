@@ -578,7 +578,7 @@ impl Gen {
     /// bank (skip-sensitive recipe loops; alloc rounds a straddling frame into
     /// the next bank). The budget is the 0x70 bound with the routine frames:
     ///   u8 mul/div/rem/shift: 3, u16 shift: 6, u16 div/rem: 8,
-    ///   u32 shift: 12, u32 div/rem: 12, u16 mul: 18, u32 mul: 22.
+    ///   u32 shift: 12, u32 div/rem: 12, u16 mul: 6, u32 mul: 22.
     ///
     /// Globals end: the fixed inputs plus checksum u8 end at 0x29; `arr[8]`
     /// adds 8 and the even-aligned struct adds 8 (epic-cc#6).
@@ -742,7 +742,7 @@ impl Gen {
             w = 8;
         }
         // (main-frame cost, runtime-routine frame the statement needs).
-        // Note w=8 mul lowers as mul i16 (__mul_u16, 18 bytes) and w=16 mul
+        // Note w=8 mul lowers as mul i16 (__mul_u16, 6 bytes) and w=16 mul
         // as mul i32 (__mul_u32, 22 bytes): the width-space widening for
         // host-overflow safety pulls in the big routines.
         let (cost, routine) = arith_cost(w, op);
@@ -1082,7 +1082,7 @@ impl Gen {
         };
         let (cost, routine) = match (w, op) {
             (_, SignedBin::Mul) => match w {
-                8 => (8, 18),
+                8 => (8, 6),
                 16 => (14, 22),
                 _ => (16, 22),
             },
@@ -1525,11 +1525,11 @@ fn ctype(w: u8) -> &'static str {
 /// (main-frame cost, runtime-routine frame) for an arith statement at a
 /// width. Main-frame costs come from clang IR shapes (loads plus op plus
 /// fold call), rounded up: u8 5, u16 9, u32 15 bytes of defs. w=8 mul lowers
-/// as mul i16 (18 bytes) and w=16 mul as mul i32 (22 bytes): width widening
+/// as mul i16 (6 bytes) and w=16 mul as mul i32 (22 bytes): width widening
 /// for host-overflow safety pulls in the big routines.
 fn arith_cost(w: u8, op: BinOp) -> (u32, u32) {
     match (w, op) {
-        (8, BinOp::Mul) => (8, 18),
+        (8, BinOp::Mul) => (8, 6),
         (8, BinOp::Div | BinOp::Rem) => (10, 14),
         (8, BinOp::Shl | BinOp::Shr) => (8, 3), // variable count maybe
         (8, _) => (7, 0),

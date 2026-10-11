@@ -36,7 +36,7 @@ fn lowers_mul_and_variable_shifts_to_runtime_calls() {
     assert!(text.contains("%k = shl i16 %a 3"));
     // The used routine defs are injected with their scratch allocas.
     assert!(
-        text.contains("fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14")
+        text.contains("fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 2")
     );
     assert!(text
         .contains("fn __shl_u16(i16) (val=i16, cnt=i16)\n  block entry:\n    %__scr = alloca 4"));
@@ -70,7 +70,7 @@ fn injected_routines_get_param_and_scratch_slots_allocated() {
     match &mul.blocks[0].insts[0] {
         Inst::Alloca(a) => {
             assert_eq!(a.dst, "__scr");
-            assert_eq!(a.size, 14);
+            assert_eq!(a.size, 2);
         }
         other => panic!("__mul_u16 must inject the scratch alloca, got {other:?}"),
     }
@@ -114,8 +114,8 @@ fn pins_all_runtime_routine_mappings() {
     use ir::Ty;
     // (op, ty text, ty, routine, param names, __scr size)
     let cases: &[(&str, &str, Ty, &str, &[&str], u8)] = &[
-        ("mul", "i8", Ty::I8, "__mul_u8", &["a", "b"], 6),
-        ("mul", "i16", Ty::I16, "__mul_u16", &["a", "b"], 14),
+        ("mul", "i8", Ty::I8, "__mul_u8", &["a", "b"], 1),
+        ("mul", "i16", Ty::I16, "__mul_u16", &["a", "b"], 2),
         ("udiv", "i8", Ty::I8, "__udiv_u8", &["num", "den"], 4),
         ("udiv", "i16", Ty::I16, "__udiv_u16", &["num", "den"], 7),
         ("urem", "i8", Ty::I8, "__urem_u8", &["num", "den"], 4),

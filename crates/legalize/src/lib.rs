@@ -5308,8 +5308,8 @@ fn param(name: &str, width: u8) -> Param {
 ///
 /// | routine | `__scr` size | offsets |
 /// |---|---|---|
-/// | `__mul_u8` | 6 | `r`@0 (8-bit running product: the i8 result keeps the low byte, so the loop accumulates mod 256 in the param slots and exits once the multiplier shifts out; the rest is unused) |
-/// | `__mul_u16` | 14 | `r`@0-1 (16-bit running product: the i16 result keeps the low half, so the loop accumulates mod 65536 in the param slots and exits once the multiplier shifts out; the rest is unused) |
+/// | `__mul_u8` | 1 | `r`@0 (8-bit running product: the i8 result keeps the low byte, so the loop accumulates mod 256 in the param slots and exits once the multiplier shifts out) |
+/// | `__mul_u16` | 2 | `r`@0-1 (16-bit running product: the i16 result keeps the low half, so the loop accumulates mod 65536 in the param slots and exits once the multiplier shifts out) |
 /// | `__udiv_u8`, `__urem_u8` | 4 | `rem_lo`@0 / `rem_hi`@1 (partial remainder: 2 bytes, since the 8-bit rem shift can carry), `cnt`@2 (loop counter, 8), `restore`@3 (restore-step scratch) |
 /// | `__udiv_u16`, `__urem_u16` | 7 | `rem`@0-1 (partial remainder), `cnt`@2 (loop counter, 16), `spare`@3 (recipe scratch), `restore`@4-6 (restore-step scratch) |
 /// | `__sdiv_i8`, `__srem_i8` | 5 | `flags`@0 (sign state: bit0 = negate quotient, bit1 = negate remainder; `\|num\|`/`\|den\|` live in the param slots), `rem_lo`@1 / `rem_hi`@2, `cnt`@3, `restore`@4 |
@@ -5343,8 +5343,8 @@ fn param(name: &str, width: u8) -> Param {
 /// strictly by offset (the recipe contract).
 fn routine_func(name: &str) -> Func {
     let (ret, params, scr) = match name {
-        "__mul_u8" => (Ty::I8, vec![param("a", 1), param("b", 1)], 6),
-        "__mul_u16" => (Ty::I16, vec![param("a", 2), param("b", 2)], 14),
+        "__mul_u8" => (Ty::I8, vec![param("a", 1), param("b", 1)], 1),
+        "__mul_u16" => (Ty::I16, vec![param("a", 2), param("b", 2)], 2),
         "__mul_u32" => (Ty::I32, vec![param("a", 4), param("b", 4)], 11),
         "__udiv_u8" | "__urem_u8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 4),
         "__udivmod_u8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 4),

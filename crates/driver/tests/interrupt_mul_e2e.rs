@@ -54,7 +54,7 @@ fn compile_fixture() -> (alloc::AllocLayout, String) {
     (layout, asm)
 }
 
-/// `__mul_u8`'s frame: the two 1-byte params and the 6-byte scratch area
+/// `__mul_u8`'s frame: the two 1-byte params and the 1-byte scratch area
 /// (`routine_func` in crates/legalize sizes the alloca).
 fn frame_ranges(layout: &alloc::AllocLayout, func: &str) -> Vec<(u16, u16)> {
     let slot = |name: &str| {
@@ -63,7 +63,7 @@ fn frame_ranges(layout: &alloc::AllocLayout, func: &str) -> Vec<(u16, u16)> {
             .get(&format!("{func}::{name}"))
             .unwrap_or_else(|| panic!("no slot {func}::{name} in the layout"))
     };
-    vec![(slot("a"), 1), (slot("b"), 1), (slot("__scr"), 6)]
+    vec![(slot("a"), 1), (slot("b"), 1), (slot("__scr"), 1)]
 }
 
 #[test]
