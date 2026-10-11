@@ -3,6 +3,10 @@
 **Status:** Accepted 2026-08-20 (implemented in feat/pic18-p4-tblrd).
 Walk amendment 2026-10-08 (epic-cc#745, epic-cc#778): adjacent reads share
 one seed and walk `TBLRD*+`, superseding item 2 below.
+Phi walk amendment 2026-10-11 (epic-cc#1101): a flash walk phi (`p = p + 1` in
+a loop) serves one runtime index term, both `p[i]` and a select `c ? p + 1 : p`
+read as seed, `ADD` the term, `TBLRD`. Several runtime terms and any store
+through the walk are refused, never emitted (ROM is not writable).
 
 ## Decision
 

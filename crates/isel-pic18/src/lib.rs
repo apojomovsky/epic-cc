@@ -3848,9 +3848,9 @@ impl<'m> Gen<'m> {
                     // A const (flash) global has no RAM address: its bytes
                     // are a link-time label, so it materializes as
                     // `LOW()/HIGH()` literals the way `emit_move_addr_to_slot`
-                    // does (epic-cc#645). A dynamic term cannot ride a
-                    // literal, so that combination still needs the FSR0
-                    // path below.
+                    // does (epic-cc#645). A `[(1, reg)]` term adds to that literal
+                    // with ADDWF; scaled or offset terms have no flash form and are
+                    // refused below.
                     if self.global_is_const(name) && terms.is_empty() {
                         // `LOW`/`HIGH` are 8-bit link-time literals, so a
                         // constant offset above 255 still needs the carry
@@ -3880,6 +3880,32 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    ADDLW 0x{hi:02X}"));
                                 }
                             }
+                            let (a, f) = self.operand(dst + u16::from(i));
+                            let bank = if a == 0 { "A" } else { "B" };
+                            self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                        }
+                        return;
+                    }
+                    if self.global_is_const(name) {
+                        // A link-time label cannot carry a constant offset in its
+                        // `LOW()/HIGH()` literal, so only k == 0 with one unscaled
+                        // term has a flash form.
+                        let (true, [(1, reg)]) = (k == 0, terms.as_slice()) else {
+                            panic!(
+                                "isel-pic18: flash-const `{name}` with a scaled, multi-term, or offset runtime index has no RAM address (epic-cc#1101)"
+                            );
+                        };
+                        let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
+                        for i in 0..ty.bytes() {
+                            let lit = if i == 0 { "LOW" } else { "HIGH" };
+                            self.emit(format!("    MOVLW {lit}({name})"));
+                            if i != 0 {
+                                self.emit("    BTFSC 0xFD8,0,A".to_string());
+                                self.emit("    ADDLW 0x01".to_string());
+                            }
+                            let (ra_a, ra_f) = self.operand(ra + u16::from(i));
+                            let ra_bank = if ra_a == 0 { "A" } else { "B" };
+                            self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
                             let (a, f) = self.operand(dst + u16::from(i));
                             let bank = if a == 0 { "A" } else { "B" };
                             self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
@@ -6201,27 +6227,35 @@ impl<'m> Gen<'m> {
                     if self.prov.flash.contains(&key) {
                         // A walk gep or a select that folds onto a walk phi has no
                         // slot of its own: read through the phi's slot at the folded
-                        // constant offset. Dynamic terms over the phi have no TBLPTR
-                        // chain here, so refuse rather than read INDF0 at a flash address.
-                        let (src, k) = match self.resolved.get(&key) {
+                        // offset. One runtime term (a loop index over the phi) seeds
+                        // TBLPTR from the slot, adds the index, and TBLRDs per byte
+                        // (epic-cc#1101); several terms have no TBLPTR chain yet.
+                        let (sname, k, terms) = match self.resolved.get(&key) {
                             Some((Base::Slot(sname, true), k, terms)) => {
-                                if !terms.is_empty() {
-                                    panic!(
-                                        "isel-pic18: load through a runtime-indexed walk over flash pointer %{sname} is not supported (epic-cc#1091)"
-                                    );
-                                }
-                                (self.slot_addr(self.cur_func, sname).direct(), *k)
+                                (sname.clone(), *k, terms.clone())
                             }
-                            // Only a non-slot base reaches here: const_base_of and
-                            // resolved_for already panic on a missing key. No slot holds
-                            // the flash address for it, so a fallback read would be wrong.
                             _ => panic!(
                                 "isel-pic18: load through flash pointer %{r} with no flash-walk slot is not supported (epic-cc#1091)"
                             ),
                         };
+                        let slot = self.slot_addr(self.cur_func, &sname).direct();
+                        if !terms.is_empty() {
+                            let [_] = terms.as_slice() else {
+                                panic!(
+                                    "isel-pic18: load through a walk over flash pointer %{sname} with several runtime indices is not supported (epic-cc#1101)"
+                                );
+                            };
+                            for kk in 0..l.ty.bytes() {
+                                self.emit_flash_tblptr_seed(slot, k.wrapping_add(u16::from(kk)));
+                                self.add_dynamic_to_tblptr(&terms);
+                                self.emit("    TBLRD*".to_string());
+                                self.emit_copy_byte(0xFF5, dst + u16::from(kk));
+                            }
+                            return;
+                        }
                         for kk in 0..l.ty.bytes() {
                             self.emit_flash_ptr_load_byte(
-                                src,
+                                slot,
                                 k.wrapping_add(u16::from(kk)),
                                 dst + u16::from(kk),
                             );
@@ -6231,15 +6265,6 @@ impl<'m> Gen<'m> {
                     if self.prov.mixed.contains(&key) {
                         panic!(
                             "isel-pic18: load through maybe-flash address %{r} is not supported (a pointer joins flash and RAM, or an unserved vtable dispatch shape; epic-cc#832, epic-cc#1099)"
-                        );
-                    }
-                    // A runtime index over a walk phi needs `phi + scale*idx` seeded
-                    // from the phi slot, which only the table-label chain emits. Refuse
-                    // rather than read INDF0 at a flash address (epic-cc#1091). A mixed
-                    // phi is the same hazard: its slot may hold a flash address (epic-cc#1099).
-                    if let Some(sname) = self.maybe_flash_slot_under_index(&key) {
-                        panic!(
-                            "isel-pic18: load through a runtime-indexed walk over flash or maybe-flash pointer %{sname} is not supported (epic-cc#1091, epic-cc#1099)"
                         );
                     }
                 }
