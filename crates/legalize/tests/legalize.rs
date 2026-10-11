@@ -36,7 +36,7 @@ fn lowers_mul_and_variable_shifts_to_runtime_calls() {
     assert!(text.contains("%k = shl i16 %a 3"));
     // The used routine defs are injected with their scratch allocas.
     assert!(
-        text.contains("fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14")
+        text.contains("fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 2")
     );
     assert!(text
         .contains("fn __shl_u16(i16) (val=i16, cnt=i16)\n  block entry:\n    %__scr = alloca 4"));
@@ -70,7 +70,7 @@ fn injected_routines_get_param_and_scratch_slots_allocated() {
     match &mul.blocks[0].insts[0] {
         Inst::Alloca(a) => {
             assert_eq!(a.dst, "__scr");
-            assert_eq!(a.size, 14);
+            assert_eq!(a.size, 2);
         }
         other => panic!("__mul_u16 must inject the scratch alloca, got {other:?}"),
     }
@@ -114,8 +114,8 @@ fn pins_all_runtime_routine_mappings() {
     use ir::Ty;
     // (op, ty text, ty, routine, param names, __scr size)
     let cases: &[(&str, &str, Ty, &str, &[&str], u8)] = &[
-        ("mul", "i8", Ty::I8, "__mul_u8", &["a", "b"], 6),
-        ("mul", "i16", Ty::I16, "__mul_u16", &["a", "b"], 14),
+        ("mul", "i8", Ty::I8, "__mul_u8", &["a", "b"], 1),
+        ("mul", "i16", Ty::I16, "__mul_u16", &["a", "b"], 2),
         ("udiv", "i8", Ty::I8, "__udiv_u8", &["num", "den"], 4),
         ("udiv", "i16", Ty::I16, "__udiv_u16", &["num", "den"], 7),
         ("urem", "i8", Ty::I8, "__urem_u8", &["num", "den"], 4),
@@ -2603,6 +2603,88 @@ fn fuses_matching_divmod_pair() {
     );
 }
 
+/// Clang's `-O1` rewrites `x % y` as `x - (x / y) * y` for non-volatile
+/// operands. The product call must not survive: the pair fuses as if the
+/// source had written `%`.
+#[test]
+fn fuses_rem_idiom_product_pair() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %5 = mul i16 %3 %2\n\
+             %6 = sub i16 %1 %5\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__udivmod_u16(i16 %1, i16 %2)"),
+        "divide became the combined call:\n{text}"
+    );
+    assert!(
+        text.contains("%6 = load volatile i16 @__udivmod_rem_u16"),
+        "subtract became the remainder slot load:\n{text}"
+    );
+    assert!(
+        !text.contains("__mul_u16"),
+        "product routine dropped:\n{text}"
+    );
+}
+
+/// Signed clang idiom: `srem` spelled as `sub(x, mul(sdiv(x, y), y))`.
+#[test]
+fn fuses_signed_rem_idiom_product_pair() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = sdiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %5 = mul i16 %3 %2\n\
+             %6 = sub i16 %1 %5\n\
+             store i16 %6 @m\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__sdivmod_i16(i16 %1, i16 %2)"),
+        "signed divide became the combined call:\n{text}"
+    );
+    assert!(
+        !text.contains("__mul_u16"),
+        "product routine dropped:\n{text}"
+    );
+}
+
+/// A product with a second reader is not the rem idiom: nothing is rewritten.
+#[test]
+fn keeps_product_with_another_reader() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %5 = mul i16 %3 %2\n\
+             %6 = sub i16 %1 %5\n\
+             store i16 %6 @m\n\
+             store i16 %5 @q\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("@__mul_u16("), "shared product kept:\n{text}");
+    assert!(!text.contains("__udivmod"), "nothing fused:\n{text}");
+}
+
 /// Reloaded volatile globals never fuse: two reads of one volatile global
 /// may return different values (MMIO, or an ISR-shared flag changed
 /// between them), so the second pair is not provably the first.
@@ -3278,4 +3360,35 @@ fn no_fuse_on_pic18_isr_spellings() {
     );
     let text = ir::serialize(&legalize_pic18(m));
     assert!(!text.contains("__udivmod"), "isr pair fused:\n{text}");
+}
+
+/// epic-cc#927: post-LSR decimal loops (header selects into a blank self-loop,
+/// phi-free exit) collapse to `__udec_u16_rj5` calls, but only in pairs on pic18.
+#[test]
+fn shares_lsr_mangled_decimal_loops_on_pic18_only_in_pairs() {
+    use legalize::legalize_pic18;
+    let site = |name: &str| {
+        format!(
+            "fn {name}(void) ()\n  block pre:\n    %v0 = load volatile i16 @vin\n    br hd\n  block hd:\n    %ivp = phi ptr %sp latch %g pre\n    %cnt = phi i16 %cn latch 0 pre\n    %v = phi i16 %q latch %v0 pre\n    %g = gep @buf +15\n    %q = udiv i16 %v, 10\n    %m = mul i16 %q, 246\n    %s = add i16 %m, %v\n    %r = trunc i16 %s to i8\n    %d = or i8 %r, 48\n    store i8 %d %ivp\n    %lt10 = icmp ult i16 %v, 10\n    %lt4 = icmp ult i16 %cnt, 4\n    %sel = select i1 %lt10 i1 %lt4 i1 0\n    br i1 %sel blank latch\n  block blank:\n    %bp = phi ptr %bsp blank %ivp hd\n    %bc = phi i16 %bn blank %cnt hd\n    store i8 32 %bp\n    %bn = add i16 %bc, 1\n    %bsp = gep %bp +65535\n    %bd = icmp eq i16 %bn, 5\n    br i1 %bd exit blank\n  block latch:\n    %cn = add i16 %cnt, 1\n    %sp = gep %ivp +65535\n    %ld = icmp eq i16 %cn, 5\n    br i1 %ld exit hd\n  block exit:\n    ret void\n"
+        )
+    };
+    let header = "global buf i8\nglobal vin i16\n";
+    let pair = format!("{header}{}", site("a")) + &site("b");
+    let text = ir::serialize(&legalize_pic18(parse(&pair)));
+    assert_eq!(
+        text.matches("@__udec_u16_rj5").count(),
+        2,
+        "both post-LSR loops share the helper:\n{text}"
+    );
+    let lone = format!("{header}{}", site("a"));
+    let lone_text = ir::serialize(&legalize_pic18(parse(&lone)));
+    assert!(
+        !lone_text.contains("@__udec_u16_rj5"),
+        "a lone loop stays expanded:\n{lone_text}"
+    );
+    let plain = ir::serialize(&legalize(parse(&pair)));
+    assert!(
+        !plain.contains("@__udec_u16_rj5"),
+        "non-pic18 injects nothing:\n{plain}"
+    );
 }

@@ -37,8 +37,6 @@ jobs:
       # "Build ci image (cached)" (or `docker buildx build --target
       # release`) step then hits CACHED against what this pushes.
       - name: Build + push the toolchain cache (ci target)
-        uses: docker/build-push-action@v6
-        with:
-          target: ci
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
+        env:
+          CACHE_REF: ghcr.io/${{ github.repository }}-toolchain
+        run: bash scripts/warm-toolchain-cache.sh

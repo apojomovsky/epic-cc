@@ -46,7 +46,8 @@
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot,
+    flash_provenance, is_directive, resolve_pointers, ssa_key, Base, FlashProvenance,
+    PtrResolution, Slot,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -629,11 +630,42 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Loads one byte of a pointer load or memcpy source into W. Direct
-    /// bases read the file register. Dynamic bases set FSR first. Const
-    /// bases call the RETLW reader. Large tables take the 16-bit index
-    /// path with chunk dispatch.
-    fn emit_ptr_load_byte(&mut self, ptr: &Val, byte_off: u8) {
+    /// Stores the byte a RETLW or chunk reader returned in W. The PCLATH
+    /// restore after the CALL clobbers W, so the store comes first: into
+    /// `dst` when the caller names one, else into scratch for the join to
+    /// reload (see `reload_read_byte`).
+    fn store_read_byte(&mut self, dst: Option<u16>) {
+        match dst {
+            Some(d) => self.emit_w_store(d),
+            None => self.emit(format!("    MOVWF 0x{:02X}", self.scratch)),
+        }
+    }
+
+    /// One RETLW reader call: `MOVLW PAGE(target); MOVWF PCLATH`, then
+    /// `index` (leaves W = in-table index), then `CALL`. The set goes before
+    /// the index because its MOVLW clobbers W.
+    fn emit_reader_call(&mut self, target: &str, dst: Option<u16>, index: impl FnOnce(&mut Self)) {
+        self.emit(format!("    MOVLW PAGE({target})"));
+        self.emit("    MOVWF PCLATH".to_string());
+        index(self);
+        self.emit(format!("    CALL {target}"));
+        self.store_read_byte(dst);
+        self.emit_pclath_restore(target);
+    }
+
+    /// Reloads the byte parked in scratch when no destination took it. A
+    /// caller that named `dst` already holds the byte there.
+    fn reload_read_byte(&mut self, dst: Option<u16>) {
+        if dst.is_none() {
+            self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+        }
+    }
+
+    /// Loads one byte of a pointer load or memcpy source, into `dst` when
+    /// the caller names one, else into W. Direct bases read the file
+    /// register. Dynamic bases set FSR first. Const bases call the RETLW
+    /// reader. Large tables take the 16-bit index path with chunk dispatch.
+    fn emit_ptr_load_byte(&mut self, ptr: &Val, byte_off: u8, dst: Option<u16>) {
         match ptr {
             Val::Reg(r) => {
                 if let (Base::Global(name), k, terms) = self.resolved_for(r) {
@@ -641,19 +673,15 @@ impl<'m> Gen<'m> {
                         if self.global_size(&name) > 255 {
                             // Reads a large table via the chunked entry: W
                             // holds the in-chunk index.
-                            self.emit_const_read_large(&name, k, &terms, byte_off);
+                            self.emit_const_read_large(&name, k, &terms, byte_off, dst);
                         } else {
-                            // Reads a RETLW table: sets PCLATH first since the
-                            // set clobbers W, computes the index into W, calls
-                            // the reader, then parks the byte across the
-                            // restore before reloading it.
-                            self.emit(format!("    MOVLW PAGE(__read_{name})"));
-                            self.emit("    MOVWF PCLATH".to_string());
-                            self.emit_ptr_index_w(k, &terms, byte_off);
-                            self.emit(format!("    CALL __read_{name}"));
-                            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                            self.emit_pclath_restore(&format!("__read_{name}"));
-                            self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                            // The index follows the PCLATH set, so it is in
+                            // W for the CALL.
+                            let target = format!("__read_{name}");
+                            self.emit_reader_call(&target, dst, |g| {
+                                g.emit_ptr_index_w(k, &terms, byte_off)
+                            });
+                            self.reload_read_byte(dst);
                         }
                         return;
                     }
@@ -670,13 +698,10 @@ impl<'m> Gen<'m> {
                         "isel: constant index into large const table @{g} not supported (size {} > 255); only a single 16-bit reg index is",
                         self.global_size(g)
                     );
-                    self.emit(format!("    MOVLW PAGE(__read_{g})"));
-                    self.emit("    MOVWF PCLATH".to_string());
-                    self.emit(format!("    MOVLW 0x{byte_off:02X}"));
-                    self.emit(format!("    CALL __read_{g}"));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                    self.emit_pclath_restore(&format!("__read_{g}"));
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                    self.emit_reader_call(&format!("__read_{g}"), dst, |s| {
+                        s.emit(format!("    MOVLW 0x{byte_off:02X}"))
+                    });
+                    self.reload_read_byte(dst);
                     return;
                 }
             }
@@ -685,6 +710,9 @@ impl<'m> Gen<'m> {
         match self.emit_ptr_setup(ptr, byte_off) {
             Addr::Direct(a) => self.emit(format!("    MOVF 0x{a:02X}, W")),
             Addr::Indirect => self.emit("    MOVF INDF0, W".to_string()),
+        }
+        if let Some(d) = dst {
+            self.emit_w_store(d);
         }
     }
 
@@ -934,10 +962,17 @@ impl<'m> Gen<'m> {
     /// Reads a large const table via a 16-bit index. Splits the index into
     /// an in-chunk byte and a chunk number. Two chunks test one bit. More
     /// chunks walk a descending threshold chain (epic-cc#8). Parks the index
-    /// across the PCLATH set and the byte across the restore. Leaves the
-    /// byte in W like the small path. Other index shapes panic: the index
-    /// set is closed.
-    fn emit_const_read_large(&mut self, name: &str, k: u16, terms: &[(u16, String)], byte_off: u8) {
+    /// across the PCLATH set. The byte goes to `dst` before each restore when
+    /// one is named; otherwise it parks across the restore and returns in W
+    /// at the join. Other index shapes panic: the index set is closed.
+    fn emit_const_read_large(
+        &mut self,
+        name: &str,
+        k: u16,
+        terms: &[(u16, String)],
+        byte_off: u8,
+        dst: Option<u16>,
+    ) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
             kk <= 0xFF,
@@ -956,15 +991,15 @@ impl<'m> Gen<'m> {
                 format!("__read_{name}_hi{c}")
             }
         };
-        // Calls one chunk entry and parks the byte across the restore.
+        // Calls one chunk reader and stores its byte (see `store_read_byte`).
+        let chunk_read = |g: &mut Self, c: usize| {
+            g.emit_reader_call(&entry(c), dst, |g| {
+                g.emit(format!("    MOVF 0x{:02X}, W", g.retval_lo))
+            });
+        };
+        // Calls one chunk reader, then jumps to the join.
         let chunk_call = |g: &mut Self, c: usize, l_done: &str| {
-            let e = entry(c);
-            g.emit(format!("    MOVLW PAGE({e})"));
-            g.emit("    MOVWF PCLATH".to_string());
-            g.emit(format!("    MOVF 0x{:02X}, W", g.retval_lo));
-            g.emit(format!("    CALL {e}"));
-            g.emit(format!("    MOVWF 0x{:02X}", g.scratch));
-            g.emit_pclath_restore(&e);
+            chunk_read(g, c);
             g.emit(format!("    GOTO {l_done}"));
         };
         // Dispatches 3 or more chunks with descending threshold tests.
@@ -986,6 +1021,23 @@ impl<'m> Gen<'m> {
                 chunk_call(g, c, l_done);
             }
         };
+        // Dispatches to the chunk readers, then joins. Two chunks test bit 0
+        // of the chunk temp; three or more walk the threshold chain.
+        let dispatch = |g: &mut Self, l_done: &str| {
+            if disp == 2 {
+                let l_hi = g.fresh_label();
+                g.emit(format!("    MOVF 0x{:02X}, W", g.retval_lo));
+                g.emit(format!("    BTFSC 0x{:02X}, 0", g.scratch));
+                g.emit(format!("    GOTO {l_hi}"));
+                chunk_call(g, 0, l_done);
+                g.emit(format!("{l_hi}:"));
+                chunk_read(g, 1);
+            } else {
+                emit_chain(g, l_done);
+            }
+            g.emit(format!("{l_done}:"));
+            g.reload_read_byte(dst);
+        };
         match terms {
             [(1, r)] => {
                 assert_eq!(
@@ -1004,33 +1056,7 @@ impl<'m> Gen<'m> {
                 self.emit("    BTFSC STATUS, 0".to_string());
                 self.emit("    ADDLW 0x01".to_string());
                 self.emit(format!("    MOVWF 0x{:02X}", self.scratch)); // hi temp (chunk)
-                if disp == 2 {
-                    // Tests bit 0 of the chunk temp for the two-chunk shape.
-                    let l_hi = self.fresh_label();
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                    self.emit(format!("    BTFSC 0x{:02X}, 0", self.scratch));
-                    self.emit(format!("    GOTO {l_hi}"));
-                    self.emit(format!("    MOVLW PAGE(__read_{name})"));
-                    self.emit("    MOVWF PCLATH".to_string());
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                    self.emit(format!("    CALL __read_{name}"));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                    self.emit_pclath_restore(&format!("__read_{name}"));
-                    self.emit(format!("    GOTO {l_done}"));
-                    self.emit(format!("{l_hi}:"));
-                    self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
-                    self.emit("    MOVWF PCLATH".to_string());
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                    self.emit(format!("    CALL __read_{name}_hi"));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                    self.emit_pclath_restore(&format!("__read_{name}_hi"));
-                } else {
-                    emit_chain(self, &l_done);
-                }
-                // Every path leaves the byte in scratch. W is reloaded here,
-                // not carried into the join: a PCLATH pair before a GOTO clobbers W.
-                self.emit(format!("{l_done}:"));
-                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                dispatch(self, &l_done);
             }
             [(scale, r)] => {
                 // Scales a multi-byte element index without a multiplier.
@@ -1077,31 +1103,7 @@ impl<'m> Gen<'m> {
                 self.emit("    BTFSC STATUS, 0".to_string());
                 self.emit("    ADDLW 0x01".to_string());
                 self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                if disp == 2 {
-                    // Tests bit 0 of the chunk temp for the two-chunk shape.
-                    let l_hi = self.fresh_label();
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                    self.emit(format!("    BTFSC 0x{:02X}, 0", self.scratch));
-                    self.emit(format!("    GOTO {l_hi}"));
-                    self.emit(format!("    MOVLW PAGE(__read_{name})"));
-                    self.emit("    MOVWF PCLATH".to_string());
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                    self.emit(format!("    CALL __read_{name}"));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                    self.emit_pclath_restore(&format!("__read_{name}"));
-                    self.emit(format!("    GOTO {l_done}"));
-                    self.emit(format!("{l_hi}:"));
-                    self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
-                    self.emit("    MOVWF PCLATH".to_string());
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                    self.emit(format!("    CALL __read_{name}_hi"));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                    self.emit_pclath_restore(&format!("__read_{name}_hi"));
-                } else {
-                    emit_chain(self, &l_done);
-                }
-                self.emit(format!("{l_done}:"));
-                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                dispatch(self, &l_done);
             }
             [] => panic!(
                 "isel: constant index into large const table @{name} not supported (size > 255); only a single 16-bit reg index is supported"
@@ -2049,8 +2051,7 @@ impl<'m> Gen<'m> {
                     "isel: byval size mismatch for arg {i} of @{func}"
                 );
                 for b in 0..size {
-                    self.emit_ptr_load_byte(&arg.val, b);
-                    self.emit(format!("    MOVWF 0x{:02X}", pa + u16::from(b)));
+                    self.emit_ptr_load_byte(&arg.val, b, Some(pa + u16::from(b)));
                 }
             } else if arg.sret {
                 // Stores an sret target address into the callee slot. The
@@ -2510,8 +2511,7 @@ impl<'m> Gen<'m> {
                         );
                     }
                     for k in 0..ty.bytes() {
-                        self.emit_ptr_load_byte(&ptr, k);
-                        self.emit_w_store(dst + u16::from(k));
+                        self.emit_ptr_load_byte(&ptr, k, Some(dst + u16::from(k)));
                     }
                 }
             }
@@ -2562,7 +2562,7 @@ impl<'m> Gen<'m> {
                     // clobbers W (docs/33 §D-2). Direct sides need no park.
                     let hold: u16 = 0x7F;
                     for i in 0..*n {
-                        self.emit_ptr_load_byte(&m.src, i);
+                        self.emit_ptr_load_byte(&m.src, i, None);
                         if self.ptr_setup_is_indirect(&m.dst, i) {
                             // Parks the byte across FSR setup, which clobbers W.
                             self.emit(format!("    MOVWF 0x{hold:02X}"));
@@ -6025,13 +6025,13 @@ fn word_size(lines: &[String]) -> usize {
             if line.is_empty() {
                 return false;
             }
-            if line.starts_with("list") || line.starts_with("radix") {
+            if is_directive(line, "list") || is_directive(line, "radix") {
                 return false;
             }
             if line.starts_with("org ") {
                 return false;
             }
-            if line.starts_with("end") {
+            if is_directive(line, "end") {
                 return false;
             }
             if line.ends_with(':') {
@@ -6114,7 +6114,7 @@ pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec
     };
     for raw in asm.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
@@ -6126,7 +6126,7 @@ pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec
             org = target;
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             break;
         }
         if let Some(l) = line.strip_suffix(':') {
@@ -6330,10 +6330,10 @@ fn measure_section_units(banked: &str) -> (HashMap<String, usize>, HashMap<Strin
     };
     for raw in banked.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             close(&mut cur, &mut stage, &mut reader);
             break;
         }
@@ -6407,7 +6407,7 @@ fn verify_section_model(places: &[ConstPlace], banked: &str) {
     };
     for raw in banked.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
@@ -6415,7 +6415,7 @@ fn verify_section_model(places: &[ConstPlace], banked: &str) {
             org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             close(&mut cur, &lens);
             break;
         }
@@ -6681,14 +6681,14 @@ fn measure_end_org(text: &str) -> usize {
     let mut org = 0usize;
     for raw in text.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
             org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             continue;
         }
-        if line.starts_with("end") || line.starts_with("__read_") {
+        if is_directive(line, "end") || line.starts_with("__read_") {
             break;
         }
         if line.strip_suffix(':').is_some() {

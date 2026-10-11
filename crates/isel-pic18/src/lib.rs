@@ -5655,7 +5655,10 @@ impl<'m> Gen<'m> {
         let b = self.inline_mul_operand(&c.args[1].val, width)?;
         let dst = match &c.dst {
             None => None,
-            Some(d) => Some(*self.addrs.get(&iselcore::ssa_key(self.cur_func, d))?),
+            Some(d) => Some(match self.store_fwd.get(d) {
+                Some(a) => *a,
+                None => *self.addrs.get(&iselcore::ssa_key(self.cur_func, d))?,
+            }),
         };
         if width == 1 {
             if matches!((a[0], b[0]), (MulOp::Lit(_), MulOp::Lit(_))) {
@@ -5702,6 +5705,13 @@ impl<'m> Gen<'m> {
                 return None;
             }
         }
+        if let Some((d0, d1)) = dst16 {
+            for x in [d0, d1] {
+                if (self.retval_lo..self.retval_lo + 4).contains(&x) {
+                    return None;
+                }
+            }
+        }
         Some(InlineMul::U16 {
             a0,
             a1,
@@ -5709,6 +5719,164 @@ impl<'m> Gen<'m> {
             b1,
             dst: dst16,
         })
+    }
+
+    /// Fold each inlined narrow multiply's operand loads and result store
+    /// into the MULWF sites (epic-cc#973). An operand load reads its
+    /// global at the call, so its read count and order stay put: the load
+    /// is single use, reads an access-bank global, and every instruction
+    /// between the first folded load and the call is another folded load.
+    /// A result store-forwards into its global when the span between call
+    /// and store touches no memory. Each call is tried with its folds in
+    /// place and reverted when `inline_mul_plan` rejects the site, so a
+    /// folded read or store always has its emitter.
+    fn fold_inline_mul_sites(g: &mut Gen, f: &Func) {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if !r.is_empty() {
+                        *uses.entry(r).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        for b in &f.blocks {
+            for (ci, inst) in b.insts.iter().enumerate() {
+                let Inst::Call(c) = inst else { continue };
+                if Gen::inline_mul_width(&c.func).is_none() || !g.is_function(&c.func) {
+                    continue;
+                }
+                let Some((loads, store)) = Gen::inline_mul_folds(g, f, &uses, b, ci, c) else {
+                    continue;
+                };
+                for (r, glob) in &loads {
+                    g.w_folds
+                        .loads
+                        .insert(r.clone(), iselcore::LoadFold::Direct(glob.clone()));
+                }
+                if let Some((d, addr)) = &store {
+                    g.store_fwd.insert(d.clone(), *addr);
+                    g.store_consumed.insert(d.clone());
+                }
+                if Gen::inline_mul_plan(g, c).is_some() {
+                    continue;
+                }
+                for (r, _) in &loads {
+                    g.w_folds.loads.remove(r);
+                }
+                if let Some((d, _)) = &store {
+                    g.store_fwd.remove(d);
+                    g.store_consumed.remove(d);
+                }
+            }
+        }
+    }
+
+    /// The operand loads and result store `fold_inline_mul_sites` would
+    /// claim for the call at `b.insts[ci]`, before the plan check.
+    fn inline_mul_folds(
+        g: &Gen,
+        f: &Func,
+        uses: &HashMap<String, usize>,
+        b: &Block,
+        ci: usize,
+        c: &ir::Call,
+    ) -> Option<(Vec<(String, String)>, Option<(String, u16)>)> {
+        // Access bank only: MOVF/MULWF here take the `A` bit.
+        let access = |glob: &str| {
+            g.addrs
+                .get(glob)
+                .copied()
+                .filter(|a| *a <= g.access_bank_hi)
+        };
+        let mut ops: Vec<(String, String, usize)> = Vec::new();
+        for arg in &c.args {
+            let Val::Reg(r) = &arg.val else { continue };
+            if uses.get(r).copied().unwrap_or(0) != 1
+                || g.resolved.contains_key(&iselcore::ssa_key(&f.name, r))
+            {
+                continue;
+            }
+            let Some(pi) = b.insts[..ci]
+                .iter()
+                .rposition(|i| matches!(i, Inst::Load(l) if &l.dst == r))
+            else {
+                continue;
+            };
+            let Inst::Load(l) = &b.insts[pi] else {
+                continue;
+            };
+            let Some(glob) = l.ptr.strip_prefix('@') else {
+                continue;
+            };
+            if l.ptr_ty || g.global_is_const(glob) || access(glob).is_none() || arg.ty != Some(l.ty)
+            {
+                continue;
+            }
+            ops.push((r.clone(), glob.to_string(), pi));
+        }
+        let first = ops.iter().map(|o| o.2).min();
+        let mut loads: Vec<(String, String)> = Vec::new();
+        if let Some(first) = first {
+            let folded = |r: &str| ops.iter().any(|o| o.0 == r);
+            let gap_clean = b.insts[first + 1..ci].iter().all(|i| match i {
+                Inst::Load(l) => folded(&l.dst),
+                Inst::Call(_)
+                | Inst::Asm(_)
+                | Inst::Store(_)
+                | Inst::Memcpy(_)
+                | Inst::VaStart(_)
+                | Inst::VaArg(_) => false,
+                Inst::Br(_) | Inst::BrCond(_) | Inst::Switch(_) | Inst::Ret(_, _) => false,
+                _ => true,
+            });
+            if gap_clean {
+                loads = ops.iter().map(|o| (o.0.clone(), o.1.clone())).collect();
+            }
+        }
+        let store = match &c.dst {
+            None => None,
+            Some(d) => {
+                (|| {
+                    if uses.get(d).copied().unwrap_or(0) != 1
+                        || g.lane_consumed.contains(d)
+                        || g.bit_lanes.contains_key(d)
+                    {
+                        return None;
+                    }
+                    let si = ci + 1 + b.insts[ci + 1..].iter().position(|i| matches!(i, Inst::Store(s) if matches!(&s.val, Val::Reg(v) if v == d)))?;
+                    let span_clean = b.insts[ci + 1..si].iter().all(|i| {
+                        !matches!(
+                            i,
+                            Inst::Call(_)
+                                | Inst::Asm(_)
+                                | Inst::Store(_)
+                                | Inst::Memcpy(_)
+                                | Inst::VaStart(_)
+                                | Inst::VaArg(_)
+                                | Inst::Load(_)
+                                | Inst::Br(_)
+                                | Inst::BrCond(_)
+                                | Inst::Switch(_)
+                                | Inst::Ret(_, _)
+                        )
+                    });
+                    let Inst::Store(s) = &b.insts[si] else {
+                        return None;
+                    };
+                    let glob = s.ptr.strip_prefix('@')?;
+                    if g.global_is_const(glob) || c.ty != Some(s.ty) || !span_clean {
+                        return None;
+                    }
+                    Some((d.clone(), access(glob)?))
+                })()
+            }
+        };
+        if loads.is_empty() && store.is_none() {
+            return None;
+        }
+        Some((loads, store))
     }
 
     /// Emit an inline narrow multiply, `true` when a plan resolved. Each
@@ -8620,6 +8788,47 @@ impl<'m> Gen<'m> {
         self.emit("    RETURN".to_string());
     }
 
+    /// The backward LSR-form digit writer (epic-cc#927): the 5 bytes ending
+    /// at `buf`, right-justified and space-padded. A zero remainder after the
+    /// first digit prints a space, matching the inlined loop it replaces.
+    /// Scratch: `den`@0-1, `rem`@2-3, `dcnt`@4, `iter`@5.
+    fn emit_udec_u16_rj5(&mut self, name: &str, scr: u16) {
+        let num = self.slot_addr(name, "num").direct();
+        let buf = self.slot_addr(name, "buf").direct();
+        let (den, rem, dcnt, iter) = (scr, scr + 2, scr + 4, scr + 5);
+        // FSR0 = buf (the last digit's address); POSTDEC0 (0xFED) walks down.
+        self.emit_copy_byte(buf, 0xFE9);
+        self.emit_copy_byte(buf + 1, 0xFEA);
+        self.emit("    MOVLW 0x0A".to_string());
+        self.emit_banked("MOVWF", den, "");
+        self.emit_banked("CLRF", den + 1, "");
+        self.emit("    MOVLW 0x05".to_string());
+        self.emit_banked("MOVWF", iter, "");
+        let l_digits = self.fresh_label();
+        let l_divide = self.fresh_label();
+        let l_next = self.fresh_label();
+        self.emit_label(&l_digits);
+        // The first digit always prints; later ones are spaces once the value is 0.
+        self.emit_banked("MOVF", iter, ",W");
+        self.emit("    XORLW 0x05".to_string());
+        self.emit(format!("    BZ {l_divide}"));
+        self.emit_banked("MOVF", num, ",W");
+        self.emit_banked("IORWF", num + 1, ",W");
+        self.emit(format!("    BNZ {l_divide}"));
+        self.emit("    MOVLW 0x20".to_string());
+        self.emit_banked("MOVWF", 0xFED, "");
+        self.emit(format!("    BRA {l_next}"));
+        self.emit_label(&l_divide);
+        self.emit_divmod_loop(num, den, rem, dcnt, 2, 2, false);
+        self.emit_banked("MOVF", rem, ",W");
+        self.emit("    IORLW 0x30".to_string());
+        self.emit_banked("MOVWF", 0xFED, "");
+        self.emit_label(&l_next);
+        self.emit_banked("DECFSZ", iter, ",F");
+        self.emit(format!("    BRA {l_digits}"));
+        self.emit("    RETURN".to_string());
+    }
+
     /// The signed div/mod wrapper: abs both operands in place in the param
     /// slots (unsigned abs, INT_MIN safe), run the unsigned divmod with
     /// `rem` at `__scr[1..]` and the counter after it (byte 0 holds the
@@ -10805,6 +11014,7 @@ impl<'m> Gen<'m> {
             "__udivmod_u32" => self.emit_udivmod(name, 4, scr),
             "__udec_u32" => self.emit_udec_u32(name, scr),
             "__udec_u16_5" => self.emit_udec_u16_5(name, scr),
+            "__udec_u16_rj5" => self.emit_udec_u16_rj5(name, scr),
             "__sdiv_i8" => self.emit_sdivmod(name, 1, scr, true),
             "__srem_i8" => self.emit_sdivmod(name, 1, scr, false),
             "__sdiv_i16" => self.emit_sdivmod(name, 2, scr, true),
@@ -12359,6 +12569,7 @@ pub fn select_with_opts(
                 .map(|x| x.name.clone())
                 .collect();
         g.w_folds = iselcore::find_value_folds(f, g.m, g.resolved, Some(&access_safe));
+        Gen::fold_inline_mul_sites(&mut g, f);
         // In-place literal-add folds for this function (epic-cc#767): same-home
         // `Bin`s and loop increments feeding their own phi backedge. Runs
         // after the value folds since same-home detection reads them.

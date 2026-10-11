@@ -44,10 +44,13 @@ stay complete by construction, never by review.
   per-entry W handling and only pays off with several handlers; every
   program in the ladder has one ISR, so the shared stub saves nothing
   where narrowing saves 32 to 64 words.
-- **Two accepted residuals.** The `sfr-context-save` density bucket does
-  not move: it counts FSR-seed/`INDF` staging triples inside ordinary
-  functions (pointer walks, flash-string copy loops), a different lever
-  filed separately. Menu-demo `-Os` grows 2 words while its listing
+- **Two accepted residuals.** The `sfr-context-save` density bucket now
+  holds only MOVFF runs over the ISR save set. A run with any peripheral move
+  (USART, EEPROM, ADC, INTCON) is priced whole as `peripheral-sfr-move`, so a
+  save move sharing that run is counted as I/O. FSR-seed/`INDF` staging
+  triples in ordinary functions (pointer walks, flash-string copy loops) are
+  claimed by `indirect-seed` first, a different lever filed separately.
+  Menu-demo `-Os` grows 2 words while its listing
   loses 16 lines: the deletion shifts downstream code 64 bytes, and the
   assembler's `.pclalign` NOP pad for a PCL-table block re-settles 34
   words heavier ending exactly on its page boundary (proven by

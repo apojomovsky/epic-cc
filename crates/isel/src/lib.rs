@@ -41,8 +41,8 @@
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    find_value_folds, flash_provenance, log_pool_site, resolve_pointers, ssa_key, Base,
-    FlashProvenance, PtrResolution, Slot, LOG_POOL_CALLEE, LOG_POOL_VARIANT,
+    find_value_folds, flash_provenance, is_directive, log_pool_site, resolve_pointers, ssa_key,
+    Base, FlashProvenance, PtrResolution, Slot, LOG_POOL_CALLEE, LOG_POOL_VARIANT,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -1888,10 +1888,7 @@ impl<'m> Gen<'m> {
         if i == 0 {
             return false;
         }
-        let prev = self.out[i - 1].trim_start();
-        ["BTFSC", "BTFSS", "DECFSZ", "INCFSZ"]
-            .iter()
-            .any(|s| prev.starts_with(s) && prev[s.len()..].starts_with([' ', '\t']))
+        is_skip_line(&self.out[i - 1])
     }
 
     /// A plain `MOVWF d` GPR store line. Special destinations never count:
@@ -7501,6 +7498,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
 /// (every PCLATH restore present) to drive the page assignment, pass
 /// B re-emits it with same-page restores skipped.
 fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
+    let body_start = g.out.len();
     // Labels, prologue, and phi-copy glue are compiler-generated: no source
     // instruction owns them, so they must not inherit a stale loc from the
     // previous function's last instruction.
@@ -7873,6 +7871,74 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
     if f.name == LOG_POOL_CALLEE && !g.pool_log && !g.pool.chunks.is_empty() {
         emit_log_pool_variant(g, f);
     }
+    // Dead PCLATH sets: a set pair that the next set overwrites before any read.
+    drop_dead_pclath_sets(&mut g.out, &mut g.locs, body_start);
+}
+
+/// Whether `line` is a skip instruction. The next line may be skipped at
+/// runtime, so that line must stay exactly as emitted.
+fn is_skip_line(line: &str) -> bool {
+    let line = line.trim_start();
+    ["BTFSC", "BTFSS", "DECFSZ", "INCFSZ"]
+        .iter()
+        .any(|s| line.starts_with(s) && line[s.len()..].starts_with([' ', '\t']))
+}
+
+/// Whether `out[k]` and `out[k+1]` are a `MOVLW X; MOVWF PCLATH` set.
+fn is_pclath_set(out: &[String], k: usize) -> bool {
+    k + 1 < out.len()
+        && out[k].trim_start().starts_with("MOVLW ")
+        && out[k + 1].trim() == "MOVWF PCLATH"
+}
+
+/// Drops a PCLATH set that the next set overwrites before any use: a
+/// `MOVLW X; MOVWF PCLATH` pair directly followed by another such pair.
+/// Only lines at or after `start` are touched, and inline asm is skipped
+/// because its text is user-authored. A pair whose nearest preceding
+/// instruction is a skip stays: removing it would let the skip land on
+/// the next pair's `MOVLW`.
+fn drop_dead_pclath_sets(out: &mut Vec<String>, locs: &mut Vec<Option<SrcLoc>>, start: usize) {
+    let mut drop = vec![false; out.len()];
+    let mut in_asm = false;
+    for k in start..out.len() {
+        let t = out[k].trim_start();
+        if t.starts_with("; --- asm start ---") {
+            in_asm = true;
+            continue;
+        }
+        if t.starts_with("; --- asm end ---") {
+            in_asm = false;
+            continue;
+        }
+        if in_asm || !is_pclath_set(out, k) || !is_pclath_set(out, k + 2) {
+            continue;
+        }
+        if prev_instruction(out, k).is_some_and(is_skip_line) {
+            continue;
+        }
+        drop[k] = true;
+        drop[k + 1] = true;
+    }
+    let mut idx = 0;
+    out.retain(|_| {
+        idx += 1;
+        !drop[idx - 1]
+    });
+    let mut idx = 0;
+    locs.retain(|_| {
+        idx += 1;
+        !drop[idx - 1]
+    });
+}
+
+/// The nearest line before `out[k]` that is an instruction. Blank lines,
+/// comments, and labels do not occupy an address, so a skip above them
+/// still targets the line below.
+fn prev_instruction(out: &[String], k: usize) -> Option<&str> {
+    out[..k].iter().rev().map(String::as_str).find(|l| {
+        let t = l.trim();
+        !(t.is_empty() || t.starts_with(';') || t.ends_with(':'))
+    })
 }
 
 /// Emit the dependency-ordered phi copies for one (pred -> merge) edge: a
@@ -8510,13 +8576,13 @@ fn line_is_word(raw: &str) -> bool {
     if line.is_empty() {
         return false;
     }
-    if line.starts_with("list") || line.starts_with("radix") {
+    if is_directive(line, "list") || is_directive(line, "radix") {
         return false;
     }
     if line.starts_with("org ") {
         return false;
     }
-    if line.starts_with("end") {
+    if is_directive(line, "end") {
         return false;
     }
     if line.ends_with(':') {
@@ -8682,7 +8748,7 @@ fn measure_fit_layout(asm: &str, targets: &HashSet<String>) -> FitLayout {
     };
     for raw in asm.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
@@ -8694,7 +8760,7 @@ fn measure_fit_layout(asm: &str, targets: &HashSet<String>) -> FitLayout {
             org = target;
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             break;
         }
         if let Some(l) = line.strip_suffix(':') {
@@ -8947,10 +9013,10 @@ fn measure_section_units(banked: &str) -> (HashMap<String, usize>, HashMap<Strin
     };
     for raw in banked.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             close(&mut cur, &mut stage, &mut reader);
             break;
         }
@@ -9024,7 +9090,7 @@ fn verify_section_model(places: &[ConstPlace], banked: &str) {
     };
     for raw in banked.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
@@ -9032,7 +9098,7 @@ fn verify_section_model(places: &[ConstPlace], banked: &str) {
             org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             close(&mut cur, &lens);
             break;
         }
@@ -9282,14 +9348,14 @@ fn measure_end_org(text: &str) -> usize {
     let mut org = 0usize;
     for raw in text.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
             org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             continue;
         }
-        if line.starts_with("end") || line.starts_with("__read_") {
+        if is_directive(line, "end") || line.starts_with("__read_") {
             break;
         }
         if line.strip_suffix(':').is_some() {
@@ -9842,14 +9908,14 @@ pub fn select_with_opts(
         let mut cur: Option<(String, usize)> = None;
         for raw in banked.lines() {
             let line = raw.split(';').next().unwrap_or("").trim();
-            if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+            if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
                 continue;
             }
             if let Some(rest) = line.strip_prefix("org ") {
                 org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
                 continue;
             }
-            if line.starts_with("end") {
+            if is_directive(line, "end") {
                 break;
             }
             if let Some(l) = line.strip_suffix(':') {
@@ -10515,3 +10581,176 @@ pub fn select_with_opts(
 /// Re-exported here so `isel`'s own binary (`src/bin/isel.rs`) keeps
 /// working unchanged.
 pub use iselcore::parse_map;
+
+#[cfg(test)]
+mod dead_pclath_tests {
+    use super::drop_dead_pclath_sets;
+
+    fn lines(src: &[&str]) -> (Vec<String>, Vec<Option<super::SrcLoc>>) {
+        let out: Vec<String> = src.iter().map(|s| s.to_string()).collect();
+        let locs = vec![None; out.len()];
+        (out, locs)
+    }
+
+    fn run(src: &[&str]) -> Vec<String> {
+        let (mut out, mut locs) = lines(src);
+        drop_dead_pclath_sets(&mut out, &mut locs, 0);
+        assert_eq!(out.len(), locs.len(), "out and locs stay index-aligned");
+        out
+    }
+
+    #[test]
+    fn adjacent_dead_set_pair_is_dropped() {
+        let out = run(&[
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+            "    CALL g",
+        ]);
+        assert_eq!(out, ["    MOVLW PAGE(f)", "    MOVWF PCLATH", "    CALL g"]);
+    }
+
+    #[test]
+    fn pair_after_a_skip_is_kept() {
+        let src = [
+            "    BTFSC 0x20, 0",
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn skip_separated_by_comment_keeps_pair() {
+        let src = [
+            "    BTFSC 0x20, 0",
+            "    ; note",
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn skip_separated_by_label_keeps_pair() {
+        let src = [
+            "    BTFSC 0x20, 0",
+            "L1:",
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn inline_asm_pairs_are_left_alone() {
+        let src = [
+            "; --- asm start ---",
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+            "; --- asm end ---",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn intervening_line_keeps_the_set() {
+        let src = [
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    NOP",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn label_between_restore_and_next_set_keeps_pair() {
+        // The label breaks the adjacent-set match, so the pair is conservatively kept.
+        let src = [
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "L1:",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn goto_between_restore_and_next_set_keeps_pair() {
+        let src = [
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    GOTO L1",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn label_before_dropped_pair_still_reaches_the_kept_set() {
+        let out = run(&[
+            "L1:",
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+            "    CALL g",
+        ]);
+        assert_eq!(
+            out,
+            ["L1:", "    MOVLW PAGE(f)", "    MOVWF PCLATH", "    CALL g"]
+        );
+    }
+
+    #[test]
+    fn chain_of_three_collapses_to_the_last_set() {
+        let out = run(&[
+            "    MOVLW 0x01",
+            "    MOVWF PCLATH",
+            "    MOVLW 0x02",
+            "    MOVWF PCLATH",
+            "    MOVLW 0x03",
+            "    MOVWF PCLATH",
+            "    RETURN",
+        ]);
+        assert_eq!(out, ["    MOVLW 0x03", "    MOVWF PCLATH", "    RETURN"]);
+    }
+
+    #[test]
+    fn dead_restore_before_next_set_keeps_that_set() {
+        let out = run(&[
+            "    MOVLW PAGE(r)",
+            "    MOVWF PCLATH",
+            "    CALL h",
+            "    MOVLW PAGE(c)",
+            "    MOVWF PCLATH",
+            "    MOVLW PAGE(r)",
+            "    MOVWF PCLATH",
+            "    CALL h",
+        ]);
+        assert_eq!(
+            out,
+            [
+                "    MOVLW PAGE(r)",
+                "    MOVWF PCLATH",
+                "    CALL h",
+                "    MOVLW PAGE(r)",
+                "    MOVWF PCLATH",
+                "    CALL h"
+            ]
+        );
+    }
+}
