@@ -163,7 +163,10 @@ fn merge_baseline(
     let mut skipped = Vec::new();
     for m in measured {
         let key = m.name.clone();
-        let base = baseline.entry.iter().find(|e| e.name == key);
+        let base = baseline
+            .entry
+            .iter()
+            .find(|e| e.name == key && e.profile == m.profile);
         if filter.is_some_and(|f| !f.contains(&key)) {
             match base {
                 Some(b) => {
@@ -871,7 +874,11 @@ fn flash_and_ram_do_not_regress() {
         let report = measure(c, "Os");
         let flash_words = parse_after(&report, "flash: ");
         let ram_bytes = parse_after(&report, "RAM: ");
-        let base = baseline.entry.iter().find(|e| e.name == c.name).cloned();
+        let base = baseline
+            .entry
+            .iter()
+            .find(|e| e.name == c.name && e.profile == "Os")
+            .cloned();
         check_gated(
             c.name,
             flash_words,
@@ -907,7 +914,7 @@ fn flash_and_ram_do_not_regress() {
         let base = baseline
             .entry
             .iter()
-            .find(|e| e.name == entry_key(c.name, "O2"))
+            .find(|e| e.name == entry_key(c.name, "O2") && e.profile == "O2")
             .cloned();
         let key = entry_key(c.name, "O2");
         let gated = O2_BASELINED.contains(&c.name) || base.is_some();
@@ -1226,5 +1233,13 @@ fn baseline_row_names_are_unique() {
             "duplicate baseline name {}",
             e.name
         );
+    }
+}
+
+#[test]
+fn case_names_are_unique() {
+    let mut seen = std::collections::HashSet::new();
+    for c in cases() {
+        assert!(seen.insert(c.name), "duplicate size case name {}", c.name);
     }
 }
