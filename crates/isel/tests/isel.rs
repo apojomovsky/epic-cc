@@ -3352,7 +3352,10 @@ fn sim_run_bytes_o2(
 ) -> Vec<u8> {
     use pic14_sim::Pic14;
     let m = parse(ir_text);
-    let opts = Options { fast_divmod: true };
+    let opts = Options {
+        fast_divmod: true,
+        fast_mul_u8: true,
+    };
     let (asm, _, _) = select_with_opts(
         &PIC16F877A,
         &m,
@@ -3742,6 +3745,11 @@ fn mul_div_rem_routines_simulate_correctly() {
         ("__mul_u8", &[0], &[123], &[0]),
         ("__mul_u8", &[255], &[255], &[0x01]),
         ("__mul_u8", &[0x80], &[2], &[0]),
+        // Multiplier top bit only and full-width operands; mod-256 keeps the low byte.
+        ("__mul_u8", &[255], &[128], &[0x80]),
+        ("__mul_u8", &[1], &[255], &[0xFF]),
+        ("__mul_u8", &[0x81], &[3], &[0x83]),
+        ("__mul_u8", &[37], &[128], &[0x80]),
         // 16-bit mul: 300*7 = 2100 = 0x0834; 0x0105*7 = 0x0723.
         ("__mul_u16", &[0x2C, 0x01], &[0x07, 0x00], &[0x34, 0x08]),
         ("__mul_u16", &[0x05, 0x01], &[0x07, 0x00], &[0x23, 0x07]),
@@ -3793,6 +3801,28 @@ fn mul_div_rem_routines_simulate_correctly() {
         }
         let got = sim_run_bytes(&ir, &map, &seed, out, want.len());
         assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) must be {want:?}");
+    }
+}
+
+/// The four-pass `__mul_u8` body (O2) is checked against `wrapping_mul` on a
+/// sweep: every multiplier for two multiplicands, and every multiplicand for
+/// the edge multipliers 0, 1, 0x80, 0xFF, 0x5A. Covers exits after the first
+/// and second group of four bits.
+#[test]
+fn mul_u8_unrolled_body_matches_wrapping_mul() {
+    let (ir, map) = routine_module("__mul_u8");
+    let check = |a: u8, b: u8| {
+        let got = sim_run_bytes_o2(&ir, &map, &[(0x20, a), (0x21, b)], 0x22, 1);
+        assert_eq!(got[0], a.wrapping_mul(b), "__mul_u8({a}, {b})");
+    };
+    for b in 0..=255u8 {
+        check(255, b);
+        check(0x37, b);
+    }
+    for a in 0..=255u8 {
+        for &b in &[0u8, 1, 0x80, 0xFF, 0x5A] {
+            check(a, b);
+        }
     }
 }
 

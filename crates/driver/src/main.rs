@@ -562,10 +562,13 @@ fn main() {
             } else {
                 isel::ConstPool::empty()
             };
-            // Normalized divide loops trade flash for cycles, so only the
-            // speed profile turns them on (epic-cc#895).
-            let fast_divmod = matches!(cli.opt_level, driver::cli::OptLevel::O2);
-            let opts = isel::Options { fast_divmod };
+            // Speed-profile codegen: normalized divide loops (epic-cc#895) and
+            // the unrolled `__mul_u8` (epic-cc#974). Both trade flash for cycles.
+            let is_o2 = matches!(cli.opt_level, driver::cli::OptLevel::O2);
+            let opts = isel::Options {
+                fast_divmod: is_o2,
+                fast_mul_u8: is_o2,
+            };
             let (asm, locs, c) =
                 isel::select_with_opts(device, &m, &addrs, &layout.staged_consts, &pool, opts);
             chunks = c;
