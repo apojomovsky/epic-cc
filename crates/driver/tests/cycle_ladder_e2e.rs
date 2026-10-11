@@ -29,8 +29,10 @@
 //! Regenerate with `UPDATE_CYCLE_BASELINE=1 cargo test -p driver --test
 //! cycle_ladder_e2e` and diff before committing.
 //! `CYCLE_BASELINE_ONLY=a,b@O2` scopes the rewrite to named rows (`name`
-//! for `-Os`, `name@O2` for `-O2`). `STRICT_CYCLE_BASELINE=1` (set in
-//! CI) additionally fails headroom, like the size ladder's strict mode.
+//! for `-Os`, `name@O2` for `-O2`). `STRICT_CYCLE_BASELINE=1` additionally
+//! fails headroom, like the size ladder's strict mode (local only: CI
+//! measures). `BASELINE_ARTIFACT_DIR` makes the run measure-only and write
+//! `cycle.json` there after the value pins pass (epic-cc#1087).
 //! `SPEED_REPORT_JSON=1` prints the machine-readable dump (one JSON array
 //! between marker lines, needs `-- --nocapture`) carrying cycles plus
 //! flash words per kernel for tooling, and returns before asserting, so
@@ -639,6 +641,34 @@ fn print_report_json(measured: &[BaselineEntry]) {
     println!("SPEED_REPORT_JSON_END");
 }
 
+/// Where a measure-only run writes its rows for the PR delta gate
+/// (`scripts/baseline_delta.py`). Set by `scripts/ci-test.sh`; unset
+/// locally, where the ladder asserts against the committed baseline.
+fn artifact_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("BASELINE_ARTIFACT_DIR").map(std::path::PathBuf::from)
+}
+
+/// Writes `measured` as `cycle.json` in the artifact dir: a JSON array of
+/// `{name, device, profile, cycles, flash_words, ram_bytes}`.
+fn write_artifact(dir: &std::path::Path, measured: &[BaselineEntry]) {
+    std::fs::create_dir_all(dir).expect("create baseline artifact dir");
+    let mut out = String::from("[\n");
+    for (i, e) in measured.iter().enumerate() {
+        out.push_str(&format!(
+            "  {{\"name\": \"{}\", \"device\": \"{}\", \"profile\": \"{}\", \"cycles\": {}, \"flash_words\": {}, \"ram_bytes\": {}}}{}\n",
+            e.name,
+            e.device,
+            e.profile,
+            e.cycles,
+            e.flash_words,
+            e.ram_bytes,
+            if i + 1 == measured.len() { "" } else { "," }
+        ));
+    }
+    out.push_str("]\n");
+    std::fs::write(dir.join("cycle.json"), out).expect("write cycle.json");
+}
+
 /// Gate one measured triple against its baseline entry: growth fails,
 /// and under `strict` so does headroom. Skipped entirely on update runs
 /// (which record instead of asserting).
@@ -828,6 +858,11 @@ fn cycle_counts_do_not_regress() {
         "result value mismatch(es):\n{}",
         value_failures.join("\n")
     );
+
+    if let Some(dir) = artifact_dir() {
+        write_artifact(&dir, &measured);
+        return;
+    }
 
     if update {
         let (to_save, updated, skipped) = merge_baseline(&baseline, &measured, filter.as_ref());
