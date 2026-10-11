@@ -91,6 +91,72 @@ fn flash_string_walk_through_offset_gep_reads_program_memory_on_p18() {
     assert!(halted);
 }
 
+/// A runtime index over a flash walk phi reads program memory (epic-cc#1101):
+/// `p` advances 3 times, then `p[3]` is the 7th byte of the literal ('A').
+#[test]
+fn flash_walk_runtime_index_reads_program_memory_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_runtime_index.c");
+    assert_eq!(
+        ram[map_addr(&map, "out")],
+        b'A',
+        "p[k] after 3 walk steps must read the literal, not INDF0 at flash"
+    );
+    assert!(halted);
+}
+
+/// A runtime condition selects between a walk arm and its offset (epic-cc#1101).
+/// The folded select is one walk slot plus one runtime term, so `q[0]` reads
+/// the literal at the selected index: 'P' for `c == 1`.
+#[test]
+fn flash_walk_selected_arm_reads_program_memory_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_selected.c");
+    assert_eq!(
+        ram[map_addr(&map, "out")],
+        b'P',
+        "q[0] with c == 1 must be the second literal byte"
+    );
+    assert!(halted);
+}
+
+/// A store through a runtime-indexed flash walk writes ROM: refuse it
+/// (epic-cc#1101), never emit a RAM write at a flash address.
+#[test]
+fn flash_walk_runtime_index_store_is_rejected_on_p18() {
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_runtime_index_store.c",
+        "ROM is not writable",
+    );
+}
+
+/// Two runtime indices stacked on a walk phi are not served yet (epic-cc#1101):
+/// refuse with the multi-index diagnostic, never a wrong TBLPTR.
+#[test]
+fn flash_walk_two_runtime_indices_is_rejected_on_p18() {
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_two_index.c",
+        "several runtime indices",
+    );
+}
+
+/// Storing a ROM address into RAM has no RAM form: a later load through the
+/// slot reads RAM at that address (epic-cc#1101). Covers a runtime index and a
+/// constant base, both refused rather than silently read as zero.
+#[test]
+fn flash_walk_store_of_rom_address_is_rejected_on_p18() {
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_store_address_runtime.c",
+        "store of a ROM address into RAM",
+    );
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_store_address_const.c",
+        "store of a ROM address into RAM",
+    );
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_store_address_walk.c",
+        "store of a ROM address into RAM",
+    );
+}
+
 /// Compiles `fixture` for p18f4550 and asserts the driver refuses it with a
 /// diagnostic containing `needle`.
 fn expect_p18_rejection(fixture: &str, needle: &str) {
@@ -123,13 +189,13 @@ fn flash_walk_phi_joined_with_ram_is_rejected_on_p18() {
     );
 }
 
-/// A runtime index over the same phi has no provenance key of its own, so the
-/// load is refused by the walk-slot check instead (epic-cc#1099).
+/// A runtime index over the same phi joins flash and RAM, so the load is refused
+/// as a maybe-flash address (epic-cc#1099).
 #[test]
 fn flash_walk_mixed_runtime_index_load_is_rejected_on_p18() {
     expect_p18_rejection(
         "tests/fixtures/flash_walk_mixed_index.c",
-        "runtime-indexed walk over flash or maybe-flash pointer",
+        "maybe-flash address",
     );
 }
 
@@ -139,7 +205,7 @@ fn flash_walk_mixed_runtime_index_load_is_rejected_on_p18() {
 fn flash_walk_mixed_runtime_index_store_is_rejected_on_p18() {
     expect_p18_rejection(
         "tests/fixtures/flash_walk_mixed_store.c",
-        "ROM is not writable: store through runtime-indexed walk",
+        "ROM is not writable",
     );
 }
 

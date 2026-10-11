@@ -1398,7 +1398,7 @@ pub fn flash_provenance(m: &Module) -> FlashProvenance {
     out
 }
 
-/// Marks flash-walk pointer regs: phi, select, and constant-gep regs whose
+/// Marks flash-walk pointer regs: phi, select, and gep regs whose
 /// every base is a flash `const` global (`is_flash_const`), closed over reg
 /// arms. A loop walk over a flash string (`%p = phi ptr [@s+1, ..], [%n, ..]`
 /// with `%n = gep %p +1`) has no RAM base, so a load through it must read
@@ -1433,7 +1433,7 @@ pub fn add_flash_walks(
                     Inst::Select(s) if s.ptr => {
                         cands.push((s.dst.clone(), vec![arm(&s.a), arm(&s.b)]));
                     }
-                    Inst::Gep(g) if g.terms.is_empty() => {
+                    Inst::Gep(g) => {
                         let base = match &g.base {
                             GepBase::Global(n) if is_flash_const(n) => Arm::Ok,
                             GepBase::Global(_) => Arm::Bad,
