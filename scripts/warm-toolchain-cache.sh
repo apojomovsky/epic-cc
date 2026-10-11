@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Warms the GHCR registry cache for toolchain-cache.yml. Docker Hub's anonymous
-# limit (100 GETs per IP per hour, HEADs uncounted) can 429 the ubuntu base pull
-# on shared runner IPs, so only that failure is retried, sleeping about 52 min
-# in total to outlast one window. Other errors fail at once.
-# Usage: CACHE_REF=ghcr.io/<owner>/<repo>-toolchain bash scripts/warm-toolchain-cache.sh
+# Runs `docker buildx build` for every job that builds the ci or release image,
+# against the GHCR registry cache. Docker Hub's anonymous limit (100 GETs per IP
+# per hour, HEADs uncounted) can 429 the ubuntu base pull on shared runner IPs,
+# so only that failure is retried, sleeping about 52 min in total to outlast one
+# window. Other errors fail at once.
+# Usage: CACHE_REF=ghcr.io/<owner>/<repo>-toolchain bash scripts/warm-toolchain-cache.sh --target ci [flags]
+# Flags go to `docker buildx build`; the cache flags and the . context are added here.
 set -uo pipefail
 
 : "${CACHE_REF:?set CACHE_REF to the registry cache ref}"
+[ "$#" -gt 0 ] || { echo "usage: warm-toolchain-cache.sh <docker buildx build flags>" >&2; exit 2; }
 
 cd "$(dirname "$0")/.." || exit 1
 
@@ -18,10 +21,10 @@ trap 'rm -f "$log"' EXIT
 attempt=0
 while :; do
   status=0
-  docker buildx build --target ci \
+  docker buildx build \
     --cache-from "type=registry,ref=$CACHE_REF,ignore-error=true" \
     --cache-to "type=registry,ref=$CACHE_REF,mode=max,ignore-error=true" \
-    . 2>&1 | tee "$log" || status=$?
+    "$@" . 2>&1 | tee "$log" || status=$?
   [ "$status" -eq 0 ] && exit 0
 
   if ! grep -qiE '429 Too Many Requests|toomanyrequests' "$log"; then

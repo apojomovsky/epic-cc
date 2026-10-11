@@ -37,13 +37,12 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build release bundle (cached clang layer)
+        env:
+          CACHE_REF: ghcr.io/${{ github.repository }}-toolchain
         run: |
           ver="${GITHUB_REF_NAME#v}"
-          docker buildx build --target release --load \
-            --build-arg EPIC_CC_VERSION="$ver" \
-            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true \
-            --cache-to type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true \
-            -t "epic-cc-release:$ver" .
+          bash scripts/warm-toolchain-cache.sh --target release --load \
+            --build-arg EPIC_CC_VERSION="$ver" -t "epic-cc-release:$ver"
 
       - name: Extract bundle from image
         run: |
