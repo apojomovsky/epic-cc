@@ -3804,24 +3804,36 @@ fn mul_div_rem_routines_simulate_correctly() {
     }
 }
 
-/// The four-pass `__mul_u8` body (O2) is checked against `wrapping_mul` on a
-/// sweep: every multiplier for two multiplicands, and every multiplicand for
-/// the edge multipliers 0, 1, 0x80, 0xFF, 0x5A. Covers exits after the first
-/// and second group of four bits.
+/// The eight-pass straight-line `__mul_u8` body (O2) is checked against
+/// `wrapping_mul` for every (a, b) pair. The body has no loop, so each pair
+/// runs the same eight passes; assembling once and re-running the simulator
+/// keeps the 65536 cases cheap.
 #[test]
 fn mul_u8_unrolled_body_matches_wrapping_mul() {
+    use pic14_sim::Pic14;
     let (ir, map) = routine_module("__mul_u8");
-    let check = |a: u8, b: u8| {
-        let got = sim_run_bytes_o2(&ir, &map, &[(0x20, a), (0x21, b)], 0x22, 1);
-        assert_eq!(got[0], a.wrapping_mul(b), "__mul_u8({a}, {b})");
+    let m = parse(&ir);
+    let opts = Options {
+        fast_divmod: true,
+        fast_mul_u8: true,
     };
-    for b in 0..=255u8 {
-        check(255, b);
-        check(0x37, b);
-    }
+    let (asm, _, _) = select_with_opts(
+        &PIC16F877A,
+        &m,
+        &addrs(&map_refs(&map)),
+        &HashSet::new(),
+        &ConstPool::empty(),
+        opts,
+    );
+    let words = asm::assemble(&asm);
     for a in 0..=255u8 {
-        for &b in &[0u8, 1, 0x80, 0xFF, 0x5A] {
-            check(a, b);
+        for b in 0..=255u8 {
+            let mut p = Pic14::new(words.clone());
+            p.ram_mut()[0x20] = a;
+            p.ram_mut()[0x21] = b;
+            p.run(200_000);
+            assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+            assert_eq!(p.ram()[0x22], a.wrapping_mul(b), "__mul_u8({a}, {b})");
         }
     }
 }
