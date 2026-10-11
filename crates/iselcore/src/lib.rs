@@ -1398,13 +1398,14 @@ pub fn flash_provenance(m: &Module) -> FlashProvenance {
     out
 }
 
-/// Marks flash-walk pointer regs as `flash`: phi, select, and constant-gep
-/// regs whose every base is a flash `const` global (`is_flash_const`), closed
-/// over reg arms. A loop walk over a flash string (`%p = phi ptr [@s+1, ..],
-/// [%n, ..]` with `%n = gep %p +1`) has no RAM base, so a load through it must
-/// read program memory via TBLRD (epic-cc#1091). Greatest fixpoint: a
-/// self-advancing cycle stays, and any non-flash arm drops the reg. A gep
-/// over a walk phi has no slot; isel-pic18 reads it through the phi's slot.
+/// Marks flash-walk pointer regs: phi, select, and constant-gep regs whose
+/// every base is a flash `const` global (`is_flash_const`), closed over reg
+/// arms. A loop walk over a flash string (`%p = phi ptr [@s+1, ..], [%n, ..]`
+/// with `%n = gep %p +1`) has no RAM base, so a load through it must read
+/// program memory via TBLRD (epic-cc#1091). Greatest fixpoint: a self-advancing
+/// cycle stays. A dropped reg that still reaches a flash arm is `mixed`
+/// (epic-cc#1099), so loads and stores through it panic. A gep over a walk phi
+/// has no slot; isel-pic18 reads it through the phi's slot.
 pub fn add_flash_walks(
     prov: &mut FlashProvenance,
     m: &Module,
@@ -1463,6 +1464,41 @@ pub fn add_flash_walks(
             for d in dead {
                 live.remove(&d);
                 changed = true;
+            }
+        }
+        // A dead candidate that still reaches a flash arm, directly or through
+        // a live, mixed, or flash-tagged reg, holds a flash address on some path
+        // and RAM on another: no single address space (epic-cc#1099).
+        let mut maybe_flash: HashSet<String> = HashSet::new();
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for (d, arms) in &cands {
+                if live.contains(d) || maybe_flash.contains(d) {
+                    continue;
+                }
+                let touches = arms.iter().any(|a| match a {
+                    Arm::Ok => true,
+                    Arm::Reg(r) => {
+                        let key = ssa_key(&f.name, r);
+                        live.contains(r)
+                            || maybe_flash.contains(r)
+                            || prov.flash.contains(&key)
+                            || prov.mixed.contains(&key)
+                    }
+                    Arm::Bad => false,
+                });
+                if touches {
+                    maybe_flash.insert(d.clone());
+                    grew = true;
+                }
+            }
+        }
+        for d in maybe_flash {
+            let key = ssa_key(&f.name, &d);
+            // flash_provenance already tagged this vptr key flash; keep it.
+            if !prov.flash.contains(&key) {
+                prov.mixed.insert(key);
             }
         }
         for d in live {
