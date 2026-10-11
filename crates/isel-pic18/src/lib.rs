@@ -4371,11 +4371,11 @@ impl<'m> Gen<'m> {
     /// reporting the resolved kinds. Bodies live in `emit_memcpy_body`
     /// so one seed can serve a whole walk. (epic-cc#492)
     fn emit_memcpy_setups(&mut self, mc: &ir::Memcpy, byte_off: u8) -> (McSrc, Addr) {
+        self.check_memcpy_flash_dst(&mc.dst);
         // Sets the source on FSR1 so the destination FSR0 setup cannot clobber
         // an indirect source (epic-cc#143); a flash source has no RAM
         // address and seeds `TBLPTR` instead.
         if let Some((table, k, terms)) = self.const_base_of(&mc.src) {
-            self.check_memcpy_flash_dst(&mc.dst);
             self.emit_tblptr_setup_shared(&table, k, &terms, byte_off);
             return (McSrc::Tblrd, self.emit_ptr_setup(&mc.dst, byte_off));
         }
@@ -4385,7 +4385,6 @@ impl<'m> Gen<'m> {
         if let Val::Reg(r) = &mc.src {
             let key = ssa_key(self.cur_func, r);
             if self.prov.flash.contains(&key) {
-                self.check_memcpy_flash_dst(&mc.dst);
                 let (sname, k) = match self.resolved.get(&key) {
                     Some((Base::Slot(sname, true), k, terms)) => {
                         if !terms.is_empty() {
@@ -4419,8 +4418,8 @@ impl<'m> Gen<'m> {
         (src_direct.map_or(McSrc::Indirect, McSrc::Direct), dst)
     }
 
-    /// Panics when a memcpy from a flash source would write into ROM. The Store
-    /// arm panics on the same shapes (epic-cc#832, epic-cc#1099).
+    /// Panics when a memcpy would write into ROM, whatever its source. The
+    /// Store arm panics on the same shapes (epic-cc#832, epic-cc#1099).
     fn check_memcpy_flash_dst(&self, dst: &Val) {
         if self.const_base_of(dst).is_some() {
             panic!(
@@ -4442,25 +4441,28 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// True when a plain `memcpy` call's source may hold a flash address.
-    /// The libc body reads its source through FSR1, so it would read RAM at
-    /// a flash address (epic-cc#1100).
+    /// True when a plain `memcpy` call touches flash: a source that may hold a
+    /// flash address (libc would read RAM there, epic-cc#1100), or a destination
+    /// that is ROM or may be flash (libc would write into ROM).
     fn memcpy_call_from_flash(&self, c: &ir::Call) -> bool {
-        let Some(src) = c.args.get(1) else {
+        let (Some(dst), Some(src)) = (c.args.first(), c.args.get(1)) else {
             return false;
         };
-        let Val::Reg(r) = &src.val else {
-            return false;
+        let may_be_flash = |v: &Val| match v {
+            Val::Reg(r) => {
+                let key = ssa_key(self.cur_func, r);
+                self.prov.flash.contains(&key)
+                    || self.prov.mixed.contains(&key)
+                    || self.maybe_flash_slot_under_index(&key).is_some()
+            }
+            _ => false,
         };
-        let key = ssa_key(self.cur_func, r);
-        self.prov.flash.contains(&key)
-            || self.prov.mixed.contains(&key)
-            || self.maybe_flash_slot_under_index(&key).is_some()
+        self.const_base_of(&dst.val).is_some() || may_be_flash(&dst.val) || may_be_flash(&src.val)
     }
 
-    /// Lowers a flash-sourced `memcpy` call as the constant-length `Memcpy`,
-    /// so the source reads through TBLRD. A runtime length panics: no flash
-    /// walk of unknown length lowers yet.
+    /// Lowers a memcpy call that touches flash as the constant-length `Memcpy`,
+    /// so a flash source reads through TBLRD and a ROM destination panics. A
+    /// runtime length panics: no flash walk of unknown length lowers yet.
     fn emit_flash_memcpy_call(&mut self, c: &ir::Call) {
         let [dst, src, len] = c.args.as_slice() else {
             panic!(
@@ -4468,6 +4470,7 @@ impl<'m> Gen<'m> {
                 c.args.len()
             );
         };
+        self.check_memcpy_flash_dst(&dst.val);
         let Val::Const(n) = len.val else {
             panic!(
                 "isel-pic18: memcpy from a flash pointer with a runtime length is not supported (epic-cc#1100)"
@@ -13912,13 +13915,11 @@ mod tests {
         assert_eq!(l2, "tmp1", "a second Gen sharing the same backing counter must continue, not restart, the sequence");
     }
 
-    /// A memcpy whose destination phi joins a RAM buffer with a flash walk
-    /// writes ROM through a maybe-flash pointer, so it is refused. `select`
-    /// runs the flash-walk provenance pass that the guard reads.
-    #[test]
-    #[should_panic(expected = "ROM is not writable: memcpy into")]
-    fn memcpy_into_maybe_flash_dst_panics() {
-        let m = ir::parse(
+    /// Runs `select` over a loop whose destination phi joins RAM `buf` with a
+    /// flash walk, with `copy` as the memcpy in the loop body. The flash-walk
+    /// provenance pass that the ROM guard reads runs inside `select`.
+    fn select_maybe_flash_dst_loop(copy: &str) {
+        let text = format!(
             r#"const .str i8
 global buf i8
 global sum i8
@@ -13932,7 +13933,7 @@ fn main(i16) ()
     %d = phi ptr %lsr.iv 1 @buf 0
     %2 = phi i8 %4 1 0 0
     %scevgep1 = gep %lsr.iv +65535
-    memcpy %d %scevgep1 16
+    {copy}
     %3 = load i8 @buf
     %4 = add i8 %3 %2
     %5 = load i8 %lsr.iv
@@ -13943,8 +13944,9 @@ fn main(i16) ()
     store volatile i8 %4 @sum
     store volatile i8 26 @sent
     ret i16 0
-"#,
+"#
         );
+        let m = ir::parse(&text);
         let names = [
             "__gep1", "lsr.iv", "d", "2", "scevgep1", "3", "4", "5", "6", "scevgep",
         ];
@@ -13958,6 +13960,30 @@ fn main(i16) ()
         addrs.insert("sent".to_string(), 0x083);
         let dev = device::resolve("p18f4550").expect("p18f4550 is a known part");
         select(dev, &m, &addrs, None);
+    }
+
+    /// A flash-walk source copied into a destination that may be flash is
+    /// refused, the same as a store through that pointer.
+    #[test]
+    #[should_panic(expected = "ROM is not writable: memcpy into")]
+    fn memcpy_into_maybe_flash_dst_panics() {
+        select_maybe_flash_dst_loop("memcpy %d %scevgep1 16");
+    }
+
+    /// A RAM source does not make a flash destination safe: the copy still
+    /// writes ROM (epic-cc#1100).
+    #[test]
+    #[should_panic(expected = "ROM is not writable: memcpy into")]
+    fn memcpy_ram_source_into_maybe_flash_dst_panics() {
+        select_maybe_flash_dst_loop("memcpy %d @buf 16");
+    }
+
+    /// A plain `memcpy` call to a maybe-flash destination is lowered to the
+    /// guarded copy rather than libc, which would store into ROM.
+    #[test]
+    #[should_panic(expected = "ROM is not writable: memcpy into")]
+    fn plain_memcpy_call_into_maybe_flash_dst_panics() {
+        select_maybe_flash_dst_loop("call void @memcpy(%d, @buf, 16)");
     }
 }
 
