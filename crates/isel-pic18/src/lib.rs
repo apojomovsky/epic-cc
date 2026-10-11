@@ -7449,6 +7449,7 @@ impl<'m> Gen<'m> {
                     }
                 }
                 ir::MemLen::Reg(_) => {
+                    self.check_memcpy_flash_dst(&mc.dst);
                     panic!("isel-pic18: dynamic-length memcpy not yet supported (P3 scope)")
                 }
             },
@@ -13984,6 +13985,14 @@ fn main(i16) ()
     #[should_panic(expected = "ROM is not writable: memcpy into")]
     fn plain_memcpy_call_into_maybe_flash_dst_panics() {
         select_maybe_flash_dst_loop("call void @memcpy(%d, @buf, 16)");
+    }
+
+    /// A runtime-length copy into a maybe-flash destination names the ROM
+    /// write, not the dynamic-length limit (epic-cc#1100).
+    #[test]
+    #[should_panic(expected = "ROM is not writable: memcpy into")]
+    fn memcpy_runtime_len_into_maybe_flash_dst_panics() {
+        select_maybe_flash_dst_loop("memcpy %d @buf %2");
     }
 }
 
