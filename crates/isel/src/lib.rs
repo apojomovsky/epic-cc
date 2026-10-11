@@ -180,6 +180,8 @@ struct Gen<'m> {
     /// unsigned divmod routines run a bit-length-derived iteration count
     /// instead of the full width, trading flash for cycles.
     fast_divmod: bool,
+    /// Four-pass `__mul_u8` body (epic-cc#974), speed profile only.
+    fast_mul_u8: bool,
     cur_func: &'m str,
     /// Module-scoped fresh-label counter, shared across every function so the
     /// emitted `tmp{n}:` labels stay unique in the single `.asm` output.
@@ -4501,22 +4503,44 @@ impl<'m> Gen<'m> {
                 let b = self.slot_addr(name, "b").direct();
                 self.assert_bank0(&[a, b, scr], name);
                 let r = scr;
-                let l_loop = self.fresh_label();
-                let l_skip = self.fresh_label();
-                self.emit(format!("    CLRF 0x{r:02X}")); // r = 0
-                self.emit(format!("{l_loop}:"));
-                self.emit(format!("    BTFSS 0x{b:02X}, 0")); // test multiplier LSB
-                self.emit(format!("    GOTO {l_skip}"));
-                self.emit(format!("    MOVF 0x{a:02X}, W"));
-                self.emit(format!("    ADDWF 0x{r:02X}, F")); // r += t, mod 256
-                self.emit(format!("{l_skip}:"));
-                self.emit("    BCF STATUS, 0".to_string());
-                self.emit(format!("    RLF 0x{a:02X}, F")); // t <<= 1, mod 256
-                self.emit("    BCF STATUS, 0".to_string());
-                self.emit(format!("    RRF 0x{b:02X}, F")); // bk >>= 1
-                self.emit(format!("    MOVF 0x{b:02X}, F")); // Z = (bk == 0)
-                self.emit("    BTFSS STATUS, 2".to_string());
-                self.emit(format!("    GOTO {l_loop}"));
+                if self.fast_mul_u8 {
+                    // Four passes per loop iteration with no per-bit branch.
+                    // W is a per-pass temporary reloaded from `a` each pass, so
+                    // a clear multiplier bit costs only the skipped ADDWF. The
+                    // zero test runs once per four bits. BCF before each RRF
+                    // keeps the ADDWF carry out of multiplier bit 7.
+                    let l_loop = self.fresh_label();
+                    self.emit(format!("    CLRF 0x{r:02X}")); // r = 0
+                    self.emit(format!("{l_loop}:"));
+                    for _ in 0..4 {
+                        self.emit(format!("    MOVF 0x{a:02X}, W")); // W = t = a << k
+                        self.emit(format!("    BTFSC 0x{b:02X}, 0")); // skip add on clear bit
+                        self.emit(format!("    ADDWF 0x{r:02X}, F")); // r += t, mod 256
+                        self.emit("    BCF STATUS, 0".to_string()); // carry from ADDWF must not enter bk bit 7
+                        self.emit(format!("    RRF 0x{b:02X}, F")); // bk >>= 1
+                        self.emit(format!("    ADDWF 0x{a:02X}, F")); // t = t + t, mod 256
+                    }
+                    self.emit(format!("    MOVF 0x{b:02X}, F")); // Z = (bk == 0)
+                    self.emit("    BTFSS STATUS, 2".to_string());
+                    self.emit(format!("    GOTO {l_loop}"));
+                } else {
+                    let l_loop = self.fresh_label();
+                    let l_skip = self.fresh_label();
+                    self.emit(format!("    CLRF 0x{r:02X}")); // r = 0
+                    self.emit(format!("{l_loop}:"));
+                    self.emit(format!("    BTFSS 0x{b:02X}, 0")); // test multiplier LSB
+                    self.emit(format!("    GOTO {l_skip}"));
+                    self.emit(format!("    MOVF 0x{a:02X}, W"));
+                    self.emit(format!("    ADDWF 0x{r:02X}, F")); // r += t, mod 256
+                    self.emit(format!("{l_skip}:"));
+                    self.emit("    BCF STATUS, 0".to_string());
+                    self.emit(format!("    RLF 0x{a:02X}, F")); // t <<= 1, mod 256
+                    self.emit("    BCF STATUS, 0".to_string());
+                    self.emit(format!("    RRF 0x{b:02X}, F")); // bk >>= 1
+                    self.emit(format!("    MOVF 0x{b:02X}, F")); // Z = (bk == 0)
+                    self.emit("    BTFSS STATUS, 2".to_string());
+                    self.emit(format!("    GOTO {l_loop}"));
+                }
                 // One byte, not two: the declared result is i8, so the
                 // high product byte is dead. Storing only the low byte
                 // also leaves it in W for the caller's return-value copy.
@@ -7468,6 +7492,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         scratch: g.scratch,
         retval_lo: g.retval_lo,
         fast_divmod: g.fast_divmod,
+        fast_mul_u8: g.fast_mul_u8,
         cur_func: g.cur_func,
         bool_temps: HashSet::new(),
         tmp: &mut *g.tmp,
@@ -9555,11 +9580,17 @@ pub struct Options {
     /// run a bit-length-derived iteration count instead of the full width.
     /// The speed profile turns it on, trading flash for cycles.
     pub fast_divmod: bool,
+    /// Unrolled `__mul_u8` (epic-cc#974): four straight-line passes per
+    /// loop iteration, no per-bit branch. The speed profile turns it on.
+    pub fast_mul_u8: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { fast_divmod: false }
+        Self {
+            fast_divmod: false,
+            fast_mul_u8: false,
+        }
     }
 }
 
@@ -9580,10 +9611,10 @@ pub fn select_with_locs(
     select_with_opts(device, m, addrs, staged, pool, Options::default())
 }
 
-/// `select_with_locs` with codegen options. The driver passes
-/// `fast_divmod: true` under the speed profile, so the unsigned divide
-/// routines run normalized loops instead of trading cycles for flash
-/// (epic-cc#895).
+/// `select_with_locs` with codegen options. The driver sets `fast_divmod`
+/// and `fast_mul_u8` under O2, so the unsigned divide and multiply routines
+/// run their normalized loops instead of trading cycles for flash
+/// (epic-cc#895, epic-cc#974).
 pub fn select_with_opts(
     device: &Device,
     m: &Module,
@@ -9780,6 +9811,7 @@ pub fn select_with_opts(
                 scratch,
                 retval_lo,
                 fast_divmod: opts.fast_divmod,
+                fast_mul_u8: opts.fast_mul_u8,
                 cur_func: &f.name,
                 bool_temps: HashSet::new(),
                 tmp: &mut tmp,
@@ -10012,6 +10044,7 @@ pub fn select_with_opts(
                     scratch,
                     retval_lo,
                     fast_divmod: opts.fast_divmod,
+                    fast_mul_u8: opts.fast_mul_u8,
                     cur_func: &f.name,
                     bool_temps: HashSet::new(),
                     tmp: &mut tmp2,
@@ -10341,6 +10374,7 @@ pub fn select_with_opts(
                                 scratch,
                                 retval_lo,
                                 fast_divmod: opts.fast_divmod,
+                                fast_mul_u8: opts.fast_mul_u8,
                                 cur_func: &f.name,
                                 bool_temps: HashSet::new(),
                                 tmp: &mut tmp,
