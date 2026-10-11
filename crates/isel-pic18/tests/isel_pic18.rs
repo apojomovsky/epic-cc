@@ -10369,3 +10369,104 @@ fn zext_returned_as_i16_keeps_its_high_byte() {
         "returned zext must write its high return byte:\n{asm}"
     );
 }
+
+/// Inline mul sites (epic-cc#973): operand loads read their globals at the
+/// MULWF, and the result stores straight into its global. No staging copy of
+/// either operand and no dst temp hop remain.
+#[test]
+fn inline_u8_mul_folds_operand_reads_and_dst_store() {
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal r i8\n\
+         fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n\
+           %3 = call i8 @__mul_u8(i8 %1, i8 %2)\n    store i8 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("r", 0x22),
+        ("__mul_u8::a", 0x30),
+        ("__mul_u8::b", 0x31),
+        ("__mul_u8::__scr", 0x32),
+        ("main::1", 0x40),
+        ("main::2", 0x41),
+        ("main::3", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVFF 0x020,") && !asm.contains("MOVFF 0x021,"),
+        "operands must not be staged through temps:\n{asm}"
+    );
+    assert!(
+        asm.contains("MULWF 0x020,A") || asm.contains("MULWF 0x021,A"),
+        "MULWF must read a folded operand global:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0xFF3, 0x022"),
+        "result must store-forward straight into r:\n{asm}"
+    );
+    assert!(
+        !asm.contains("0x042"),
+        "the dst temp must not be written when forwarded:\n{asm}"
+    );
+}
+
+/// A store between the call and the result's store is a memory access the
+/// result cannot cross, so the dst keeps its temp and the forward is refused.
+#[test]
+fn inline_u8_mul_dst_not_forwarded_across_a_store() {
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal r i8\nglobal c i8\n\
+         fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n\
+           %3 = call i8 @__mul_u8(i8 %1, i8 %2)\n    store i8 7 @c\n    store i8 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("r", 0x22),
+        ("c", 0x23),
+        ("__mul_u8::a", 0x30),
+        ("__mul_u8::b", 0x31),
+        ("__mul_u8::__scr", 0x32),
+        ("main::1", 0x40),
+        ("main::2", 0x41),
+        ("main::3", 0x42),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MULWF"), "the call stays inline:\n{asm}");
+    assert!(
+        !asm.contains("MOVFF 0xFF3, 0x022"),
+        "result must not forward across the store to c:\n{asm}"
+    );
+}
+
+/// An unfolded load between the operand loads and the call is a read the
+/// operand reads cannot be moved across, so both operands stay staged.
+#[test]
+fn inline_u8_mul_operand_not_folded_across_a_load() {
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal c i8\nglobal r i8\n\
+         fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %4 = load i8 @c\n    %2 = load i8 @b\n\
+           %3 = call i8 @__mul_u8(i8 %1, i8 %2)\n    store i8 %3 @r\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("c", 0x23),
+        ("r", 0x22),
+        ("__mul_u8::a", 0x30),
+        ("__mul_u8::b", 0x31),
+        ("__mul_u8::__scr", 0x32),
+        ("main::1", 0x40),
+        ("main::2", 0x41),
+        ("main::3", 0x42),
+        ("main::4", 0x43),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x020, 0x040"),
+        "operand a must be read at its load, not folded past load c:\n{asm}"
+    );
+}
