@@ -8,6 +8,10 @@
 //! the trip count as well as the last byte. The offset fixture reads through
 //! a constant-offset gep over the walk phi (`q = p + 1; q[1]`), whose result
 //! is pinned against the literal bytes.
+//!
+//! The mixed-phi fixtures (epic-cc#1099) join a flash literal with a RAM buffer.
+//! Direct and runtime-indexed loads and stores through them are refused at
+//! compile time, never emitted as a read or write at a flash address.
 
 use std::process::Command;
 
@@ -85,4 +89,56 @@ fn flash_string_walk_through_offset_gep_reads_program_memory_on_p18() {
     );
     assert_eq!(ram[map_addr(&map, "n")], 25, "walk must take 25 steps");
     assert!(halted);
+}
+
+/// Compiles `fixture` for p18f4550 and asserts the driver refuses it with a
+/// diagnostic containing `needle`.
+fn expect_p18_rejection(fixture: &str, needle: &str) {
+    let stem = std::path::Path::new(fixture)
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let hex_path = std::env::temp_dir().join(format!("{stem}_{}.hex", std::process::id()));
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args(["--device", "p18f4550", "-o"])
+        .arg(&hex_path)
+        .arg(fixture)
+        .output()
+        .expect("run driver");
+    let _ = std::fs::remove_file(&hex_path);
+    assert!(!out.status.success(), "{fixture} must not compile");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(needle), "stderr:\n{stderr}");
+}
+
+/// A flash literal joined with a RAM buffer (`p = buf` in the walk loop) has
+/// no single address space. The driver must refuse it (epic-cc#1099) rather
+/// than emit an INDF0 read at a flash address.
+#[test]
+fn flash_walk_phi_joined_with_ram_is_rejected_on_p18() {
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_mixed_phi.c",
+        "maybe-flash address",
+    );
+}
+
+/// A runtime index over the same phi has no provenance key of its own, so the
+/// load is refused by the walk-slot check instead (epic-cc#1099).
+#[test]
+fn flash_walk_mixed_runtime_index_load_is_rejected_on_p18() {
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_mixed_index.c",
+        "runtime-indexed walk over flash or maybe-flash pointer",
+    );
+}
+
+/// The store through the runtime-indexed mixed phi lands on the same slot as
+/// the load above: refused, never written to RAM at a flash address (epic-cc#1099).
+#[test]
+fn flash_walk_mixed_runtime_index_store_is_rejected_on_p18() {
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_mixed_store.c",
+        "ROM is not writable: store through runtime-indexed walk",
+    );
 }

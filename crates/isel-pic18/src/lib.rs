@@ -3563,6 +3563,20 @@ impl<'m> Gen<'m> {
         )
     }
 
+    /// Names the walk-phi slot that a runtime-indexed gep over `key` reads through,
+    /// when that slot may hold a flash address (flash or maybe-flash, epic-cc#1091,
+    /// epic-cc#1099). Such a gep has no provenance key of its own.
+    fn maybe_flash_slot_under_index(&self, key: &str) -> Option<String> {
+        match self.resolved.get(key) {
+            Some((Base::Slot(sname, true), _, terms)) if !terms.is_empty() => {
+                let sk = ssa_key(self.cur_func, sname);
+                (self.prov.flash.contains(&sk) || self.prov.mixed.contains(&sk))
+                    .then(|| sname.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the `(a, f)` components for a `W`-routing instruction,
     /// emitting `MOVLB` when the tracked `BSR` mismatches.
     /// Both Access Bank ranges (`0x000-0x05F` and `0xF60-0xFFF`) use `a=0`
@@ -6086,20 +6100,17 @@ impl<'m> Gen<'m> {
                     }
                     if self.prov.mixed.contains(&key) {
                         panic!(
-                            "isel-pic18: load through maybe-flash address %{r} is not supported (unserved vtable dispatch shape, epic-cc#832)"
+                            "isel-pic18: load through maybe-flash address %{r} is not supported (a pointer joins flash and RAM, or an unserved vtable dispatch shape; epic-cc#832, epic-cc#1099)"
                         );
                     }
                     // A runtime index over a walk phi needs `phi + scale*idx` seeded
                     // from the phi slot, which only the table-label chain emits. Refuse
-                    // rather than read INDF0 at a flash address (epic-cc#1091).
-                    if let Some((Base::Slot(sname, true), _, terms)) = self.resolved.get(&key) {
-                        if !terms.is_empty()
-                            && self.prov.flash.contains(&ssa_key(self.cur_func, sname))
-                        {
-                            panic!(
-                                "isel-pic18: load through a runtime-indexed walk over flash pointer %{sname} is not supported (epic-cc#1091)"
-                            );
-                        }
+                    // rather than read INDF0 at a flash address (epic-cc#1091). A mixed
+                    // phi is the same hazard: its slot may hold a flash address (epic-cc#1099).
+                    if let Some(sname) = self.maybe_flash_slot_under_index(&key) {
+                        panic!(
+                            "isel-pic18: load through a runtime-indexed walk over flash or maybe-flash pointer %{sname} is not supported (epic-cc#1091, epic-cc#1099)"
+                        );
                     }
                 }
                 // FSR0 seeds once (byte_off 0); indirect bytes walk
@@ -6198,6 +6209,13 @@ impl<'m> Gen<'m> {
                     if self.prov.flash.contains(&key) || self.prov.mixed.contains(&key) {
                         panic!(
                             "isel-pic18: ROM is not writable: store through flash-derived address %{r} (epic-cc#832)"
+                        );
+                    }
+                    // A runtime-indexed gep has no provenance key: its store lands on the
+                    // walk phi's slot, which may hold a flash address (epic-cc#1099).
+                    if let Some(sname) = self.maybe_flash_slot_under_index(&key) {
+                        panic!(
+                            "isel-pic18: ROM is not writable: store through runtime-indexed walk over flash or maybe-flash pointer %{sname} (epic-cc#832, epic-cc#1099)"
                         );
                     }
                 }

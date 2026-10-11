@@ -26,6 +26,13 @@
   stores through either. The PIC14, PIC14E, and baseline backends panic on
   both: C++ virtual dispatch is PIC18-only, and a data-memory read of a
   flash address must never emit silently.
+* Amended (epic-cc#1099): the same `mixed` rule covers string literals. A
+  phi or select joining a flash literal with any non-walk arm (RAM global,
+  null, integer, or pointer param) lands in `mixed`, so a direct load through
+  it panics on PIC18 instead of reading INDF0 at a flash address. A
+  runtime-indexed load or store through a flash or `mixed` walk phi also
+  panics: the check runs on the phi slot, since a dynamic index has no
+  provenance key of its own.
 * The dispatch sequence replays on hardware through the `tblrd-flash-ptr`
   superopt spec (candidate plus `LOW/HIGH` gensym support in the batch
   builder); per-fixture runs stay sim-only per docs/40 §5.
