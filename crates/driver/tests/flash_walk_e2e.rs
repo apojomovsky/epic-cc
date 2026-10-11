@@ -138,6 +138,21 @@ fn flash_walk_two_runtime_indices_is_rejected_on_p18() {
     );
 }
 
+/// Storing a ROM address into RAM has no RAM form: a later load through the
+/// slot reads RAM at that address (epic-cc#1101). Covers a runtime index and a
+/// constant base, both refused rather than silently read as zero.
+#[test]
+fn flash_walk_store_of_rom_address_is_rejected_on_p18() {
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_store_address_runtime.c",
+        "store of a ROM address into RAM",
+    );
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_store_address_const.c",
+        "store of a ROM address into RAM",
+    );
+}
+
 /// Compiles `fixture` for p18f4550 and asserts the driver refuses it with a
 /// diagnostic containing `needle`.
 fn expect_p18_rejection(fixture: &str, needle: &str) {

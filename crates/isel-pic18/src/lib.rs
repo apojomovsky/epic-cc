@@ -6356,6 +6356,23 @@ impl<'m> Gen<'m> {
                         "isel-pic18: ROM is not writable: store through const global {ptr_val:?}"
                     );
                 }
+                // A ROM address has no RAM form: a later load through the stored
+                // slot reads RAM at that address, silently wrong. Refused until
+                // flash pointers can live in RAM (epic-cc#1101).
+                let stores_rom = match &s.val {
+                    Val::Global(g) => self.global_is_const(g),
+                    Val::Reg(r) => matches!(
+                        self.resolved.get(&ssa_key(self.cur_func, r)),
+                        Some((Base::Global(g), _, _)) if self.global_is_const(g)
+                    ),
+                    _ => false,
+                };
+                if stores_rom {
+                    panic!(
+                        "isel-pic18: store of a ROM address into RAM is not supported: {:?} (epic-cc#1101)",
+                        s.val
+                    );
+                }
                 // A store through a flash-derived address is a write to ROM
                 // through a runtime pointer: panic like the const-base case
                 // above, never emit it as a RAM write (epic-cc#832).

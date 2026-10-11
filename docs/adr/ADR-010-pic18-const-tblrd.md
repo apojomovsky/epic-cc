@@ -6,7 +6,7 @@ one seed and walk `TBLRD*+`, superseding item 2 below.
 Phi walk amendment 2026-10-11 (epic-cc#1101): a flash walk phi (`p = p + 1` in
 a loop) serves one runtime index term, both `p[i]` and a select `c ? p + 1 : p`
 read as seed, `ADD` the term, `TBLRD`. Several runtime terms and any store
-through the walk are refused, never emitted (ROM is not writable).
+through the walk and any ROM address stored into RAM (a pointer global set to `s + n`) are refused, never emitted (ROM is not writable).
 
 ## Decision
 
