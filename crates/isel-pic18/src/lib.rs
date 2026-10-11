@@ -5120,16 +5120,21 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Add the single dynamic term (if any) onto `TBLPTR` with carry,
-    /// `scale` times. One repetition is `MOVF %reg_lo,W; ADDWF TBLPTRL,F`
+    /// Add each dynamic term onto `TBLPTR` with carry, `scale` times, except
+    /// the term at index `skip` (a chain already folded it in). One repetition
+    /// is `MOVF %reg_lo,W; ADDWF TBLPTRL,F`
     /// seeding the carry, then `TBLPTRH` consumes either the index's real
     /// high byte (`MOVF %reg_hi,W; ADDWFC TBLPTRH,F`) or a zero
     /// (`MOVLW 0`, same word cost), and `TBLPTRU` consumes the running
     /// carry (`ADDWFC TBLPTRU,F`; `W` still holds 0 in the width-1 case).
     /// A 16-bit index needs its high byte folded in or `table[0x1XX]`
     /// reads the wrong byte, which is why `reg_width` is consulted.
-    fn add_dynamic_to_tblptr(&mut self, terms: &[(u16, String)]) {
-        if let Some((scale, reg)) = terms.first() {
+    fn add_dynamic_to_tblptr(&mut self, terms: &[(u16, String)], skip: Option<usize>) {
+        for (scale, reg) in terms
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| (Some(i) != skip).then_some(t))
+        {
             let lo = self.slot_addr(self.cur_func, reg).direct();
             let wide = self.reg_width(reg) == 2;
             for _ in 0..*scale {
@@ -5196,12 +5201,15 @@ impl<'m> Gen<'m> {
     /// scales, or the zero-seeded shift-add chain when a big stride wins.
     fn emit_tblptr_setup(&mut self, table: &str, k: u16, terms: &[(u16, String)], byte_off: u8) {
         let static_part = k.wrapping_add(u16::from(byte_off));
-        if let Some((i, scale)) = self.tblptr_chain_term(terms, static_part) {
+        let skip = if let Some((i, scale)) = self.tblptr_chain_term(terms, static_part) {
             self.emit_tblptr_dynamic_chain(table, static_part, scale, &terms[i].1);
-            return;
-        }
-        self.emit_tblptr_static(table, k, byte_off);
-        self.add_dynamic_to_tblptr(terms);
+            Some(i)
+        } else {
+            self.emit_tblptr_static(table, k, byte_off);
+            None
+        };
+        // The chain already folded term `skip` in; the others add onto its result.
+        self.add_dynamic_to_tblptr(terms, skip);
     }
     /// Seed `TBLPTR` for `(table, k + byte_off)` unless it already points
     /// there: either from the previous static const read (epic-cc#745), or
@@ -5328,11 +5336,6 @@ impl<'m> Gen<'m> {
         byte_off: u8,
         dst: u16,
     ) {
-        assert!(
-            terms.len() <= 1,
-            "isel-pic18: multi-term dynamic pointer offsets not yet supported (P4 scope; {} terms)",
-            terms.len()
-        );
         self.emit_tblptr_setup_shared(table, k, terms, byte_off);
         if terms.is_empty() {
             self.emit("    TBLRD*+".to_string());
@@ -6227,9 +6230,8 @@ impl<'m> Gen<'m> {
                     if self.prov.flash.contains(&key) {
                         // A walk gep or a select that folds onto a walk phi has no
                         // slot of its own: read through the phi's slot at the folded
-                        // offset. One runtime term (a loop index over the phi) seeds
-                        // TBLPTR from the slot, adds the index, and TBLRDs per byte
-                        // (epic-cc#1101); several terms have no TBLPTR chain yet.
+                        // offset. Each runtime term (a loop index over the phi) is added
+                        // to TBLPTR from the slot, then TBLRDs per byte (epic-cc#1101).
                         let (sname, k, terms) = match self.resolved.get(&key) {
                             Some((Base::Slot(sname, true), k, terms)) => {
                                 (sname.clone(), *k, terms.clone())
@@ -6240,14 +6242,9 @@ impl<'m> Gen<'m> {
                         };
                         let slot = self.slot_addr(self.cur_func, &sname).direct();
                         if !terms.is_empty() {
-                            let [_] = terms.as_slice() else {
-                                panic!(
-                                    "isel-pic18: load through a walk over flash pointer %{sname} with several runtime indices is not supported (epic-cc#1101)"
-                                );
-                            };
                             for kk in 0..l.ty.bytes() {
                                 self.emit_flash_tblptr_seed(slot, k.wrapping_add(u16::from(kk)));
-                                self.add_dynamic_to_tblptr(&terms);
+                                self.add_dynamic_to_tblptr(&terms, None);
                                 self.emit("    TBLRD*".to_string());
                                 self.emit_copy_byte(0xFF5, dst + u16::from(kk));
                             }
