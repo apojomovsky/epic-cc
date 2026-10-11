@@ -142,3 +142,65 @@ fn flash_walk_mixed_runtime_index_store_is_rejected_on_p18() {
         "ROM is not writable: store through runtime-indexed walk",
     );
 }
+
+/// A constant-length `memcpy` from a flash walk must copy program memory
+/// (epic-cc#1100). `sum` adds the first copied byte on every step, so it pins
+/// each walk position, not only the last one.
+#[test]
+fn flash_walk_memcpy_reads_program_memory_on_p18() {
+    const S: &[u8] = b"EPIC_HARNESS_RESULT: PASS\n";
+    let expected = S.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_memcpy.c");
+    assert_eq!(
+        ram[map_addr(&map, "sum")],
+        expected,
+        "sum of buf[0] over the walk"
+    );
+    assert_eq!(
+        ram[map_addr(&map, "sent")],
+        26,
+        "walk must visit all 26 bytes"
+    );
+    assert!(halted);
+}
+
+/// A `memcpy` from a pointer phi joining flash and RAM has no single address
+/// space, so it is refused at compile time (epic-cc#1100, epic-cc#1099).
+#[test]
+fn flash_walk_mixed_memcpy_is_rejected_on_p18() {
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_mixed_memcpy.c",
+        "memcpy from maybe-flash address",
+    );
+}
+
+/// The ticket's shape: a plain `memcpy` call (not `__builtin_memcpy`) from a
+/// flash walk with a constant length must copy program memory (epic-cc#1100).
+/// Before the redirect the libc body read RAM at the walk's flash address.
+#[test]
+fn flash_walk_plain_memcpy_reads_program_memory_on_p18() {
+    const S: &[u8] = b"EPIC_HARNESS_RESULT: PASS\n";
+    let expected = S.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_plain_memcpy.c");
+    assert_eq!(
+        ram[map_addr(&map, "sum")],
+        expected,
+        "sum of buf[0] over the walk"
+    );
+    assert_eq!(
+        ram[map_addr(&map, "sent")],
+        26,
+        "walk must visit all 26 bytes"
+    );
+    assert!(halted);
+}
+
+/// A plain `memcpy` from a flash walk with a runtime length has no inline
+/// lowering, so it is refused at compile time (epic-cc#1100).
+#[test]
+fn flash_walk_plain_memcpy_runtime_length_is_rejected_on_p18() {
+    expect_p18_rejection(
+        "tests/fixtures/flash_walk_plain_memcpy_runtime.c",
+        "memcpy from a flash pointer with a runtime length",
+    );
+}

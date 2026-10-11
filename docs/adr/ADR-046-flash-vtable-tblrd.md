@@ -33,6 +33,16 @@
   runtime-indexed load or store through a flash or `mixed` walk phi also
   panics: the check runs on the phi slot, since a dynamic index has no
   provenance key of its own.
+* Amended (epic-cc#1100): a constant-length `memcpy` from a `flash` walk reads
+  through TBLRD, seeding `TBLPTR` from the walk slot. This covers
+  `__builtin_memcpy` and a plain `memcpy` call, which is lowered to the same
+  copy because the libc body would read RAM. A `mixed` or runtime-indexed
+  source panics. A plain `memcpy` call with a runtime length from a flash walk
+  panics. A destination that may be flash (a flash-derived pointer, a `mixed`
+  phi, or a runtime-indexed walk) panics, as the Store arm does. The resolver
+  folds a displacement to `u16`, so a walk stepped back (`p[-1]`) sign-extends
+  from bit 15; a positive offset of 0x8000 or more reads as negative until the
+  resolver carries a signed `i32`.
 * The dispatch sequence replays on hardware through the `tblrd-flash-ptr`
   superopt spec (candidate plus `LOW/HIGH` gensym support in the batch
   builder); per-fixture runs stay sim-only per docs/40 §5.
