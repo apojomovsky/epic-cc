@@ -920,3 +920,43 @@ fn mul_edges_c_wraps_and_exits_on_zero() {
         assert_eq!(got, want, "u16 {a:#06x} * {b:#06x} mod 65536");
     }
 }
+
+#[test]
+fn mul_edges_u32_wraps_and_exits_on_zero() {
+    // Zero multiplier takes the early exit; the short-a / long-b pair takes
+    // the operand swap; 0x80000000 * 2 and all-ones wrap mod 2^32.
+    let (mut p, globals, asm, _locals) = compile_with_layout(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mul_edges_u32.c"
+    ));
+    assert!(
+        asm.contains("__mul_u32"),
+        "fixture must reach the u32 routine"
+    );
+
+    let pairs: [(u32, u32); 4] = [
+        (0, 0x1234_5678),
+        (0x0000_ABCD, 0x1234_5678),
+        (0x8000_0000, 2),
+        (0xFFFF_FFFF, 0xFFFF_FFFF),
+    ];
+    for (i, &(a, b)) in pairs.iter().enumerate() {
+        for k in 0..4 {
+            p.ram_mut()[globals["pa32"] as usize + 4 * i + k] = (a >> (8 * k)) as u8;
+            p.ram_mut()[globals["pb32"] as usize + 4 * i + k] = (b >> (8 * k)) as u8;
+        }
+    }
+    p.run(500_000);
+    assert!(p.halted());
+
+    for (i, &(a, b)) in pairs.iter().enumerate() {
+        let base = globals["pa32"] as usize + 4 * i;
+        let got = u32::from_le_bytes([
+            p.ram()[base],
+            p.ram()[base + 1],
+            p.ram()[base + 2],
+            p.ram()[base + 3],
+        ]);
+        assert_eq!(got, a.wrapping_mul(b), "u32 {a:#010x} * {b:#010x} mod 2^32");
+    }
+}

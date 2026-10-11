@@ -3028,43 +3028,6 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// One 16-iteration chunk of the 32-iteration `__mul_u32` AN526 loop:
-    /// test `bk`'s LSB, add `t` to `r` across all 4 bytes (the incfsz
-    /// carry idiom), shift `t` left with wraparound (the shifted-out high
-    /// bits are discarded, i32 `mul` wraps), shift `bk` right, count 16.
-    fn emit_mul32_loop(
-        &mut self,
-        l_loop: String,
-        l_skip: String,
-        bk_lo: u16,
-        bk_hi: u16,
-        cnt: u16,
-        r: [u16; 4],
-        t: [u16; 4],
-    ) {
-        self.emit(format!("{l_loop}:"));
-        self.emit(format!("    BTFSS 0x{bk_lo:02X}, 0")); // test multiplier LSB
-        self.emit(format!("    GOTO {l_skip}"));
-        self.emit(format!("    MOVF 0x{:02X}, W", t[0]));
-        self.emit(format!("    ADDWF 0x{:02X}, F", r[0]));
-        for i in 1..4 {
-            self.emit(format!("    MOVF 0x{:02X}, W", t[i]));
-            self.emit("    BTFSC STATUS, 0".to_string());
-            self.emit(format!("    INCFSZ 0x{:02X}, W", t[i]));
-            self.emit(format!("    ADDWF 0x{:02X}, F", r[i]));
-        }
-        self.emit(format!("{l_skip}:"));
-        self.emit("    BCF STATUS, 0".to_string());
-        for t_i in t {
-            self.emit(format!("    RLF 0x{t_i:02X}, F")); // t <<= 1 (wrapping)
-        }
-        self.emit("    BCF STATUS, 0".to_string());
-        self.emit(format!("    RRF 0x{bk_hi:02X}, F"));
-        self.emit(format!("    RRF 0x{bk_lo:02X}, F")); // bk >>= 1
-        self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
-        self.emit(format!("    GOTO {l_loop}"));
-    }
-
     /// Runs the shared 32-iteration restoring division loop. Shifts the
     /// quotient into the numerator slots while accumulating the partial
     /// remainder. Holds denominator, remainder, and count in scratch.
@@ -3524,50 +3487,68 @@ impl<'m> Gen<'m> {
                 }
                 self.emit("    RETURN".to_string());
             }
-            // 32x32 -> 32 shift-add (AN526), 32 iterations: t = a (4 bytes,
-            // shifted left one bit per iteration: the shifted-out high
-            // bits are DISCARDED, so i32 mul wraps mod 2^32); for each set
-            // bit of the multiplier, r += t across all 4 bytes with the
-            // incfsz carry idiom. bk is 2 bytes: the low 16 multiplier bits
-            // first, then reloaded from b's high half for the second 16
-            // iterations (the b param slot is untouched). Store the low 32
-            // bits (the i32 result).
+            // 32x32 -> 32 shift-add, in place like __mul_u16: the multiplicand
+            // is shifted left and the multiplier right through the param
+            // slots, with the loop exiting once the multiplier is zero. The
+            // accumulator is the 4-byte i32 result, so bits shifted past
+            // bit 31 are discarded and the product wraps mod 2^32. When the
+            // short operand arrived in `a`, the slots are XOR-swapped so the
+            // long one is shifted as the multiplicand, cutting loop passes.
             "__mul_u32" => {
                 let a = self.slot_addr(name, "a").direct();
                 let b = self.slot_addr(name, "b").direct();
-                self.assert_bank0(&[a, a + 3, b, b + 3, scr, scr + 10], name);
-                let (bk_lo, bk_hi, cnt) = (scr, scr + 1, scr + 2);
-                let r = [scr + 3, scr + 4, scr + 5, scr + 6];
-                let t = [scr + 7, scr + 8, scr + 9, scr + 10];
-                for i in 0..4 {
-                    self.emit(format!("    CLRF 0x{:02X}", r[i]));
-                    self.emit(format!("    CLRF 0x{:02X}", t[i]));
-                }
-                for i in 0..4u16 {
-                    self.emit(format!("    MOVF 0x{:02X}, W", a + i));
-                    self.emit(format!("    MOVWF 0x{:02X}", t[usize::from(i)]));
-                    // t = a (32-bit)
-                }
-                self.emit(format!("    MOVF 0x{:02X}, W", b));
-                self.emit(format!("    MOVWF 0x{bk_lo:02X}"));
-                self.emit(format!("    MOVF 0x{:02X}, W", b + 1));
-                self.emit(format!("    MOVWF 0x{bk_hi:02X}")); // bk = b low 16
-                self.emit("    MOVLW 0x10".to_string());
-                self.emit(format!("    MOVWF 0x{cnt:02X}")); // cnt = 16
-                let l_loop1 = self.fresh_label();
-                let l_skip1 = self.fresh_label();
-                self.emit_mul32_loop(l_loop1, l_skip1, bk_lo, bk_hi, cnt, r, t);
-                // reload bk from b's high half for the second 16 iterations
-                self.emit(format!("    MOVF 0x{:02X}, W", b + 2));
-                self.emit(format!("    MOVWF 0x{bk_lo:02X}"));
+                self.assert_bank0(&[a, a + 3, b, b + 3, scr, scr + 3], name);
+                let r = [scr, scr + 1, scr + 2, scr + 3];
+                let l_loop = self.fresh_label();
+                let l_skip = self.fresh_label();
+                let l_noswap = self.fresh_label();
+                self.emit(format!("    MOVF 0x{:02X}, W", a + 3));
+                self.emit("    BTFSS STATUS, 2".to_string());
+                self.emit(format!("    GOTO {l_noswap}"));
                 self.emit(format!("    MOVF 0x{:02X}, W", b + 3));
-                self.emit(format!("    MOVWF 0x{bk_hi:02X}"));
-                self.emit("    MOVLW 0x10".to_string());
-                self.emit(format!("    MOVWF 0x{cnt:02X}"));
-                let l_loop2 = self.fresh_label();
-                let l_skip2 = self.fresh_label();
-                self.emit_mul32_loop(l_loop2, l_skip2, bk_lo, bk_hi, cnt, r, t);
-                self.store_retval(scr + 3, 4);
+                self.emit("    BTFSC STATUS, 2".to_string());
+                self.emit(format!("    GOTO {l_noswap}"));
+                for i in 0..4u16 {
+                    let (x, y) = (a + i, b + i);
+                    self.emit(format!("    MOVF 0x{y:02X}, W"));
+                    self.emit(format!("    XORWF 0x{x:02X}, F"));
+                    self.emit(format!("    MOVF 0x{x:02X}, W"));
+                    self.emit(format!("    XORWF 0x{y:02X}, F"));
+                    self.emit(format!("    MOVF 0x{y:02X}, W"));
+                    self.emit(format!("    XORWF 0x{x:02X}, F"));
+                }
+                self.emit(format!("{l_noswap}:"));
+                for r_i in r {
+                    self.emit(format!("    CLRF 0x{r_i:02X}"));
+                }
+                self.emit(format!("{l_loop}:"));
+                self.emit(format!("    BTFSS 0x{b:02X}, 0")); // test multiplier LSB
+                self.emit(format!("    GOTO {l_skip}"));
+                self.emit(format!("    MOVF 0x{a:02X}, W"));
+                self.emit(format!("    ADDWF 0x{:02X}, F", r[0]));
+                for i in 1..4u16 {
+                    let ai = a + i;
+                    self.emit(format!("    MOVF 0x{ai:02X}, W"));
+                    self.emit("    BTFSC STATUS, 0".to_string());
+                    self.emit(format!("    INCFSZ 0x{ai:02X}, W")); // carry idiom, slot kept
+                    self.emit(format!("    ADDWF 0x{:02X}, F", r[usize::from(i)]));
+                }
+                self.emit(format!("{l_skip}:"));
+                self.emit("    BCF STATUS, 0".to_string());
+                for i in 0..4u16 {
+                    self.emit(format!("    RLF 0x{:02X}, F", a + i)); // a <<= 1, mod 2^32
+                }
+                self.emit("    BCF STATUS, 0".to_string());
+                for i in (0..4u16).rev() {
+                    self.emit(format!("    RRF 0x{:02X}, F", b + i)); // b >>= 1
+                }
+                self.emit(format!("    MOVF 0x{b:02X}, W"));
+                for i in 1..4u16 {
+                    self.emit(format!("    IORWF 0x{:02X}, W", b + i));
+                }
+                self.emit("    BTFSS STATUS, 2".to_string()); // Z = (b == 0)
+                self.emit(format!("    GOTO {l_loop}"));
+                self.store_retval(scr, 4);
                 self.emit("    RETURN".to_string());
             }
             // 32/32 restoring division (32 iterations): num <<= 1 (C = old
