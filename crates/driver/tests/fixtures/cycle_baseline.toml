@@ -81,16 +81,16 @@ ram_bytes = 49
 [[entry]]
 name = "speed-mul-u32-16f877a"
 device = "16F877A"
-cycles = 689
-flash_words = 148
+cycles = 685
+flash_words = 144
 ram_bytes = 48
 
 [[entry]]
 name = "speed-mul-u32-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 689
-flash_words = 148
+cycles = 685
+flash_words = 144
 ram_bytes = 48
 
 [[entry]]
@@ -276,16 +276,16 @@ ram_bytes = 53
 [[entry]]
 name = "speed-shift-18f4550"
 device = "18F4550"
-cycles = 518
-flash_words = 212
+cycles = 498
+flash_words = 192
 ram_bytes = 43
 
 [[entry]]
 name = "speed-shift-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 510
-flash_words = 213
+cycles = 490
+flash_words = 193
 ram_bytes = 43
 
 [[entry]]
@@ -366,31 +366,31 @@ ram_bytes = 47
 [[entry]]
 name = "speed-strlen-strcmp-18f4550"
 device = "18F4550"
-cycles = 2127
-flash_words = 214
-ram_bytes = 57
+cycles = 962
+flash_words = 147
+ram_bytes = 55
 
 [[entry]]
 name = "speed-strlen-strcmp-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 1927
-flash_words = 217
-ram_bytes = 57
+cycles = 950
+flash_words = 149
+ram_bytes = 55
 
 [[entry]]
 name = "speed-strlen-strcmp-16f877a"
 device = "16F877A"
-cycles = 1197
-flash_words = 204
+cycles = 1194
+flash_words = 201
 ram_bytes = 56
 
 [[entry]]
 name = "speed-strlen-strcmp-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 1197
-flash_words = 204
+cycles = 1194
+flash_words = 201
 ram_bytes = 56
 
 [[entry]]
@@ -411,16 +411,16 @@ ram_bytes = 52
 [[entry]]
 name = "speed-crc16-16f877a"
 device = "16F877A"
-cycles = 13294
-flash_words = 147
+cycles = 9454
+flash_words = 132
 ram_bytes = 55
 
 [[entry]]
 name = "speed-crc16-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 13294
-flash_words = 147
+cycles = 9454
+flash_words = 132
 ram_bytes = 55
 
 [[entry]]
@@ -441,46 +441,46 @@ ram_bytes = 10
 [[entry]]
 name = "speed-switch16-16f877a"
 device = "16F877A"
-cycles = 71
-flash_words = 100
+cycles = 62
+flash_words = 95
 ram_bytes = 11
 
 [[entry]]
 name = "speed-switch16-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 71
-flash_words = 100
+cycles = 62
+flash_words = 95
 ram_bytes = 11
 
 [[entry]]
 name = "speed-struct-scan-18f4550"
 device = "18F4550"
-cycles = 347
-flash_words = 73
+cycles = 241
+flash_words = 60
 ram_bytes = 46
 
 [[entry]]
 name = "speed-struct-scan-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 347
-flash_words = 73
+cycles = 241
+flash_words = 60
 ram_bytes = 46
 
 [[entry]]
 name = "speed-struct-scan-16f877a"
 device = "16F877A"
-cycles = 534
-flash_words = 89
+cycles = 518
+flash_words = 87
 ram_bytes = 47
 
 [[entry]]
 name = "speed-struct-scan-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 534
-flash_words = 89
+cycles = 518
+flash_words = 87
 ram_bytes = 47
 
 [[entry]]
@@ -501,16 +501,16 @@ ram_bytes = 23
 [[entry]]
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
-cycles = 2633
-flash_words = 134
+cycles = 2623
+flash_words = 132
 ram_bytes = 29
 
 [[entry]]
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 1845
-flash_words = 283
+cycles = 1835
+flash_words = 281
 ram_bytes = 29
 
 [[entry]]
@@ -548,7 +548,7 @@ name = "speed-mul-u32-16f1937"
 device = "16F1937"
 cycles = 812
 flash_words = 144
-ram_bytes = 48
+ram_bytes = 41
 
 [[entry]]
 name = "speed-mul-u32-16f1937"
@@ -556,14 +556,14 @@ device = "16F1937"
 profile = "O2"
 cycles = 812
 flash_words = 144
-ram_bytes = 48
+ram_bytes = 41
 
 [[entry]]
 name = "speed-mul-u32-16f505"
 device = "16F505"
 cycles = 1824
 flash_words = 361
-ram_bytes = 51
+ram_bytes = 48
 
 [[entry]]
 name = "speed-mul-u32-16f505"
@@ -571,7 +571,7 @@ device = "16F505"
 profile = "O2"
 cycles = 1824
 flash_words = 361
-ram_bytes = 51
+ram_bytes = 48
 
 [[entry]]
 name = "scen-pid-update-18f4550"
@@ -591,17 +591,17 @@ ram_bytes = 131
 [[entry]]
 name = "scen-control-pass-18f4550"
 device = "18F4550"
-cycles = 775
-flash_words = 3937
-ram_bytes = 638
+cycles = 774
+flash_words = 3931
+ram_bytes = 636
 
 [[entry]]
 name = "scen-control-pass-18f4550"
 device = "18F4550"
 profile = "O2"
 cycles = 725
-flash_words = 4193
-ram_bytes = 678
+flash_words = 4171
+ram_bytes = 676
 
 [[entry]]
 name = "speed-isr-18f4550-latency"
