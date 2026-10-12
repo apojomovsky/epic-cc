@@ -297,6 +297,34 @@ fn zext_i1_to_i8_copies_the_icmp_byte() {
 }
 
 #[test]
+fn zext_onto_its_own_slot_collapses_the_second_store() {
+    // epic-cc#1030: alloc overlays a zext dst on its single-use source
+    // slot (the encoder-full ring index). The load's tracked store
+    // already put W there, so the zext copy is a no-op.
+    let m = parse(
+        "global in i8\nglobal out16 i16\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    %z = zext i8 %v to i16\n    store i16 %z @out16\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out16", 0x22),
+        ("main::v", 0x27),
+        ("main::z", 0x27),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert_eq!(
+        asm.matches("MOVWF 0x27").count(),
+        1,
+        "one store serves both load and zext:\n{asm}"
+    );
+    assert!(asm.contains("CLRF 0x28"), "zext zeroes d_hi:\n{asm}");
+    assert_eq!(
+        sim_run_asm(&asm, &[(0x20, 5)], 0x22),
+        5,
+        "zext still widens the byte:\n{asm}"
+    );
+}
+
+#[test]
 fn sext_i8_to_i16_copies_low_and_sign_fills_high() {
     let m = parse(
         "global in i8\nglobal out16 i16\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    %s = sext i8 %v to i16\n    store i16 %s @out16\n    ret void\n",
@@ -10365,50 +10393,54 @@ fn const_reader_at_page_tail_pins_to_next_page() {
     // epic-cc#844: a 6-word reader placed at a page tail straddled into the
     // next page (the encoder-sim `__read_main.pos_seq` at 0x1FFE). The
     // emitter now pins a straddling reader with `.org` to the next page.
-    // main is padded so the section starts with the reader straddling
-    // 0x7FF/0x800; re-tune the pad when call sequences change length.
-    let ir_text = format!(
-        "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n{}    ret void\n",
-        pad_body(676)
-    );
-    let m = module_with_globals(
-        &ir_text,
-        vec![
-            ir::Global {
-                name: "in".into(),
-                ty: ir::Ty::I8,
-                is_const: false,
-                size: 1,
-                bytes: vec![0],
-                addr: None,
-                internal: false,
-                refs: Vec::new(),
-            },
-            ir::Global {
-                name: "out".into(),
-                ty: ir::Ty::I8,
-                is_const: false,
-                size: 1,
-                bytes: vec![0],
-                addr: None,
-                internal: false,
-                refs: Vec::new(),
-            },
-            const_table_global("t", 60),
-        ],
-    );
-    let addrs = addrs(&[
-        ("in", 0x20),
-        ("out", 0x21),
-        ("main::i", 0x25),
-        ("main::v", 0x26),
-        ("main::a", 0x27),
-    ]);
-    let asm = select(&PIC16F877A, &m, &addrs);
-    assert!(
-        asm.contains("    org 0x0800\n__read_t:"),
-        "the straddling reader must pin to page 1:\n{asm}"
-    );
+    // The pad is found by search, not tuned: 3-word pads cannot track
+    // 2-word restore-elision drift one-for-one, so any call-sequence
+    // change just moves which pad straddles (epic-cc#1032).
+    let asm_for_pad = |n: usize| {
+        let ir_text = format!(
+            "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n{}    ret void\n",
+            pad_body(n)
+        );
+        let m = module_with_globals(
+            &ir_text,
+            vec![
+                ir::Global {
+                    name: "in".into(),
+                    ty: ir::Ty::I8,
+                    is_const: false,
+                    size: 1,
+                    bytes: vec![0],
+                    addr: None,
+                    internal: false,
+                    refs: Vec::new(),
+                },
+                ir::Global {
+                    name: "out".into(),
+                    ty: ir::Ty::I8,
+                    is_const: false,
+                    size: 1,
+                    bytes: vec![0],
+                    addr: None,
+                    internal: false,
+                    refs: Vec::new(),
+                },
+                const_table_global("t", 60),
+            ],
+        );
+        let addrs = addrs(&[
+            ("in", 0x20),
+            ("out", 0x21),
+            ("main::i", 0x25),
+            ("main::v", 0x26),
+            ("main::a", 0x27),
+        ]);
+        let asm = select(&PIC16F877A, &m, &addrs);
+        (m, asm)
+    };
+    let (m, asm) = (660..700)
+        .map(asm_for_pad)
+        .find(|(_, asm)| asm.contains("    org 0x0800\n__read_t:"))
+        .expect("some pad in range must straddle the reader into page 1");
     assert_eq!(
         label_addr(&asm, "__read_t"),
         0x800,
@@ -10424,6 +10456,34 @@ fn const_reader_at_page_tail_pins_to_next_page() {
         sim_run_asm(&asm, &[(0x20, 3)], 0x21),
         3,
         "table[3] = 3 through the pinned reader:\n{asm}"
+    );
+}
+
+#[test]
+fn zext_of_deferred_temp_commits_its_own_slot() {
+    // A single-use lane temp never commits: the consumer adopts it
+    // straight from W, so its slot is stale. A zext onto that same
+    // slot must materialize, never skip on the stale belief.
+    let m = parse(
+        "global in i8\nglobal out16 i16\nfn main(void) ()\n  block entry:\n    %a = load i8 @in\n    %b = and i8 %a, 1\n    %z = zext i8 %b to i16\n    store i16 %z @out16\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out16", 0x22),
+        ("main::a", 0x26),
+        ("main::b", 0x27),
+        ("main::z", 0x27),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert_eq!(
+        asm.matches("MOVWF 0x27").count(),
+        1,
+        "the adopted value must commit once:\n{asm}"
+    );
+    assert_eq!(
+        sim_run_asm(&asm, &[(0x20, 5)], 0x22),
+        1,
+        "zext widens the adopted lane value:\n{asm}"
     );
 }
 
