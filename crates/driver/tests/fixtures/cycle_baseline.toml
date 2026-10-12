@@ -591,9 +591,9 @@ ram_bytes = 131
 [[entry]]
 name = "scen-control-pass-18f4550"
 device = "18F4550"
-cycles = 774
-flash_words = 3931
-ram_bytes = 636
+cycles = 778
+flash_words = 3561
+ram_bytes = 533
 
 [[entry]]
 name = "scen-control-pass-18f4550"

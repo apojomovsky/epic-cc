@@ -188,6 +188,10 @@ struct Gen<'m> {
     fast_divmod: bool,
     /// Eight-pass straight-line `__mul_u8` body (epic-cc#974, #1095), speed profile only.
     fast_mul_u8: bool,
+    /// Byte-granular variable shifts (epic-cc#1171): the u16/u32 shift
+    /// routines move whole bytes first when the masked count is >= 8,
+    /// then bit-loop the remainder. Speed profile only.
+    fast_shift: bool,
     cur_func: &'m str,
     /// Module-scoped fresh-label counter, shared across every function so the
     /// emitted `tmp{n}:` labels stay unique in the single `.asm` output.
@@ -4773,6 +4777,84 @@ impl<'m> Gen<'m> {
                 self.store_retval(r0, 2);
                 self.emit("    RETURN".to_string());
             }
+            // Signed 16x16 -> 32 shift-add (epic-cc#1174): the loop
+            // multiplies the two's-complement patterns as unsigned into
+            // the 32-bit `r`, pre-seeded with the sign correction (`r`
+            // starts at `-ub << 16` when `a` is negative, minus `ua << 16`
+            // when `b` is). Seeding runs first: the loop shifts the `a`
+            // slot as the multiplicand's low half (plus two scratch bytes)
+            // and the `b` slot as the multiplier, destroying both patterns,
+            // and exits once the multiplier shifts out.
+            "__mul_s16" => {
+                let a = self.slot_addr(name, "a").direct();
+                let b = self.slot_addr(name, "b").direct();
+                self.assert_bank0(&[a, a + 1, b, b + 1, scr, scr + 5], name);
+                let (a_lo, a_hi) = (a, a + 1);
+                let (b_lo, b_hi) = (b, b + 1);
+                let (bk_lo, bk_hi) = (b_lo, b_hi);
+                let r = [scr, scr + 1, scr + 2, scr + 3];
+                let (t_hi_lo, t_hi_hi) = (scr + 4, scr + 5);
+                let l_loop = self.fresh_label();
+                let l_skip = self.fresh_label();
+                let l_a_done = self.fresh_label();
+                let l_b_done = self.fresh_label();
+                for r_i in r {
+                    self.emit(format!("    CLRF 0x{r_i:02X}"));
+                }
+                self.emit(format!("    CLRF 0x{t_hi_lo:02X}"));
+                self.emit(format!("    CLRF 0x{t_hi_hi:02X}")); // t = zero-extended `a` pattern
+                self.emit(format!("    BTFSS 0x{a_hi:02X}, 7")); // `a` negative: r = -`b` << 16
+                self.emit(format!("    GOTO {l_a_done}"));
+                self.emit(format!("    COMF 0x{b_lo:02X}, W"));
+                self.emit(format!("    MOVWF 0x{:02X}", r[2]));
+                self.emit(format!("    COMF 0x{b_hi:02X}, W"));
+                self.emit(format!("    MOVWF 0x{:02X}", r[3]));
+                self.emit(format!("    INCF 0x{:02X}, F", r[2]));
+                self.emit("    BTFSC STATUS, 2".to_string());
+                self.emit(format!("    INCF 0x{:02X}, F", r[3]));
+                self.emit(format!("{l_a_done}:"));
+                self.emit(format!("    BTFSS 0x{b_hi:02X}, 7")); // `b` negative: r -= `a` << 16
+                self.emit(format!("    GOTO {l_b_done}"));
+                self.emit(format!("    MOVF 0x{a_lo:02X}, W"));
+                self.emit(format!("    SUBWF 0x{:02X}, F", r[2]));
+                self.emit(format!("    MOVF 0x{a_hi:02X}, W"));
+                self.emit("    BTFSS STATUS, 0".to_string());
+                self.emit(format!("    INCFSZ 0x{a_hi:02X}, W")); // borrow idiom, slot kept
+                self.emit(format!("    SUBWF 0x{:02X}, F", r[3]));
+                self.emit(format!("{l_b_done}:"));
+                self.emit(format!("{l_loop}:"));
+                self.emit(format!("    BTFSS 0x{bk_lo:02X}, 0")); // test multiplier LSB
+                self.emit(format!("    GOTO {l_skip}"));
+                self.emit(format!("    MOVF 0x{a_lo:02X}, W"));
+                self.emit(format!("    ADDWF 0x{:02X}, F", r[0]));
+                self.emit(format!("    MOVF 0x{a_hi:02X}, W"));
+                self.emit("    BTFSC STATUS, 0".to_string());
+                self.emit(format!("    INCFSZ 0x{a_hi:02X}, W")); // carry idiom, slot kept
+                self.emit(format!("    ADDWF 0x{:02X}, F", r[1]));
+                self.emit(format!("    MOVF 0x{t_hi_lo:02X}, W"));
+                self.emit("    BTFSC STATUS, 0".to_string());
+                self.emit(format!("    INCFSZ 0x{t_hi_lo:02X}, W"));
+                self.emit(format!("    ADDWF 0x{:02X}, F", r[2]));
+                self.emit(format!("    MOVF 0x{t_hi_hi:02X}, W"));
+                self.emit("    BTFSC STATUS, 0".to_string());
+                self.emit(format!("    INCFSZ 0x{t_hi_hi:02X}, W"));
+                self.emit(format!("    ADDWF 0x{:02X}, F", r[3]));
+                self.emit(format!("{l_skip}:"));
+                self.emit("    BCF STATUS, 0".to_string());
+                self.emit(format!("    RLF 0x{a_lo:02X}, F"));
+                self.emit(format!("    RLF 0x{a_hi:02X}, F"));
+                self.emit(format!("    RLF 0x{t_hi_lo:02X}, F"));
+                self.emit(format!("    RLF 0x{t_hi_hi:02X}, F")); // t <<= 1, mod 2^32
+                self.emit("    BCF STATUS, 0".to_string());
+                self.emit(format!("    RRF 0x{bk_hi:02X}, F"));
+                self.emit(format!("    RRF 0x{bk_lo:02X}, F")); // bk >>= 1
+                self.emit(format!("    MOVF 0x{bk_lo:02X}, W"));
+                self.emit(format!("    IORWF 0x{bk_hi:02X}, W")); // Z = (bk == 0)
+                self.emit("    BTFSS STATUS, 2".to_string());
+                self.emit(format!("    GOTO {l_loop}"));
+                self.store_retval(scr, 4);
+                self.emit("    RETURN".to_string());
+            }
             // 8/8 restoring division (8 iterations): num <<= 1 (C = old
             // MSB); rem = (rem << 1) | C; if rem >= den set the quotient bit
             // else restore (add den back). rem is 2 bytes: the 8-bit rem
@@ -5272,6 +5354,9 @@ impl<'m> Gen<'m> {
     /// layout-contract offset). ashr sets C from the sign bit before each
     /// rrf so the sign fills every vacated bit. All slots stay inside one
     /// GPR bank (any bank), the loops are skip-sensitive (epic-cc#6).
+    /// Under `fast_shift` (epic-cc#1171) the u16/u32 bodies move whole
+    /// bytes first when the masked count reaches 8, then bit-loop the
+    /// remainder (i8 counts never reach 8, so that body keeps the loop).
     fn emit_shift_body(&mut self, bytes: u16, op: BinOp, scr: u16) {
         let name = self.cur_func;
         let val = self.slot_addr(name, "val").direct();
@@ -5293,6 +5378,9 @@ impl<'m> Gen<'m> {
             // lives entirely in the low byte. Clear it once so a stale high
             // byte from an earlier call can't be misread as part of the count.
             self.emit(format!("    CLRF 0x{:02X}", scr + 1));
+        }
+        if self.fast_shift && bytes > 1 {
+            self.emit_shift_byte_prefix(bytes, op, val, scr);
         }
         let l_loop = self.fresh_label();
         let l_done = self.fresh_label();
@@ -5331,6 +5419,78 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_done}:"));
         self.store_retval(val, bytes as u8);
         self.emit("    RETURN".to_string());
+    }
+
+    /// Byte-granular prefix for the u16/u32 shift bodies (epic-cc#1171):
+    /// each set high count bit moves whole bytes, then clears its bit so
+    /// the bit loop below sees count % 8. Bit 3 selects one byte (u16 and
+    /// u32); bit 4 selects two more bytes first (u32 only). A clear bit
+    /// costs one GOTO; each set bit saves eight bit-loop trips.
+    fn emit_shift_byte_prefix(&mut self, bytes: u16, op: BinOp, val: u16, scr: u16) {
+        let l_bits = self.fresh_label();
+        if bytes == 4 {
+            let l_chk8 = self.fresh_label();
+            self.emit(format!("    BTFSS 0x{scr:02X}, 4")); // count >= 16?
+            self.emit(format!("    GOTO {l_chk8}"));
+            self.emit_shift_byte_move(bytes, 2, op, val);
+            self.emit(format!("    BCF 0x{scr:02X}, 4")); // remainder -= 16
+            self.emit(format!("{l_chk8}:"));
+        }
+        self.emit(format!("    BTFSS 0x{scr:02X}, 3")); // count >= 8?
+        self.emit(format!("    GOTO {l_bits}"));
+        self.emit_shift_byte_move(bytes, 1, op, val);
+        self.emit(format!("    BCF 0x{scr:02X}, 3")); // remainder -= 8
+        self.emit(format!("{l_bits}:"));
+    }
+
+    /// One whole-byte shift by `n` bytes over a `bytes`-byte LE value in
+    /// place. shl slides bytes up and clears the vacated low bytes; lshr
+    /// slides down and clears the high bytes; ashr slides down and fills
+    /// the high bytes with the original sign (still in the top byte: the
+    /// moves never write it before the fill reads it).
+    fn emit_shift_byte_move(&mut self, bytes: u16, n: u16, op: BinOp, val: u16) {
+        match op {
+            BinOp::Shl => {
+                for i in (0..bytes - n).rev() {
+                    self.emit(format!("    MOVF 0x{:02X}, W", val + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", val + i + n));
+                }
+                for i in 0..n {
+                    self.emit(format!("    CLRF 0x{:02X}", val + i));
+                }
+            }
+            BinOp::LShr => {
+                for i in n..bytes {
+                    self.emit(format!("    MOVF 0x{:02X}, W", val + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", val + i - n));
+                }
+                for i in bytes - n..bytes {
+                    self.emit(format!("    CLRF 0x{:02X}", val + i));
+                }
+            }
+            BinOp::AShr => {
+                for i in n..bytes {
+                    self.emit(format!("    MOVF 0x{:02X}, W", val + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", val + i - n));
+                }
+                let top = val + bytes - 1;
+                let l_neg = self.fresh_label();
+                let l_fill = self.fresh_label();
+                self.emit(format!("    BTFSC 0x{top:02X}, 7"));
+                self.emit(format!("    GOTO {l_neg}"));
+                for i in bytes - n..bytes {
+                    self.emit(format!("    CLRF 0x{:02X}", val + i));
+                }
+                self.emit(format!("    GOTO {l_fill}"));
+                self.emit(format!("{l_neg}:"));
+                self.emit("    MOVLW 0xFF".to_string());
+                for i in bytes - n..bytes {
+                    self.emit(format!("    MOVWF 0x{:02X}", val + i));
+                }
+                self.emit(format!("{l_fill}:"));
+            }
+            _ => unreachable!("isel: shift byte move takes a shift op"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7798,6 +7958,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         retval_lo: g.retval_lo,
         fast_divmod: g.fast_divmod,
         fast_mul_u8: g.fast_mul_u8,
+        fast_shift: g.fast_shift,
         cur_func: g.cur_func,
         bool_temps: HashSet::new(),
         tmp: &mut *g.tmp,
@@ -10508,14 +10669,14 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
     // into the next function.
     if let Some(recipe) = routine_recipe(&f.name) {
         match recipe {
-            "__mul_u8" | "__mul_u16" | "__mul_u32" | "__udiv_u8" | "__urem_u8" | "__udivmod_u8"
-            | "__udiv_u16" | "__urem_u16" | "__udivmod_u16" | "__udiv_u32" | "__urem_u32"
-            | "__udivmod_u32" | "__sdiv_i8" | "__srem_i8" | "__sdivmod_i8" | "__sdiv_i16"
-            | "__srem_i16" | "__sdivmod_i16" | "__sdiv_i32" | "__srem_i32" | "__sdivmod_i32"
-            | "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16" | "__lshr_u16"
-            | "__ashr_i16" | "__shl_u32" | "__lshr_u32" | "__ashr_i32" | "__add_f32"
-            | "__sub_f32" | "__mul_f32" | "__div_f32" | "__cmp_f32" | "__uitofp_f32"
-            | "__sitofp_f32" | "__fptoui_f32" | "__fptosi_f32" => {}
+            "__mul_u8" | "__mul_u16" | "__mul_s16" | "__mul_u32" | "__udiv_u8" | "__urem_u8"
+            | "__udivmod_u8" | "__udiv_u16" | "__urem_u16" | "__udivmod_u16" | "__udiv_u32"
+            | "__urem_u32" | "__udivmod_u32" | "__sdiv_i8" | "__srem_i8" | "__sdivmod_i8"
+            | "__sdiv_i16" | "__srem_i16" | "__sdivmod_i16" | "__sdiv_i32" | "__srem_i32"
+            | "__sdivmod_i32" | "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16"
+            | "__lshr_u16" | "__ashr_i16" | "__shl_u32" | "__lshr_u32" | "__ashr_i32"
+            | "__add_f32" | "__sub_f32" | "__mul_f32" | "__div_f32" | "__cmp_f32"
+            | "__uitofp_f32" | "__sitofp_f32" | "__fptoui_f32" | "__fptosi_f32" => {}
             other => panic!("isel: unknown runtime routine @{other}"),
         }
         g.emit_routine();
@@ -13019,6 +13180,10 @@ pub struct Options {
     /// Unrolled `__mul_u8` (epic-cc#974, #1095): eight straight-line passes,
     /// no loop and no per-bit branch. The speed profile turns it on.
     pub fast_mul_u8: bool,
+    /// Byte-granular variable shifts (epic-cc#1171): the u16/u32 shift
+    /// routines move whole bytes first when the masked count is >= 8,
+    /// then bit-loop the remainder. The speed profile turns it on.
+    pub fast_shift: bool,
 }
 
 impl Default for Options {
@@ -13026,6 +13191,7 @@ impl Default for Options {
         Self {
             fast_divmod: false,
             fast_mul_u8: false,
+            fast_shift: false,
         }
     }
 }
@@ -13054,10 +13220,11 @@ pub fn select_with_locs(
     select_with_opts(device, m, addrs, staged, pool, Options::default())
 }
 
-/// `select_with_locs` with codegen options. The driver sets `fast_divmod`
-/// and `fast_mul_u8` under O2, so the unsigned divide and multiply routines
-/// run their normalized loops instead of trading cycles for flash
-/// (epic-cc#895, epic-cc#974).
+/// `select_with_locs` with codegen options. The driver sets `fast_divmod`,
+/// `fast_mul_u8`, and `fast_shift` under O2, so the unsigned divide and
+/// multiply routines run their normalized loops and the u16/u32 shift
+/// routines move whole bytes first, instead of trading cycles for flash
+/// (epic-cc#895, epic-cc#974, epic-cc#1171).
 pub fn select_with_opts(
     device: &Device,
     m: &Module,
@@ -13264,6 +13431,7 @@ pub fn select_with_opts(
                 retval_lo,
                 fast_divmod: opts.fast_divmod,
                 fast_mul_u8: opts.fast_mul_u8,
+                fast_shift: opts.fast_shift,
                 cur_func: &f.name,
                 bool_temps: HashSet::new(),
                 tmp: &mut tmp,
@@ -13500,6 +13668,7 @@ pub fn select_with_opts(
                     retval_lo,
                     fast_divmod: opts.fast_divmod,
                     fast_mul_u8: opts.fast_mul_u8,
+                    fast_shift: opts.fast_shift,
                     cur_func: &f.name,
                     bool_temps: HashSet::new(),
                     tmp: &mut tmp2,
@@ -13853,6 +14022,7 @@ pub fn select_with_opts(
                                 retval_lo,
                                 fast_divmod: opts.fast_divmod,
                                 fast_mul_u8: opts.fast_mul_u8,
+                                fast_shift: opts.fast_shift,
                                 cur_func: &f.name,
                                 bool_temps: HashSet::new(),
                                 tmp: &mut tmp,
