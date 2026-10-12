@@ -7,7 +7,9 @@ use ir::parse;
 /// main calls a and b; each of a and b carries two i16 locals, main carries
 /// one i8 local. The overlay must give a and b the same base (never co-live),
 /// place main's locals just before that base, and keep the total below the
-/// sum of the three functions' individual demands (1 + 4 + 4 = 9).
+/// sum of the three functions' individual demands (1 + 4 + 4 = 9). main's
+/// local is stored after both calls, so it stays live across them and the
+/// callees stack above it (a dead local would let them dip into its slot).
 fn overlay_module() -> ir::Module {
     parse(
         "global in i8\n\
@@ -16,6 +18,7 @@ fn overlay_module() -> ir::Module {
              %m0 = load i8 @in\n\
              call void @a()\n\
              call void @b()\n\
+             store i8 %m0, ptr @in\n\
              ret void\n\
          fn a(void) ()\n\
            block entry:\n\
@@ -194,12 +197,16 @@ fn callee_base_follows_callers_physical_frame_end() {
     // base must be a's PHYSICAL frame end (0xAB, just past a's last local) —
     // not the virtual sum base(a) + locals_size(a) = 0x7B, which lands in the
     // common-RAM gap and would place b at 0xA0, exactly where a's spill
-    // locals live while both frames are live during the call.
+    // locals live while both frames are live during the call. Every value is
+    // stored after its function's call, so each stays live across it and no
+    // callee dips into a dead slot (a dead local would share the caller's
+    // base instead of stacking past its end).
     let mut src = String::from(
         "const sink i8\nfn main(void) ()\n\
            block entry:\n\
              %m0 = add i8 1, 2\n\
              call void @a()\n\
+             store i8 %m0, ptr @sink\n\
              ret void\n\
          fn a(void) ()\n\
            block entry:\n",
@@ -207,12 +214,12 @@ fn callee_base_follows_callers_physical_frame_end() {
     for i in 0..90 {
         src.push_str(&format!("    %v{i} = add i8 1, 2\n"));
     }
+    src.push_str("    call void @b()\n");
     for i in 0..90 {
         src.push_str(&format!("    store i8 %v{i}, ptr @sink\n"));
     }
     src.push_str(
-        "    call void @b()\n\
-           ret void\n\
+        "    ret void\n\
          fn b(void) ()\n\
            block entry:\n\
              %b0 = add i8 1, 2\n\
@@ -247,7 +254,9 @@ fn callee_base_clears_region_tail_hole_left_by_i16_local() {
     // contiguous-blob frame_end(0x6F, 3) would count the hole byte and stop
     // at 0xA2, and a callee b based on that would land exactly on main's
     // live v1 (silent miscompile). The frame end must come from the actually
-    // placed locals: b's base is 0xA3, strictly after main::v1.
+    // placed locals: b's base is 0xA3, strictly after main::v1. Both values
+    // store after the call, so each stays live across it (dead values would
+    // let b dip into their slots instead of stacking past the end).
     let mut gsrc = String::new();
     for i in 0..79 {
         gsrc.push_str(&format!("global g{i} i8\n"));
@@ -257,9 +266,9 @@ fn callee_base_clears_region_tail_hole_left_by_i16_local() {
            block entry:\n\
              %v0 = add i16 1, 2\n\
              %v1 = add i8 3, 4\n\
+             call void @b()\n\
              store i16 %v0, ptr @sink\n\
              store i8 %v1, ptr @sink\n\
-             call void @b()\n\
              ret void\n\
          fn b(void) ()\n\
            block entry:\n\
@@ -366,13 +375,16 @@ fn const_globals_get_no_address_and_sized_globals_span() {
 fn sized_array_global_does_not_break_frame_overlay() {
     // An 8-byte array global consumes 8 addresses; the root frame's locals
     // must start after it (0x28), not after a 1-byte type, and a callee
-    // overlaid on that frame must respect the sized end_of_globals.
+    // overlaid on that frame must respect the sized end_of_globals. main's
+    // local stores after the call, so it stays live across it and the callee
+    // stacks at main's physical end (a dead local would share its base).
     let mut m = parse(
         "global ram i8\n\
          fn main(void) ()\n\
            block entry:\n\
              %m0 = add i8 1, 2\n\
              call void @a()\n\
+             store i8 %m0, ptr @ram\n\
              ret void\n\
          fn a(void) ()\n\
            block entry:\n\
@@ -1191,22 +1203,27 @@ fn layout_is_debug_printable_and_default() {
 }
 
 /// main's context (main -> m1 -> m2, one i8 local each) occupies
-/// 0x20..0x23; the ISR root's frame base is AFTER the main context's total,
+/// 0x21..0x24; the ISR root's frame base is AFTER the main context's total,
 /// and the `_isr` copies (isr -> m1_isr -> m2_isr) live entirely in that
 /// disjoint region — no _isr frame overlaps any main-context frame, so a
 /// preempted main's live frames are never clobbered by the ISR context.
+/// Every value stores after its function's call, so each stays live across
+/// it and the chain stacks (dead values would share one base instead).
 #[test]
 fn isr_root_region_is_disjoint_from_the_main_context() {
     let m = parse(
-        "fn main(void) ()\n\
+        "global sink i8\n\
+         fn main(void) ()\n\
            block entry:\n\
              %v0 = add i8 1, 2\n\
              call void @m1()\n\
+             store i8 %v0, ptr @sink\n\
              ret void\n\
          fn m1(void) ()\n\
            block entry:\n\
              %v1 = add i8 1, 2\n\
              call void @m2()\n\
+             store i8 %v1, ptr @sink\n\
              ret void\n\
          fn m2(void) ()\n\
            block entry:\n\
@@ -1216,11 +1233,13 @@ fn isr_root_region_is_disjoint_from_the_main_context() {
            block entry:\n\
              %i0 = add i8 1, 2\n\
              call void @m1_isr()\n\
+             store i8 %i0, ptr @sink\n\
              ret void\n\
          fn m1_isr(void) ()\n\
            block entry:\n\
              %i1 = add i8 1, 2\n\
              call void @m2_isr()\n\
+             store i8 %i1, ptr @sink\n\
              ret void\n\
          fn m2_isr(void) ()\n\
            block entry:\n\
@@ -1232,23 +1251,23 @@ fn isr_root_region_is_disjoint_from_the_main_context() {
         &m,
         "edge main m1\nedge m1 m2\nedge isr m1_isr\nedge m1_isr m2_isr\n",
     );
-    // main's context: main at 0x20, m1 at 0x21, m2 at 0x22 (depth_end = 3).
-    assert_eq!(out.locals["main::v0"], 0x20);
-    assert_eq!(out.locals["m1::v1"], 0x21);
-    assert_eq!(out.locals["m2::v2"], 0x22);
+    // main's context: sink at 0x20, main at 0x21, m1 at 0x22, m2 at 0x23.
+    assert_eq!(out.locals["main::v0"], 0x21);
+    assert_eq!(out.locals["m1::v1"], 0x22);
+    assert_eq!(out.locals["m2::v2"], 0x23);
     // The ISR root's base is after the main context's total: isr starts at
-    // bank0_start + depth_end(main) = 0x23, and the copies follow its chain.
-    assert_eq!(out.locals["isr::i0"], 0x23);
-    assert_eq!(out.locals["m1_isr::i1"], 0x24);
-    assert_eq!(out.locals["m2_isr::i2"], 0x25);
+    // 0x24, and the copies follow its chain.
+    assert_eq!(out.locals["isr::i0"], 0x24);
+    assert_eq!(out.locals["m1_isr::i1"], 0x25);
+    assert_eq!(out.locals["m2_isr::i2"], 0x26);
     // Disjointness: no _isr frame overlaps a main-context frame (which
-    // occupy 0x20..0x23).
+    // occupy 0x21..0x24).
     assert!(
-        out.locals["isr::i0"] >= 0x23,
+        out.locals["isr::i0"] >= 0x24,
         "isr frame overlaps the main context"
     );
     assert!(
-        out.locals["m2_isr::i2"] >= 0x23,
+        out.locals["m2_isr::i2"] >= 0x24,
         "m2_isr frame overlaps the main context"
     );
 }
@@ -1339,19 +1358,24 @@ fn bank_used_counts_a_multi_byte_value_in_full() {
 
 #[test]
 fn isr_bytes_reports_the_disjoint_region_span() {
-    // main's context occupies 0x20..0x23 (depth_end 3); the ISR root's
-    // base is 0x23 and its chain (isr -> m1_isr -> m2_isr, one i8 local
-    // each) ends at 0x26. isr_bytes = 0x26 - 0x23 = 3.
+    // main's context occupies 0x21..0x24 (sink at 0x20); the ISR root's
+    // base is 0x24 and its chain (isr -> m1_isr -> m2_isr, one i8 local
+    // each) ends at 0x27. isr_bytes = 0x27 - 0x24 = 3. Every value stores
+    // after its function's call, so each stays live across it and the chain
+    // stacks (dead values would share one base instead).
     let m = parse(
-        "fn main(void) ()\n\
+        "global sink i8\n\
+         fn main(void) ()\n\
            block entry:\n\
              %v0 = add i8 1, 2\n\
              call void @m1()\n\
+             store i8 %v0, ptr @sink\n\
              ret void\n\
          fn m1(void) ()\n\
            block entry:\n\
              %v1 = add i8 1, 2\n\
              call void @m2()\n\
+             store i8 %v1, ptr @sink\n\
              ret void\n\
          fn m2(void) ()\n\
            block entry:\n\
@@ -1361,11 +1385,13 @@ fn isr_bytes_reports_the_disjoint_region_span() {
            block entry:\n\
              %i0 = add i8 1, 2\n\
              call void @m1_isr()\n\
+             store i8 %i0, ptr @sink\n\
              ret void\n\
          fn m1_isr(void) ()\n\
            block entry:\n\
              %i1 = add i8 1, 2\n\
              call void @m2_isr()\n\
+             store i8 %i1, ptr @sink\n\
              ret void\n\
          fn m2_isr(void) ()\n\
            block entry:\n\
@@ -1381,9 +1407,9 @@ fn isr_bytes_reports_the_disjoint_region_span() {
     // has_isr is true: an [isr]-annotated function is present (Lane C, #287:
     // the `!isr_names.is_empty()` field).
     assert!(out.has_isr, "an [isr] function must set has_isr");
-    // The ISR region is included in the bank totals: the highest ISR
-    // address 0x25 is in bank 0, so bank_used[0] = 0x26 - 0x20 = 6.
-    assert_eq!(out.bank_used[0], 6);
+    // The ISR region is included in the bank totals: sink at 0x20 through
+    // the highest ISR address 0x26, so bank_used[0] = 0x27 - 0x20 = 7.
+    assert_eq!(out.bank_used[0], 7);
 }
 
 #[test]
@@ -1493,6 +1519,10 @@ fn routine_module(main_locals: u32) -> ir::Module {
     for i in 0..main_locals {
         src.push_str(&format!("    %m{i} = add i8 1, 2\n"));
     }
+    // The call sits between the defs and their stores, so every local stays
+    // live across it and the routine stacks past the frame end (dead values
+    // would let it dip into their slots instead).
+    src.push_str("    call void @__mul_u16()\n");
     for i in 0..main_locals {
         src.push_str(&format!("    store i8 %m{i}, ptr @sink\n"));
     }
@@ -1563,10 +1593,13 @@ fn routine_rounding_wastes_only_the_partial_bank() {
     for i in 0..74u32 {
         src.push_str(&format!("    %f{i} = add i8 1, 2\n"));
     }
+    // The calls sit between the defs and their stores, so every local stays
+    // live across both and the routines stack past f's frame end.
+    src.push_str("    call void @__udiv_u8()\n    call void @__mul_u16()\n");
     for i in 0..74u32 {
         src.push_str(&format!("    store i8 %f{i}, ptr @sink\n"));
     }
-    src.push_str("    call void @__udiv_u8()\n    call void @__mul_u16()\n    ret void\n");
+    src.push_str("    ret void\n");
     src.push_str("fn main(void) ()\n  block entry:\n    ret void\n");
     let m = parse(&src);
     let out = allocate(
@@ -2155,6 +2188,7 @@ fn pic18_keeps_globals_first_when_a_pinned_global_blocks_the_overlay() {
            block entry:\n\
              %m0 = load i8 @pinned\n\
              call void @a()\n\
+             store i8 %m0, ptr @pinned\n\
              ret void\n\
          fn a(void) ()\n\
            block entry:\n\
@@ -2214,8 +2248,8 @@ fn pic18_two_region_device_keeps_the_globals_above_the_overlay() {
 #[test]
 fn pic18_routine_frame_snaps_to_the_next_bsr_bank() {
     // Counts are calibrated for this fixture: main's frame end lands at
-    // 0xF1, so `__add_f32`'s derived base is 0xF1 and its 22-byte frame
-    // would span 0xF1..0x107, crossing the boundary; it must snap to
+    // 0xF4, so `__add_f32`'s derived base is 0xF4 and its 22-byte frame
+    // would span 0xF4..0x10A, crossing the boundary; it must snap to
     // 0x100. Arg homing (epic-cc#830) does not move this frame: a homed
     // value keeps its caller slot.
     let mut src = String::from("global sink i8\nglobal in float\n");
@@ -2224,12 +2258,16 @@ fn pic18_routine_frame_snaps_to_the_next_bsr_bank() {
     for i in 0..216 {
         src.push_str(&format!("    %v{i} = add i8 1, 2\n"));
     }
+    // The float loads and the call sit between the defs and their stores,
+    // so every i8 local stays live across the call and the routine stacks
+    // past main's full frame end (dead values would let it dip instead).
+    src.push_str(
+        "    %x = load float @in\n    %y = load float @in\n    %r = call float @__add_f32(float %x, float %y)\n",
+    );
     for i in 0..216 {
         src.push_str(&format!("    store i8 %v{i}, ptr @sink\n"));
     }
-    src.push_str(
-        "    %x = load float @in\n    %y = load float @in\n    %r = call float @__add_f32(float %x, float %y)\n    ret void\n",
-    );
+    src.push_str("    ret void\n");
     let m = parse(&src);
     let out = allocate(&PIC18F4550, &m, "edge main __add_f32\n");
     let a = out.locals["__add_f32::a"];
@@ -2256,12 +2294,16 @@ fn pic18_routine_frame_does_not_snap_back_to_the_region_start() {
         for i in 0..k {
             src.push_str(&format!("    %v{i} = add i8 1, 2\n"));
         }
+        // The float loads and the call sit between the defs and their
+        // stores, so every local stays live across the call and the routine
+        // stacks past main's full frame end.
+        src.push_str(
+            "    %x = load float @in\n    %y = load float @in\n    %r = call float @__add_f32(float %x, float %y)\n",
+        );
         for i in 0..k {
             src.push_str(&format!("    store i8 %v{i}, ptr @sink\n"));
         }
-        src.push_str(
-            "    %x = load float @in\n    %y = load float @in\n    %r = call float @__add_f32(float %x, float %y)\n    ret void\n",
-        );
+        src.push_str("    ret void\n");
         let m = parse(&src);
         let out = allocate(&PIC18F4550, &m, "edge main __add_f32\n");
         let a = out.locals["__add_f32::a"];
@@ -3494,5 +3536,145 @@ fn pooled_const_select_arm_keeps_its_copy() {
         pooled.globals.contains_key("a") && !pooled.const_globals.contains("a"),
         "select-arm pooled const keeps its copy: {:?}",
         pooled.globals.keys().collect::<Vec<_>>()
+    );
+}
+
+/// epic-cc#855: a callee whose caller holds nothing live across the call
+/// shares the caller's base outright; a live value keeps the slots below it.
+/// main's local is dead across the call to a (never read), so a lands on
+/// main's base. b's caller holds one live i8 across its call, so b stacks
+/// past that slot only, not past the whole dead prefix. The dip keeps the
+/// frame inside its old banks (see `bank_key`), so no bank select moves.
+#[test]
+fn callee_dips_into_dead_caller_slots_but_clears_live_ones() {
+    let m = parse(
+        "global sink i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %dead0 = add i8 1, 2\n\
+             %dead1 = add i8 3, 4\n\
+             call void @a()\n\
+             ret void\n\
+         fn a(void) ()\n\
+           block entry:\n\
+             %live = add i8 5, 6\n\
+             call void @b()\n\
+             store i8 %live, ptr @sink\n\
+             ret void\n\
+         fn b(void) ()\n\
+           block entry:\n\
+             %b0 = add i8 7, 8\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main a\nedge a b\ndepth 3\n");
+    // main's frame is one shared dead slot at 0x21 (sink is the only
+    // global); a shares that base outright.
+    assert_eq!(out.locals["main::dead0"], 0x21);
+    assert_eq!(out.locals["a::live"], 0x21);
+    // a's live slot ends at 0x22, so b stacks there, below a's old end.
+    assert_eq!(out.locals["b::b0"], 0x22);
+    assert!(out.locals["b::b0"] > out.locals["a::live"]);
+}
+/// epic-cc#855: the indirect dispatch fan-out shares one frame. A dispatch
+/// function whose slots are dead across its indirect call sites bases every
+/// candidate at its own base, so the region holds one shared frame sized to
+/// the widest candidate instead of a stacked copy per handler. The test
+/// dispatches from an interrupt root, which also pulls dispatch above the
+/// main total (the disjoint-region rule).
+#[test]
+fn indirect_dispatch_candidates_share_the_dispatch_base() {
+    let m = parse(
+        "global sink i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %m0 = add i8 1, 2\n\
+             call void @dispatch()\n\
+             store i8 %m0, ptr @sink\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             call void @dispatch()\n\
+             ret void\n\
+         fn dispatch(void) ()\n\
+           block entry:\n\
+             %d0 = add i8 3, 4\n\
+             call void %7() callees a_isr b_isr\n\
+         fn a_isr(void) ()\n\
+           block entry:\n\
+             %a0 = add i16 1, 2\n\
+             ret void\n\
+         fn b_isr(void) ()\n\
+           block entry:\n\
+             %b0 = add i8 5, 6\n\
+             ret void\n",
+    );
+    let out = allocate(
+        &PIC16F877A,
+        &m,
+        "edge main dispatch\nedge isr dispatch\nedge dispatch a_isr\nedge dispatch b_isr\n",
+    );
+    // The ISR region opens above the main total (which counts the copies'
+    // step-5 ends); dispatch re-derives at its base and the dead dispatch
+    // slot lets both candidates share it.
+    assert_eq!(out.locals["main::m0"], 0x21);
+    assert_eq!(out.locals["dispatch::d0"], 0x24);
+    assert_eq!(out.locals["a_isr::a0"], 0x24);
+    assert_eq!(out.locals["b_isr::b0"], 0x24);
+}
+
+/// epic-cc#855: `_isr` duplicates reachable from one dispatch root share a
+/// single dispatch-context frame when the dispatch slots are dead across
+/// their calls. The ISR region then spans the widest copy only, and stays
+/// disjoint from the main context above it.
+#[test]
+fn isr_copies_share_one_frame_when_dispatch_slots_are_dead() {
+    let m = parse(
+        "global sink i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %m0 = add i8 1, 2\n\
+             call void @work()\n\
+             store i8 %m0, ptr @sink\n\
+             ret void\n\
+         fn work(void) ()\n\
+           block entry:\n\
+             %w0 = add i8 3, 4\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             call void @dispatch_isr()\n\
+             ret void\n\
+         fn dispatch_isr(void) ()\n\
+           block entry:\n\
+             %d0 = add i8 5, 6\n\
+             call void @h1_isr()\n\
+             call void @h2_isr()\n\
+             ret void\n\
+         fn h1_isr(void) ()\n\
+           block entry:\n\
+             %h0 = add i16 7, 8\n\
+             ret void\n\
+         fn h2_isr(void) ()\n\
+           block entry:\n\
+             %h1 = add i8 9, 10\n\
+             ret void\n",
+    );
+    let out = allocate(
+        &PIC16F877A,
+        &m,
+        "edge main work\nedge isr dispatch_isr\nedge dispatch_isr h1_isr\nedge dispatch_isr h2_isr\n",
+    );
+    // Main context: sink, main, workstacked above it.
+    assert_eq!(out.locals["main::m0"], 0x21);
+    assert_eq!(out.locals["work::w0"], 0x22);
+    // ISR region: the dispatch root above main's total, both copies on its
+    // base, the region spanning the widest (the 2-byte h1).
+    assert_eq!(out.locals["dispatch_isr::d0"], 0x23);
+    assert_eq!(out.locals["h1_isr::h0"], 0x23);
+    assert_eq!(out.locals["h2_isr::h1"], 0x23);
+    assert_eq!(out.isr_bytes, 2);
+    assert!(
+        out.locals["dispatch_isr::d0"] > out.locals["work::w0"],
+        "the shared dispatch frame must clear the main context"
     );
 }

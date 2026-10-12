@@ -1,7 +1,7 @@
 //! Milestone-3 overlay acceptance: two sibling functions (big_a, big_b) each
 //! carry >= 16 bytes of simultaneous live i16 locals, called sequentially
 //! from main. Acceptance: (a) the program runs correctly in the simulator,
-//! (b) the local address map shows big_a and big_b sharing a base region
+//! (b) the local address map shows big_a and big_b sharing RAM bytes
 //! (overlay), and total_bank0 < locals_size(big_a) + locals_size(big_b) +
 //! locals_size(main).
 
@@ -122,8 +122,15 @@ fn overlay_frames_share_ram() {
     assert!(span_a >= 16 && span_b >= 16,
         "each sibling must carry >= 16 bytes of simultaneous locals (got big_a={span_a}, big_b={span_b})");
 
-    // (b) sibling frames overlay: identical base region (never co-live).
-    assert_eq!(a[0], b[0], "big_a and big_b must share a base address");
+    // (b) sibling frames overlay: overlapping base regions (never co-live).
+    // Per-site bases may differ when the two call sites hold different
+    // caller values live (epic-cc#855), so identical bases are not required;
+    // what matters is shared bytes. The lower-bound spans prove it: each
+    // start sits inside the other's span (true spans only grow).
+    assert!(
+        a[0] <= b[b.len() - 1] && b[0] <= a[a.len() - 1],
+        "big_a and big_b must share RAM (got {a:?} vs {b:?})"
+    );
 
     // Homed call args (epic-cc#830) live in their callee's param slot by
     // design: a main address shared with a sibling frame is a homed arg,
