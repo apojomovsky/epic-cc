@@ -321,16 +321,16 @@ ram_bytes = 83
 [[entry]]
 name = "speed-memcpy-32-16f877a"
 device = "16F877A"
-cycles = 3675
-flash_words = 180
+cycles = 1295
+flash_words = 107
 ram_bytes = 84
 
 [[entry]]
 name = "speed-memcpy-32-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 3675
-flash_words = 180
+cycles = 1295
+flash_words = 107
 ram_bytes = 84
 
 [[entry]]
@@ -351,17 +351,17 @@ ram_bytes = 53
 [[entry]]
 name = "speed-memset-32-16f877a"
 device = "16F877A"
-cycles = 2239
-flash_words = 131
-ram_bytes = 53
+cycles = 749
+flash_words = 86
+ram_bytes = 47
 
 [[entry]]
 name = "speed-memset-32-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 2239
-flash_words = 131
-ram_bytes = 53
+cycles = 749
+flash_words = 86
+ram_bytes = 47
 
 [[entry]]
 name = "speed-strlen-strcmp-18f4550"
@@ -411,16 +411,16 @@ ram_bytes = 52
 [[entry]]
 name = "speed-crc16-16f877a"
 device = "16F877A"
-cycles = 17530
-flash_words = 210
+cycles = 14970
+flash_words = 200
 ram_bytes = 54
 
 [[entry]]
 name = "speed-crc16-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 17530
-flash_words = 210
+cycles = 14970
+flash_words = 200
 ram_bytes = 54
 
 [[entry]]
