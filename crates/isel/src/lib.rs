@@ -2486,6 +2486,33 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_end}:"));
     }
 
+    /// The `SelectFold` diamond: same copy arms as `emit_select`, but the
+    /// test is a direct `BTFSC`/`BTFSS` on the folded source's slot. The
+    /// folded `and`/`icmp` never emitted, so a pending deferred store to
+    /// the `and` slot has no consumer left and drops, mirroring the
+    /// branch collapse. The first `emit` flushes any other pending store.
+    fn emit_select_fold(&mut self, s: &ir::Select, fold: &SelectFold) {
+        if let Some(a) = &fold.and_dst {
+            let and_slot = self.slot_addr(self.cur_func, a).direct();
+            if self.deferred_store == Some(and_slot) {
+                self.deferred_store = None;
+                self.deferred_uses = 0;
+            }
+        }
+        self.cur_loc = s.loc.clone();
+        let da = self.slot_addr(self.cur_func, &s.dst).direct();
+        let l_else = self.fresh_label();
+        let l_end = self.fresh_label();
+        let skip = if fold.taken_on_set { "BTFSS" } else { "BTFSC" };
+        self.emit(format!("    {skip} 0x{:02X}, {}", fold.slot, fold.bit));
+        self.emit(format!("    GOTO {l_else}"));
+        self.emit_move_val_to_slot(&s.a, s.ty, da);
+        self.emit(format!("    GOTO {l_end}"));
+        self.emit(format!("{l_else}:"));
+        self.emit_move_val_to_slot(&s.b, s.ty, da);
+        self.emit(format!("{l_end}:"));
+    }
+
     /// A fresh local label for intra-block jumps (select branches). The
     /// counter lives at module scope so labels are unique across functions.
     fn fresh_label(&mut self) -> String {
@@ -4938,9 +4965,10 @@ impl<'m> Gen<'m> {
                 let (bk_lo, bk_hi, cnt) = (scr, scr + 1, scr + 2);
                 let r = [scr + 3, scr + 4, scr + 5, scr + 6];
                 let t = [scr + 7, scr + 8, scr + 9, scr + 10];
+                // Only r needs a zero init: every t byte is overwritten by
+                // the a copy below before the loop reads it.
                 for i in 0..4 {
                     self.emit(format!("    CLRF 0x{:02X}", r[i]));
-                    self.emit(format!("    CLRF 0x{:02X}", t[i]));
                 }
                 for i in 0..4u16 {
                     self.emit(format!("    MOVF 0x{:02X}, W", a + i));
@@ -7383,6 +7411,49 @@ fn emit_isr_epilogue(
     g.emit("    RETFIE".to_string());
 }
 
+/// Slot and bit for a direct single-bit test of `%x_name`'s absolute bit
+/// `bit` within its `width_bytes` value. The source must be shared (2+
+/// uses, so its store committed and the slot still holds it at any later
+/// read) and live in banked GPR outside the ISR-shared common area and
+/// the retval window. A slotless source bails instead of panicking.
+fn bit_test_slot(
+    g: &Gen,
+    func: &str,
+    x_name: &str,
+    bit: u32,
+    width_bytes: u8,
+) -> Option<(u16, u8)> {
+    if bit >= u32::from(width_bytes) * 8 {
+        return None;
+    }
+    if g.use_count
+        .get(&ssa_key(func, x_name))
+        .copied()
+        .unwrap_or(0)
+        < 2
+    {
+        return None;
+    }
+    let slot = g.addrs.get(&ssa_key(func, x_name)).copied()? + u16::from((bit / 8) as u8);
+    let in_gpr = g
+        .device
+        .ram_banks
+        .iter()
+        .any(|w| slot >= w.0 && slot <= w.1);
+    let in_common = g
+        .device
+        .common_ram
+        .is_some_and(|w| slot >= w.0 && slot <= w.1);
+    let in_ret = g
+        .device
+        .fixed_retval
+        .is_some_and(|w| slot >= w.0 && slot <= w.1);
+    if !in_gpr || in_common || in_ret {
+        return None;
+    }
+    Some((slot, (bit % 8) as u8))
+}
+
 /// A branch testing one bit of a RAM slot directly: an adjacent
 /// `and`-single-bit, `icmp eq/ne 0`, `brcond` triple whose middle values
 /// are branch-only collapses to `BTFSS slot,bit`, skipping the AND, the
@@ -7451,11 +7522,8 @@ fn find_bit_test_collapse(
         return None;
     }
     let bit = mask.trailing_zeros();
-    if bit >= u32::from(and.ty.bytes()) * 8 {
-        return None;
-    }
     let uses = |name: &str| g.use_count.get(&ssa_key(func, name)).copied().unwrap_or(0);
-    if uses(&icmp.dst) != 1 || uses(&and.dst) != 1 || uses(x_name) < 2 {
+    if uses(&icmp.dst) != 1 || uses(&and.dst) != 1 {
         return None;
     }
     if phi_copies.contains_key(&(b.label.clone(), br.t.clone())) {
@@ -7464,29 +7532,125 @@ fn find_bit_test_collapse(
     if phi_copies.contains_key(&(b.label.clone(), br.f.clone())) {
         return None;
     }
-    let slot = g.slot_addr(func, x_name).direct();
-    let in_gpr = g
-        .device
-        .ram_banks
-        .iter()
-        .any(|w| slot >= w.0 && slot <= w.1);
-    let in_common = g
-        .device
-        .common_ram
-        .is_some_and(|w| slot >= w.0 && slot <= w.1);
-    let in_ret = g
-        .device
-        .fixed_retval
-        .is_some_and(|w| slot >= w.0 && slot <= w.1);
-    if !in_gpr || in_common || in_ret {
-        return None;
-    }
+    let (slot, bit) = bit_test_slot(g, func, x_name, bit, and.ty.bytes())?;
     Some(BitTestCollapse {
         and_dst: and.dst.clone(),
         icmp_dst: icmp.dst.clone(),
-        slot: slot + u16::from((bit / 8) as u8),
-        bit: (bit % 8) as u8,
+        slot,
+        bit,
         taken_on_set: icmp.pred == "ne",
+    })
+}
+
+/// A value `select` on a directly testable bit: the folded `icmp` (plus
+/// the `and` in the mask shape) never emits, and the diamond tests the
+/// source slot with `BTFSC`/`BTFSS` instead of reloading the i1. Selects
+/// have no edges, so unlike the branch collapse no phi-copy restriction
+/// applies. Keyed by the select's index in its block.
+struct SelectFold {
+    and_dst: Option<String>,
+    icmp_dst: String,
+    slot: u16,
+    bit: u8,
+    /// True when cond holds exactly when the bit is set (`ne`, `slt`).
+    taken_on_set: bool,
+}
+
+/// A same-block `and` or `icmp` definition a select fold can consume.
+enum FoldDef<'b> {
+    And(usize, &'b ir::Bin),
+    Cmp(usize, &'b ir::Icmp),
+}
+
+fn find_select_folds(g: &Gen, func: &str, b: &ir::Block) -> HashMap<usize, SelectFold> {
+    let mut defs: HashMap<&str, FoldDef> = HashMap::new();
+    let mut folds = HashMap::new();
+    let uses = |name: &str| g.use_count.get(&ssa_key(func, name)).copied().unwrap_or(0);
+    for (idx, inst) in b.insts.iter().enumerate() {
+        match inst {
+            Inst::Bin(bin) if bin.op == BinOp::And => {
+                defs.insert(bin.dst.as_str(), FoldDef::And(idx, bin));
+            }
+            Inst::Icmp(ic) => {
+                defs.insert(ic.dst.as_str(), FoldDef::Cmp(idx, ic));
+            }
+            Inst::Select(s) if !s.ptr => {
+                if let Val::Reg(c) = &s.cond {
+                    if let Some(fold) = select_fold_at(g, func, &defs, &uses, idx, c) {
+                        folds.insert(idx, fold);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    folds
+}
+
+/// The fold for one `select`, or `None`: cond is a single-use `icmp`
+/// that is either `slt`/`sge` against zero (a sign-bit test, the crc
+/// inner-loop shape) or `eq`/`ne` against zero over a single-use
+/// single-bit `and`. Both defs must sit earlier in the same block.
+fn select_fold_at(
+    g: &Gen,
+    func: &str,
+    defs: &HashMap<&str, FoldDef>,
+    uses: &impl Fn(&str) -> u32,
+    idx: usize,
+    c: &str,
+) -> Option<SelectFold> {
+    let (icmp_idx, icmp) = match defs.get(c) {
+        Some(FoldDef::Cmp(j, ic)) if *j < idx && uses(c) == 1 => (*j, *ic),
+        _ => return None,
+    };
+    let (x_name, bit, width, taken_on_set, and_dst) = match icmp.pred.as_str() {
+        "slt" | "sge" => {
+            // Signed compare against zero with the value on the left:
+            // `x < 0` holds exactly when the top bit is set. A const
+            // LHS (`0 < x`, i.e. `x > 0`) is a different predicate.
+            let Val::Reg(x) = &icmp.a else {
+                return None;
+            };
+            if !matches!(&icmp.b, Val::Const(0)) {
+                return None;
+            }
+            let width = icmp.ty.bytes();
+            (x, u32::from(width) * 8 - 1, width, icmp.pred == "slt", None)
+        }
+        "eq" | "ne" => {
+            let a_name = match (&icmp.a, &icmp.b) {
+                (Val::Reg(a), Val::Const(0)) | (Val::Const(0), Val::Reg(a)) => a,
+                _ => return None,
+            };
+            let (_, and) = match defs.get(a_name.as_str()) {
+                Some(FoldDef::And(k, and)) if *k < icmp_idx && uses(a_name) == 1 => (*k, *and),
+                _ => return None,
+            };
+            let (x, mask) = match (&and.a, &and.b) {
+                (Val::Reg(x), Val::Const(m)) | (Val::Const(m), Val::Reg(x)) => (x, *m),
+                _ => return None,
+            };
+            if mask <= 0 || mask & (mask - 1) != 0 {
+                return None;
+            }
+            let width = and.ty.bytes();
+            (
+                x,
+                mask.trailing_zeros(),
+                width,
+                icmp.pred == "ne",
+                Some(a_name.clone()),
+            )
+        }
+        _ => return None,
+    };
+    let (slot, bit) = bit_test_slot(g, func, x_name, bit, width)?;
+    Some(SelectFold {
+        and_dst,
+        icmp_dst: c.to_string(),
+        slot,
+        bit,
+        taken_on_set,
     })
 }
 
@@ -8566,12 +8730,32 @@ impl<'m> Gen<'m> {
     /// Emits a walk loop's header body ops in IR order. Carried copies
     /// run at the latch below; the counter's own copies are dropped,
     /// its slot already holds the trip count.
-    fn emit_walk_body(&mut self, plan: &WalkLoop, b: &ir::Block) {
+    fn emit_walk_body(
+        &mut self,
+        plan: &WalkLoop,
+        b: &ir::Block,
+        select_folds: &HashMap<usize, SelectFold>,
+    ) {
         self.call_follows = false;
         for op in &plan.body {
             match op {
                 WalkOp::Emit(ii) => {
-                    self.emit_inst(&b.insts[*ii]);
+                    if let Inst::Select(s) = &b.insts[*ii] {
+                        if let Some(fold) = select_folds.get(ii) {
+                            self.emit_select_fold(s, fold);
+                            continue;
+                        }
+                    }
+                    let folded_tmp = match &b.insts[*ii] {
+                        Inst::Bin(bin) => select_folds
+                            .values()
+                            .any(|f| f.and_dst.as_deref() == Some(bin.dst.as_str())),
+                        Inst::Icmp(ic) => select_folds.values().any(|f| f.icmp_dst == ic.dst),
+                        _ => false,
+                    };
+                    if !folded_tmp {
+                        self.emit_inst(&b.insts[*ii]);
+                    }
                 }
                 WalkOp::Load {
                     slot,
@@ -8830,6 +9014,14 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
         }
         let mut terminator = None;
         let collapse = find_bit_test_collapse(g, &f.name, b, &phi_copies);
+        let select_folds = find_select_folds(g, &f.name, b);
+        let mut folded_tmps: HashSet<String> = HashSet::new();
+        for f in select_folds.values() {
+            if let Some(a) = &f.and_dst {
+                folded_tmps.insert(a.clone());
+            }
+            folded_tmps.insert(f.icmp_dst.clone());
+        }
         // Same route as `emit_inst` into `emit_call` (`_delay` is inlined, an unresolved
         // callee takes the trap loop): the trap's `GOTO` sets no PCLATH, so it may not follow.
         let direct_call = |g: &Gen, n: &Inst| matches!(n, Inst::Call(c) if c.callees.is_empty() && c.func != "_delay" && g.is_function(&c.func));
@@ -8838,10 +9030,19 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
                 Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
                 Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(..) => terminator = Some(i),
                 _ if walk_loops.contains_key(&b.label) => {} // walk body emits whole below
+                Inst::Select(s) if select_folds.contains_key(&idx) => {
+                    g.emit_select_fold(s, &select_folds[&idx]);
+                }
                 _ => {
                     let skipped = match i {
-                        Inst::Bin(bin) => collapse.as_ref().is_some_and(|c| c.and_dst == bin.dst),
-                        Inst::Icmp(ic) => collapse.as_ref().is_some_and(|c| c.icmp_dst == ic.dst),
+                        Inst::Bin(bin) => {
+                            collapse.as_ref().is_some_and(|c| c.and_dst == bin.dst)
+                                || folded_tmps.contains(&bin.dst)
+                        }
+                        Inst::Icmp(ic) => {
+                            collapse.as_ref().is_some_and(|c| c.icmp_dst == ic.dst)
+                                || folded_tmps.contains(&ic.dst)
+                        }
                         _ => false,
                     };
                     if !skipped {
@@ -8853,7 +9054,7 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
             }
         }
         if let Some(plan) = walk_loops.get(&b.label) {
-            g.emit_walk_body(plan, b);
+            g.emit_walk_body(plan, b, &select_folds);
         }
         if let Some(t) = terminator {
             match t {
