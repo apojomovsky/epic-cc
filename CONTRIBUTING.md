@@ -56,17 +56,18 @@ Two suites deserve a special mention. The **size ladder** and the **cycle
 ladder** (`crates/driver/tests/size_regression_e2e.rs` and
 `cycle_ladder_e2e.rs`) record how much flash, RAM, and time each benchmark
 program uses, in `crates/driver/tests/fixtures/`. A pull request does not
-edit those baselines. CI measures the ladders and `scripts/baseline_delta.py`
-judges the move against master's baseline: a net win (no total grows, at
-least one shrinks) passes; flash growth up to 8 words or cycle growth up to
-1% on a single row passes when the PR body names it on a line of its own,
-`delta-ok: <row>`; RAM growth, a larger regression, a net loss, or a new or
-removed row holds for a human. After a merge, the `baseline-regen` workflow
-re-measures the ladders on master and commits the refreshed TOMLs as
-`chore(baseline): regenerate`, so the next pull request is judged against
-current numbers. To preview what the bot will commit, run
-`bash scripts/baseline-regen.sh` in the dev container and read the diff;
-never commit the result from a pull request branch.
+edit those baselines. CI measures the ladders on the head and on the base
+commit in the same run, and `scripts/baseline_delta.py` judges the head
+against the base measurement: a net win (no total grows, at least one
+shrinks) passes; flash growth up to 8 words or cycle growth up to 1% on a
+single row passes when the PR body names it on a line of its own,
+`delta-ok: <row>`; RAM growth, a larger regression, a net loss, or a
+removed row holds for a human. A new row has nothing to regress against,
+so it is reported and never holds. The committed TOMLs are a local record
+for non-CI runs, refreshed by an occasional manual regen pull request: from
+a clean master worktree run `bash scripts/baseline-regen.sh` in the dev
+container and open the diff as a PR; never commit the result from a pull
+request branch.
 
 ## Conventions, in brief
 

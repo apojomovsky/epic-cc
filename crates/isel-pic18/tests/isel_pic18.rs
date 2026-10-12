@@ -1248,6 +1248,7 @@ fn inline_u16_call_emits_three_partials_under_the_speed_profile() {
     let opts = isel_pic18::Options {
         copy_loop: true,
         divmod_fold: false,
+        sdiv_prescale: false,
         inline_mul16: true,
     };
     let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
@@ -1289,6 +1290,7 @@ fn inline_u16_with_a_banked_operand_keeps_the_call() {
     let opts = isel_pic18::Options {
         copy_loop: true,
         divmod_fold: false,
+        sdiv_prescale: false,
         inline_mul16: true,
     };
     let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
@@ -1340,6 +1342,7 @@ fn udivmod_u16_recipe_spills_remainder_and_returns_quotient() {
         let opts = isel_pic18::Options {
             copy_loop: true,
             divmod_fold: fold,
+            sdiv_prescale: false,
             inline_mul16: false,
         };
         let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
@@ -1438,6 +1441,91 @@ fn udivmod_routines_simulate_quotient_and_remainder() {
         assert_eq!(&got_q[..], *want_q, "{name}({x:?}, {y:?}) quotient");
         let got_r: Vec<u8> = (0..w).map(|i| p.ram()[gm as usize + i]).collect();
         assert_eq!(&got_r[..], *want_r, "{name}({x:?}, {y:?}) remainder");
+    }
+}
+
+/// The signed prescale (epic-cc#1090) simulates exact quotients and
+/// remainders: small abs dividends run the short loop, INT_MIN and zero
+/// dividends take the guard paths. The `BZ` pin keeps the test on the
+/// prescale prefix, never the plain loop.
+#[test]
+fn sdiv_prescale_routines_simulate_signed_halves() {
+    // (routine, x bytes, y bytes, want bytes)
+    let cases: &[(&str, &[u8], &[u8], &[u8])] = &[
+        ("__sdiv_i8", &[0x9C], &[13], &[0xF9]),
+        ("__srem_i8", &[0x9C], &[13], &[0xF7]),
+        ("__sdiv_i8", &[100], &[13], &[7]),
+        ("__sdiv_i8", &[0x80], &[1], &[0x80]),
+        ("__srem_i8", &[0x80], &[1], &[0]),
+        ("__sdiv_i8", &[0], &[13], &[0]),
+        ("__srem_i8", &[0], &[13], &[0]),
+        ("__sdiv_i8", &[127], &[0xF3], &[0xF7]),
+        ("__srem_i8", &[127], &[0xF3], &[0x0A]),
+        ("__sdiv_i16", &[0xD0, 0x8A], &[0x89, 0x00], &[0x26, 0xFF]),
+        ("__srem_i16", &[0xD0, 0x8A], &[0x89, 0x00], &[0x7A, 0xFF]),
+        (
+            "__sdiv_i32",
+            &[0xEB, 0x32, 0xA4, 0xF8],
+            &[0x00, 0x01, 0x00, 0x00],
+            &[0x33, 0xA4, 0xF8, 0xFF],
+        ),
+        (
+            "__srem_i32",
+            &[0xEB, 0x32, 0xA4, 0xF8],
+            &[0x00, 0x01, 0x00, 0x00],
+            &[0xEB, 0xFF, 0xFF, 0xFF],
+        ),
+    ];
+    for (name, x, y, want) in cases {
+        let w = want.len();
+        let ret = match w {
+            1 => "i8",
+            2 => "i16",
+            _ => "i32",
+        };
+        let m = parse(&format!(
+            "global a {ret}\nglobal b {ret}\nglobal q {ret}\n\
+             fn {name}({ret}) (num={ret}, den={ret})\n  block entry:\n    %__scr = alloca 10\n    ret {ret} 0\n\
+             fn main(void) ()\n  block entry:\n    %1 = load {ret} @a\n    %2 = load {ret} @b\n\
+               %3 = call {ret} @{name}({ret} %1, {ret} %2)\n    store {ret} %3 @q\n    ret void\n"
+        ));
+        let (ga, gb, gq) = (0x10, 0x14, 0x18);
+        let addrs = addrs(&[
+            ("a", ga),
+            ("b", gb),
+            ("q", gq),
+            (&format!("{name}::num"), 0x20),
+            (&format!("{name}::den"), 0x24),
+            (&format!("{name}::__scr"), 0x30),
+            ("main::1", 0x40),
+            ("main::2", 0x44),
+            ("main::3", 0x48),
+        ]);
+        let opts = isel_pic18::Options {
+            copy_loop: true,
+            divmod_fold: true,
+            sdiv_prescale: true,
+            inline_mul16: false,
+        };
+        let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+        assert!(
+            asm.contains("    BZ tmp"),
+            "{name} must carry the prescale den check:\n{asm}"
+        );
+        let words = asm::assemble_pic18(&asm);
+        let start = start_steps(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start);
+        for (i, b) in x.iter().enumerate() {
+            p.ram_mut()[ga as usize + i] = *b;
+        }
+        for (i, b) in y.iter().enumerate() {
+            p.ram_mut()[gb as usize + i] = *b;
+        }
+        p.run(20_000);
+        assert!(p.halted(), "{name} must halt");
+        let got: Vec<u8> = (0..w).map(|i| p.ram()[gq as usize + i]).collect();
+        assert_eq!(&got[..], *want, "{name}({x:?}, {y:?})");
     }
 }
 
@@ -4085,6 +4173,7 @@ fn speed_profile_drains_long_copy_runs_straight() {
     let opts = isel_pic18::Options {
         copy_loop: false,
         divmod_fold: false,
+        sdiv_prescale: false,
         inline_mul16: false,
     };
     let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
@@ -4597,6 +4686,7 @@ fn speed_profile_unrolls_short_const_memcpy_only() {
         copy_loop: false,
         divmod_fold: false,
         inline_mul16: false,
+        sdiv_prescale: false,
     };
     let asm = isel_pic18::select_with_opts(
         &PIC18F4550,

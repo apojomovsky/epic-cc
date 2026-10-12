@@ -183,13 +183,14 @@ jobs:
           if-no-files-found: error
 
   baseline-delta:
-    # PR-only growth gate for the size and cycle ladders (epic-cc#1087). Runs
-    # after canonical so a value-pin failure there blocks before any judging.
+    # PR-only growth gate for the size and cycle ladders (epic-cc#1087,
+    # base-measured since epic-cc#1135). Runs after canonical so a value-pin
+    # failure there blocks before any judging.
     name: baseline delta (PR)
-    needs: canonical
+    needs: [warm-toolchain-cache, canonical]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
         with:
@@ -201,6 +202,64 @@ jobs:
           result="$(python3 scripts/ci_noncode_check.py '${{ github.event.pull_request.base.sha }}')"
           echo "non_code=$result" >> "$GITHUB_OUTPUT"
 
+      - name: Set up Docker Buildx
+        if: steps.noncode.outputs.non_code != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.noncode.outputs.non_code != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build ci image (cached)
+        if: steps.noncode.outputs.non_code != 'true'
+        env:
+          CACHE_REF: ghcr.io/${{ github.repository }}-toolchain
+        run: bash scripts/warm-toolchain-cache.sh --target ci --load -t epic-cc-ci:latest
+
+      - name: Check out base commit
+        if: steps.noncode.outputs.non_code != 'true'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      # Exact-match content key only, no restore-keys prefix fallback, as in
+      # canonical: a prefix-hit restores artifacts built from a different
+      # tree and cargo can then link a stale rlib (#828, #831).
+      - name: Cache base cargo target dir
+        if: steps.noncode.outputs.non_code != 'true'
+        uses: actions/cache@v5
+        with:
+          path: base/target
+          key: cargo-${{ runner.os }}-${{ github.workflow }}-${{ hashFiles('base/Cargo.lock', 'base/**/*.rs', 'base/**/*.toml') }}-baseline-base
+
+      - name: Cache cargo home
+        if: steps.noncode.outputs.non_code != 'true'
+        uses: actions/cache@v5
+        with:
+          path: /tmp/cargo-home
+          key: cargo-home-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      # One extra ladder run: the base tree's own ladders measure-only into
+      # base/scratch/baseline-artifacts, and the judge compares the head
+      # measurement against that instead of master's committed TOMLs. Only
+      # the two ladder targets run, not the full suite. A failed base run
+      # does not fail the job: the judge falls back per ladder to the
+      # committed TOML at the base SHA and says so in the summary.
+      - name: Measure base ladders
+        if: steps.noncode.outputs.non_code != 'true'
+        run: |
+          docker run --rm -v "$PWD/base:/workspace" -w /workspace \
+            -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
+            -e BASELINE_ARTIFACT_DIR=/workspace/scratch/baseline-artifacts \
+            epic-cc-ci:latest bash -c 'cargo test -p driver --test size_regression_e2e --test cycle_ladder_e2e' || \
+            echo "::warning::base ladder run failed, judge falls back to committed TOMLs"
+          sudo chown -R "$(id -u):$(id -g)" base
+
       - name: Download ladder measurements
         if: steps.noncode.outputs.non_code != 'true'
         uses: actions/download-artifact@v4
@@ -210,15 +269,15 @@ jobs:
 
       # The PR body reaches the script via env, never interpolated into the
       # shell, so a body containing quotes or $(...) cannot run commands.
-      - name: Judge against master baselines
+      - name: Judge head against base measurement
         if: steps.noncode.outputs.non_code != 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          # The rules come from master, not from the PR: a PR cannot relax
-          # the thresholds it is judged by. The one exception is the PR that
-          # introduces the judge, where master has no copy to trust yet.
+          # The rules come from the base commit, not from the PR: a PR cannot
+          # relax the thresholds it is judged by. The one exception is the PR
+          # that introduces the judge, where the base has no copy to trust yet.
           if git cat-file -e "$BASE_SHA:scripts/baseline_delta.py" 2>/dev/null; then
             git show "$BASE_SHA:scripts/baseline_delta.py" > "$RUNNER_TEMP/baseline_delta.py"
           else
@@ -226,8 +285,21 @@ jobs:
           fi
           git show "$BASE_SHA:scripts/add_device.py" > "$RUNNER_TEMP/add_device.py"
           printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
-          python3 "$RUNNER_TEMP/baseline_delta.py" --base-sha "$BASE_SHA" \
-            --artifacts scratch/baseline-artifacts --pr-body "$RUNNER_TEMP/pr-body.md"
+          # Bootstrap for bases predating epic-cc#1135: their judge knows no
+          # --base-artifacts flag, so they run without it and judge against
+          # the committed TOML, as before. The base copy always rules; a PR
+          # never judges itself. This PR is the one such run: it moves no
+          # ladder row, so its hold names only other merges' stale TOML
+          # deltas and is safe to tap through (see the PR body).
+          if grep -q -- --base-artifacts "$RUNNER_TEMP/baseline_delta.py"; then
+            python3 "$RUNNER_TEMP/baseline_delta.py" --base-sha "$BASE_SHA" \
+              --artifacts scratch/baseline-artifacts --base-artifacts base/scratch/baseline-artifacts \
+              --pr-body "$RUNNER_TEMP/pr-body.md"
+          else
+            python3 "$RUNNER_TEMP/baseline_delta.py" --base-sha "$BASE_SHA" \
+              --artifacts scratch/baseline-artifacts \
+              --pr-body "$RUNNER_TEMP/pr-body.md"
+          fi
 
       - name: Publish delta summary
         if: always() && steps.noncode.outputs.non_code != 'true'

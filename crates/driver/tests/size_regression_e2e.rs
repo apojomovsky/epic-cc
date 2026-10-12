@@ -30,7 +30,8 @@
 //! headroom; see epic-cc#629. That is a local knob only: CI measures.
 //! `BASELINE_ARTIFACT_DIR` (set by `scripts/ci-test.sh`) makes the run
 //! measure-only and write `size.json` there; growth is then judged by
-//! `scripts/baseline_delta.py` against master's TOML (epic-cc#1087).
+//! `scripts/baseline_delta.py` against the same run's measurement of the
+//! base commit (epic-cc#1135).
 //!
 //! The ladder mixes program sizes deliberately: `add.c` is near-zero, so
 //! it catches boilerplate/startup regressions cheaply; the vendored

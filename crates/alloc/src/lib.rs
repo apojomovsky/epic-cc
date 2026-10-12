@@ -7,7 +7,11 @@
 //! function lives in a frame assigned from the call graph: `base(f) = max
 //! over callers of the caller's **physical** frame end` (the address just
 //! past its last placed local, bank crossings included; see `frame_end`),
-//! so sibling functions (never co-live) share RAM.
+//! so sibling functions (never co-live) share RAM. Inside the interrupt
+//! context the rule sharpens per call site: `base(f) = max over its sites
+//! of the caller's live-high at that site` (past the caller's last slot
+//! live across the call; see `live_high`), so the ISR dispatch fan-out
+//! shares one frame sized to the widest copy (epic-cc#855).
 //!
 //! Which block starts at the device's first GPR bank is the core's call:
 //! PIC14 puts the globals there and the frames above them, PIC18 the
@@ -289,6 +293,63 @@ fn routine_base(device: &Device, base: u16, widths: &[u8]) -> u16 {
 /// the skipped instruction names, not just its position, so the whole frame
 /// must sit in one bank (epic-cc#357, epic-cc#509). Shared by the
 /// main-context and ISR-context base-assignment loops (epic-cc#6).
+/// Callee base for one call site: the caller frame prefix a callee called
+/// there may reuse. Walks the caller's slot widths through
+/// `place_contiguous` up past the highest slot holding a value live across
+/// the site, exactly the way the locals layout would place the next local,
+/// so the result is always a valid frame base. A value is live across the
+/// site when its own range spans it: an argument, the indirect target, or
+/// anything used past it. The call's own result is excluded: it is written
+/// after the callee returns, so the stale slot needs no preservation. Slots
+/// above hold only values dead across the call. With nothing live the callee
+/// shares the caller's base outright. Never above the caller's physical end,
+/// so every pre-existing layout stays reachable.
+fn live_high(
+    device: &Device,
+    base: u16,
+    widths: &[u8],
+    live: &HashMap<String, (usize, (usize, u16), (usize, u16))>,
+    site: (usize, u16),
+    exclude: Option<&str>,
+) -> u16 {
+    let mut top: Option<usize> = None;
+    for (v, (slot, lo, hi)) in live {
+        if Some(v.as_str()) == exclude {
+            continue;
+        }
+        if *lo <= site && site <= *hi && top.is_none_or(|t| t < *slot) {
+            top = Some(*slot);
+        }
+    }
+    let Some(k) = top else {
+        return base;
+    };
+    let mut addr = base;
+    for &w in &widths[..=k] {
+        addr = place_contiguous(device, addr, w) + u16::from(w);
+    }
+    addr
+}
+/// The bank-select key of an address: what isel's bank select keys on, so
+/// two frames with equal keys at both ends need identical selects. PIC18
+/// selects by BSR bank with the access window free; banked cores select by
+/// GPR region. Total (never panics): a gap address maps to the next
+/// region, consistently, and equality is all the cap below reads.
+fn bank_key(device: &Device, addr: u16) -> (u16, bool) {
+    if device.core == Core::Pic18 {
+        let in_window = device
+            .access_bank
+            .is_some_and(|(lo, hi)| addr >= lo && addr <= hi);
+        return ((addr >> 8) << 1 | u16::from(in_window), true);
+    }
+    let idx = device
+        .ram_banks
+        .iter()
+        .position(|&(_, end)| addr <= end)
+        .unwrap_or(device.ram_banks.len()) as u16;
+    (idx, false)
+}
+
 fn round_if_routine(
     device: &Device,
     f: &str,
@@ -344,6 +405,12 @@ struct FrameLayout {
     /// reads it to rank the slots of a frame whose access-window prefix is
     /// worth filling (epic-cc#535).
     heat: Vec<u32>,
+    /// Live range per colored value: slot index plus the `(lo, hi)` range in
+    /// linear block order. `live_high` reads which caller slots a call site
+    /// must preserve: a value covers a site its own range spans, so a slot
+    /// shared by many short disjoint values frees up between them even
+    /// though the slot union spans the whole function.
+    live: HashMap<String, (usize, (usize, u16), (usize, u16))>,
 }
 
 /// Blocks of `f` in liveness and placement order: the entry (the function's
@@ -1066,11 +1133,18 @@ fn frame_layout(
         heat[slot] += reads + 1;
     }
     let size: u16 = widths.iter().map(|&w| u16::from(w)).sum();
+    let mut live: HashMap<String, (usize, (usize, u16), (usize, u16))> = HashMap::new();
+    for (v, lo, hi, _, _) in &vals {
+        if let Some(&s) = slot_of.get(*v) {
+            live.insert((*v).clone(), (s, *lo, *hi));
+        }
+    }
     FrameLayout {
         widths,
         size,
         slot_of,
         heat,
+        live,
     }
 }
 
@@ -2218,35 +2292,50 @@ pub fn allocate_with_pool(
     edges_text: &str,
     pool: bool,
 ) -> AllocLayout {
-    let (nofold, fit) = allocate_inner(device, m, edges_text, None, pool);
-    if device.core == Core::Pic14 {
-        // Globals-first is exact, not monotone: global placement reads
-        // only the module's globals, never the frame widths the gated
-        // pass shrinks, so the bounding map's globals are the final
-        // map's globals and the two passes fold the same set.
+    // The fold-gate selection below, run with and without the per-site dip:
+    // a dip that does not shrink reported RAM only churns addresses
+    // (outliner sharing, select placement), so ties keep the old layout.
+    // Fixed bytes are identical either way (same device and ISR), so the
+    // bank-used sum is the whole comparison.
+    let select = |allow_dip: bool| -> AllocLayout {
+        let (nofold, fit) = allocate_inner(device, m, edges_text, None, pool, allow_dip);
+        if device.core == Core::Pic14 {
+            // Globals-first is exact, not monotone: global placement reads
+            // only the module's globals, never the frame widths the gated
+            // pass shrinks, so the bounding map's globals are the final
+            // map's globals and the two passes fold the same set.
+            let safe: HashSet<String> = m
+                .globals
+                .iter()
+                .filter(|g| !g.is_const && nofold.globals.contains_key(&g.name))
+                .map(|g| g.name.clone())
+                .collect();
+            return allocate_inner(device, m, edges_text, Some(&safe), pool, allow_dip).0;
+        }
+        if device.core != Core::Pic18 || !fit {
+            return nofold;
+        }
+        let Some((_, hi)) = device.access_bank else {
+            return nofold;
+        };
+        // Same bank test `isel-pic18` applies to the final map, so its
+        // folds agree with these drops on every placed slot.
         let safe: HashSet<String> = m
             .globals
             .iter()
-            .filter(|g| !g.is_const && nofold.globals.contains_key(&g.name))
+            .filter(|g| !g.is_const && nofold.globals.get(&g.name).is_some_and(|a| *a <= hi))
             .map(|g| g.name.clone())
             .collect();
-        return allocate_inner(device, m, edges_text, Some(&safe), pool).0;
-    }
-    if device.core != Core::Pic18 || !fit {
-        return nofold;
-    }
-    let Some((_, hi)) = device.access_bank else {
-        return nofold;
+        allocate_inner(device, m, edges_text, Some(&safe), pool, allow_dip).0
     };
-    // Same bank test `isel-pic18` applies to the final map, so its
-    // folds agree with these drops on every placed slot.
-    let safe: HashSet<String> = m
-        .globals
-        .iter()
-        .filter(|g| !g.is_const && nofold.globals.get(&g.name).is_some_and(|a| *a <= hi))
-        .map(|g| g.name.clone())
-        .collect();
-    allocate_inner(device, m, edges_text, Some(&safe), pool).0
+    let dipped = select(true);
+    let plain = select(false);
+    let ram = |l: &AllocLayout| l.bank_used.iter().sum::<u16>();
+    if ram(&plain) <= ram(&dipped) {
+        plain
+    } else {
+        dipped
+    }
 }
 
 /// Address allocation with a value-fold gate (epic-cc#863). `None`
@@ -2254,13 +2343,16 @@ pub fn allocate_with_pool(
 /// public `allocate` pairs a bounding pass with the gated one. The
 /// `bool` reports whether the frames fit below the globals; when they
 /// do not, the globals-first fallback owns the layout instead. `pool`
-/// gates pooled-const RAM copies on PIC14 (epic-cc#816).
+/// gates pooled-const RAM copies on PIC14 (epic-cc#816). `allow_dip`
+/// admits the per-site live-high dip (epic-cc#855); without it every base
+/// follows the caller-end rule, the pre-dip layout bit for bit.
 fn allocate_inner(
     device: &Device,
     m: &Module,
     edges_text: &str,
     gate: Option<&HashSet<String>>,
     pool: bool,
+    allow_dip: bool,
 ) -> (AllocLayout, bool) {
     // The va region size frame_layout reserves: the widest call site, with
     // a one-byte floor so a variadic function whose call sites pass no
@@ -2380,6 +2472,18 @@ fn allocate_inner(
             final_tgt.insert(src, tgt);
         }
     }
+    // Callees that receive homed args never dip below a caller's end: a
+    // homed value lives at its callee-param address, which the coloring
+    // never sees, so a dipped callee frame could land a dead caller slot
+    // on it and the caller's own setup order would clobber the homed
+    // value before the callee reads it (the SPBRG dividend, epic-cc#855:
+    // main's const setup overwrote the homed fosc sharing the routine's
+    // param slot). Stacked frames cannot collide this way, so the old
+    // caller-end rule stands for these callees.
+    let homed_callee: HashSet<String> = final_tgt
+        .values()
+        .map(|(callee, _)| callee.clone())
+        .collect();
 
     // 2. locals_widths(f) = the liveness-overlay slot widths of f's params
     // and defined values, in allocation order (the order `frame_end` walks
@@ -2389,6 +2493,10 @@ fn allocate_inner(
     // size (epic-cc#172).
     let mut locals_widths: HashMap<String, Vec<u8>> = HashMap::new();
     let mut locals_size: HashMap<String, u16> = HashMap::new();
+    // Live range per value per function: the live-across map below reads
+    // which caller slots each call site must preserve.
+    let mut live_map: HashMap<String, HashMap<String, (usize, (usize, u16), (usize, u16))>> =
+        HashMap::new();
     let va_sizes = va_sizes(m);
     for f in &m.funcs {
         let fl = frame_layout(
@@ -2398,6 +2506,7 @@ fn allocate_inner(
             unplaced_in(&f.name),
             &retval_in(&f.name),
         );
+        live_map.insert(f.name.clone(), fl.live);
         locals_widths.insert(f.name.clone(), fl.widths);
         locals_size.insert(f.name.clone(), fl.size);
     }
@@ -2464,6 +2573,40 @@ fn allocate_inner(
             callers.entry(c.clone()).or_default().push(p.clone());
         }
     }
+    // Call sites per callee: (caller, block-order index, inst position) of
+    // every call that can reach it (direct target, or one site per indirect
+    // candidate, mirroring `callgraph`'s edges; `_delay` and malformed
+    // numeric targets contribute none). Positions share `frame_layout`'s
+    // block order, and each site records the call result for `live_high`
+    // to exclude.
+    let mut sites: HashMap<String, Vec<(String, usize, u16, Option<String>)>> = HashMap::new();
+    for f in &m.funcs {
+        let order = block_order(f);
+        for (bi, b) in order.iter().enumerate() {
+            for (pos, inst) in b.insts.iter().enumerate() {
+                let ir::Inst::Call(c) = inst else {
+                    continue;
+                };
+                if c.func == "_delay" {
+                    continue;
+                }
+                // The call's own result is excluded from the live-across set
+                // at its site (see `live_high`): it is written after the
+                // callee returns, so the stale slot needs no preservation.
+                let site = (f.name.clone(), bi, pos as u16, c.dst.clone());
+                if c.callees.is_empty() {
+                    if c.func.chars().all(|ch| ch.is_ascii_digit()) {
+                        continue;
+                    }
+                    sites.entry(c.func.clone()).or_default().push(site);
+                } else {
+                    for callee in &c.callees {
+                        sites.entry(callee.clone()).or_default().push(site.clone());
+                    }
+                }
+            }
+        }
+    }
     let isr_names: HashSet<&str> = m
         .funcs
         .iter()
@@ -2476,26 +2619,63 @@ fn allocate_inner(
     // them (PIC14) without the derivation existing twice.
     let assign_bases =
         |region_start: u16| -> (HashMap<String, u16>, Option<u16>, Option<u16>, Option<u16>) {
-            // 5. base(f) = max over direct callers of the caller's PHYSICAL
-            // frame end; roots at region_start, in forward topo order so every
-            // caller precedes its callees.
+            // 5. base(f) = max over its call sites of the caller's live-high
+            // at that site; roots at region_start, callers precede callees.
+            // A site with nothing live across it shares the caller's base,
+            // so the ISR dispatch fan-out shares one frame sized to the
+            // widest; live values stay below the callee. Never above the old
+            // caller-end rule, and a dip leaving its old banks is refused,
+            // so the selects stay put (epic-cc#855).
 
             // The virtual sum base(p) + locals_size[p] is NOT used: a caller
             // whose frame spills past a bank region end ends beyond that sum,
             // and a callee based on it could land in the gap at the next
             // region's start, exactly where the caller's spill locals live
-            // while both frames are live. frame_end walks the caller's actual
+            // while both frames are live. live_high walks the caller's actual
             // widths through place_contiguous, so it matches step 7's
             // placement exactly, hole bytes included.
             let mut base: HashMap<String, u16> = HashMap::new();
             for f in &topo {
-                let b = match callers.get(f) {
+                // A callee that receives homed args keeps the caller-end
+                // rule: its homed addresses are invisible to the coloring
+                // (see `homed_callee`), so no dip.
+                let dipped = if !allow_dip || homed_callee.contains(f) {
+                    None
+                } else {
+                    match sites.get(f) {
+                        Some(ss) => ss
+                            .iter()
+                            .map(|(p, bi, pos, dst)| {
+                                live_high(
+                                    device,
+                                    base[p],
+                                    &locals_widths[p],
+                                    &live_map[p],
+                                    (*bi, *pos),
+                                    dst.as_deref(),
+                                )
+                            })
+                            .max(),
+                        None => None,
+                    }
+                };
+                let old = match callers.get(f) {
                     Some(ps) => ps
                         .iter()
                         .map(|p| frame_end(device, base[p], &locals_widths[p]))
                         .max()
                         .expect("alloc: empty caller list"),
                     None => region_start,
+                };
+                let b = match dipped {
+                    Some(d)
+                        if bank_key(device, d) == bank_key(device, old)
+                            && bank_key(device, frame_end(device, d, &locals_widths[f]))
+                                == bank_key(device, frame_end(device, old, &locals_widths[f])) =>
+                    {
+                        d
+                    }
+                    _ => old,
                 };
                 // A runtime routine's frame must stay inside ONE GPR bank: its
                 // skip-sensitive recipe loops cannot tolerate a BANKSEL between a
@@ -2579,11 +2759,45 @@ fn allocate_inner(
                             let b = if roots.iter().any(|r| r.as_str() == f.as_str()) {
                                 region_base
                             } else {
-                                callers[f]
+                                let old = callers[f]
                                     .iter()
                                     .map(|p| frame_end(device, base[p], &locals_widths[p]))
                                     .max()
-                                    .expect("alloc: empty caller list")
+                                    .expect("alloc: empty caller list");
+                                let dipped = if !allow_dip || homed_callee.contains(f) {
+                                    None
+                                } else {
+                                    sites.get(f).map(|ss| {
+                                        ss.iter()
+                                            .map(|(p, bi, pos, dst)| {
+                                                live_high(
+                                                    device,
+                                                    base[p],
+                                                    &locals_widths[p],
+                                                    &live_map[p],
+                                                    (*bi, *pos),
+                                                    dst.as_deref(),
+                                                )
+                                            })
+                                            .max()
+                                            .expect("alloc: empty site list")
+                                    })
+                                };
+                                match dipped {
+                                    Some(d)
+                                        if bank_key(device, d) == bank_key(device, old)
+                                            && bank_key(
+                                                device,
+                                                frame_end(device, d, &locals_widths[f]),
+                                            ) == bank_key(
+                                                device,
+                                                frame_end(device, old, &locals_widths[f]),
+                                            ) =>
+                                    {
+                                        d
+                                    }
+                                    _ => old,
+                                }
                             };
                             // Issue #6: the ISR context's routine copies get the same
                             // single-bank frame rounding as the main context's.
@@ -3661,7 +3875,23 @@ fn allocate_inner(
         Some(r) => r,
         None => assign_bases(bank0_start),
     };
-
+    // Callers a callee dips into (its base sits below their physical end):
+    // the dipped base was derived from the coloring's slot order, so those
+    // frames keep it in step 7. Any other frame keeps today's heat order:
+    // its callees start at its physical end, which no permutation moves.
+    let mut dipped: HashSet<String> = HashSet::new();
+    if allow_dip {
+        for (t, ss) in &sites {
+            let Some(&bt) = base.get(t) else {
+                continue;
+            };
+            for (p, _, _, _) in ss {
+                if bt < frame_end(device, base[p], &locals_widths[p]) {
+                    dipped.insert(p.clone());
+                }
+            }
+        }
+    }
     // 7. Local addresses: each slot of the liveness-colored frame at the
     // next free frame byte, stepping through the banks via
     // `place_contiguous`/`region_for` (which panics if a frame exceeds the
@@ -3690,10 +3920,16 @@ fn allocate_inner(
         // window's end, the coloring's order otherwise. A permutation keeps
         // the frame's byte size but can in principle move the end where a
         // slot crosses a region boundary (p18f2450, the one PIC18 with a
-        // split `ram_banks`); fall back rather than rebase the callees.
-        let order: Vec<usize> = match win_end.and_then(|we| window_order(b, we, &fl)) {
-            Some(p) if frame_end(device, b, &perm_widths(&fl, &p)) == size_end => p,
-            _ => (0..fl.widths.len()).collect(),
+        // split `ram_banks`); fall back rather than rebase the callees. A
+        // dipped-into frame always keeps the coloring's order: the dipped
+        // bases below its end were derived from it.
+        let order: Vec<usize> = if dipped.contains(&f.name) {
+            (0..fl.widths.len()).collect()
+        } else {
+            match win_end.and_then(|we| window_order(b, we, &fl)) {
+                Some(p) if frame_end(device, b, &perm_widths(&fl, &p)) == size_end => p,
+                _ => (0..fl.widths.len()).collect(),
+            }
         };
         let mut slot_addr: Vec<u16> = vec![0; fl.widths.len()];
         let mut addr = b;
@@ -3996,6 +4232,7 @@ mod tests {
             widths,
             slot_of: HashMap::new(),
             heat,
+            live: HashMap::new(),
         };
         // A window of [0x10, 0x60) with frames based at 0x10, the PIC18 shape.
         // Wholly inside: 1 + 2 = 3 bytes, ending at 0x13, well under 0x60.

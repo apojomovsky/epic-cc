@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Behavior tests for baseline_delta.judge: the epic-tasks#306 rules."""
+"""Behavior tests for baseline_delta.judge: epic-tasks#306 as amended by epic-cc#1135."""
 
 import importlib.util
+import json
 import pathlib
+import tempfile
 import unittest
 
 SCRIPT = pathlib.Path(__file__).resolve().parent / "baseline_delta.py"
@@ -87,13 +89,18 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(r["verdict"], "hold")
         self.assertFalse(r["net_win"])
 
-    def test_new_or_removed_row_holds(self):
-        self.assertEqual(
-            run([size_row("add", 50)], [size_row("add", 50), size_row("mul", 9)])[
-                "verdict"
-            ],
-            "hold",
-        )
+    def test_new_row_is_informational_and_passes(self):
+        r = run([size_row("add", 50)], [size_row("add", 50), size_row("mul", 9)])
+        self.assertEqual(r["verdict"], "pass")
+        self.assertEqual(r["new_rows"], ["size mul"])
+        self.assertIn("informational", bd.render_markdown(r))
+
+    def test_new_row_alone_passes_with_no_moved_rows(self):
+        r = run([], [size_row("mul", 9)])
+        self.assertEqual(r["verdict"], "pass")
+        self.assertEqual(r["totals"]["flash_words"], 0)
+
+    def test_removed_row_holds(self):
         self.assertEqual(
             run([size_row("add", 50), size_row("mul", 9)], [size_row("add", 50)])[
                 "verdict"
@@ -141,6 +148,32 @@ class JudgeTests(unittest.TestCase):
     def test_duplicate_ladder_row_is_an_error(self):
         with self.assertRaises(ValueError):
             run([size_row("add", 50), size_row("add", 40)], [size_row("add", 40)])
+
+
+class MeasuredBaseTests(unittest.TestCase):
+    def read(self, files):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for name, content in files.items():
+                if isinstance(content, bytes):
+                    (root / name).write_bytes(content)
+                else:
+                    (root / name).write_text(content)
+            return bd.read_measured_base(root, "size")
+
+    def test_missing_dir_and_file_read_as_no_base(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(bd.read_measured_base(None, "size"))
+            self.assertIsNone(bd.read_measured_base(pathlib.Path(tmp), "size"))
+
+    def test_valid_json_reads_entries(self):
+        rows = [size_row("add", 50)]
+        self.assertEqual(self.read({"size.json": json.dumps(rows)}), rows)
+
+    def test_empty_or_broken_json_reads_as_no_base(self):
+        self.assertIsNone(self.read({"size.json": "[]"}))
+        self.assertIsNone(self.read({"size.json": "{oops"}))
+        self.assertIsNone(self.read({"size.json": b"\xff\xfe"}))
 
 
 if __name__ == "__main__":
