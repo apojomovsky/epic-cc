@@ -2108,6 +2108,37 @@ fn diamond_phi_dst_keeps_slot_when_function_calls() {
     assert_ne!(out.locals["f::x"], out.locals["f::p"]);
 }
 
+/// A merge with two diamonds pins only the first: the second keeps its own
+/// slot even though its arms are dead after, so same-block dsts never share
+/// copy points twice over.
+#[test]
+fn diamond_phi_second_dst_in_merge_keeps_slot() {
+    let m = parse(
+        "const sink i16\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             %x = add i16 1, 2\n\
+             %y = add i16 3, 4\n\
+             %u = add i16 5, 6\n\
+             %v = add i16 7, 8\n\
+             br i1 %c, label %t, label %ff\n\
+           block t:\n\
+             br label %m\n\
+           block ff:\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi i16 %x t %y ff\n\
+             %q = phi i16 %u t %v ff\n\
+             %w = add i16 %p, %q\n\
+             store i16 %w, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::x"], out.locals["f::p"]);
+    assert_ne!(out.locals["f::u"], out.locals["f::q"]);
+    assert_ne!(out.locals["f::v"], out.locals["f::q"]);
+}
+
 /// The or-bool tail (`or` over a zexted compare, no select) pins the same
 /// way: bit 0 lands destructively on the dead accumulator.
 #[test]

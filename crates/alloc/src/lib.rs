@@ -923,6 +923,7 @@ fn frame_layout(
         .flat_map(|b| &b.insts)
         .any(|inst| matches!(inst, ir::Inst::Call(c) if is_site_call(c)));
     let mut diamond: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pinned_merge: HashSet<usize> = HashSet::new();
     for (mi, b) in order.iter().enumerate() {
         for inst in &b.insts {
             let ir::Inst::Phi(p) = inst else {
@@ -1025,7 +1026,10 @@ fn frame_layout(
                 }
                 eligible.push(s.clone());
             }
-            if !eligible.is_empty() && leaf {
+            // At most one diamond dst per merge: a second pin in the same
+            // block shares copy points with the first, and their dsts can
+            // land in each other's way. First admitted in block order wins.
+            if !eligible.is_empty() && leaf && pinned_merge.insert(mi) {
                 diamond.insert(p.dst.clone(), eligible);
             }
         }
