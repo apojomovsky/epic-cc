@@ -10226,6 +10226,21 @@ fn forwarded_bin_result_keeps_its_slot() {
 }
 
 #[test]
+fn two_loads_into_add_read_both_globals() {
+    // Co-fold (epic-cc#876): `%1` feeds the b side and leads, so the
+    // add reads `@a` into W first, then `@b` as the file operand.
+    // Neither load needs an entry: a lookup would panic, so their
+    // absence proves both slots are gone. The bin result still keeps
+    // its temp on PIC14 (epic-cc#875).
+    let m = parse("global a i8\nglobal b i8\nglobal c i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = add i8 %2 %1\n    store i8 %3 @c\n    ret void\n");
+    let addrs = addrs(&[("a", 0x20), ("b", 0x21), ("c", 0x22), ("main::3", 0x26)]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        asm.contains("MOVF 0x20, W\n    ADDWF 0x21, W\n    MOVWF 0x26"),
+        "add reads both globals into the temp:\n{asm}"
+    );
+}
+#[test]
 fn or_operand_load_stays_staged_for_the_lanes() {
     // `Or` feeds the boolean lanes, whose target reads the slot: the
     // load stays staged even single-use (epic-cc#875).

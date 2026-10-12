@@ -481,10 +481,9 @@ fn single_use_load_into_add_folds_direct() {
 }
 
 #[test]
-fn two_loads_into_add_folds_only_the_adjacent_one() {
-    // `%1` stays staged: its gap holds `%2`'s load, and moving its read
-    // past another load would reorder two volatile reads. Widening the
-    // gap to co-folding loads is a follow-up; each fold alone is sound.
+fn two_loads_into_add_cofold_when_b_side_leads() {
+    // `%1` feeds the b side and leads in program order; the op reads
+    // the b side first, so both reads keep their sequence (epic-cc#876).
     let m = parse(
         "global a i8\n\
          global b i8\n\
@@ -502,8 +501,8 @@ fn two_loads_into_add_folds_only_the_adjacent_one() {
         m.globals.iter().map(|g| g.name.clone()).collect();
     let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
     assert!(
-        !folds.loads.contains_key("1"),
-        "gapped load stays staged: {:?}",
+        matches!(folds.loads.get("1"), Some(iselcore::LoadFold::Direct(g)) if g == "a"),
+        "gapped load co-folds: {:?}",
         folds.loads
     );
     assert!(
@@ -514,6 +513,171 @@ fn two_loads_into_add_folds_only_the_adjacent_one() {
     assert!(
         folds.forwarded.contains_key("3"),
         "add result forwards to the store"
+    );
+}
+
+#[test]
+fn two_loads_into_add_keep_single_fold_when_a_side_leads() {
+    // The a-side load leads, but the op reads the b side first, so
+    // co-folding would swap the two reads. Only the adjacent load
+    // folds, as before (epic-cc#876).
+    let m = parse(
+        "global a i8\n\
+         global b i8\n\
+         global c i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @a\n\
+             %2 = load i8 @b\n\
+             %3 = add i8 %1 %2\n\
+             store i8 %3 @c\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        !folds.loads.contains_key("1"),
+        "leading a-side load stays staged: {:?}",
+        folds.loads
+    );
+    assert!(
+        matches!(folds.loads.get("2"), Some(iselcore::LoadFold::Direct(g)) if g == "b"),
+        "adjacent load folds: {:?}",
+        folds.loads
+    );
+}
+
+#[test]
+fn volatile_i16_pair_cofolds_only_once() {
+    // Past one byte the folded reads interleave, so two volatile wide
+    // reads never co-fold. The adjacent load still folds alone, which
+    // moves no read past another (epic-cc#876).
+    let m = parse(
+        "global a i16\n\
+         global b i16\n\
+         global c i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load volatile i16 @a\n\
+             %2 = load volatile i16 @b\n\
+             %3 = add i16 %2 %1\n\
+             store i16 %3 @c\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        !folds.loads.contains_key("1"),
+        "gapped volatile wide load stays staged: {:?}",
+        folds.loads
+    );
+    assert!(
+        matches!(folds.loads.get("2"), Some(iselcore::LoadFold::Direct(g)) if g == "b"),
+        "adjacent load folds: {:?}",
+        folds.loads
+    );
+}
+
+#[test]
+fn plain_i16_pair_cofolds_when_b_side_leads() {
+    // No volatile read in the pair, so the byte interleave is
+    // unobservable and both loads fold (epic-cc#876).
+    let m = parse(
+        "global a i16\n\
+         global b i16\n\
+         global c i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = add i16 %2 %1\n\
+             store i16 %3 @c\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        matches!(folds.loads.get("1"), Some(iselcore::LoadFold::Direct(g)) if g == "a"),
+        "gapped load co-folds: {:?}",
+        folds.loads
+    );
+    assert!(
+        matches!(folds.loads.get("2"), Some(iselcore::LoadFold::Direct(g)) if g == "b"),
+        "adjacent load folds: {:?}",
+        folds.loads
+    );
+}
+
+#[test]
+fn cofold_needs_an_access_safe_sister() {
+    // The sister load is banked, so it never folds and the gap stays
+    // opaque: the candidate stages too (epic-cc#876).
+    let m = parse(
+        "global a i8\n\
+         global b i8\n\
+         global c i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @a\n\
+             %2 = load i8 @b\n\
+             %3 = add i8 %2 %1\n\
+             store i8 %3 @c\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        ["a", "c"].iter().map(|s| s.to_string()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        !folds.loads.contains_key("1"),
+        "candidate stages past an unfolded sister: {:?}",
+        folds.loads
+    );
+    assert!(
+        !folds.loads.contains_key("2"),
+        "banked sister stays staged: {:?}",
+        folds.loads
+    );
+}
+
+#[test]
+fn cofold_ignores_a_gap_load_feeding_elsewhere() {
+    // `%9` sits in `%1`'s gap but feeds its own store, so it never
+    // becomes transparent: `%1` stages while `%2` folds (epic-cc#876).
+    let m = parse(
+        "global a i8\n\
+         global b i8\n\
+         global c i8\n\
+         global d i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @a\n\
+             %9 = load i8 @d\n\
+             %2 = load i8 @b\n\
+             %3 = add i8 %2 %1\n\
+             store i8 %9 @c\n\
+             store i8 %3 @c\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        !folds.loads.contains_key("1"),
+        "load past a foreign gap load stays staged: {:?}",
+        folds.loads
+    );
+    assert!(
+        matches!(folds.loads.get("2"), Some(iselcore::LoadFold::Direct(g)) if g == "b"),
+        "adjacent load folds: {:?}",
+        folds.loads
     );
 }
 
