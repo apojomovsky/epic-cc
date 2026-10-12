@@ -366,17 +366,17 @@ ram_bytes = 47
 [[entry]]
 name = "speed-strlen-strcmp-18f4550"
 device = "18F4550"
-cycles = 2127
-flash_words = 214
-ram_bytes = 57
+cycles = 962
+flash_words = 147
+ram_bytes = 55
 
 [[entry]]
 name = "speed-strlen-strcmp-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 1927
-flash_words = 217
-ram_bytes = 57
+cycles = 950
+flash_words = 149
+ram_bytes = 55
 
 [[entry]]
 name = "speed-strlen-strcmp-16f877a"
@@ -456,16 +456,16 @@ ram_bytes = 11
 [[entry]]
 name = "speed-struct-scan-18f4550"
 device = "18F4550"
-cycles = 347
-flash_words = 73
+cycles = 241
+flash_words = 60
 ram_bytes = 46
 
 [[entry]]
 name = "speed-struct-scan-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 347
-flash_words = 73
+cycles = 241
+flash_words = 60
 ram_bytes = 46
 
 [[entry]]
@@ -548,7 +548,7 @@ name = "speed-mul-u32-16f1937"
 device = "16F1937"
 cycles = 812
 flash_words = 144
-ram_bytes = 48
+ram_bytes = 41
 
 [[entry]]
 name = "speed-mul-u32-16f1937"
@@ -556,14 +556,14 @@ device = "16F1937"
 profile = "O2"
 cycles = 812
 flash_words = 144
-ram_bytes = 48
+ram_bytes = 41
 
 [[entry]]
 name = "speed-mul-u32-16f505"
 device = "16F505"
 cycles = 1824
 flash_words = 361
-ram_bytes = 51
+ram_bytes = 48
 
 [[entry]]
 name = "speed-mul-u32-16f505"
@@ -571,7 +571,7 @@ device = "16F505"
 profile = "O2"
 cycles = 1824
 flash_words = 361
-ram_bytes = 51
+ram_bytes = 48
 
 [[entry]]
 name = "scen-pid-update-18f4550"

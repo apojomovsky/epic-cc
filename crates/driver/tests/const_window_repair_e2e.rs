@@ -38,7 +38,7 @@ fn drifted_table_fails_without_repair() {
 fn repaired_table_pads_and_reads_run() {
     let asm = drifted_text();
     let locs = vec![None; asm.lines().count()];
-    let (fixed, _) = driver::const_window::repair_with_locs(&asm, &locs);
+    let (fixed, _) = driver::const_window::repair_with_locs(&asm, &locs, &[]);
     assert_eq!(
         fixed.matches("    .align 256").count(),
         1,

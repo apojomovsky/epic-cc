@@ -51,9 +51,10 @@ use ir::{
     Val, Zext,
 };
 /// Whole-module lowering: scalar ops that need runtime support become calls
-/// to injected routine functions (see module docs).
+/// to injected routine functions (see module docs). Classic-core sizing:
+/// `__mul_u32` gets the full 11-byte frame the AN526 recipe reads.
 pub fn legalize(m: Module) -> Module {
-    legalize_inner(m, false)
+    legalize_inner(m, false, device::Core::Pic14)
 }
 
 /// PIC18 entry: shares each u32 decimal-digit loop as one call to the
@@ -61,10 +62,17 @@ pub fn legalize(m: Module) -> Module {
 /// helper body exists only in the PIC18 backend, so every other core uses
 /// the plain entry and its IR stays byte-identical.
 pub fn legalize_pic18(m: Module) -> Module {
-    legalize_inner(m, true)
+    legalize_inner(m, true, device::Core::Pic18)
 }
 
-fn legalize_inner(m: Module, pic18: bool) -> Module {
+/// Core-sized entry: `__mul_u32` scratch matches the recipe the core emits
+/// (epic-cc#1068). PIC18 keeps the decimal-loop sharing through the plain
+/// flag, so this covers every other core without a second call site.
+pub fn legalize_for_core(m: Module, core: device::Core) -> Module {
+    legalize_inner(m, matches!(core, device::Core::Pic18), core)
+}
+
+fn legalize_inner(m: Module, pic18: bool, core: device::Core) -> Module {
     // Interrupt duplication happens in two layers. User functions split
     // here, before the lowering loop, because their calls already exist.
     // The runtime routines split after it (`split_isr_routines`), because
@@ -186,14 +194,14 @@ fn legalize_inner(m: Module, pic18: bool) -> Module {
     recover_rem_idiom(&mut funcs, &mut used);
     fuse_divmod_pairs(&mut funcs, &mut m.globals, &mut used);
     for name in &used {
-        funcs.push(routine_func(name));
+        funcs.push(routine_func(name, core));
     }
     for name in &isr_used {
         let base = name
             .strip_suffix("_isr_high")
             .or_else(|| name.strip_suffix("_isr"))
             .expect("legalize: isr routine name must end in _isr or _isr_high");
-        let mut f = routine_func(base);
+        let mut f = routine_func(base, core);
         f.name = name.clone();
         funcs.push(f);
     }
@@ -5509,6 +5517,19 @@ fn param(name: &str, width: u8) -> Param {
     }
 }
 
+/// `__mul_u32` scratch bytes per core: the classic AN526 recipe keeps its
+/// multiplier backup, counter, product and multiplicand in scratch (11),
+/// while pic14e shifts both operands in their param slots (4) and baseline
+/// copies only the multiplicand (8). PIC18 keeps 11, its hw recipe is out
+/// of this ticket's scope.
+fn mul_u32_scratch(core: device::Core) -> u8 {
+    match core {
+        device::Core::Pic14e => 4,
+        device::Core::PicBaseline => 8,
+        device::Core::Pic14 | device::Core::Pic18 => 11,
+    }
+}
+
 /// The injected runtime routine definitions. Each is an ordinary function
 /// with one empty block containing only the scratch alloca, so `alloc`
 /// places the frame and the recipe emitters resolve every slot
@@ -5542,7 +5563,7 @@ fn param(name: &str, width: u8) -> Param {
 /// | `__sdivmod_i16` | 7 | same frame as `__sdiv_i16`: both halves negate in place, quotient to retval, remainder to the spill slot |
 /// | `__shl_u8`, `__lshr_u8`, `__ashr_i8` | 3 | `cnt`@0 (masked count / loop counter: the value shifts in the `val` param slot), `spare`@1-2 (recipe scratch) |
 /// | `__shl_u16`, `__lshr_u16`, `__ashr_i16` | 4 | `cnt`@0-1 (masked count / loop counter), `spare`@2-3 (recipe scratch) |
-/// | `__mul_u32` | 11 | `bk_lo`@0 / `bk_hi`@1 (multiplier backup: 2 bytes, the low 16 bits first, reloaded from `b`'s high half for the second 16 of the 32 iterations), `cnt`@2 (loop counter, 32), `r`@3-6 (32-bit running product: the low 32 bits of the full product), `t`@7-10 (shifted multiplicand: 4 bytes, shifting left with wraparound, so the shifted-out high bits drop and i32 `mul` wraps) |
+/// | `__mul_u32` | 11 classic/PIC18, 4 pic14e, 8 baseline | classic: `bk_lo`@0 / `bk_hi`@1 (multiplier backup: 2 bytes, the low 16 bits first, reloaded from `b`'s high half for the second 16 of the 32 iterations), `cnt`@2 (loop counter, 32), `r`@3-6 (32-bit running product: the low 32 bits of the full product), `t`@7-10 (shifted multiplicand: 4 bytes, shifting left with wraparound, so the shifted-out high bits drop and i32 `mul` wraps). pic14e keeps `r`@0-3 only (both operands shift in their param slots); baseline keeps `r`@0-3 plus `t`@4-7 (only the multiplicand copy needs scratch, the multiplier shifts in place) |
 /// | `__udiv_u32`, `__urem_u32` | 10 | `rem`@0-3 (partial remainder: full 32 bits, with no carry out for a 32/32 divide), `den`@4-7 (denominator copy: the divmod subtracts/restores against this, so the param slot stays untouched), `cnt`@8 (loop counter, 32), `spare`@9 (recipe scratch) |
 /// | `__udec_u32` | 11 | `den`@0-3 (baked divisor 10, set once: the loop divides by a constant), `rem`@4-7 (divmod remainder, digit source), `cnt`@8 (bit counter, 32), `digit`@9 (ASCII digit staging), `n`@10 (digit count, the return value) |
 /// | `__udec_u16_5` | 7 | `den`@0-1 (baked divisor 10), `rem`@2-3 (divmod remainder, digit source), `dcnt`@4 (bit counter, 16), `iter`@5 (digit counter, 5), `digit`@6 (binary digit staging) |
@@ -5565,11 +5586,17 @@ fn param(name: &str, width: u8) -> Param {
 /// f32 bytes; `val` is the 4-byte int slot: an i8/i16 source or result uses
 /// the low bytes), write the result to the retval slots, and use `__scr`
 /// strictly by offset (the recipe contract).
-fn routine_func(name: &str) -> Func {
+/// The `core` sizes `__mul_u32` only; every other routine reads the same
+/// offsets on every backend, so its size stays core-independent.
+fn routine_func(name: &str, core: device::Core) -> Func {
     let (ret, params, scr) = match name {
         "__mul_u8" => (Ty::I8, vec![param("a", 1), param("b", 1)], 1),
         "__mul_u16" => (Ty::I16, vec![param("a", 2), param("b", 2)], 2),
-        "__mul_u32" => (Ty::I32, vec![param("a", 4), param("b", 4)], 11),
+        "__mul_u32" => (
+            Ty::I32,
+            vec![param("a", 4), param("b", 4)],
+            mul_u32_scratch(core),
+        ),
         "__udiv_u8" | "__urem_u8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 4),
         "__udivmod_u8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 4),
         "__udiv_u16" | "__urem_u16" => (Ty::I16, vec![param("num", 2), param("den", 2)], 7),

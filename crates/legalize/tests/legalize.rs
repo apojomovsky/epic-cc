@@ -104,6 +104,43 @@ fn injected_routines_get_param_and_scratch_slots_allocated() {
     );
 }
 
+/// `__mul_u32` scratch follows the core: the classic AN526 frame (11), the
+/// pic14e in-place frame (4), the baseline multiplicand-copy frame (8). The
+/// default and PIC18 entries keep classic sizing.
+#[test]
+fn mul_u32_scratch_is_sized_per_core() {
+    let src = "global in i32\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load i32 @in\n\
+             %m = mul i32 %a, 7\n\
+             store i32 %m, @in\n\
+             ret void\n";
+    let scr_of = |m: ir::Module| {
+        let f = m.funcs.iter().find(|f| f.name == "__mul_u32").unwrap();
+        match &f.blocks[0].insts[0] {
+            Inst::Alloca(a) => a.size,
+            other => panic!("__mul_u32 must inject the scratch alloca, got {other:?}"),
+        }
+    };
+    assert_eq!(scr_of(legalize(parse(src))), 11);
+    assert_eq!(scr_of(legalize::legalize_pic18(parse(src))), 11);
+    assert_eq!(
+        scr_of(legalize::legalize_for_core(
+            parse(src),
+            device::Core::Pic14e
+        )),
+        4
+    );
+    assert_eq!(
+        scr_of(legalize::legalize_for_core(
+            parse(src),
+            device::Core::PicBaseline
+        )),
+        8
+    );
+}
+
 /// Table-driven: every mul/div/rem binop and every reg-count shift on i8/i16
 /// lowers to a call to the matching runtime routine, and the injected Func
 /// (signature: ret + 2 params) carries the exact scratch alloca size from the
