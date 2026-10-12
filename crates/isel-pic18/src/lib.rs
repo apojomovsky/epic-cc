@@ -46,6 +46,10 @@ const CONST_COPY_O2_UNROLL_MAX: usize = 8;
 /// `divmod_fold` folds the software divide/modulo loop counter into both
 /// bit paths (epic-cc#894), dropping the taken `BRA` off the success path
 /// at 2 words per helper. Speed profile only.
+/// `sdiv_prescale` left-shifts the signed divide/modulo dividend past its
+/// leading zeros before the restoring loop, running only the significant
+/// bit count (epic-cc#1090). Signed only: unsigned bench dividends already
+/// have the top bit set, so the check would cost cycles there. Speed only.
 /// `inline_mul16` inlines the u16 widening multiply at the call site
 /// instead of calling `__mul_u16`. The inline form parks both operand
 /// bytes in the retval region, so it costs flash per site; the speed
@@ -55,6 +59,7 @@ const CONST_COPY_O2_UNROLL_MAX: usize = 8;
 pub struct Options {
     pub copy_loop: bool,
     pub divmod_fold: bool,
+    pub sdiv_prescale: bool,
     pub inline_mul16: bool,
 }
 
@@ -63,6 +68,7 @@ impl Default for Options {
         Self {
             copy_loop: true,
             divmod_fold: false,
+            sdiv_prescale: false,
             inline_mul16: false,
         }
     }
@@ -361,6 +367,9 @@ struct Gen<'m> {
     /// Whether the divmod bit loop folds its counter into both paths. On
     /// under the speed profile only.
     divmod_fold: bool,
+    /// Whether the signed divmod wrappers prescale the dividend past its
+    /// leading zeros. On under the speed profile only.
+    sdiv_prescale: bool,
     /// Whether `__mul_u16` calls inline at the site (epic-cc#892).
     inline_mul16: bool,
     /// Every RAM address a global occupies. The W cache never records or
@@ -749,9 +758,9 @@ impl<'m> Gen<'m> {
     /// decision, so it must never contribute. Central `emit` calls this
     /// for every single-operand branch to a `tmp` label; block labels
     /// (`{func}_L*`, entries) never match, so IR-pred joins are
-    /// unaffected, and loop headers stay unknown because every loop in
-    /// this backend enters its header by fall-through or back-edge,
-    /// never by a recorded forward branch (audited per loop site).
+    /// unaffected. Headers rejoin on agreement and fall back to unknown,
+    /// so the divide prescale's forward branches into its loop header
+    /// cannot mistrack the bank (audited at the emitter).
     fn note_branch(&mut self, label: &str) {
         let cur = self.bsr;
         self.fwd_join
@@ -9891,7 +9900,9 @@ impl<'m> Gen<'m> {
     /// unsigned and signed wrappers. The u8 case pairs a 2-byte remainder
     /// with a 1-byte divisor (implicit high byte 0 via `MOVLW 0` folds).
     /// With `fold` the counter lives in both bit paths, dropping the taken
-    /// `BRA` off the success path at 2 words.
+    /// `BRA` off the success path at 2 words. With `prescale` (signed
+    /// wrappers only) the dividend shifts past its leading zeros first and
+    /// the loop runs the significant count; `den == 0` keeps the full loop.
     fn emit_divmod_loop(
         &mut self,
         num: u16,
@@ -9901,12 +9912,20 @@ impl<'m> Gen<'m> {
         den_bytes: u8,
         rem_bytes: u8,
         fold: bool,
+        prescale: bool,
     ) {
         // Mint order matches the old head so unfolded output keeps its
-        // label numbering; the fold-only label never shifts it.
+        // label numbering; the prescale-only and fold-only labels never
+        // shift it. The prescale label is minted only on that path, so
+        // unsigned output keeps its numbering even under the speed profile.
         let l_loop = self.fresh_label();
         let l_restore = self.fresh_label();
         let l_next = self.fresh_label();
+        let l_pre = if prescale {
+            self.fresh_label()
+        } else {
+            String::new()
+        };
         let l_done = if fold {
             self.fresh_label()
         } else {
@@ -9925,6 +9944,50 @@ impl<'m> Gen<'m> {
             "    MOVWF 0x{cf:03X},{}",
             if ca == 0 { "A" } else { "B" }
         ));
+        if prescale {
+            // den == 0 keeps the full loop, preserving the poison path.
+            let (za, zf) = self.operand(den);
+            self.emit(format!(
+                "    MOVF 0x{zf:03X},W,{}",
+                if za == 0 { "A" } else { "B" }
+            ));
+            for i in 1..u16::from(den_bytes) {
+                let (za, zf) = self.operand(den + i);
+                self.emit(format!(
+                    "    IORWF 0x{zf:03X},W,{}",
+                    if za == 0 { "A" } else { "B" }
+                ));
+            }
+            self.emit(format!("    BZ {l_loop}"));
+            // Shift the dividend past its leading zeros, one count per
+            // bit; the short loop then finishes identically. A zero
+            // dividend would wrap the counter, so it runs one pass.
+            self.emit_label(&l_pre);
+            let (ha, hf) = self.operand(num + u16::from(den_bytes) - 1);
+            self.emit(format!(
+                "    BTFSC 0x{hf:03X},7,{}",
+                if ha == 0 { "A" } else { "B" }
+            ));
+            self.emit(format!("    BRA {l_loop}"));
+            self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
+            for i in 0..u16::from(den_bytes) {
+                let (pa, pf) = self.operand(num + i);
+                self.emit(format!(
+                    "    RLCF 0x{pf:03X},F,{}",
+                    if pa == 0 { "A" } else { "B" }
+                ));
+            }
+            let (qa, qf) = self.operand(cnt);
+            self.emit(format!(
+                "    DECFSZ 0x{qf:03X},F,{}",
+                if qa == 0 { "A" } else { "B" }
+            ));
+            self.emit(format!("    BRA {l_pre}"));
+            self.emit(format!(
+                "    INCF 0x{qf:03X},F,{}",
+                if qa == 0 { "A" } else { "B" }
+            ));
+        }
         self.emit_label(&l_loop);
         self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
         for i in 0..u16::from(den_bytes) {
@@ -10038,6 +10101,7 @@ impl<'m> Gen<'m> {
             den_bytes,
             rem_bytes,
             self.divmod_fold,
+            false,
         );
         if quotient {
             self.store_retval(num, den_bytes);
@@ -10061,6 +10125,7 @@ impl<'m> Gen<'m> {
             den_bytes,
             rem_bytes,
             self.divmod_fold,
+            false,
         );
         let slot = match den_bytes {
             1 => "__udivmod_rem_u8",
@@ -10102,7 +10167,7 @@ impl<'m> Gen<'m> {
         // One restoring-division pass: quotient back into `num`, remainder
         // (the digit value, 0-9) into `rem`. Unfolded: the digit rows pin
         // the full-count timing and are out of scope.
-        self.emit_divmod_loop(num, den, rem, cnt, 4, 4, false);
+        self.emit_divmod_loop(num, den, rem, cnt, 4, 4, false, false);
         // digit = rem0 | 48, then POSTINC0 (0xFEE) = digit: the FSR walks
         // the buffer, one advance per digit. (0xFEB is PLUSW0, the indexed
         // form, not this.)
@@ -10144,7 +10209,7 @@ impl<'m> Gen<'m> {
         self.emit_label(&l_digits);
         // One restoring-division pass: quotient back into `num`, remainder
         // (the binary digit, 0-9) into `rem`. Unfolded like its u32 sibling.
-        self.emit_divmod_loop(num, den, rem, dcnt, 2, 2, false);
+        self.emit_divmod_loop(num, den, rem, dcnt, 2, 2, false, false);
         // digit = rem0, then POSTINC0 (0xFEE) = digit.
         self.emit_banked("MOVF", rem, ",W");
         self.emit_banked("MOVWF", digit, "");
@@ -10186,7 +10251,7 @@ impl<'m> Gen<'m> {
         self.emit_banked("MOVWF", 0xFED, "");
         self.emit(format!("    BRA {l_next}"));
         self.emit_label(&l_divide);
-        self.emit_divmod_loop(num, den, rem, dcnt, 2, 2, false);
+        self.emit_divmod_loop(num, den, rem, dcnt, 2, 2, false, false);
         self.emit_banked("MOVF", rem, ",W");
         self.emit("    IORLW 0x30".to_string());
         self.emit_banked("MOVWF", 0xFED, "");
@@ -10254,6 +10319,7 @@ impl<'m> Gen<'m> {
             den_bytes,
             rem_bytes,
             self.divmod_fold,
+            self.sdiv_prescale,
         );
         if quotient {
             let (sa, sf) = self.operand(scr);
@@ -13924,6 +13990,7 @@ pub fn select_with_opts(
                 pending_copies: Vec::new(),
                 copy_loop: opts.copy_loop,
                 divmod_fold: opts.divmod_fold,
+                sdiv_prescale: opts.sdiv_prescale,
                 inline_mul16: opts.inline_mul16,
                 cur_func: &f.name,
                 global_addrs: &global_addrs,
@@ -14005,6 +14072,7 @@ pub fn select_with_opts(
             pending_copies: Vec::new(),
             copy_loop: opts.copy_loop,
             divmod_fold: opts.divmod_fold,
+            sdiv_prescale: opts.sdiv_prescale,
             inline_mul16: opts.inline_mul16,
             cur_func: &f.name,
             global_addrs: &global_addrs,
@@ -14794,6 +14862,7 @@ pub fn select_with_opts(
             pending_copies: Vec::new(),
             copy_loop: opts.copy_loop,
             divmod_fold: opts.divmod_fold,
+            sdiv_prescale: opts.sdiv_prescale,
             inline_mul16: opts.inline_mul16,
             cur_func: &f.name,
             global_addrs: &global_addrs,
@@ -15182,6 +15251,7 @@ mod tests {
                 pending_copies: Vec::new(),
                 copy_loop: true,
                 divmod_fold: false,
+                sdiv_prescale: false,
                 inline_mul16: false,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
@@ -15229,6 +15299,7 @@ mod tests {
                 pending_copies: Vec::new(),
                 copy_loop: true,
                 divmod_fold: false,
+                sdiv_prescale: false,
                 inline_mul16: false,
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
@@ -15370,6 +15441,7 @@ mod p3_gen_tests {
             pending_copies: Vec::new(),
             copy_loop: true,
             divmod_fold: false,
+            sdiv_prescale: false,
             inline_mul16: false,
             cur_func: "main",
             global_addrs: empty_global_addrs(),
