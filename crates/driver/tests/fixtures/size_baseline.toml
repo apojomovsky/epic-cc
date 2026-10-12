@@ -192,8 +192,8 @@ ram_bytes = 500
 [[entry]]
 name = "hal-pic18-bridge-demo-18f4550"
 device = "18F4550"
-flash_words = 12800
-ram_bytes = 1296
+flash_words = 12987
+ram_bytes = 1321
 
 [[entry]]
 name = "add-16f877a@O2"

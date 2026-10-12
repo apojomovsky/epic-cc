@@ -92,8 +92,6 @@ static uint8_t i2c_real_read_byte(int ack)
     return b;
 }
 
-/* Default I2C ops in flash: const structs of function pointers lower to
- * flash tables (epic-cc#833), so no mutable copy is needed. */
 static const epic_bus_i2c_ops_t g_i2c_default = {
     i2c_real_start, i2c_real_repeated_start, i2c_real_stop,
     i2c_real_write_byte, i2c_real_read_byte

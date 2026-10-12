@@ -35,7 +35,7 @@ import subprocess
 import sys
 import tempfile
 
-HAL_PIN = "51a048421ca28ebf539251957b895946ade680b8"
+HAL_PIN = "ac43c99a81f12a3c97b1d86b5a5b31ccc57c890c"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "crates/driver/tests/fixtures/vendor"

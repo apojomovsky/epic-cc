@@ -3,7 +3,7 @@
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
 - Date (UTC): 2026-10-12
-- Commit: 5690510
+- Commit: 79c04bd
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
 - Menu-demo listing: 8639 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
@@ -14,13 +14,13 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | bench-shift | 18F4550 | 88 | 22 | = / = |
 | bench-wide-const | 18F4550 | 23 | 6 | = / = |
 | bench-zero-init | 18F4550 | 25 | 12 | = / = |
-| bench-struct-copy | 18F4550 | 35 | 45 | = / = |
+| bench-struct-copy | 18F4550 | 33 | 45 | -2 / = |
 | bench-counted-copy | 18F4550 | 74 | 25 | = / = |
 | bench-switch | 18F4550 | 58 | 5 | = / = |
 | bench-bool | 18F4550 | 35 | 4 | = / = |
 | bench-const-sub | 18F4550 | 25 | 5 | = / = |
 | bench-dead-store | 18F4550 | 16 | 3 | = / = |
-| bench-w-roundtrip | 18F4550 | 18 | 4 | = / = |
+| bench-w-roundtrip | 18F4550 | 16 | 3 | -2 / -1 |
 | bench-bank | 18F4550 | 23 | 10 | = / = |
 | bench-handle-init | 18F4550 | 21 | 4 | = / = |
 | bench-switch-calls | 18F4550 | 44 | 6 | = / = |
@@ -47,9 +47,9 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | hal-pic14e-blink-16f1937 | 16F1937 | 100 | 6 | = / = |
 | hal-pic16-encoder-full-16f877a | 16F877A | 5279 | 326 | = / = |
 | hal-pic18-menu-demo-18f4550 | 18F4550 | 8667 | 761 | = / = |
-| hal-pic18-control-demo-18f4550 | 18F4550 | 9178 | 963 | = / = |
+| hal-pic18-control-demo-18f4550 | 18F4550 | 9177 | 963 | = / = |
 | hal-pic18-pid-18f4550 | 18F4550 | 3151 | 500 | = / = |
-| hal-pic18-bridge-demo-18f4550 | 18F4550 | 12800 | 1296 | = / = |
+| hal-pic18-bridge-demo-18f4550 | 18F4550 | 12987 | 1321 | = / = |
 
 ## Menu-demo clusters (listing words)
 

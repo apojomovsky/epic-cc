@@ -637,6 +637,11 @@ fn cases() -> Vec<Case> {
             .map(|f| fixture(f))
             .collect(),
         },
+        // Subset build, not the full-tree sim recipe: this row links the
+        // vendored TUs only, while epic-hal builds the whole tree for the
+        // same demo. At the same epic-hal commit the full tree measures
+        // 160 flash words and 16 RAM bytes more (epic-benchmarks#17), so a
+        // larger number there is build config, not a regression here.
         Case {
             name: "hal-pic18-bridge-demo-18f4550",
             device: "18F4550",
