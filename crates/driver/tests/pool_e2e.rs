@@ -111,11 +111,26 @@ fn pool_emits_byte_identical_concatenation() {
     );
 }
 
+/// Drop every `.align 256` line that directly precedes a `.table` line.
+fn drop_table_aligns(lines: Vec<&str>) -> Vec<&str> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| {
+            !(l.trim() == ".align 256"
+                && lines
+                    .get(i + 1)
+                    .is_some_and(|n| n.trim().starts_with(".table ")))
+        })
+        .map(|(_, l)| *l)
+        .collect()
+}
+
 #[test]
 fn pool_is_additive_unflagged_output_unchanged() {
     // Strip every pool trace (chunk spans, reader entries, name
     // references) from the flagged listing: the remainder must equal
-    // the unflagged listing byte for byte.
+    // the unflagged listing byte for byte, modulo table window padding.
     let flagged = asm_for("additive-flagged", &["--const-pool"]);
     let plain = asm_for("additive-plain", &[]);
     let mut stripped: Vec<&str> = Vec::new();
@@ -162,6 +177,12 @@ fn pool_is_additive_unflagged_output_unchanged() {
     while plain_lines.last().is_some_and(|l| l.trim().is_empty()) {
         plain_lines.pop();
     }
+    // A table's `.align 256` is placement-driven window padding: the pool
+    // table moves code, so either side may carry one where the other does
+    // not. Each align is decided from measured bases at emission, and a
+    // full build rechecks every window in the assembler.
+    let stripped = drop_table_aligns(stripped);
+    let plain_lines = drop_table_aligns(plain_lines);
     assert_eq!(
         stripped, plain_lines,
         "flagged output must be plain output plus the pool"

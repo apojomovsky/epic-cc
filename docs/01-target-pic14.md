@@ -93,9 +93,11 @@ the caller's intra-function `GOTO`s run on the right page. The restore is skippe
 instruction is itself a resolvable direct call: that call sets `PCLATH` for its own target before
 any `GOTO` reads it. Unresolved callees, `_delay`, and split functions keep the restore, since their
 trap path (`GOTO` to self) reads `PCLATH` without setting it. A `MOVLW k; MOVWF PCLATH` pair
-directly followed by another such set is dead (the next set overwrites `PCLATH` before any read),
-so `isel` drops it after emission. A pair right after a skip instruction stays, since removing it
-would move the skip's target. Inline asm is never rewritten.
+is dead when a later `MOVWF PCLATH` overwrites it before any read (a later pre-call set, or
+the same literal reaching a second call, which the peephole pass then folds), so `isel` drops
+it after emission. The scan crosses only neutral lines: any `CALL`, `GOTO`, return, `MOVF PCLATH`,
+or computed `PCL` jump keeps the pair, as does a skip-targeted pair (removing it would move the
+skip's target) and user inline asm, which is never rewritten.
 
 ### 6. A single indirect pointer
 
