@@ -707,11 +707,11 @@ impl ValueFolds {
         out.extend(self.loads.keys().cloned());
         out
     }
-    /// Regs needing no slot on classic PIC14 (epic-cc#875): folded loads
-    /// plus forwarded regs produced by a `Load`, whose store reads the
-    /// source global. Forwarded `Bin` results keep their slot: `isel`
-    /// computes those into the temp as before, it has no store-folded
-    /// destination there.
+    /// Regs needing no slot on classic PIC14 (epic-cc#875) and PIC14E
+    /// (epic-cc#902): folded loads plus forwarded regs produced by a
+    /// `Load`, whose store reads the source global. Forwarded `Bin`
+    /// results keep their slot: both backends compute those into the
+    /// temp as before, neither has a store-folded destination there.
     pub fn unplaced_pic14(&self, f: &ir::Func) -> HashSet<String> {
         let mut out: HashSet<String> = self.loads.keys().cloned().collect();
         for r in self.forwarded.keys() {
@@ -1651,11 +1651,13 @@ mod tests {
         assert!(is_directive("list\tp=16f877a", "list"));
         assert!(is_directive("radix dec", "radix"));
         assert!(is_directive("end", "end"));
+        assert!(is_directive("end reset", "end"));
     }
 
     #[test]
     fn label_sharing_a_directive_prefix_is_not_a_directive() {
         assert!(!is_directive("endpoint:", "end"));
+        assert!(!is_directive("endpoint: MOVLW 1", "end"));
         assert!(!is_directive("listen: MOVLW 1", "list"));
         assert!(!is_directive("listing", "list"));
         assert!(!is_directive("radix_mode:", "radix"));

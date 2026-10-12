@@ -16,6 +16,12 @@ flash_words = 16
 ram_bytes = 2
 
 [[entry]]
+name = "add-p16f1939"
+device = "16F1939"
+flash_words = 11
+ram_bytes = 3
+
+[[entry]]
 name = "bench-shift-18f4550"
 device = "18F4550"
 flash_words = 88
@@ -36,13 +42,13 @@ ram_bytes = 12
 [[entry]]
 name = "bench-struct-copy-18f4550"
 device = "18F4550"
-flash_words = 35
+flash_words = 33
 ram_bytes = 45
 
 [[entry]]
 name = "bench-counted-copy-18f4550"
 device = "18F4550"
-flash_words = 74
+flash_words = 72
 ram_bytes = 25
 
 [[entry]]
@@ -72,8 +78,8 @@ ram_bytes = 3
 [[entry]]
 name = "bench-w-roundtrip-18f4550"
 device = "18F4550"
-flash_words = 18
-ram_bytes = 4
+flash_words = 16
+ram_bytes = 3
 
 [[entry]]
 name = "bench-bank-18f4550"
@@ -96,7 +102,7 @@ ram_bytes = 6
 [[entry]]
 name = "bench-u32-loop-18f4550"
 device = "18F4550"
-flash_words = 48
+flash_words = 47
 ram_bytes = 19
 
 [[entry]]
@@ -108,13 +114,13 @@ ram_bytes = 21
 [[entry]]
 name = "bench-u16-dec-rj5-18f4550"
 device = "18F4550"
-flash_words = 388
-ram_bytes = 61
+flash_words = 384
+ram_bytes = 57
 
 [[entry]]
 name = "bench-struct-scan-18f4550"
 device = "18F4550"
-flash_words = 92
+flash_words = 91
 ram_bytes = 95
 
 [[entry]]
@@ -157,13 +163,13 @@ ram_bytes = 14
 name = "hal-pic16-blink-16f877a"
 device = "16F877A"
 flash_words = 459
-ram_bytes = 44
+ram_bytes = 41
 
 [[entry]]
 name = "hal-pic18-blink-18f4550"
 device = "18F4550"
-flash_words = 313
-ram_bytes = 30
+flash_words = 319
+ram_bytes = 22
 
 [[entry]]
 name = "hal-pic14e-blink-16f1937"
@@ -175,37 +181,37 @@ ram_bytes = 6
 name = "hal-pic16-encoder-full-16f877a"
 device = "16F877A"
 flash_words = 5279
-ram_bytes = 326
+ram_bytes = 304
 
 [[entry]]
 name = "hal-pic16-encoder-sim-16f877a"
 device = "16F877A"
-flash_words = 6881
-ram_bytes = 299
+flash_words = 6631
+ram_bytes = 262
 
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 8667
-ram_bytes = 761
+flash_words = 8628
+ram_bytes = 739
 
 [[entry]]
 name = "hal-pic18-control-demo-18f4550"
 device = "18F4550"
-flash_words = 9177
-ram_bytes = 963
+flash_words = 9057
+ram_bytes = 961
 
 [[entry]]
 name = "hal-pic18-pid-18f4550"
 device = "18F4550"
-flash_words = 3151
-ram_bytes = 500
+flash_words = 3132
+ram_bytes = 496
 
 [[entry]]
 name = "hal-pic18-bridge-demo-18f4550"
 device = "18F4550"
-flash_words = 12987
-ram_bytes = 1321
+flash_words = 12908
+ram_bytes = 1278
 
 [[entry]]
 name = "add-16f877a@O2"
@@ -225,7 +231,7 @@ ram_bytes = 2
 name = "bench-struct-scan-18f4550@O2"
 device = "18F4550"
 profile = "O2"
-flash_words = 105
+flash_words = 104
 ram_bytes = 95
 
 [[entry]]
@@ -240,11 +246,11 @@ name = "hal-pic16-encoder-full-16f877a@O2"
 device = "16F877A"
 profile = "O2"
 flash_words = 5535
-ram_bytes = 339
+ram_bytes = 328
 
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550@O2"
 device = "18F4550"
 profile = "O2"
-flash_words = 10031
-ram_bytes = 791
+flash_words = 10007
+ram_bytes = 739

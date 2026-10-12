@@ -22,6 +22,7 @@
 //! `PAGE(label)` operand resolved to its literal `(addr >> 11) << 3`. The
 //! byte-for-byte compare proves the translation is word-exact.
 use asm::assemble_file_to_hex;
+use iselcore::is_directive;
 use pic14_sim::{parse_hex, Pic14};
 use std::collections::HashMap;
 use std::process::Command;
@@ -42,7 +43,7 @@ fn label_addrs(src: &str) -> HashMap<String, usize> {
             org = (org + n - 1) & !(n - 1);
         } else if let Some(l) = t.strip_suffix(':') {
             sym.insert(l.trim().to_string(), org);
-        } else if t.starts_with(".table ") || t.starts_with("end") || t.is_empty() {
+        } else if t.starts_with(".table ") || is_directive(t, "end") || t.is_empty() {
             // no word
         } else {
             org += 1;
@@ -61,8 +62,8 @@ fn to_gpasm_src(src: &str) -> String {
     for raw in src.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
         if line.is_empty()
-            || line.starts_with("list")
-            || line.starts_with("radix")
+            || is_directive(line, "list")
+            || is_directive(line, "radix")
             || line.contains(" equ ")
             || line.ends_with(':')
         {
@@ -78,7 +79,7 @@ fn to_gpasm_src(src: &str) -> String {
             org = target;
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             out.push(raw.to_string());
             break;
         }
