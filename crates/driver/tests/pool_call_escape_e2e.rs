@@ -60,7 +60,7 @@ fn run(
 fn pooled_pointer_into_noinline_callee_matches_unpooled() {
     let f = "tests/fixtures/pool_call_escape.c";
     let g = ["g_direct", "g_offset"];
-    let (halted, base) = run(f, "base", &[], &g, 200_000);
+    let (halted, base) = run(f, "base", &["--no-const-pool"], &g, 200_000);
     assert!(halted, "unpooled build must halt");
     assert_eq!(base, [108, 108], "unpooled build: pick('l') on both args");
     let (halted, pooled) = run(f, "pool", &["--const-pool"], &g, 200_000);
@@ -73,7 +73,7 @@ fn pooled_printf_format_matches_unpooled() {
     // The format string is a pooled literal passed to the printf family; each
     // `putchar` call bumps g_n, so the counts must match the unpooled build.
     let f = "tests/fixtures/stdio_printf_no_varargs.c";
-    let (halted, base) = run(f, "stdio_base", &[], &["g_n"], 200_000);
+    let (halted, base) = run(f, "stdio_base", &["--no-const-pool"], &["g_n"], 200_000);
     assert!(halted, "unpooled stdio fixture must halt");
     assert_eq!(base, [3], "unpooled build: three putchar calls");
     let (halted, pooled) = run(f, "stdio_pool", &["--const-pool"], &["g_n"], 200_000);
@@ -87,7 +87,7 @@ fn pooled_strlen_consumer_matches_unpooled() {
     // the select-merged arg are observed (epic-cc#1026).
     let f = "tests/fixtures/pool_call_escape_strlen.c";
     let g = ["g_len_a", "g_len_b"];
-    let (halted, base) = run(f, "strlen_base", &[], &g, 200_000);
+    let (halted, base) = run(f, "strlen_base", &["--no-const-pool"], &g, 200_000);
     assert!(halted, "unpooled build must halt");
     assert_eq!(
         base,
