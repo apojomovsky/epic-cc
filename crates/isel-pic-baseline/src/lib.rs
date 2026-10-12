@@ -3251,9 +3251,23 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     }
 }
 
-/// Emit the phi copies for one (predecessor, merge) edge.
+/// Emit the phi copies for one (predecessor, merge) edge. A back-edge
+/// cycle (a loop-carried pointer swap) stages one arm through the first
+/// two retval bytes and replays it once its destination is free. Both
+/// bytes are dead at every block edge: call results copy out and `_delay`
+/// counters loop inside their own lowerings, and this core has no
+/// interrupts to preempt a staged arm. Anything else cyclic still panics
+/// instead of miscompiling.
 fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge: bool) {
-    let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
+    struct Pend {
+        da: u16,
+        src: Option<u16>,
+        ty: Ty,
+        val: Val,
+        from_temp: bool,
+    }
+    let temp_lo = g.retval_lo;
+    let mut pending: Vec<Pend> = copies
         .iter()
         .map(|(dst, ty, val)| {
             let da = g.slot_addr(g.cur_func, dst).direct();
@@ -3273,36 +3287,75 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
                 },
                 _ => None,
             };
-            (da, src, *ty, val.clone())
+            Pend {
+                da,
+                src,
+                ty: *ty,
+                val: val.clone(),
+                from_temp: false,
+            }
         })
         .collect();
     let n = pending.len();
     let mut emitted = vec![false; n];
     let mut emitted_count = 0usize;
+    let mut temp_live = false;
     while emitted_count < n {
         let mut progress = false;
         for i in 0..n {
             if emitted[i] {
                 continue;
             }
-            let (da, src, ty, val) = &pending[i];
             let blocked = if back_edge {
-                (0..n).any(|j| !emitted[j] && j != i && pending[j].1 == Some(*da))
+                let da = pending[i].da;
+                (0..n).any(|j| !emitted[j] && j != i && pending[j].src == Some(da))
             } else {
-                match src {
-                    Some(s) => (0..n).any(|j| !emitted[j] && j != i && pending[j].0 == *s),
+                match pending[i].src {
+                    Some(s) => (0..n).any(|j| !emitted[j] && j != i && pending[j].da == s),
                     None => false,
                 }
             };
             if !blocked {
-                g.emit_move_val_to_slot(val, *ty, *da);
+                if pending[i].from_temp {
+                    for b in 0..pending[i].ty.bytes() {
+                        let t = temp_lo + u16::from(b);
+                        let d = pending[i].da + u16::from(b);
+                        g.emit_bank_select(t);
+                        g.emit(format!("    MOVF {}, W", g.fop(t)));
+                        g.emit_bank_select(d);
+                        g.emit(format!("    MOVWF {}", g.fop(d)));
+                    }
+                    temp_live = false;
+                } else {
+                    let (val, ty, da) = (pending[i].val.clone(), pending[i].ty, pending[i].da);
+                    g.emit_move_val_to_slot(&val, ty, da);
+                }
                 emitted[i] = true;
                 emitted_count += 1;
                 progress = true;
             }
         }
         if !progress {
-            panic!("isel: cyclic phi copies not supported");
+            if !back_edge {
+                panic!("isel: cyclic phi copies not supported");
+            }
+            if temp_live {
+                panic!("isel: disjoint cyclic phi copies not supported");
+            }
+            let pick = (0..n)
+                .find(|&i| !emitted[i] && pending[i].src.is_some())
+                .unwrap_or_else(|| panic!("isel: cyclic phi copies not supported"));
+            if pending[pick].ty.bytes() > 2 {
+                panic!("isel: phi copy cycle wider than temp not supported");
+            }
+            // Reader-first order kept every read of this slot pre-edge, so
+            // staging it now captures the current value; the arm replays
+            // from the temp once its destination is free.
+            let (val, ty) = (pending[pick].val.clone(), pending[pick].ty);
+            g.emit_move_val_to_slot(&val, ty, temp_lo);
+            pending[pick].src = Some(temp_lo);
+            pending[pick].from_temp = true;
+            temp_live = true;
         }
     }
 }

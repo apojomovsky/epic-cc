@@ -127,3 +127,47 @@ fn pool_is_additive_unflagged_output_unchanged() {
         "flagged output must be plain output plus the pool"
     );
 }
+
+/// Value pin for the staged walks (epic-cc#1141): every member stages
+/// through the shared buffer, so the consumer loop reads RAM, not flash.
+/// The last call walks `dup2` (`"same-bytes"`), so `g_sink` must end as
+/// `s`. The shape assertions above cannot catch a misread walk.
+#[test]
+fn pool_staged_walks_read_correct_bytes() {
+    let hex_path = std::env::temp_dir().join(format!("pool_values_{}.hex", std::process::id()));
+    let map_path = hex_path.with_extension("map");
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            "tests/fixtures/pool_strings.c",
+            "-o",
+            hex_path.to_str().unwrap(),
+            "--map",
+            map_path.to_str().unwrap(),
+            "--device",
+            "p16f877a",
+        ])
+        .output()
+        .expect("run driver");
+    assert!(
+        out.status.success(),
+        "driver pool_strings: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let map = std::fs::read_to_string(&map_path).expect("read map");
+    let _ = std::fs::remove_file(&hex_path);
+    let _ = std::fs::remove_file(&map_path);
+    let prefix = "global g_sink 0x";
+    let addr = usize::from_str_radix(
+        map.lines()
+            .find(|l| l.starts_with(prefix))
+            .expect("map entry for g_sink")[prefix.len()..]
+            .trim(),
+        16,
+    )
+    .expect("map address is hex");
+    let mut p = pic14_sim::Pic14::with_device(&device::PIC16F877A, pic14_sim::parse_hex(&hex));
+    p.run(2_000_000);
+    assert_eq!(p.ram()[addr], 0x73, "last walked byte must be 's'");
+    assert!(p.halted());
+}
