@@ -51,6 +51,18 @@ ERROR: failed to solve: process "/bin/sh -c apt-get install -y foo" did \\
   not complete successfully: exit code: 100
 """
 
+FINAL_BARE_502 = """\
+#1 [internal] load build definition from Dockerfile
+ERROR: failed to solve: unexpected status from GET request to \
+  https://registry-1.docker.io/v2/library/ubuntu/manifests/sha256:abc: \
+  502
+"""
+
+BARE_502_WITHOUT_REGISTRY = """\
+#5 [stage-0 3/5] RUN apt-get install -y foo
+ERROR: failed to solve: unexpected status: 502 from mirror-proxy.internal
+"""
+
 
 class WarmToolchainCache(unittest.TestCase):
     def run_script(self, calls):
@@ -105,6 +117,18 @@ class WarmToolchainCache(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertEqual(docker_calls, 6)
         self.assertEqual(len(sleeps), 5)
+
+    def test_bare_code_registry_5xx_retries_once(self):
+        rc, docker_calls, sleeps = self.run_script([(FINAL_BARE_502, 1), ("", 0)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(docker_calls, 2)
+        self.assertEqual(len(sleeps), 1)
+
+    def test_bare_code_without_registry_fails_at_once(self):
+        rc, docker_calls, sleeps = self.run_script([(BARE_502_WITHOUT_REGISTRY, 1)])
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(docker_calls, 1)
+        self.assertEqual(sleeps, [])
 
 
 if __name__ == "__main__":
