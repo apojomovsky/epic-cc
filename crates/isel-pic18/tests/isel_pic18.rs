@@ -9331,16 +9331,11 @@ fn phi_folded_i16_increment_reads_the_phi_home_through_a_materialized_compare() 
         assert_eq!(p.ram()[0x22], 1, "flag must ride the match (limit={limit})");
     }
 }
-
 #[test]
-fn phi_folded_i16_increment_with_earlier_index_uses_folds_in_place() {
-    // A counted copy loop reads its index for both ends before bumping
-    // it, so the phi has three uses and the single-use gate of
-    // epic-cc#767 stays shut. The two index reads sit before the `Bin`
-    // in the latch block and nothing on the exit path observes the
-    // slot, so the increment still computes into the phi's home
-    // (epic-cc#937): the backedge copies degrade to skipped self-copies
-    // exactly like the single-use shape.
+fn walk_counted_copy_bridges_pointers_and_counts_down() {
+    // A counted copy loop walks its pointers instead of re-deriving
+    // them: one `LFSR` per pointer up front, then a `POSTINC` bridge
+    // per byte closed by the down-counter (epic-cc#896).
     let m = parse(
         "global src i8\n\
          global dst i8\n\
@@ -9368,13 +9363,21 @@ fn phi_folded_i16_increment_with_earlier_index_uses_folds_in_place() {
         ("main::c", 0x046),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("LFSR 0, 0x020"), "source seed:\n{asm}");
+    assert!(asm.contains("LFSR 1, 0x030"), "destination seed:\n{asm}");
+    assert!(asm.contains("MOVLW 0x0B"), "trip count:\n{asm}");
     let lp = block_section(&asm, "main_Lloop");
-    assert!(lp.contains("INCF 0x040,F,A"), "loop:\n{lp}");
-    assert!(lp.contains("BTFSC 0xFD8,0,A"), "loop:\n{lp}");
-    assert!(lp.contains("INCF 0x041,F,A"), "loop:\n{lp}");
-    assert!(!lp.contains("0x044"), "dead temp must go unread:\n{lp}");
-    assert!(!lp.contains("MOVWF 0x040"), "no staged low store:\n{lp}");
-    assert!(!lp.contains("MOVWF 0x041"), "no staged high store:\n{lp}");
+    assert!(
+        lp.contains("MOVF 0xFEE,W,A"),
+        "bridge reads POSTINC0:\n{lp}"
+    );
+    assert!(
+        lp.contains("MOVWF 0xFE6,A"),
+        "bridge writes POSTINC1:\n{lp}"
+    );
+    assert!(lp.contains("DECFSZ 0x040,F,A"), "down-counter latch:\n{lp}");
+    assert!(!lp.contains("LFSR"), "no per-step seed:\n{lp}");
+    assert!(!lp.contains("INCF 0x040"), "no up-counter:\n{lp}");
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
     step_past_start(&mut p, start_steps(&asm));
@@ -9386,8 +9389,141 @@ fn phi_folded_i16_increment_with_earlier_index_uses_folds_in_place() {
     for k in 0..11u8 {
         assert_eq!(p.ram()[0x30 + usize::from(k)], 0x50 + k, "copied byte {k}");
     }
-    assert_eq!(p.ram()[0x40], 11, "counter lo must hold the bound");
-    assert_eq!(p.ram()[0x41], 0, "counter hi must hold the bound");
+    assert_eq!(p.ram()[0x40], 0, "counter must end at zero");
+}
+
+#[test]
+fn walk_const_store_writes_literal_per_step() {
+    // A counted constant fill keeps the literal in the loop: `MOVLW`
+    // plus a `POSTINC` store per step under the down-counter.
+    let m = parse(
+        "global buf i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i8 %r loop 0 entry\n\
+             %g = gep @buf +0 +1*%i\n\
+             store i8 9 %g\n\
+             %r = add i8 %i, 1\n\
+             %c = icmp eq i8 %r, 5\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("main::i", 0x040),
+        ("main::r", 0x042),
+        ("main::c", 0x044),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(lp.contains("MOVLW 0x09"), "fill literal:\n{lp}");
+    assert!(lp.contains("MOVWF 0xFEE,A"), "POSTINC store:\n{lp}");
+    assert!(lp.contains("DECFSZ 0x040,F,A"), "down-counter latch:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(4000);
+    assert!(p.halted(), "program must halt");
+    for k in 0..5u8 {
+        assert_eq!(p.ram()[0x20 + usize::from(k)], 9, "filled byte {k}");
+    }
+}
+
+#[test]
+fn walk_index_value_store_rebuilds_from_down_counter() {
+    // `buf[i] = 7 + i` without an up-counter: the value rebuilds from
+    // the down-counter as `(7 + K) - cnt` around one `SUBLW`.
+    let m = parse(
+        "global buf i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i8 %r loop 0 entry\n\
+             %g = gep @buf +0 +1*%i\n\
+             %v = add i8 %i 7\n\
+             store i8 %v %g\n\
+             %r = add i8 %i, 1\n\
+             %c = icmp eq i8 %r, 5\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("main::i", 0x040),
+        ("main::v", 0x042),
+        ("main::r", 0x044),
+        ("main::c", 0x046),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(lp.contains("SUBLW 0x0C"), "folded (7 + 5) minuend:\n{lp}");
+    assert!(lp.contains("MOVWF 0xFEE,A"), "POSTINC store:\n{lp}");
+    assert!(lp.contains("DECFSZ 0x040,F,A"), "down-counter latch:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(4000);
+    assert!(p.halted(), "program must halt");
+    for k in 0..5u8 {
+        assert_eq!(p.ram()[0x20 + usize::from(k)], 7 + k, "indexed byte {k}");
+    }
+}
+
+#[test]
+fn walk_counter_only_loop_keeps_body_and_counts_down() {
+    // A counted loop with no memory walk still drops its compare for
+    // the down-counter; the body (here carrying a select) runs first.
+    let m = parse(
+        "global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %s = phi i8 %a loop 0 entry\n\
+             %i = phi i8 %r loop 0 entry\n\
+             %t = xor i8 %s, 1\n\
+             %d = icmp eq i8 %s, 0\n\
+             %a = select i1 %d, i8 %t, i8 %s\n\
+             %r = add i8 %i, 1\n\
+             %c = icmp eq i8 %r, 4\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             store i8 %a @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("out", 0x020),
+        ("main::s", 0x040),
+        ("main::i", 0x042),
+        ("main::t", 0x044),
+        ("main::d", 0x046),
+        ("main::a", 0x048),
+        ("main::r", 0x04A),
+        ("main::c", 0x04C),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    // The select in the body carries its own join labels, so the latch
+    // assertions read the whole output rather than the loop section.
+    assert!(
+        asm.contains("DECFSZ 0x042,F,A"),
+        "down-counter latch:\n{asm}"
+    );
+    assert!(
+        !asm.contains("DECF 0x042"),
+        "no up-counter decrement:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(4000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x20], 1, "carried select result");
+    assert_eq!(p.ram()[0x42], 0, "counter must end at zero");
 }
 
 #[test]
