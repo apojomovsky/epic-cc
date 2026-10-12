@@ -81,16 +81,16 @@ ram_bytes = 49
 [[entry]]
 name = "speed-mul-u32-16f877a"
 device = "16F877A"
-cycles = 689
-flash_words = 148
+cycles = 685
+flash_words = 144
 ram_bytes = 48
 
 [[entry]]
 name = "speed-mul-u32-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 689
-flash_words = 148
+cycles = 685
+flash_words = 144
 ram_bytes = 48
 
 [[entry]]
