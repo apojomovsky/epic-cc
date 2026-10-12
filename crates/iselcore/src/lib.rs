@@ -1651,11 +1651,13 @@ mod tests {
         assert!(is_directive("list\tp=16f877a", "list"));
         assert!(is_directive("radix dec", "radix"));
         assert!(is_directive("end", "end"));
+        assert!(is_directive("end reset", "end"));
     }
 
     #[test]
     fn label_sharing_a_directive_prefix_is_not_a_directive() {
         assert!(!is_directive("endpoint:", "end"));
+        assert!(!is_directive("endpoint: MOVLW 1", "end"));
         assert!(!is_directive("listen: MOVLW 1", "list"));
         assert!(!is_directive("listing", "list"));
         assert!(!is_directive("radix_mode:", "radix"));

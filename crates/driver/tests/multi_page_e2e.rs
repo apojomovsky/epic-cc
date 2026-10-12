@@ -94,6 +94,7 @@
 //! `out` is the u8 global at 0x22 (read off `--map` below, not
 //! hardcoded).
 
+use iselcore::is_directive;
 use std::collections::HashMap;
 use std::process::Command;
 
@@ -143,7 +144,11 @@ fn label_addrs(asm: &str) -> HashMap<String, usize> {
     let mut out = HashMap::new();
     for raw in asm.lines() {
         let t = raw.split(';').next().unwrap_or("").trim();
-        if t.is_empty() || t.starts_with("list") || t.starts_with("radix") || t.contains(" equ ") {
+        if t.is_empty()
+            || is_directive(t, "list")
+            || is_directive(t, "radix")
+            || t.contains(" equ ")
+        {
             continue;
         }
         if let Some(rest) = t.strip_prefix("org ") {
@@ -153,7 +158,7 @@ fn label_addrs(asm: &str) -> HashMap<String, usize> {
             org = (org + n - 1) & !(n - 1);
         } else if let Some(l) = t.strip_suffix(':') {
             out.insert(l.trim().to_string(), org);
-        } else if t.starts_with(".table ") || t.starts_with("end") {
+        } else if t.starts_with(".table ") || is_directive(t, "end") {
             // no words
         } else {
             org += 1;

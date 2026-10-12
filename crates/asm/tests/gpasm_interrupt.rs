@@ -27,6 +27,7 @@
 //! completes 0x11 -> 0x12 -> 0x13 -> 0x16 and PORTB = 0x22, then the
 //! __start SLEEP halts the machine.
 use asm::assemble_file_to_hex;
+use iselcore::is_directive;
 use pic14_sim::{parse_hex, Pic14};
 use std::collections::HashMap;
 use std::process::Command;
@@ -47,7 +48,11 @@ fn label_addrs(src: &str) -> HashMap<String, usize> {
     let mut out = HashMap::new();
     for raw in src.lines() {
         let t = raw.split(';').next().unwrap_or("").trim();
-        if t.is_empty() || t.starts_with("list") || t.starts_with("radix") || t.contains(" equ ") {
+        if t.is_empty()
+            || is_directive(t, "list")
+            || is_directive(t, "radix")
+            || t.contains(" equ ")
+        {
             continue;
         }
         if let Some(rest) = t.strip_prefix("org ") {
@@ -57,7 +62,7 @@ fn label_addrs(src: &str) -> HashMap<String, usize> {
             org = (org + n - 1) & !(n - 1);
         } else if let Some(l) = t.strip_suffix(':') {
             out.insert(l.trim().to_string(), org);
-        } else if t.starts_with(".table ") || t.starts_with("end") {
+        } else if t.starts_with(".table ") || is_directive(t, "end") {
             // no words
         } else {
             org += 1;
@@ -76,8 +81,8 @@ fn to_gpasm_src(src: &str) -> String {
     for raw in src.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
         if line.is_empty()
-            || line.starts_with("list")
-            || line.starts_with("radix")
+            || is_directive(line, "list")
+            || is_directive(line, "radix")
             || line.contains(" equ ")
             || line.ends_with(':')
         {
@@ -93,7 +98,7 @@ fn to_gpasm_src(src: &str) -> String {
             org = target;
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             out.push(raw.to_string());
             break;
         }

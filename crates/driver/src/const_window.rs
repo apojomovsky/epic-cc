@@ -14,6 +14,7 @@
 //! pass through byte-identical, so the size ladder never moves.
 
 use ir::SrcLoc;
+use iselcore::is_directive;
 
 /// The repaired text plus a parallel per-line source-location vector, kept
 /// index-aligned with the returned text: an inserted `.align` carries
@@ -142,21 +143,11 @@ pub fn repair_with_locs(asm: &str, locs: &[Option<SrcLoc>]) -> (String, Vec<Opti
     }
     (text, out_locs)
 }
+
 /// Round `org` up to the next `n`-word boundary, the assembler's `.align`
 /// semantics for the power-of-two sizes isel emits.
 fn align_up(org: usize, n: usize) -> usize {
     (org + n - 1) & !(n - 1)
-}
-
-/// True when a comment-stripped, trimmed listing line is the bare directive
-/// `name`: exactly `name`, or `name` followed by whitespace. Mirrors
-/// `iselcore::is_directive` so a label starting with a directive name is
-/// never mistaken for one.
-fn is_directive(line: &str, name: &str) -> bool {
-    line == name
-        || line
-            .strip_prefix(name)
-            .is_some_and(|rest| rest.starts_with([' ', '\t']))
 }
 
 /// A decimal or `0x`-prefixed hex number, the assembler's literal grammar.
