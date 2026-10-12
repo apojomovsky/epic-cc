@@ -247,6 +247,13 @@ fn cases() -> Vec<Case> {
             inputs: vec![fixture("add.c")],
         },
         Case {
+            name: "add-p16f1939",
+            device: "16F1939",
+            includes: vec![],
+            defines: vec![],
+            inputs: vec![fixture("add.c")],
+        },
+        Case {
             name: "bench-shift-18f4550",
             device: "18F4550",
             includes: vec![],

@@ -707,11 +707,11 @@ impl ValueFolds {
         out.extend(self.loads.keys().cloned());
         out
     }
-    /// Regs needing no slot on classic PIC14 (epic-cc#875): folded loads
-    /// plus forwarded regs produced by a `Load`, whose store reads the
-    /// source global. Forwarded `Bin` results keep their slot: `isel`
-    /// computes those into the temp as before, it has no store-folded
-    /// destination there.
+    /// Regs needing no slot on classic PIC14 (epic-cc#875) and PIC14E
+    /// (epic-cc#902): folded loads plus forwarded regs produced by a
+    /// `Load`, whose store reads the source global. Forwarded `Bin`
+    /// results keep their slot: both backends compute those into the
+    /// temp as before, neither has a store-folded destination there.
     pub fn unplaced_pic14(&self, f: &ir::Func) -> HashSet<String> {
         let mut out: HashSet<String> = self.loads.keys().cloned().collect();
         for r in self.forwarded.keys() {

@@ -14,22 +14,26 @@ fn addrs(pairs: &[(&str, u16)]) -> HashMap<String, u16> {
 
 #[test]
 fn lowers_i1_load_and_store_as_one_byte() {
+    // `%1` forwards into its store (epic-cc#902): the store reads `@flag`
+    // directly, so no slot stages the byte. `%1` keeps no entry: a lookup
+    // would panic, so its absence proves the slot is gone. The copy stays
+    // a byte MOVF plus a byte MOVWF, never a bit op.
     let m = parse(
         "global flag i8\nfn main(void) ()\n  block entry:\n    %1 = load i1 @flag\n    store i1 %1 @flag\n    ret void\n",
     );
-    let addrs = addrs(&[("flag", 0x20), ("main::1", 0x25)]);
+    let addrs = addrs(&[("flag", 0x20)]);
     let asm = select(&PIC16F1937, &m, &addrs);
     assert!(
         asm.contains("MOVF 0x20, W"),
         "the load reads the byte:\n{asm}"
     );
     assert!(
-        asm.contains("MOVWF 0x25"),
-        "the loaded i1 lands in its one-byte slot:\n{asm}"
+        asm.contains("MOVWF 0x20"),
+        "the store writes the byte back:\n{asm}"
     );
     assert!(
-        asm.contains("MOVWF 0x20"),
-        "the store writes the one-byte slot back:\n{asm}"
+        !asm.contains("BCF") && !asm.contains("BSF"),
+        "no bit ops on the i1 byte path:\n{asm}"
     );
 }
 
