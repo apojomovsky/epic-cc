@@ -3255,13 +3255,19 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
         .map(|(dst, ty, val)| {
             let da = g.slot_addr(g.cur_func, dst).direct();
             let src = match val {
-                Val::Reg(r) => {
-                    if g.resolved.contains_key(&ssa_key(g.cur_func, r)) {
-                        None
-                    } else {
-                        Some(g.slot_addr(g.cur_func, r).direct())
+                Val::Reg(r) => match g.resolved.get(&ssa_key(g.cur_func, r)) {
+                    // A resolved Slot arm reads its base slot's bytes; an
+                    // alloca address or a global folds to literals and reads
+                    // no slot. Recording the read keeps a back-edge copy
+                    // cycle loud (epic-cc#1127).
+                    Some((Base::Slot(sname, indirect), _, _))
+                        if *indirect || g.param_holds_addr(sname) =>
+                    {
+                        Some(g.slot_addr(g.cur_func, sname).direct())
                     }
-                }
+                    Some(_) => None,
+                    None => Some(g.slot_addr(g.cur_func, r).direct()),
+                },
                 _ => None,
             };
             (da, src, *ty, val.clone())

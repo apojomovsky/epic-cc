@@ -217,14 +217,19 @@ fn flash_walk_mixed_runtime_index_load_is_rejected_on_p18() {
 }
 
 /// Two `const char *` walk phis swap each iteration, one advancing through a
-/// gep over the other (epic-cc#1117). iselcore refuses the phi cycle, since
-/// lifting that refusal also needs a copy temp in the p18 backend (ADR-050).
+/// gep over the other (epic-cc#1117, epic-cc#1127). The back-edge copy cycle
+/// stages one arm through PRODL/PRODH, so every iteration reads pre-edge
+/// bytes.
 #[test]
-fn flash_walk_phi_swap_is_refused_on_p18() {
-    expect_p18_rejection(
-        "tests/fixtures/flash_walk_swap.c",
-        "cyclic or unresolvable pointer chain",
+fn flash_walk_phi_swap_reads_program_memory_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_swap.c");
+    assert_eq!(ram[map_addr(&map, "sum")], 162, "sum over the swap walk");
+    assert_eq!(
+        ram[map_addr(&map, "out")],
+        68,
+        "b[0] after 6 swaps must be 'D'"
     );
+    assert!(halted);
 }
 
 /// The store through the runtime-indexed mixed phi lands on the same slot as
