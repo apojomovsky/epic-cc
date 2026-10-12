@@ -1,0 +1,116 @@
+name: baseline-regen
+
+# Post-merge baseline regeneration (epic-cc#1087). Pull requests never commit
+# baseline values: CI measures the ladders and the baseline-delta job judges
+# them against master's TOMLs. After a merge this workflow re-measures the
+# ladders on the merged tree and commits the refreshed TOMLs, so the next
+# pull request is judged against current numbers. A push whose head is the
+# bot commit carries no code change and skips before the image build.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+# Two merges in a row queue instead of racing: the commit step re-measures
+# on the latest master before pushing, so serialized runs converge without
+# ever force pushing.
+concurrency:
+  group: baseline-regen
+  cancel-in-progress: false
+
+jobs:
+  # Warms the toolchain registry cache once, as in ci.yml: without this,
+  # the image build below races canonical's own builds on a cold cache.
+  warm-toolchain-cache:
+    uses: ./.github/workflows/toolchain-cache.yml
+
+  regen:
+    name: regenerate baselines
+    needs: warm-toolchain-cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Skip on bot commit
+        id: skip
+        run: |
+          if [ "$(git log -1 --format=%s)" = "chore(baseline): regenerate" ]; then
+            echo "head is the bot commit, nothing to regenerate"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.skip.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.skip.outputs.skip != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build ci image (cached)
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          CACHE_REF: ghcr.io/${{ github.repository }}-toolchain
+        run: bash scripts/warm-toolchain-cache.sh --target ci --load -t epic-cc-ci:latest
+
+      - name: Cache cargo target dir
+        if: steps.skip.outputs.skip != 'true'
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: cargo-${{ runner.os }}-${{ github.workflow }}-${{ hashFiles('Cargo.lock', '**/*.rs', '**/*.toml') }}-regen
+
+      - name: Cache cargo home
+        if: steps.skip.outputs.skip != 'true'
+        uses: actions/cache@v5
+        with:
+          path: /tmp/cargo-home
+          key: cargo-home-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      # Each attempt re-measures on the latest master, so a push that lands
+      # mid-run is picked up by the retry instead of rejected forever. A
+      # broken tree fails the ladders before they write, so a red run never
+      # commits. Unchanged TOMLs commit nothing.
+      - name: Regenerate and push
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            git fetch origin master
+            git checkout -B baseline-regen origin/master
+            if ! docker run --rm -v "$PWD:/workspace" -w /workspace \
+              -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
+              epic-cc-ci:latest bash scripts/baseline-regen.sh; then
+              echo "::error::ladders failed, not committing" >&2
+              exit 1
+            fi
+            sudo chown -R "$(id -u):$(id -g)" target crates/driver/tests/fixtures
+            git add crates/driver/tests/fixtures/size_baseline.toml \
+              crates/driver/tests/fixtures/cycle_baseline.toml
+            if git diff --cached --quiet; then
+              echo "baselines unchanged, nothing to commit"
+              exit 0
+            fi
+            git -c user.name='github-actions[bot]' \
+              -c user.email='github-actions[bot]@users.noreply.github.com' \
+              commit -m 'chore(baseline): regenerate'
+            if git push origin HEAD:master; then
+              echo "pushed regenerated baselines"
+              exit 0
+            fi
+            echo "push raced another merge, re-measuring (attempt $attempt)"
+            sleep 10
+          done
+          echo "::error::baseline-regen: push kept racing, aborting" >&2
+          exit 1

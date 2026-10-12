@@ -18,13 +18,12 @@
 
 set -uo pipefail
 
-# The size and cycle ladders are strict here: a baseline row that records
-# more than the tree produces is a failure, not free headroom, so a shrink
-# that was never re-baselined cannot silently absorb a later regression (epic-cc#629). The
-# inner loop leaves this unset, so shrinking a program mid-iteration does
-# not demand a re-baseline before the change is even finished.
-export STRICT_SIZE_BASELINE=1
-export STRICT_CYCLE_BASELINE=1
+# The ladders measure-only here and write their rows to BASELINE_ARTIFACT_DIR.
+# CI judges those rows with scripts/baseline_delta.py against master's
+# baselines; this script no longer asserts growth itself. PRs never edit the
+# committed TOMLs; the baseline-regen workflow refreshes them on master
+# after each merge (epic-cc#1087).
+export BASELINE_ARTIFACT_DIR="$PWD/scratch/baseline-artifacts"
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo "::error::cargo not on PATH; run inside the dev container (see docs/09-build-environment.md)" >&2
@@ -73,7 +72,7 @@ fi
 # cross-check does; the density profiler derives its word table from the
 # `asm` crate, so a change there has to keep it readable.
 echo "::group::python-tools"
-if python3 scripts/test_gen_device.py && python3 scripts/test_device_names.py && python3 scripts/test_add_device.py && python3 scripts/test_gen_devices_manifest.py && python3 scripts/test_density_profile.py && python3 scripts/test_inline_map.py && python3 scripts/test_size_report.py && python3 scripts/test_size_probe.py; then
+if python3 scripts/test_gen_device.py && python3 scripts/test_device_names.py && python3 scripts/test_add_device.py && python3 scripts/test_gen_devices_manifest.py && python3 scripts/test_density_profile.py && python3 scripts/test_inline_map.py && python3 scripts/test_size_report.py && python3 scripts/test_size_probe.py && python3 scripts/test_baseline_delta.py; then
   echo "PASS: python-tools"
   row="| python-tools | PASS |"
 else

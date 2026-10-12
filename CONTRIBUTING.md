@@ -55,15 +55,18 @@ make compile FILE=crates/driver/tests/fixtures/add.c TARGET=p16f877a  # C to HEX
 Two suites deserve a special mention. The **size ladder** and the **cycle
 ladder** (`crates/driver/tests/size_regression_e2e.rs` and
 `cycle_ladder_e2e.rs`) record how much flash, RAM, and time each benchmark
-program uses, checked into `crates/driver/tests/fixtures/`. They fail when a
-change makes a program bigger, and under the strict CI setting they also fail
-when a program gets smaller without the baseline being updated, so a silent
-shrink can never mask a later regression. If your change moves a ladder row
-in either direction, re-baseline the ladder you moved (`UPDATE_SIZE_BASELINE=1`
-for `size_baseline.toml`, `UPDATE_CYCLE_BASELINE=1` for
-`cycle_baseline.toml`, each set when running its ladder test), regenerate the
-report with `make size-report`, and call the move out in your pull request. A
-row you move should be a net win: explain any regression.
+program uses, in `crates/driver/tests/fixtures/`. A pull request does not
+edit those baselines. CI measures the ladders and `scripts/baseline_delta.py`
+judges the move against master's baseline: a net win (no total grows, at
+least one shrinks) passes; flash growth up to 8 words or cycle growth up to
+1% on a single row passes when the PR body names it on a line of its own,
+`delta-ok: <row>`; RAM growth, a larger regression, a net loss, or a new or
+removed row holds for a human. After a merge, the `baseline-regen` workflow
+re-measures the ladders on master and commits the refreshed TOMLs as
+`chore(baseline): regenerate`, so the next pull request is judged against
+current numbers. To preview what the bot will commit, run
+`bash scripts/baseline-regen.sh` in the dev container and read the diff;
+never commit the result from a pull request branch.
 
 ## Conventions, in brief
 

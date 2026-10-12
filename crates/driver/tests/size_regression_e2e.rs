@@ -26,10 +26,11 @@
 //!
 //! Because shrinking is free by default, a baseline row can sit above
 //! what the tree produces and silently absorb a later regression of that
-//! size. `STRICT_SIZE_BASELINE=1` (set in CI) fails on such a row instead,
-//! naming the headroom; see epic-cc#629. That rewrite regenerates every
-//! row, so a re-baseline must be diffed row by row: absorbing a row the
-//! change did not affect is how headroom accumulates in the first place.
+//! size. `STRICT_SIZE_BASELINE=1` fails on such a row instead, naming the
+//! headroom; see epic-cc#629. That is a local knob only: CI measures.
+//! `BASELINE_ARTIFACT_DIR` (set by `scripts/ci-test.sh`) makes the run
+//! measure-only and write `size.json` there; growth is then judged by
+//! `scripts/baseline_delta.py` against master's TOML (epic-cc#1087).
 //!
 //! The ladder mixes program sizes deliberately: `add.c` is near-zero, so
 //! it catches boilerplate/startup regressions cheaply; the vendored
@@ -800,6 +801,33 @@ fn print_report_json(measured: &[BaselineEntry], cases: &[Case]) {
     println!("SIZE_REPORT_JSON_END");
 }
 
+/// Where a measure-only run writes its rows for the PR delta gate
+/// (`scripts/baseline_delta.py`). Set by `scripts/ci-test.sh`; unset
+/// locally, where the ladder asserts against the committed baseline.
+fn artifact_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("BASELINE_ARTIFACT_DIR").map(std::path::PathBuf::from)
+}
+
+/// Writes `measured` as `size.json` in the artifact dir: a JSON array of
+/// `{name, device, profile, flash_words, ram_bytes}`.
+fn write_artifact(dir: &std::path::Path, measured: &[BaselineEntry]) {
+    std::fs::create_dir_all(dir).expect("create baseline artifact dir");
+    let mut out = String::from("[\n");
+    for (i, e) in measured.iter().enumerate() {
+        out.push_str(&format!(
+            "  {{\"name\": \"{}\", \"device\": \"{}\", \"profile\": \"{}\", \"flash_words\": {}, \"ram_bytes\": {}}}{}\n",
+            e.name,
+            e.device,
+            e.profile,
+            e.flash_words,
+            e.ram_bytes,
+            if i + 1 == measured.len() { "" } else { "," }
+        ));
+    }
+    out.push_str("]\n");
+    std::fs::write(dir.join("size.json"), out).expect("write size.json");
+}
+
 /// Gate one measured `(flash, ram)` pair against its baseline entry:
 /// growth fails, and under `strict` so does headroom. Skipped entirely
 /// on update runs (which record instead of asserting).
@@ -954,6 +982,10 @@ fn flash_and_ram_do_not_regress() {
 
     let mut measured = measured_os;
     measured.extend(measured_o2);
+    if let Some(dir) = artifact_dir() {
+        write_artifact(&dir, &measured);
+        return;
+    }
     if update {
         let (to_save, updated, skipped) = merge_baseline(&baseline, &measured, filter.as_ref());
         save_baseline(&Baseline { entry: to_save });

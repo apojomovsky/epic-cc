@@ -165,9 +165,76 @@ jobs:
       # "Cache cargo target dir" step's post-job save fails silently
       # (tar: Permission denied on target/debug/incremental/**/*.lock),
       # and the cache above never actually saves.
-      - name: Fix target dir ownership (container runs as root)
+      - name: Fix target and scratch ownership (container runs as root)
         if: steps.noncode.outputs.non_code != 'true'
-        run: sudo chown -R "$(id -u):$(id -g)" target
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" target
+          if [ -d scratch ]; then sudo chown -R "$(id -u):$(id -g)" scratch; fi
+
+      # The ladders measure-only in CI and write rows here; the baseline-delta
+      # job judges them. The pic14 job's copy is the one judged (both cores
+      # measure the same ladder rows).
+      - name: Upload ladder measurements
+        if: steps.noncode.outputs.non_code != 'true' && matrix.core == 'pic14'
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-artifacts
+          path: scratch/baseline-artifacts
+          if-no-files-found: error
+
+  baseline-delta:
+    # PR-only growth gate for the size and cycle ladders (epic-cc#1087). Runs
+    # after canonical so a value-pin failure there blocks before any judging.
+    name: baseline delta (PR)
+    needs: canonical
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Determine non-code
+        id: noncode
+        run: |
+          result="$(python3 scripts/ci_noncode_check.py '${{ github.event.pull_request.base.sha }}')"
+          echo "non_code=$result" >> "$GITHUB_OUTPUT"
+
+      - name: Download ladder measurements
+        if: steps.noncode.outputs.non_code != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: baseline-artifacts
+          path: scratch/baseline-artifacts
+
+      # The PR body reaches the script via env, never interpolated into the
+      # shell, so a body containing quotes or $(...) cannot run commands.
+      - name: Judge against master baselines
+        if: steps.noncode.outputs.non_code != 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # The rules come from master, not from the PR: a PR cannot relax
+          # the thresholds it is judged by. The one exception is the PR that
+          # introduces the judge, where master has no copy to trust yet.
+          if git cat-file -e "$BASE_SHA:scripts/baseline_delta.py" 2>/dev/null; then
+            git show "$BASE_SHA:scripts/baseline_delta.py" > "$RUNNER_TEMP/baseline_delta.py"
+          else
+            cp scripts/baseline_delta.py "$RUNNER_TEMP/baseline_delta.py"
+          fi
+          git show "$BASE_SHA:scripts/add_device.py" > "$RUNNER_TEMP/add_device.py"
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+          python3 "$RUNNER_TEMP/baseline_delta.py" --base-sha "$BASE_SHA" \
+            --artifacts scratch/baseline-artifacts --pr-body "$RUNNER_TEMP/pr-body.md"
+
+      - name: Publish delta summary
+        if: always() && steps.noncode.outputs.non_code != 'true'
+        run: |
+          if [ -f scratch/baseline-artifacts/baseline-delta.md ]; then
+            cat scratch/baseline-artifacts/baseline-delta.md >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   hal-887:
     # epic-hal's 887 firmware is built by this compiler but nothing in either
