@@ -600,6 +600,84 @@ fn const_large_ptr_call_arg_stays_in_flash() {
 }
 
 #[test]
+fn const_asm_operand_is_copied_to_ram() {
+    // An asm operand naming a const needs its address for substitution
+    // (epic-cc#1132): a 10-byte const used only by asm keeps a RAM copy
+    // instead of ICEing with no address, while a large one stays in flash.
+    let mut m = parse(
+        "const small i8\n\
+         const big i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             asm \"movf $0, W\" *m @small\n\
+             asm \"movf $0, W\" *m @big\n\
+             ret void\n",
+    );
+    m.globals[0].size = 10; // small: [10 x i8]
+    m.globals[1].size = 300; // big: [300 x i8], over the RAM copy limit
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert!(
+        out.globals.contains_key("small"),
+        "asm-named const @small must be copied to RAM"
+    );
+    assert!(
+        !out.const_globals.contains("small"),
+        "copied const @small must leave the flash set"
+    );
+    assert!(
+        !out.globals.contains_key("big"),
+        "large asm-named const @big must get no RAM copy"
+    );
+    assert!(
+        out.const_globals.contains("big"),
+        "large asm-named const @big must stay in the flash set"
+    );
+}
+
+#[test]
+fn const_asm_operand_keeps_copy_when_direct_consts_stage() {
+    // Small cores stage directly named call-arg consts through one shared
+    // buffer, which has no re-copy site before asm. An asm-named const
+    // must keep its own RAM copy while the direct ones stage, even when
+    // it is itself a direct call arg (epic-cc#1132).
+    let mut m = parse(
+        "const c i8\n\
+         const big i8\n\
+         const extra i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(@c)\n\
+             call void @f(@big)\n\
+             call void @f(@extra)\n\
+             asm \"movf $0, W\" *m @c\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 2; // c: [2 x i8]
+    m.globals[1].size = 5; // big: [5 x i8]
+    m.globals[2].size = 3; // extra: [3 x i8]
+    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        !out.globals.contains_key("big") && !out.globals.contains_key("extra"),
+        "direct-only call-arg consts must stage, not keep RAM copies"
+    );
+    assert!(
+        out.globals.contains_key("__const_stage"),
+        "one shared staging buffer must be placed"
+    );
+    assert!(
+        out.globals.contains_key("c"),
+        "asm-named const @c must keep its RAM copy through staging"
+    );
+    assert!(
+        !out.const_globals.contains("c"),
+        "copied const @c must leave the flash set"
+    );
+}
+
+#[test]
 fn staged_const_call_args_share_one_buffer() {
     // Small cores (epic-cc#790): directly named const call args stage
     // through one shared buffer instead of per-copy RAM. The buffer sizes

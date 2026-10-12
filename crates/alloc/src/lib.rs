@@ -2925,6 +2925,10 @@ fn allocate_inner(
     // select seeds an indirect slot isel derefs with RAM semantics,
     // so each const arm keeps its copy even when directly named.
     let mut const_sel: HashSet<String> = HashSet::new();
+    // An asm operand naming a const needs its address for substitution,
+    // so it keeps a RAM copy like any other direct use. Kept out of
+    // const_direct on purpose: staging has no re-copy site before asm.
+    let mut const_asm: HashSet<String> = HashSet::new();
     // Staging site records (epic-cc#790): per-call direct consts and reg
     // args, per-select dst with direct const arms, operand users per
     // (func, reg) with block positions, direct call edges, and functions
@@ -3015,6 +3019,14 @@ fn allocate_inner(
                             for op in &a.operands {
                                 if let Some(name) = op.ptr.strip_prefix('@') {
                                     addr_taken.insert(name.to_string());
+                                    if let Some(gl) =
+                                        m.globals.iter().find(|gl| gl.name == name && gl.is_const)
+                                    {
+                                        if gl.size <= 255 {
+                                            const_to_ram.insert(name.to_string());
+                                            const_asm.insert(name.to_string());
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3483,8 +3495,11 @@ fn allocate_inner(
         }
 
         // Survivors stage: direct-only, unpinned, small enough, paying.
+        // Asm-named consts never stage: no re-copy precedes asm, so the
+        // substitution would lose its address (epic-cc#1132).
         for gname in &const_direct {
-            if const_derived.contains(gname) || demote.contains(gname) {
+            if const_derived.contains(gname) || demote.contains(gname) || const_asm.contains(gname)
+            {
                 continue;
             }
             if let Some(gl) = m.globals.iter().find(|gl| &gl.name == gname) {
@@ -3524,7 +3539,7 @@ fn allocate_inner(
                     .is_some_and(iselcore::pool_member)
         };
         let ram_use = |g: &str| -> bool {
-            if const_byval.contains(g) || const_phi.contains(g) {
+            if const_byval.contains(g) || const_phi.contains(g) || const_asm.contains(g) {
                 return true;
             }
             // A pointer escapes into a callee that may read it (epic-cc#1026),
