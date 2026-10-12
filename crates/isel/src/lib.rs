@@ -4934,9 +4934,10 @@ impl<'m> Gen<'m> {
                 let (bk_lo, bk_hi, cnt) = (scr, scr + 1, scr + 2);
                 let r = [scr + 3, scr + 4, scr + 5, scr + 6];
                 let t = [scr + 7, scr + 8, scr + 9, scr + 10];
+                // Only r needs a zero init: every t byte is overwritten by
+                // the a copy below before the loop reads it.
                 for i in 0..4 {
                     self.emit(format!("    CLRF 0x{:02X}", r[i]));
-                    self.emit(format!("    CLRF 0x{:02X}", t[i]));
                 }
                 for i in 0..4u16 {
                     self.emit(format!("    MOVF 0x{:02X}, W", a + i));
