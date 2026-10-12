@@ -2543,7 +2543,11 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
                 .collect();
         }
         m = wholeprog::merge(m);
-        m = legalize::legalize(m);
+        m = if device.core == device::Core::Pic18 {
+            legalize::legalize_pic18(m)
+        } else {
+            legalize::legalize_for_core(m, device.core)
+        };
         let cg = callgraph::build(&m);
         let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
         let mut addrs: HashMap<String, u16> = HashMap::new();
@@ -2555,7 +2559,7 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
                 asm::assemble_file_to_hex(device, &asm)
             }
             device::Core::Pic14 => {
-                let (asm, _, _) = isel::select_with_locs(
+                let (asm, _, _, _) = isel::select_with_locs(
                     device,
                     &m,
                     &addrs,
@@ -2567,7 +2571,7 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
                 asm::assemble_file_to_hex(device, &asm)
             }
             device::Core::Pic14e => {
-                let (asm, _, chunks) =
+                let (asm, _, chunks, _) =
                     isel_pic14e::select_with_locs(device, &m, &addrs, &layout.staged_consts);
                 let asm = schedule::schedule(device, &asm);
                 let asm = banking::assign_banks(device, &asm);
