@@ -10491,8 +10491,7 @@ struct FitLayout {
     extents: Vec<FitExtent>,
     backward_orgs: Vec<(usize, usize)>,
     /// Names of the extents open at each backward `.org`, in detection
-    /// order: the spilling extent's true end is the reported address, which
-    /// its clamped `end` hides, so repair reads the owner here.
+    /// order, so repair can name the spiller without re-walking the text.
     backward_spillers: Vec<String>,
 }
 
@@ -10563,7 +10562,9 @@ fn measure_fit_layout(asm: &str, targets: &HashSet<String>) -> FitLayout {
                     .backward_spillers
                     .push(cur.as_ref().map(|e| e.name.clone()).unwrap_or_default());
             }
-            close(&mut cur, target, &mut layout);
+            // Close at the pre-jump address: a backward target would clamp
+            // spilled words out of the size, a forward one would gift the pad.
+            close(&mut cur, org, &mut layout);
             org = target;
             continue;
         }
@@ -11568,6 +11569,57 @@ pub fn select_with_locs(
     select_with_opts(device, m, addrs, staged, pool, Options::default())
 }
 
+/// Words a tail fill must leave free at a page end. Placement sizes are
+/// measured before the final banking context, whose entry drift is at
+/// most one full BANKSEL (2 words, as the chunk reserves assume), so a
+/// fill ending inside that margin is one drift event from spilling.
+/// The repair loop backstops the margin, so it only sets how often
+/// repair fires, never correctness.
+const PLACEMENT_SLACK: usize = 2;
+
+/// First-fit placement of one unit (function or chunk): the lowest page
+/// whose tail fits it, else a new page under the device flash bound
+/// (docs/39 D-1, epic-cc#398). Returns `(page, start)`.
+fn place_unit(
+    device: &Device,
+    page_next: &mut Vec<usize>,
+    name: &str,
+    size: usize,
+) -> (usize, usize) {
+    let num_pages = device.flash_words.div_ceil(0x800);
+    for (pi, next) in page_next.iter_mut().enumerate() {
+        let page_end = (pi + 1) * 0x800;
+        if *next + size > page_end {
+            continue;
+        }
+        // A unit at a page base or on the last page has no tighter page
+        // to move to, so the slack only rejects mid-device tail fills.
+        let at_page_base = *next == pi * 0x800;
+        if !at_page_base
+            && pi + 1 < num_pages as usize
+            && page_end - (*next + size) < PLACEMENT_SLACK
+        {
+            continue;
+        }
+        let start = *next;
+        *next += size;
+        return (pi, start);
+    }
+    let pi = page_next.len();
+    let last_page = num_pages - 1;
+
+    if pi as u32 >= num_pages {
+        panic!(
+            "isel: function @{name} would start at 0x{:04X}, beyond page {last_page} (device flash is {:#06x} words)",
+            pi * 0x800,
+            device.flash_words
+        );
+    }
+    let start = pi * 0x800;
+    page_next.push(start + size);
+    (pi, start)
+}
+
 /// `select_with_locs` with codegen options. The driver sets `fast_divmod`,
 /// `fast_mul_u8`, and `fast_shift` under O2, so the unsigned divide and
 /// multiply routines run their normalized loops and the u16/u32 shift
@@ -12094,36 +12146,7 @@ pub fn select_with_opts(
         // room, so later small functions fill tails a greedy pass would
         // waste. The page-0 base counts the reset vector, module asm, and
         // `__start` plus init (epic-cc#207); with an ISR the vector owns
-        // word 4 and `__start` follows it. `place_unit` packs one unit
-        // (function or chunk) into the lowest fitting tail, else a new page
-        // under the device flash bound (docs/39 D-1, epic-cc#398).
-        fn place_unit(
-            device: &Device,
-            page_next: &mut Vec<usize>,
-            name: &str,
-            size: usize,
-        ) -> (usize, usize) {
-            for (pi, next) in page_next.iter_mut().enumerate() {
-                if *next + size <= (pi + 1) * 0x800 {
-                    let start = *next;
-                    *next += size;
-                    return (pi, start);
-                }
-            }
-            let pi = page_next.len();
-            let num_pages = device.flash_words.div_ceil(0x800);
-            let last_page = num_pages - 1;
-            if pi as u32 >= num_pages {
-                panic!(
-                    "isel: function @{name} would start at 0x{:04X}, beyond page {last_page} (device flash is {:#06x} words)",
-                    pi * 0x800,
-                    device.flash_words
-                );
-            }
-            let start = pi * 0x800;
-            page_next.push(start + size);
-            (pi, start)
-        }
+        // word 4 and `__start` follows it.
         let mut pages: HashMap<String, usize> = HashMap::new();
         let mut pads: HashMap<String, usize> = HashMap::new();
         // Split chunks live here: entry label to (page, start). Chunk 0's
@@ -13034,5 +13057,91 @@ mod fit_repair_tests {
             FitVerdict::Fit => panic!("a repeat must not report Fit"),
             FitVerdict::Broken(msg) => panic!("exhaustion must not break: {msg}"),
         }
+    }
+    #[test]
+    fn spilled_extent_reports_honest_size() {
+        // f runs 281 words from 0x700, so its true end is 0x819, past the
+        // backward anchor at 0x800 that opens g. The clamped end (0x800)
+        // would report 256 words and hide the 25 spilled words.
+        let asm = format!(
+            "    org 0x0700\nf:\n{}    GOTO f\n    org 0x0800\ng:\n{}    GOTO g\n    end\n",
+            words(140),
+            words(10)
+        );
+        let targets: std::collections::HashSet<String> =
+            ["f".to_string(), "g".to_string()].into_iter().collect();
+        let layout = super::measure_fit_layout(&asm, &targets);
+        let f = &layout.extents[0];
+        assert_eq!(f.name, "f");
+        assert_eq!(f.end, 0x819, "spilled extent must keep its true end");
+        match assess(&asm, &Repair::default()) {
+            FitVerdict::Again(next) => assert_eq!(
+                next.func_sizes.get("f"),
+                Some(&281),
+                "replace path must carry the honest spilled size"
+            ),
+            FitVerdict::Fit => panic!("spilled layout must need repair"),
+            FitVerdict::Broken(msg) => panic!("spilled layout must repair, got Broken: {msg}"),
+            FitVerdict::NoConverge(msg) => panic!("spilled layout must repair: {msg}"),
+        }
+    }
+
+    #[test]
+    fn forward_pad_is_not_owned_by_previous_extent() {
+        let asm = format!(
+            "f:\n{}    GOTO f\n    org 0x0800\ng:\n{}    GOTO g\n    end\n",
+            words(10),
+            words(10)
+        );
+        let targets: std::collections::HashSet<String> =
+            ["f".to_string(), "g".to_string()].into_iter().collect();
+        let layout = super::measure_fit_layout(&asm, &targets);
+        let f = &layout.extents[0];
+        assert_eq!(f.end, 21, "the org pad gap is not part of f");
+    }
+    #[test]
+    fn tail_fill_leaving_less_than_slack_moves_to_next_page() {
+        let mut page_next = vec![0x700usize];
+        let placed = super::place_unit(&PIC16F877A, &mut page_next, "f", 255);
+        assert_eq!(placed, (1, 0x800));
+        assert_eq!(page_next, vec![0x700, 0x800 + 255]);
+    }
+
+    #[test]
+    fn tail_fill_leaving_full_slack_stays() {
+        let mut page_next = vec![0x700usize];
+        let placed = super::place_unit(&PIC16F877A, &mut page_next, "f", 254);
+        assert_eq!(placed, (0, 0x700));
+        assert_eq!(page_next, vec![0x700 + 254]);
+    }
+
+    #[test]
+    fn page_filling_unit_at_page_base_stays() {
+        // A zero-size unit opens page 1 through the fallback, so its base
+        // entry is a state the placer itself produces.
+        let mut page_next = vec![0x800usize];
+        assert_eq!(
+            super::place_unit(&PIC16F877A, &mut page_next, "z", 0),
+            (1, 0x800)
+        );
+        let placed = super::place_unit(&PIC16F877A, &mut page_next, "f", 2047);
+        assert_eq!(placed, (1, 0x800));
+    }
+
+    #[test]
+    fn tail_fill_inside_slack_on_last_page_stays() {
+        let mut page_next = vec![0x800usize, 0x1000, 0x1800, 0x1F00];
+        let placed = super::place_unit(&PIC16F877A, &mut page_next, "f", 255);
+        assert_eq!(placed, (3, 0x1F00));
+        assert_eq!(page_next[3], 0x1F00 + 255);
+    }
+
+    #[test]
+    fn tail_fill_inside_slack_on_single_page_device_stays() {
+        let single = device::by_name("p12f683").expect("p12f683 is catalogued");
+        assert_eq!(single.flash_words, 0x800);
+        let mut page_next = vec![0x100usize];
+        let placed = super::place_unit(single, &mut page_next, "f", 1791);
+        assert_eq!(placed, (0, 0x100));
     }
 }
