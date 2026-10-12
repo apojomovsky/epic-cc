@@ -73,3 +73,63 @@ fn const_period_search_folds_and_still_computes() {
     assert_eq!(p.ram()[map_addr(&map, "out_pre")], 1, "prescaler enum");
     assert_eq!(p.ram()[map_addr(&map, "out_post")], 4, "postscaler");
 }
+
+#[test]
+fn runtime_loop_beside_a_const_search_stays_rolled() {
+    let ll_path = tmp("mixed", "ll");
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            "tests/fixtures/const_div_runtime_loop.c",
+            "--emit",
+            "ll",
+            "-o",
+        ])
+        .arg(&ll_path)
+        .output()
+        .expect("run driver for ll");
+    assert!(
+        out.status.success(),
+        "driver ll: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ll = std::fs::read_to_string(&ll_path).expect("read emitted ll");
+    let _ = std::fs::remove_file(&ll_path);
+    assert!(
+        !ll.contains("udiv i32 5000"),
+        "constant search still divides at runtime:\n{ll}"
+    );
+    assert!(
+        ll.contains("!llvm.loop"),
+        "runtime loop beside the search was unrolled away:\n{ll}"
+    );
+}
+
+#[test]
+fn non_shrinking_const_div_target_does_not_veto_the_fold() {
+    let ll_path = tmp("two", "ll");
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            "tests/fixtures/const_div_two_targets.c",
+            "--emit",
+            "ll",
+            "-o",
+        ])
+        .arg(&ll_path)
+        .output()
+        .expect("run driver for ll");
+    assert!(
+        out.status.success(),
+        "driver ll: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ll = std::fs::read_to_string(&ll_path).expect("read emitted ll");
+    let _ = std::fs::remove_file(&ll_path);
+    assert!(
+        !ll.contains("udiv i32 5000"),
+        "search vetoed by the non-shrinking target:\n{ll}"
+    );
+    assert!(
+        ll.contains("udiv"),
+        "runtime divide in the scaling loop should survive:\n{ll}"
+    );
+}

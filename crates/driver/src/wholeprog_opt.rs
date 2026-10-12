@@ -62,11 +62,11 @@
 //! so both cores run it now.
 //! After the base list, a guarded second run tries to fold an
 //! all-constant search loop (the `compute_period` shape, epic-cc#1212):
-//! strip the `llvm.loop.unroll.disable` marks clang `-O1` stamps on
-//! every loop, unroll at a raised threshold, and clean up. The result
-//! is kept only when it has fewer instructions than the base result,
-//! so a runtime loop that unrolls into more code is never shipped.
-//! Skipped at `-O0`, whose contract leaves control flow untouched.
+//! it removes the `llvm.loop.unroll.disable` mark only from loops
+//! holding a constant divide, unrolls at a raised threshold, and
+//! cleans up. The result ships only when every marked loop's
+//! function shrinks and no other function grows, so sibling runtime
+//! loops stay rolled. Skipped at `-O0`: control flow untouched.
 use crate::cli::OptLevel;
 
 use std::path::Path;
@@ -417,7 +417,7 @@ const FOLD_PASSES: &str =
     "loop-unroll,instcombine,simplifycfg,sccp,adce,instcombine,simplifycfg,dce";
 /// Raised unroll threshold for the fold run. The default (a few hundred)
 /// stops just short of the 3x16x2 search body; this clears it while the
-/// keep-if-smaller guard in `run` bounds what can actually ship.
+/// per-function guard in `run` bounds what can actually ship.
 const FOLD_UNROLL_THRESHOLD: &str = "1024";
 
 /// One divide or remainder with a constant operand (`udiv i32 5000, %pq`).
@@ -441,12 +441,186 @@ fn is_const_div_line(t: &str) -> bool {
     })
 }
 
-/// Remove `llvm.loop.unroll.disable` from the loop metadata of
-/// functions containing a constant divide. clang `-O1` stamps the
-/// mark on every loop and the unroller honours it unconditionally,
-/// so no threshold alone can unroll `-O1` IR. Scoping to those
-/// functions keeps unrelated runtime loops out of the fold run.
-fn strip_unroll_disable(ll_text: &str) -> String {
+/// A basic block in one function: successor labels, the loop ids on
+/// its branches, and whether any instruction divides by or of a
+/// constant.
+struct BlockInfo {
+    name: String,
+    succs: Vec<String>,
+    loop_ids: Vec<String>,
+    has_const_div: bool,
+}
+
+/// The `label %name` targets in one terminator line.
+fn label_targets(t: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = t;
+    while let Some(pos) = rest.find("label %") {
+        let tok = &rest[pos + "label %".len()..];
+        let name: String = tok
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+            .collect();
+        if !name.is_empty() {
+            out.push(name.clone());
+        }
+        rest = &tok[name.len().max(1)..];
+    }
+    out
+}
+
+/// The `!llvm.loop !N` ids attached to one line.
+fn loop_ids_on(t: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = t;
+    while let Some(pos) = rest.find("!llvm.loop !") {
+        let num = &rest[pos + "!llvm.loop !".len()..];
+        let id: String = num.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if id.is_empty() {
+            break;
+        }
+        out.push(id.clone());
+        rest = &num[id.len()..];
+    }
+    out
+}
+
+/// Basic blocks of one function span. A label line is a head before
+/// any `;` comment that ends in `:` with no whitespace or `=` in it;
+/// the entry block keeps the empty name.
+fn blocks_of(lines: &[&str], span: &FuncSpan) -> Vec<BlockInfo> {
+    let mut blocks = vec![BlockInfo {
+        name: String::new(),
+        succs: Vec::new(),
+        loop_ids: Vec::new(),
+        has_const_div: false,
+    }];
+    for line in &lines[span.start + 1..span.end] {
+        let t = line.trim();
+        let head = t.split(';').next().unwrap_or("").trim();
+        if head.ends_with(':')
+            && !head[..head.len() - 1].contains(|c: char| c.is_whitespace() || c == '=')
+        {
+            blocks.push(BlockInfo {
+                name: head[..head.len() - 1].to_string(),
+                succs: Vec::new(),
+                loop_ids: Vec::new(),
+                has_const_div: false,
+            });
+            continue;
+        }
+        let b = blocks.last_mut().expect("entry block exists");
+        b.succs.extend(label_targets(t));
+        b.loop_ids.extend(loop_ids_on(t));
+        if is_const_div_line(t) {
+            b.has_const_div = true;
+        }
+    }
+    blocks
+}
+
+/// Loop metadata ids in the nest of a constant divide: loops whose
+/// natural loop holds a divide, and loops nested inside or enclosing
+/// one. The natural loop of a back edge latch to header is the header
+/// and every block reaching the latch without passing the header.
+/// The whole nest must unroll to evaluate the search; a sequential
+/// sibling loop is disjoint and stays rolled.
+fn const_div_loops(lines: &[&str], span: &FuncSpan) -> (Vec<String>, bool) {
+    let blocks = blocks_of(lines, span);
+    let index: std::collections::HashMap<&str, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.name.as_str(), i))
+        .collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
+    for (i, b) in blocks.iter().enumerate() {
+        for s in &b.succs {
+            if let Some(&j) = index.get(s.as_str()) {
+                preds[j].push(i);
+            }
+        }
+    }
+    let mut loops: Vec<(Vec<String>, Vec<bool>)> = Vec::new();
+    for (latch, b) in blocks.iter().enumerate() {
+        if b.loop_ids.is_empty() {
+            continue;
+        }
+        for header_name in &b.succs {
+            let Some(&header) = index.get(header_name.as_str()) else {
+                continue;
+            };
+            // A back edge's header reaches the latch; an exit
+            // successor does not, and treating it as a header would
+            // pull every predecessor block into the loop.
+            let mut reaches = vec![false; blocks.len()];
+            let mut stack = vec![header];
+            while let Some(n) = stack.pop() {
+                if reaches[n] {
+                    continue;
+                }
+                reaches[n] = true;
+                for s in &blocks[n].succs {
+                    if let Some(&j) = index.get(s.as_str()) {
+                        stack.push(j);
+                    }
+                }
+            }
+            if !reaches[latch] {
+                continue;
+            }
+            let mut in_loop = vec![false; blocks.len()];
+            in_loop[header] = true;
+            let mut stack = vec![latch];
+            while let Some(n) = stack.pop() {
+                if in_loop[n] {
+                    continue;
+                }
+                in_loop[n] = true;
+                stack.extend(preds[n].iter().copied());
+            }
+            loops.push((b.loop_ids.clone(), in_loop));
+        }
+    }
+    let has_div = |set: &Vec<bool>| {
+        blocks
+            .iter()
+            .zip(set)
+            .any(|(blk, inside)| *inside && blk.has_const_div)
+    };
+    let div_sets: Vec<&Vec<bool>> = loops
+        .iter()
+        .map(|(_, set)| set)
+        .filter(|set| has_div(set))
+        .collect();
+    let mut ids: Vec<String> = Vec::new();
+    for (loop_ids, set) in &loops {
+        let in_nest = div_sets
+            .iter()
+            .any(|div_set| set.iter().zip(div_set.iter()).any(|(a, b)| *a && *b));
+        if in_nest {
+            for id in loop_ids {
+                if !ids.contains(id) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+    }
+    let any = !ids.is_empty();
+    (ids, any)
+}
+
+/// Remove `llvm.loop.unroll.disable` from the nest of a constant
+/// divide, returning the edited text and the functions owning those
+/// loops. clang `-O1` stamps the mark on every loop and the
+/// unroller honours it unconditionally, so no threshold alone can
+/// unroll `-O1` IR. Scoping to the nest keeps sibling loops rolled.
+fn strip_unroll_disable(ll_text: &str) -> (String, Vec<String>) {
+    strip_unroll_disable_for(ll_text, None)
+}
+
+/// `strip_unroll_disable` restricted to the named functions, used to
+/// rerun the fold with only the targets that actually shrank.
+fn strip_unroll_disable_for(ll_text: &str, only: Option<&[String]>) -> (String, Vec<String>) {
     let lines: Vec<&str> = ll_text.lines().collect();
     let mut disable_ids: Vec<String> = Vec::new();
     for line in &lines {
@@ -461,37 +635,33 @@ fn strip_unroll_disable(ll_text: &str) -> String {
         }
     }
     if disable_ids.is_empty() {
-        return ll_text.to_string();
+        return (ll_text.to_string(), Vec::new());
     }
     let mut loop_ids: Vec<String> = Vec::new();
+    let mut targets: Vec<String> = Vec::new();
     for span in function_spans(&lines) {
-        let body = &lines[span.start..=span.end];
-        if !body.iter().any(|l| is_const_div_line(l.trim())) {
-            continue;
+        if let Some(only) = only {
+            if !only.contains(&span.name) {
+                continue;
+            }
         }
-        for line in body {
-            let mut rest = *line;
-            while let Some(pos) = rest.find("!llvm.loop !") {
-                let num = &rest[pos + "!llvm.loop !".len()..];
-                let id: String = num.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if id.is_empty() {
-                    break;
-                }
+        let (ids, any) = const_div_loops(&lines, &span);
+        if any {
+            targets.push(span.name.clone());
+            for id in ids {
                 if !loop_ids.contains(&id) {
-                    loop_ids.push(id.clone());
+                    loop_ids.push(id);
                 }
-                rest = &num[id.len()..];
             }
         }
     }
     if loop_ids.is_empty() {
-        return ll_text.to_string();
+        return (ll_text.to_string(), Vec::new());
     }
     let mut out = String::with_capacity(ll_text.len());
     for line in &lines {
         let t = line.trim_start();
-        let is_target = loop_ids.iter().any(|id| t.starts_with(&format!("!{id} =")));
-        if !is_target {
+        if !loop_ids.iter().any(|id| t.starts_with(&format!("!{id} ="))) {
             out.push_str(line);
             out.push('\n');
             continue;
@@ -508,47 +678,36 @@ fn strip_unroll_disable(ll_text: &str) -> String {
         out.push_str(&owned);
         out.push('\n');
     }
-    out
+    (out, targets)
 }
 
-/// IR instruction count inside function bodies, debug records excluded.
-/// The proxy the fold guard compares: unrolled-and-folded must be
-/// strictly smaller than the loop it replaces.
-fn instruction_count(ll_text: &str) -> usize {
-    let mut in_fn = false;
-    let mut n = 0;
-    for line in ll_text.lines() {
-        let t = line.trim();
-        if t.starts_with("define ") {
-            in_fn = true;
-            continue;
-        }
-        if in_fn && t == "}" {
-            in_fn = false;
-            continue;
-        }
-        if !in_fn || t.starts_with("#dbg") || t.ends_with(':') {
-            continue;
-        }
-        if t.starts_with('%')
+/// One instruction line inside a function body, debug excluded.
+fn is_instruction(t: &str) -> bool {
+    !t.starts_with("#dbg")
+        && !t.ends_with(':')
+        && (t.starts_with('%')
             || t.starts_with("store ")
             || t.starts_with("br ")
             || t.starts_with("call ")
             || t.starts_with("tail call ")
             || t.starts_with("ret ")
             || t.starts_with("switch ")
-            || t.starts_with("unreachable")
-        {
-            n += 1;
-        }
-    }
-    n
+            || t.starts_with("unreachable"))
 }
 
-/// The search shape worth a fold attempt: a loop plus a divide or
-/// remainder with a constant operand (`udiv i32 5000, %pq` and kin).
-fn has_const_div_loop(ll_text: &str) -> bool {
-    ll_text.contains("!llvm.loop") && ll_text.lines().any(|line| is_const_div_line(line.trim()))
+/// Per-function IR instruction counts. The fold guard compares
+/// these: every target must shrink and no other function may grow.
+fn function_instruction_counts(ll_text: &str) -> std::collections::HashMap<String, usize> {
+    let lines: Vec<&str> = ll_text.lines().collect();
+    let mut out = std::collections::HashMap::new();
+    for span in function_spans(&lines) {
+        let n = lines[span.start + 1..span.end]
+            .iter()
+            .filter(|l| is_instruction(l.trim()))
+            .count();
+        out.insert(span.name.clone(), n);
+    }
+    out
 }
 
 /// One `opt` invocation: `input` to `out`, returning the output text.
@@ -629,22 +788,61 @@ pub fn run(
         .map_err(|e| format!("write {}: {e}", merged_path.display()))?;
     let api_arg = format!("--internalize-public-api-list={}", api.join(","));
     let base_text = run_opt(opt_bin, merged_path, out_path, &passes, &[api_arg])?;
-    if opt_level == OptLevel::O0 || !has_const_div_loop(&base_text) {
+    if opt_level == OptLevel::O0 {
         return Ok(base_text);
     }
-    // Fold attempt (epic-cc#1212): unroll the now-constant search and
-    // keep it only if the folded module is strictly smaller.
+    // Fold attempt (epic-cc#1212): unroll the now-constant search.
+    // Gated on the strip actually changing the text, and kept only
+    // when a target function shrinks and no function grows. Targets
+    // that do not shrink are dropped and the fold reruns without
+    // them, so their loops are never unrolled in the shipped text.
+    let (stripped, targets) = strip_unroll_disable(&base_text);
+    if targets.is_empty() || stripped == base_text {
+        return Ok(base_text);
+    }
     let fold_in = out_path.with_extension("fold_in.ll");
     let fold_out = out_path.with_extension("fold.ll");
-    let stripped = strip_unroll_disable(&base_text);
-    if std::fs::write(&fold_in, &stripped).is_err() {
-        return Ok(base_text);
-    }
     let threshold = format!("--unroll-threshold={FOLD_UNROLL_THRESHOLD}");
-    let Ok(folded) = run_opt(opt_bin, &fold_in, &fold_out, FOLD_PASSES, &[threshold]) else {
+    let attempt = |text: &str| -> Option<String> {
+        std::fs::write(&fold_in, text).ok()?;
+        run_opt(
+            opt_bin,
+            &fold_in,
+            &fold_out,
+            FOLD_PASSES,
+            &[threshold.clone()],
+        )
+        .ok()
+    };
+    let Some(mut folded) = attempt(&stripped) else {
         return Ok(base_text);
     };
-    if instruction_count(&folded) >= instruction_count(&base_text) {
+    let base_counts = function_instruction_counts(&base_text);
+    let shrunk = |counts: &std::collections::HashMap<String, usize>, name: &str| {
+        counts.get(name).copied().unwrap_or(0) < base_counts.get(name).copied().unwrap_or(0)
+    };
+    let first_counts = function_instruction_counts(&folded);
+    let shrinking: Vec<String> = targets
+        .iter()
+        .filter(|name| shrunk(&first_counts, name))
+        .cloned()
+        .collect();
+    if shrinking.is_empty() {
+        return Ok(base_text);
+    }
+    if shrinking.len() != targets.len() {
+        let (reduced, _) = strip_unroll_disable_for(&base_text, Some(&shrinking));
+        let Some(rerun) = attempt(&reduced) else {
+            return Ok(base_text);
+        };
+        folded = rerun;
+    }
+    let fold_counts = function_instruction_counts(&folded);
+    let any_target_shrinks = shrinking.iter().any(|name| shrunk(&fold_counts, name));
+    let nothing_grows = fold_counts
+        .iter()
+        .all(|(name, n)| *n <= base_counts.get(name).copied().unwrap_or(0));
+    if !any_target_shrinks || !nothing_grows {
         return Ok(base_text);
     }
     std::fs::write(out_path, &folded).map_err(|e| format!("write {}: {e}", out_path.display()))?;
@@ -865,10 +1063,26 @@ define internal void @driver() #0 {
             "define internal void @helper(i16 %0) local_unnamed_addr #3 alwaysinline {\n}\n"
         );
     }
+
+    #[test]
+    fn strip_unroll_disable_covers_loops_nested_in_a_const_div_loop() {
+        let ll = "define i16 @main() #0 {\n  br label %shead\nshead:\n  %n = udiv i32 5000, %pq\n  br label %ihead\nihead:\n  %m = mul i32 %a, 3\n  br i1 %c, label %ihead, label %snext, !llvm.loop !7\nsnext:\n  br i1 %d, label %shead, label %exit, !llvm.loop !4\nexit:\n  ret i16 0\n}\n!4 = distinct !{!4, !6}\n!7 = distinct !{!7, !6}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
+        let (out, targets) = strip_unroll_disable(ll);
+        assert_eq!(targets, vec!["main".to_string()]);
+        assert!(
+            out.contains("!4 = distinct !{!4}"),
+            "outer loop unmarked: {out}"
+        );
+        assert!(
+            out.contains("!7 = distinct !{!7}"),
+            "nested loop unmarked: {out}"
+        );
+    }
     #[test]
     fn strip_unroll_disable_removes_mark_from_const_div_loops() {
-        let ll = "define i16 @main() #0 {\n  %n = udiv i32 5000, %pq\n  br i1 %c, label %a, label %b, !llvm.loop !4\n}\n!4 = distinct !{!4, !5, !6}\n!5 = !{!\"llvm.loop.mustprogress\"}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
-        let out = strip_unroll_disable(ll);
+        let ll = "define i16 @main() #0 {\n  br label %head\nhead:\n  %n = udiv i32 5000, %pq\n  br i1 %c, label %head, label %exit, !llvm.loop !4\nexit:\n  ret i16 0\n}\n!4 = distinct !{!4, !5, !6}\n!5 = !{!\"llvm.loop.mustprogress\"}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
+        let (out, targets) = strip_unroll_disable(ll);
+        assert_eq!(targets, vec!["main".to_string()]);
         assert!(
             out.contains("!4 = distinct !{!4, !5}"),
             "mark removed from loop node: {out}"
@@ -877,30 +1091,40 @@ define internal void @driver() #0 {
     }
 
     #[test]
+    fn strip_unroll_disable_keeps_sibling_runtime_loop_marks() {
+        let ll = "define i16 @main() #0 {\n  br label %shead\nshead:\n  %n = udiv i32 5000, %pq\n  br i1 %c, label %shead, label %rhead, !llvm.loop !4\nrhead:\n  %m = mul i32 %a, 3\n  br i1 %d, label %rhead, label %exit, !llvm.loop !7\nexit:\n  ret i16 0\n}\n!4 = distinct !{!4, !6}\n!7 = distinct !{!7, !6}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
+        let (out, targets) = strip_unroll_disable(ll);
+        assert_eq!(targets, vec!["main".to_string()]);
+        assert!(
+            out.contains("!4 = distinct !{!4}"),
+            "search loop unmarked: {out}"
+        );
+        assert!(
+            out.contains("!7 = distinct !{!7, !6}"),
+            "runtime loop keeps its mark: {out}"
+        );
+    }
+
+    #[test]
     fn strip_unroll_disable_keeps_runtime_loop_marks() {
-        let ll = "define i16 @main() #0 {\n  br i1 %c, label %a, label %b, !llvm.loop !4\n}\n!4 = distinct !{!4, !5, !6}\n!5 = !{!\"llvm.loop.mustprogress\"}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
-        assert_eq!(strip_unroll_disable(ll), ll);
+        let ll = "define i16 @main() #0 {\n  br label %head\nhead:\n  br i1 %c, label %head, label %exit, !llvm.loop !4\nexit:\n  ret i16 0\n}\n!4 = distinct !{!4, !5, !6}\n!5 = !{!\"llvm.loop.mustprogress\"}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
+        let (out, targets) = strip_unroll_disable(ll);
+        assert!(targets.is_empty());
+        assert_eq!(out, ll);
     }
 
     #[test]
     fn strip_unroll_disable_without_node_is_identity() {
         let ll = "define i16 @main() #0 {\n  ret i16 0\n}\n";
-        assert_eq!(strip_unroll_disable(ll), ll);
+        let (out, targets) = strip_unroll_disable(ll);
+        assert!(targets.is_empty());
+        assert_eq!(out, ll);
     }
 
     #[test]
-    fn has_const_div_loop_needs_loop_and_constant_operand() {
-        let search = "define i16 @main() #0 {\n1:\n  %n = udiv i32 5000, %pq\n  br label %1, !llvm.loop !4\n}\n";
-        assert!(has_const_div_loop(search));
-        let runtime = "define i16 @main() #0 {\n1:\n  %n = udiv i32 %a, %b\n  br label %1, !llvm.loop !4\n}\n";
-        assert!(!has_const_div_loop(runtime));
-        let no_loop = "define i16 @main() #0 {\n  %n = udiv i32 5000, %pq\n  ret i16 0\n}\n";
-        assert!(!has_const_div_loop(no_loop));
-    }
-
-    #[test]
-    fn instruction_count_skips_debug_and_metadata() {
+    fn function_instruction_counts_skips_debug_and_metadata() {
         let ll = "define i16 @main() #0 !dbg !9 {\n  %a = add i16 1, 2\n  #dbg_value(i16 %a, !1, !DIExpression(), !2)\n  store i16 %a, ptr @g\n  ret i16 %a\n}\n!9 = !{}\n";
-        assert_eq!(instruction_count(ll), 3);
+        let counts = function_instruction_counts(ll);
+        assert_eq!(counts.get("main"), Some(&3));
     }
 }
