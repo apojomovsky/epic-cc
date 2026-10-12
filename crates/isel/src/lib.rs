@@ -188,6 +188,10 @@ struct Gen<'m> {
     fast_divmod: bool,
     /// Eight-pass straight-line `__mul_u8` body (epic-cc#974, #1095), speed profile only.
     fast_mul_u8: bool,
+    /// Byte-granular variable shifts (epic-cc#1171): the u16/u32 shift
+    /// routines move whole bytes first when the masked count is >= 8,
+    /// then bit-loop the remainder. Speed profile only.
+    fast_shift: bool,
     cur_func: &'m str,
     /// Module-scoped fresh-label counter, shared across every function so the
     /// emitted `tmp{n}:` labels stay unique in the single `.asm` output.
@@ -5350,6 +5354,9 @@ impl<'m> Gen<'m> {
     /// layout-contract offset). ashr sets C from the sign bit before each
     /// rrf so the sign fills every vacated bit. All slots stay inside one
     /// GPR bank (any bank), the loops are skip-sensitive (epic-cc#6).
+    /// Under `fast_shift` (epic-cc#1171) the u16/u32 bodies move whole
+    /// bytes first when the masked count reaches 8, then bit-loop the
+    /// remainder (i8 counts never reach 8, so that body keeps the loop).
     fn emit_shift_body(&mut self, bytes: u16, op: BinOp, scr: u16) {
         let name = self.cur_func;
         let val = self.slot_addr(name, "val").direct();
@@ -5371,6 +5378,9 @@ impl<'m> Gen<'m> {
             // lives entirely in the low byte. Clear it once so a stale high
             // byte from an earlier call can't be misread as part of the count.
             self.emit(format!("    CLRF 0x{:02X}", scr + 1));
+        }
+        if self.fast_shift && bytes > 1 {
+            self.emit_shift_byte_prefix(bytes, op, val, scr);
         }
         let l_loop = self.fresh_label();
         let l_done = self.fresh_label();
@@ -5409,6 +5419,78 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_done}:"));
         self.store_retval(val, bytes as u8);
         self.emit("    RETURN".to_string());
+    }
+
+    /// Byte-granular prefix for the u16/u32 shift bodies (epic-cc#1171):
+    /// each set high count bit moves whole bytes, then clears its bit so
+    /// the bit loop below sees count % 8. Bit 3 selects one byte (u16 and
+    /// u32); bit 4 selects two more bytes first (u32 only). A clear bit
+    /// costs one GOTO; each set bit saves eight bit-loop trips.
+    fn emit_shift_byte_prefix(&mut self, bytes: u16, op: BinOp, val: u16, scr: u16) {
+        let l_bits = self.fresh_label();
+        if bytes == 4 {
+            let l_chk8 = self.fresh_label();
+            self.emit(format!("    BTFSS 0x{scr:02X}, 4")); // count >= 16?
+            self.emit(format!("    GOTO {l_chk8}"));
+            self.emit_shift_byte_move(bytes, 2, op, val);
+            self.emit(format!("    BCF 0x{scr:02X}, 4")); // remainder -= 16
+            self.emit(format!("{l_chk8}:"));
+        }
+        self.emit(format!("    BTFSS 0x{scr:02X}, 3")); // count >= 8?
+        self.emit(format!("    GOTO {l_bits}"));
+        self.emit_shift_byte_move(bytes, 1, op, val);
+        self.emit(format!("    BCF 0x{scr:02X}, 3")); // remainder -= 8
+        self.emit(format!("{l_bits}:"));
+    }
+
+    /// One whole-byte shift by `n` bytes over a `bytes`-byte LE value in
+    /// place. shl slides bytes up and clears the vacated low bytes; lshr
+    /// slides down and clears the high bytes; ashr slides down and fills
+    /// the high bytes with the original sign (still in the top byte: the
+    /// moves never write it before the fill reads it).
+    fn emit_shift_byte_move(&mut self, bytes: u16, n: u16, op: BinOp, val: u16) {
+        match op {
+            BinOp::Shl => {
+                for i in (0..bytes - n).rev() {
+                    self.emit(format!("    MOVF 0x{:02X}, W", val + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", val + i + n));
+                }
+                for i in 0..n {
+                    self.emit(format!("    CLRF 0x{:02X}", val + i));
+                }
+            }
+            BinOp::LShr => {
+                for i in n..bytes {
+                    self.emit(format!("    MOVF 0x{:02X}, W", val + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", val + i - n));
+                }
+                for i in bytes - n..bytes {
+                    self.emit(format!("    CLRF 0x{:02X}", val + i));
+                }
+            }
+            BinOp::AShr => {
+                for i in n..bytes {
+                    self.emit(format!("    MOVF 0x{:02X}, W", val + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", val + i - n));
+                }
+                let top = val + bytes - 1;
+                let l_neg = self.fresh_label();
+                let l_fill = self.fresh_label();
+                self.emit(format!("    BTFSC 0x{top:02X}, 7"));
+                self.emit(format!("    GOTO {l_neg}"));
+                for i in bytes - n..bytes {
+                    self.emit(format!("    CLRF 0x{:02X}", val + i));
+                }
+                self.emit(format!("    GOTO {l_fill}"));
+                self.emit(format!("{l_neg}:"));
+                self.emit("    MOVLW 0xFF".to_string());
+                for i in bytes - n..bytes {
+                    self.emit(format!("    MOVWF 0x{:02X}", val + i));
+                }
+                self.emit(format!("{l_fill}:"));
+            }
+            _ => unreachable!("isel: shift byte move takes a shift op"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7876,6 +7958,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         retval_lo: g.retval_lo,
         fast_divmod: g.fast_divmod,
         fast_mul_u8: g.fast_mul_u8,
+        fast_shift: g.fast_shift,
         cur_func: g.cur_func,
         bool_temps: HashSet::new(),
         tmp: &mut *g.tmp,
@@ -11445,6 +11528,10 @@ pub struct Options {
     /// Unrolled `__mul_u8` (epic-cc#974, #1095): eight straight-line passes,
     /// no loop and no per-bit branch. The speed profile turns it on.
     pub fast_mul_u8: bool,
+    /// Byte-granular variable shifts (epic-cc#1171): the u16/u32 shift
+    /// routines move whole bytes first when the masked count is >= 8,
+    /// then bit-loop the remainder. The speed profile turns it on.
+    pub fast_shift: bool,
 }
 
 impl Default for Options {
@@ -11452,6 +11539,7 @@ impl Default for Options {
         Self {
             fast_divmod: false,
             fast_mul_u8: false,
+            fast_shift: false,
         }
     }
 }
@@ -11480,10 +11568,11 @@ pub fn select_with_locs(
     select_with_opts(device, m, addrs, staged, pool, Options::default())
 }
 
-/// `select_with_locs` with codegen options. The driver sets `fast_divmod`
-/// and `fast_mul_u8` under O2, so the unsigned divide and multiply routines
-/// run their normalized loops instead of trading cycles for flash
-/// (epic-cc#895, epic-cc#974).
+/// `select_with_locs` with codegen options. The driver sets `fast_divmod`,
+/// `fast_mul_u8`, and `fast_shift` under O2, so the unsigned divide and
+/// multiply routines run their normalized loops and the u16/u32 shift
+/// routines move whole bytes first, instead of trading cycles for flash
+/// (epic-cc#895, epic-cc#974, epic-cc#1171).
 pub fn select_with_opts(
     device: &Device,
     m: &Module,
@@ -11690,6 +11779,7 @@ pub fn select_with_opts(
                 retval_lo,
                 fast_divmod: opts.fast_divmod,
                 fast_mul_u8: opts.fast_mul_u8,
+                fast_shift: opts.fast_shift,
                 cur_func: &f.name,
                 bool_temps: HashSet::new(),
                 tmp: &mut tmp,
@@ -11926,6 +12016,7 @@ pub fn select_with_opts(
                     retval_lo,
                     fast_divmod: opts.fast_divmod,
                     fast_mul_u8: opts.fast_mul_u8,
+                    fast_shift: opts.fast_shift,
                     cur_func: &f.name,
                     bool_temps: HashSet::new(),
                     tmp: &mut tmp2,
@@ -12279,6 +12370,7 @@ pub fn select_with_opts(
                                 retval_lo,
                                 fast_divmod: opts.fast_divmod,
                                 fast_mul_u8: opts.fast_mul_u8,
+                                fast_shift: opts.fast_shift,
                                 cur_func: &f.name,
                                 bool_temps: HashSet::new(),
                                 tmp: &mut tmp,

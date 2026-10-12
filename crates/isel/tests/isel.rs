@@ -3516,6 +3516,7 @@ fn sim_run_bytes_o2(
     let opts = Options {
         fast_divmod: true,
         fast_mul_u8: true,
+        fast_shift: true,
     };
     let (asm, _, _, _) = select_with_opts(
         &PIC16F877A,
@@ -3977,6 +3978,7 @@ fn mul_u8_unrolled_body_matches_wrapping_mul() {
     let opts = Options {
         fast_divmod: true,
         fast_mul_u8: true,
+        fast_shift: true,
     };
     let (asm, _, _, _) = select_with_opts(
         &PIC16F877A,
@@ -4665,6 +4667,261 @@ fn variable_count_shifts_mask_wide_counts() {
             &[wlo, whi],
             "{name} with count 0x{nhi:02X}{nlo:02X} (masked) must be 0x{whi:02X}{wlo:02X}"
         );
+    }
+}
+
+/// `sim_run_bytes` with only the byte-granular shift prefix on: isolates
+/// the epic-cc#1171 path from the other O2 bodies.
+fn sim_run_bytes_shift(
+    ir_text: &str,
+    map: &[(String, u16)],
+    seed: &[(u16, u8)],
+    out: u16,
+    n: usize,
+) -> Vec<u8> {
+    use pic14_sim::Pic14;
+    let m = parse(ir_text);
+    let opts = Options {
+        fast_divmod: false,
+        fast_mul_u8: false,
+        fast_shift: true,
+    };
+    let (asm, _, _, _) = select_with_opts(
+        &PIC16F877A,
+        &m,
+        &addrs(&map_refs(map)),
+        &HashSet::new(),
+        &ConstPool::empty(),
+        opts,
+    );
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    for (a, v) in seed {
+        p.ram_mut()[*a as usize] = *v;
+    }
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    (0..n).map(|i| p.ram()[out as usize + i]).collect()
+}
+
+/// The fast-shift prefix emits where it should and nowhere else: the O2
+/// bodies carry the count-bit dispatch and the byte moves, the default
+/// bodies keep the pure bit loop (the -Os flash pin).
+#[test]
+fn fast_shift_prefix_emits_only_under_o2() {
+    let fast = Options {
+        fast_divmod: false,
+        fast_mul_u8: false,
+        fast_shift: true,
+    };
+    let emit = |ir: &str, map: &[(String, u16)], opts: Options| {
+        let (asm, _, _, _) = select_with_opts(
+            &PIC16F877A,
+            &parse(ir),
+            &addrs(&map_refs(map)),
+            &HashSet::new(),
+            &ConstPool::empty(),
+            opts,
+        );
+        asm
+    };
+    let (ir16, map16) = routine_module("__shl_u16");
+    let slow16 = emit(&ir16, &map16, Options::default());
+    assert!(
+        !slow16.contains("BTFSS 0x44, 3"),
+        "default __shl_u16 keeps the bit loop:\n{slow16}"
+    );
+    let fast16 = emit(&ir16, &map16, fast);
+    for p in [
+        "BTFSS 0x44, 3",
+        "MOVF 0x40, W",
+        "MOVWF 0x41",
+        "CLRF 0x40",
+        "BCF 0x44, 3",
+    ] {
+        assert!(
+            fast16.contains(p),
+            "fast __shl_u16 must contain `{p}`:\n{fast16}"
+        );
+    }
+    let (ir32, map32) = routine_module32("__shl_u32");
+    let slow32 = emit(&ir32, &map32, Options::default());
+    assert!(
+        !slow32.contains("BTFSS 0x48, 4"),
+        "default __shl_u32 keeps the bit loop:\n{slow32}"
+    );
+    let fast32 = emit(&ir32, &map32, fast);
+    for p in [
+        "BTFSS 0x48, 4",
+        "BCF 0x48, 4",
+        "BTFSS 0x48, 3",
+        "BCF 0x48, 3",
+    ] {
+        assert!(
+            fast32.contains(p),
+            "fast __shl_u32 must contain `{p}`:\n{fast32}"
+        );
+    }
+    // i8 counts never reach 8: no prefix even under O2.
+    let (ir8, map8) = routine_module("__shl_u8");
+    let fast8 = emit(&ir8, &map8, fast);
+    assert!(
+        !fast8.contains("BTFSS 0x32, 3"),
+        "fast __shl_u8 must not grow a byte prefix:\n{fast8}"
+    );
+}
+
+/// The fast u16 bodies return exact results on byte-path counts (8..15),
+/// small counts, zero, and masked poison-range counts.
+#[test]
+fn fast_shift_u16_simulates_byte_path_counts() {
+    // (routine, val bytes lo..hi, cnt bytes lo..hi, expected result bytes)
+    let cases: &[(&str, &[u8], &[u8], &[u8])] = &[
+        ("__shl_u16", &[0x05, 0x00], &[0x08, 0x00], &[0x00, 0x05]),
+        ("__shl_u16", &[0xFF, 0x00], &[0x09, 0x00], &[0x00, 0xFE]),
+        ("__shl_u16", &[0x01, 0x00], &[0x0F, 0x00], &[0x00, 0x80]),
+        ("__shl_u16", &[0x05, 0x00], &[0x03, 0x00], &[0x28, 0x00]),
+        ("__shl_u16", &[0x05, 0x00], &[0x00, 0x00], &[0x05, 0x00]),
+        ("__shl_u16", &[0x05, 0x00], &[0x10, 0x00], &[0x05, 0x00]),
+        ("__lshr_u16", &[0x34, 0x12], &[0x08, 0x00], &[0x12, 0x00]),
+        ("__lshr_u16", &[0x34, 0x12], &[0x0C, 0x00], &[0x01, 0x00]),
+        ("__lshr_u16", &[0xCD, 0xAB], &[0x0F, 0x00], &[0x01, 0x00]),
+        ("__lshr_u16", &[0x00, 0x80], &[0x04, 0x00], &[0x00, 0x08]),
+        ("__ashr_i16", &[0x05, 0x80], &[0x08, 0x00], &[0x80, 0xFF]),
+        ("__ashr_i16", &[0x00, 0x7F], &[0x09, 0x00], &[0x3F, 0x00]),
+        ("__ashr_i16", &[0x00, 0x80], &[0x0F, 0x00], &[0xFF, 0xFF]),
+        ("__ashr_i16", &[0x00, 0x40], &[0x0F, 0x00], &[0x00, 0x00]),
+        ("__ashr_i16", &[0x05, 0x80], &[0x02, 0x00], &[0x01, 0xE0]),
+    ];
+    for &(name, x, n, want) in cases {
+        let (ir, map) = routine_module(name);
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((0x20 + i as u16, *b));
+        }
+        for (i, b) in n.iter().enumerate() {
+            seed.push((0x22 + i as u16, *b));
+        }
+        let got = sim_run_bytes_shift(&ir, &map, &seed, 0x24, want.len());
+        assert_eq!(&got[..], want, "{name}({x:?}, {n:?}) must be {want:?}");
+    }
+}
+
+/// The fast u32 bodies return exact results on two-byte (16..23),
+/// three-byte (24..31), one-byte (8..15), and small counts.
+#[test]
+fn fast_shift_u32_simulates_byte_path_counts() {
+    // (routine, val bytes lo..hi, cnt bytes lo..hi, expected result bytes)
+    let cases: &[(&str, &[u8], &[u8], &[u8])] = &[
+        ("__shl_u32", &[1, 0, 0, 0], &[19, 0, 0, 0], &[0, 0, 8, 0]),
+        ("__shl_u32", &[1, 0, 0, 0], &[31, 0, 0, 0], &[0, 0, 0, 0x80]),
+        (
+            "__shl_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[16, 0, 0, 0],
+            &[0, 0, 0x78, 0x56],
+        ),
+        (
+            "__shl_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[24, 0, 0, 0],
+            &[0, 0, 0, 0x78],
+        ),
+        ("__shl_u32", &[1, 0, 0, 0], &[3, 0, 0, 0], &[8, 0, 0, 0]),
+        ("__shl_u32", &[1, 0, 0, 0], &[33, 0, 0, 0], &[2, 0, 0, 0]),
+        // One-byte counts (8..15): bit 4 clear, bit 3 set.
+        (
+            "__shl_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[8, 0, 0, 0],
+            &[0, 0x78, 0x56, 0x34],
+        ),
+        ("__shl_u32", &[1, 0, 0, 0], &[15, 0, 0, 0], &[0, 0x80, 0, 0]),
+        (
+            "__lshr_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[19, 0, 0, 0],
+            &[0x46, 0x02, 0, 0],
+        ),
+        (
+            "__lshr_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[24, 0, 0, 0],
+            &[0x12, 0, 0, 0],
+        ),
+        (
+            "__lshr_u32",
+            &[0, 0, 0, 0x80],
+            &[31, 0, 0, 0],
+            &[1, 0, 0, 0],
+        ),
+        (
+            "__lshr_u32",
+            &[0, 0, 0, 0x80],
+            &[16, 0, 0, 0],
+            &[0, 0x80, 0, 0],
+        ),
+        ("__lshr_u32", &[0, 0, 0, 0x80], &[4, 0, 0, 0], &[0, 0, 0, 8]),
+        (
+            "__lshr_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[8, 0, 0, 0],
+            &[0x56, 0x34, 0x12, 0],
+        ),
+        (
+            "__ashr_i32",
+            &[0, 0, 0, 0x80],
+            &[19, 0, 0, 0],
+            &[0, 0xF0, 0xFF, 0xFF],
+        ),
+        (
+            "__ashr_i32",
+            &[1, 0, 0, 0x80],
+            &[24, 0, 0, 0],
+            &[0x80, 0xFF, 0xFF, 0xFF],
+        ),
+        (
+            "__ashr_i32",
+            &[0, 0, 0, 0x80],
+            &[31, 0, 0, 0],
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+        ),
+        (
+            "__ashr_i32",
+            &[0xFF, 0xFF, 0xFF, 0x7F],
+            &[31, 0, 0, 0],
+            &[0, 0, 0, 0],
+        ),
+        (
+            "__ashr_i32",
+            &[0, 0, 0, 0x80],
+            &[4, 0, 0, 0],
+            &[0, 0, 0, 0xF8],
+        ),
+        (
+            "__ashr_i32",
+            &[1, 0, 0, 0x80],
+            &[8, 0, 0, 0],
+            &[0, 0, 0x80, 0xFF],
+        ),
+        (
+            "__ashr_i32",
+            &[0, 0, 0, 0x7F],
+            &[8, 0, 0, 0],
+            &[0, 0, 0x7F, 0],
+        ),
+    ];
+    for &(name, x, y, want) in cases {
+        let (ir, map) = routine_module32(name);
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((0x20 + i as u16, *b));
+        }
+        for (i, b) in y.iter().enumerate() {
+            seed.push((0x24 + i as u16, *b));
+        }
+        let got = sim_run_bytes_shift(&ir, &map, &seed, 0x28, want.len());
+        assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) must be {want:?}");
     }
 }
 
