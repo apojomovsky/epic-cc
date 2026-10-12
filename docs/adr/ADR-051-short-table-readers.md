@@ -40,12 +40,14 @@ The full `HIGH(base)` set costs the caller nothing (one word either
 way); the saving is the entry's four words per same-page table. Twelve
 sites on the surveyed listing, all same-page. The map, not a new
 calling convention, keeps the contract local: an entry absent from the
-map behaves exactly as before.
+map behaves exactly as before. The driver re-checks every modeled base
+page after its own passes (cc#1195), so a repair pad that drifted a
+base across a page fails loudly instead of silently breaking a pair.
 
 ## Rejected alternatives
 
-- Same-window shortness without a caller change: `PCLATH<2:0>` is stale
-  on entry (callers set only bits 4:3), so the jump would land wrong.
-  Setting the low bits with `BSF`/`BCF` costs more than the park.
+- Same-window shortness without a caller change: the caller set leaves
+  `PCLATH<2:0>` zeroed, so only a window-aligned base could skip the
+  set. Setting other low bits with `BSF`/`BCF` costs more than the park.
 - Deciding shortness in the window-repair pass: the callers are
   out of its reach, and their sets must change together with the entry.
