@@ -204,8 +204,12 @@ fn staged_const_call_args_share_one_buffer() {
         let routine = &asm[start..end];
         assert_eq!(
             routine.matches(&format!("CALL __read_{name}")).count(),
-            routine.matches(&format!("PAGE(__read_{name})")).count(),
-            "every reader CALL in __stage_{name} re-sets the entry page (the reader leaves PCLATH on the table page)"
+            routine.matches(&format!("HIGH({name})")).count(),
+            "every reader CALL in __stage_{name} sets HIGH (short entry here)"
+        );
+        assert!(
+            !routine.contains(&format!("PAGE(__read_{name})")),
+            "no PAGE set for a short entry in __stage_{name}:\n{routine}"
         );
     }
     assert!(
