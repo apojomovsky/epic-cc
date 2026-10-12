@@ -544,6 +544,36 @@ flash_words = 362
 ram_bytes = 53
 
 [[entry]]
+name = "speed-mul-u32-16f1937"
+device = "16F1937"
+cycles = 812
+flash_words = 144
+ram_bytes = 48
+
+[[entry]]
+name = "speed-mul-u32-16f1937"
+device = "16F1937"
+profile = "O2"
+cycles = 812
+flash_words = 144
+ram_bytes = 48
+
+[[entry]]
+name = "speed-mul-u32-16f505"
+device = "16F505"
+cycles = 1824
+flash_words = 361
+ram_bytes = 51
+
+[[entry]]
+name = "speed-mul-u32-16f505"
+device = "16F505"
+profile = "O2"
+cycles = 1824
+flash_words = 361
+ram_bytes = 51
+
+[[entry]]
 name = "scen-pid-update-18f4550"
 device = "18F4550"
 cycles = 730
