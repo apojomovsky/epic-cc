@@ -46,8 +46,8 @@
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    flash_provenance, is_directive, resolve_pointers, ssa_key, Base, FlashProvenance,
-    PtrResolution, Slot,
+    find_value_folds, flash_provenance, is_directive, resolve_pointers, ssa_key, Base,
+    FlashProvenance, PtrResolution, Slot,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -152,6 +152,16 @@ struct Gen<'m> {
     /// every restore for measurement. `Some` in pass B skips same-page
     /// restores.
     page_of: Option<&'m HashMap<String, usize>>,
+    /// Every RAM byte a global occupies. The W cache never records or
+    /// reuses one: an interrupt can rewrite a global between the store
+    /// and the reload while its epilogue restores W, so a cached global
+    /// byte is never trustworthy. Only a function-private frame slot is
+    /// safe to track, the same rule `isel` states (epic-cc#875).
+    global_addrs: &'m HashSet<u16>,
+    /// Value folds from the shared per-function pre-scan (epic-cc#902):
+    /// loads whose byte never stages to a slot. `alloc` drops those
+    /// slots; the load arm skips them and consumers read the source.
+    w_folds: iselcore::ValueFolds,
     /// Tracks the slot address whose value also sits in W, or `None`.
     /// Collapses a store followed by a reload of the same slot (epic-cc#214).
     /// Wires only private result slots, never the address read or written,
@@ -178,6 +188,19 @@ impl<'m> Gen<'m> {
         self.locs.push(self.cur_loc.clone());
     }
 
+    /// Record that W holds the byte at `addr`, unless the address belongs
+    /// to a global: an interrupt can rewrite a global at any time while
+    /// its epilogue restores the interrupted W, so a global's cached byte
+    /// is never trustworthy across the next instruction boundary. Loads
+    /// of folded sources therefore always re-read (epic-cc#902).
+    fn mark_w(&mut self, addr: u16) {
+        self.w_holds = if self.global_addrs.contains(&addr) {
+            None
+        } else {
+            Some(addr)
+        };
+    }
+
     /// `MOVWF addr`, unless `addr` is already known to hold W's value from
     /// an immediately preceding `emit_w_store`/`emit_w_load` of the same
     /// address (a genuine no-op then: the byte there already equals W).
@@ -186,7 +209,7 @@ impl<'m> Gen<'m> {
         if self.w_holds != Some(addr) {
             self.emit(format!("    MOVWF 0x{addr:02X}"));
         }
-        self.w_holds = Some(addr);
+        self.mark_w(addr);
     }
 
     /// Emits `MOVF addr, W` unless W already holds the address value.
@@ -196,7 +219,7 @@ impl<'m> Gen<'m> {
         if self.w_holds != Some(addr) {
             self.emit(format!("    MOVF 0x{addr:02X}, W"));
         }
-        self.w_holds = Some(addr);
+        self.mark_w(addr);
     }
 
     /// Emits the restore pair after a CALL. Skips it when caller and
@@ -357,10 +380,41 @@ impl<'m> Gen<'m> {
         out
     }
 
+    /// The source global a skipped load read, when `r` is one (epic-cc#902):
+    /// a `Direct` fold names it, and a load forwarded into its store
+    /// re-reads it from the load. Forwarded `Bin` results return `None`:
+    /// those still stage, so every reader resolves to the temp as before.
+    fn folded_load_source(&self, r: &str) -> Option<u16> {
+        if let Some(iselcore::LoadFold::Direct(g)) = self.w_folds.loads.get(r) {
+            return Some(self.global_addr(g));
+        }
+        if !self.w_folds.forwarded.contains_key(r) {
+            return None;
+        }
+        let f = self.m.funcs.iter().find(|f| f.name == self.cur_func)?;
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Load(l) = inst {
+                    if l.dst == r {
+                        return Some(self.global_addr(l.ptr.strip_prefix('@').unwrap_or(&l.ptr)));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Resolve an operand value to its base byte address (lo for multi-byte).
     fn val_addr(&self, v: &Val) -> Slot {
         match v {
-            Val::Reg(r) => self.slot_addr(self.cur_func, r),
+            // A folded load reads its source global: the slot is gone, so
+            // every reader resolves here (epic-cc#902). A threaded load
+            // never arrives: its only readers are the stores below, which
+            // write back the byte still in W instead.
+            Val::Reg(r) => match self.folded_load_source(r) {
+                Some(a) => Slot::Direct(a),
+                None => self.slot_addr(self.cur_func, r),
+            },
             Val::Global(g) => Slot::Direct(
                 *self
                     .addrs
@@ -2480,6 +2534,26 @@ impl<'m> Gen<'m> {
             Inst::Load(l) => {
                 // Treats i1 as one byte like i8 throughout (epic-cc#304).
                 let ty = if l.ty == Ty::I1 { Ty::I8 } else { l.ty };
+                // A folded load never stages (epic-cc#902): the consumer
+                // reads the source global directly, or the byte rides W
+                // to its stores. `alloc` dropped the slot, so nothing
+                // below may look it up.
+                if let Some(fold) = self.w_folds.loads.get(&l.dst).cloned() {
+                    match fold {
+                        iselcore::LoadFold::Direct(_) => return,
+                        iselcore::LoadFold::ThreadW(g, _) => {
+                            let src = self.global_addr(&g);
+                            self.emit(format!("    MOVF 0x{src:02X}, W"));
+                            return;
+                        }
+                    }
+                }
+                // A load forwarded into its store never stages either: this
+                // load is the forwarded producer, so the store below reads
+                // the source global through `folded_load_source`.
+                if self.w_folds.forwarded.contains_key(&l.dst) {
+                    return;
+                }
                 let dst = self.slot_addr(self.cur_func, &l.dst).direct();
                 if let Some(g) = l.ptr.strip_prefix('@') {
                     let src = self.global_addr(g);
@@ -2522,6 +2596,20 @@ impl<'m> Gen<'m> {
                 let ty = if s.ty == Ty::I1 { Ty::I8 } else { s.ty };
                 if let Some(g) = s.ptr.strip_prefix('@') {
                     let dst = self.global_addr(g);
+                    // A W-threaded store (epic-cc#902): the folded load left
+                    // the byte in W, so the store writes it back out with no
+                    // slot read. The predicate allows only direct-global
+                    // single-byte stores with a stores-only gap, which W
+                    // survives (`MOVWF` preserves it; the ISR restores it).
+                    if let Val::Reg(r) = &s.val {
+                        if matches!(
+                            self.w_folds.loads.get(r),
+                            Some(iselcore::LoadFold::ThreadW(_, _))
+                        ) {
+                            self.emit(format!("    MOVWF 0x{dst:02X}"));
+                            return;
+                        }
+                    }
                     self.emit_move_val_to_slot(&s.val, ty, dst);
                 } else if s.ptr.starts_with("0x") {
                     // Writes an SFR literal directly with no FSR setup.
@@ -6741,6 +6829,8 @@ pub fn const_memcpy_parks_hold(device: &Device, m: &Module, addrs: &HashMap<Stri
             cur_func: &f.name,
             tmp: &mut tmp,
             page_of: None,
+            global_addrs: &HashSet::new(),
+            w_folds: iselcore::ValueFolds::default(),
             w_holds: None,
             cur_loc: None,
             out: Vec::new(),
@@ -6895,6 +6985,38 @@ pub fn select_with_locs(
     // Flash-pointer provenance for the C++ dispatch panic below: computed
     // once beside the pointer resolution (epic-cc#832).
     let prov = flash_provenance(m);
+    // Value folds for every function (epic-cc#902): loads whose byte never
+    // stages, over the same mapped-global set `alloc` places by, so a
+    // skipped load reads an address both stages agree on. Pass-independent
+    // (module, map, and pointer resolution only), so pass A and pass B
+    // share the one map.
+    let fold_safe: HashSet<String> = m
+        .globals
+        .iter()
+        .filter(|x| !x.is_const && addrs.contains_key(&x.name))
+        .map(|x| x.name.clone())
+        .collect();
+    let folds: HashMap<String, iselcore::ValueFolds> = m
+        .funcs
+        .iter()
+        .map(|f| {
+            (
+                f.name.clone(),
+                find_value_folds(f, m, &resolved, Some(&fold_safe)),
+            )
+        })
+        .collect();
+    // Every byte a RAM global occupies, so no W-cache entry can be
+    // grounded in storage an interrupt may rewrite behind the
+    // compiler's back (the same rule `isel` states).
+    let mut global_addrs: HashSet<u16> = HashSet::new();
+    for g in &m.globals {
+        if let Some(&a) = addrs.get(&g.name) {
+            for i in 0..g.size as u16 {
+                global_addrs.insert(a + i);
+            }
+        }
+    }
     // Keeps labels file-scoped with one module counter.
     // Pass A emits every body with all restores, then assigns pages.
     // Forward targets need computed sizes first, so one pass cannot do
@@ -6920,6 +7042,8 @@ pub fn select_with_locs(
                 cur_func: &f.name,
                 tmp: &mut tmp,
                 page_of: None,
+                global_addrs: &global_addrs,
+                w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
                 w_holds: None,
                 cur_loc: None,
                 out: Vec::new(),
@@ -7201,6 +7325,8 @@ pub fn select_with_locs(
                         cur_func: &f.name,
                         tmp: &mut tmp,
                         page_of: Some(&pages),
+                        global_addrs: &global_addrs,
+                        w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
                         w_holds: None,
                         cur_loc: None,
                         out: Vec::new(),

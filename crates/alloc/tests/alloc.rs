@@ -3679,3 +3679,87 @@ fn isr_copies_share_one_frame_when_dispatch_slots_are_dead() {
         "the shared dispatch frame must clear the main context"
     );
 }
+
+#[test]
+fn pic14e_drops_direct_load_slot_but_keeps_bin_slot() {
+    // The add shape (epic-cc#902): `%1` reads `@in` in W, so its slot
+    // drops, while the `add` result still stages into `%2`'s slot.
+    // Globals stay exactly placed: the gated pass never moves them.
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %2 = add i8 %1, 1\n\
+             store i8 %2 @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F1939, &m, "depth 1\n");
+    assert_eq!(out.globals["in"], 0x20);
+    assert_eq!(out.globals["out"], 0x21);
+    assert!(
+        !out.locals.contains_key("main::1"),
+        "folded load needs no slot: {:?}",
+        out.locals
+    );
+    assert!(
+        out.locals.contains_key("main::2"),
+        "forwarded bin result keeps its slot: {:?}",
+        out.locals
+    );
+}
+
+#[test]
+fn pic14e_drops_threaded_and_forwarded_load_slots() {
+    // `%1` fans out to two stores (ThreadW) and `%2` forwards into one:
+    // neither stages (epic-cc#902).
+    let m = parse(
+        "global in i8\n\
+         global slot i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             store i8 %1 @slot\n\
+             store i8 %1 @out\n\
+             %2 = load i8 @slot\n\
+             store i8 %2 @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F1939, &m, "depth 1\n");
+    assert!(
+        !out.locals.contains_key("main::1"),
+        "threaded load needs no slot: {:?}",
+        out.locals
+    );
+    assert!(
+        !out.locals.contains_key("main::2"),
+        "forwarded load needs no slot: {:?}",
+        out.locals
+    );
+}
+
+#[test]
+fn pic14e_multi_use_load_keeps_its_slot() {
+    // `%1` feeds two binops: no fold applies and the slot stays.
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         global out2 i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %2 = add i8 %1, 1\n\
+             %3 = add i8 %1, 2\n\
+             store i8 %2 @out\n\
+             store i8 %3 @out2\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F1939, &m, "depth 1\n");
+    assert!(
+        out.locals.contains_key("main::1"),
+        "shared load keeps its slot: {:?}",
+        out.locals
+    );
+}
