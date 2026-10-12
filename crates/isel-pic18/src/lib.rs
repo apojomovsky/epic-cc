@@ -14527,11 +14527,6 @@ pub fn select_with_opts(
                         Vec::new();
                     if dense {
                         let l_tbl = g.fresh_label();
-                        // Alignment anchor for the assembler's page
-                        // fixup: if dispatch plus table would straddle a
-                        // 256-byte page, the assembler pads NOPs here to
-                        // push the block onto the next page.
-                        g.emit("    .pclalign".to_string());
                         // Bounds check, then `ADDWF PCL,F` into a table of
                         // absolute 2-word GOTO entries (4 bytes each, so the
                         // selector needs W = 4*idx). PCL reads as the address
@@ -14595,6 +14590,10 @@ pub fn select_with_opts(
                         g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
                         g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
                         g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
+                        // Page-fixup anchor sits past the prologue: only the
+                        // entry plus table must share a page, so a straddle
+                        // pads just those onto the next page (epic-cc#1065).
+                        g.emit("    .pclalign".to_string());
                         g.emit("    ADDWF 0xFF9,F,A".to_string()); // PCL: the jump
                         g.emit_label(&l_tbl);
                         let span = (base + n as i64) * 4;

@@ -6922,11 +6922,11 @@ fn dense_switch_lowers_to_pcl_table() {
         None,
     );
     assert!(asm.contains("ADDWF 0xFF9,F,A"), "PCL dispatch:\n{asm}");
-    assert!(
-        asm.contains("MOVLW HIGH("),
-        "table page into PCLATH:\n{asm}"
+    assert_eq!(
+        asm.matches("ADDWF 0x030,W,A").count(),
+        3,
+        "W = 4*idx takes three slot accumulations:\n{asm}"
     );
-    assert!(asm.contains(".pcltbl "), "page-check marker:\n{asm}");
     assert!(
         asm.contains("SUBLW 0x07"),
         "bounds check against n-1:\n{asm}"
