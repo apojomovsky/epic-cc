@@ -250,7 +250,10 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
     /// against this seed by the GEP fixpoint); a link-time-constant GEP
     /// over a global; or a select that folds right now. Anything else
     /// (notably a folded dynamic GEP reg) stays pending for the
-    /// unresolvable-chain panic. Returns true when it seeded.
+    /// unresolvable-chain panic. In the optimistic round (`optimistic` holds
+    /// the still-unseeded phi keys) an arm that is itself an unresolved phi,
+    /// gep, or select also counts: the fixpoint verifies it, and a chain
+    /// that never resolves still stalls and panics. Returns true on seed.
     fn seed_phi(
         f: &ir::Func,
         fname: &str,
@@ -258,6 +261,7 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
         geps: &HashMap<String, ir::Gep>,
         selects: &HashMap<String, ir::Select>,
         resolved: &mut PtrResolution,
+        optimistic: Option<&HashSet<String>>,
     ) -> bool {
         // Only a pointer-typed phi (`phi ptr [...]`) is a pointer VALUE; a
         // plain i16 value phi (clang emits `phi i8`/`phi i16` for value
@@ -322,6 +326,19 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
                 None => false,
             }
         };
+        // Optimistic round only: an arm that is itself an unresolved phi,
+        // gep, or select resolves once the seeds land (a swap partner, a
+        // gep over one). Strict mode rejects these, so this runs solely on
+        // programs the fixpoint would otherwise refuse.
+        let optimistic_arm = |r: &str| {
+            let Some(keys) = optimistic else {
+                return false;
+            };
+            let rkey = ssa_key(fname, r);
+            keys.contains(&rkey)
+                || (geps.contains_key(&rkey) && !resolved.contains_key(&rkey))
+                || (selects.contains_key(&rkey) && !resolved.contains_key(&rkey))
+        };
         let runtime = p.incoming.iter().all(|(v, _)| match v {
             ir::Val::Const(_) | ir::Val::Global(_) => true,
             ir::Val::Reg(r) => match resolved.get(&ssa_key(fname, r)) {
@@ -338,7 +355,7 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
                 // plus dynamic terms, and SSA dominance keeps every term
                 // live on the incoming edge by construction.
                 Some((Base::Global(_), _, _)) => true,
-                _ => self_gep(r) || const_gep(r) || foldable_select(r),
+                _ => self_gep(r) || const_gep(r) || foldable_select(r) || optimistic_arm(r),
             },
         });
         if runtime && !p.incoming.is_empty() {
@@ -360,7 +377,7 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
             for b in &f.blocks {
                 for i in &b.insts {
                     if let Inst::Phi(p) = i {
-                        if seed_phi(f, &fname, p, &geps, &selects, &mut resolved) {
+                        if seed_phi(f, &fname, p, &geps, &selects, &mut resolved, None) {
                             progressed = true;
                         }
                     }
@@ -543,7 +560,7 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
                 if resolved.contains_key(&key) {
                     continue;
                 }
-                if seed_phi(f, &fname, &p, &geps, &selects, &mut resolved) {
+                if seed_phi(f, &fname, &p, &geps, &selects, &mut resolved, None) {
                     progressed = true;
                     continue;
                 }
@@ -555,6 +572,26 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
             // and isel never queries them, so stalling on them would fail
             // working programs. A phi that IS used but never seeds still
             // panics downstream at isel with its precise "no resolved base".
+            // Optimistic round (epic-cc#1127): a phi cycle whose arms are
+            // each other's pending phis or geps (a pointer swap, one arm a
+            // gep over its partner) stalls strict seeding forever. Seed
+            // those phis at once; the next rounds verify every chain, and
+            // anything still stuck panics below as before.
+            if !progressed && (!pending.is_empty() || !pending_selects.is_empty()) {
+                let keys: HashSet<String> = pending_phis.iter().map(|(k, _)| k.clone()).collect();
+                let mut rest = Vec::new();
+                for (key, p) in pending_phis {
+                    if resolved.contains_key(&key) {
+                        continue;
+                    }
+                    if seed_phi(f, &fname, &p, &geps, &selects, &mut resolved, Some(&keys)) {
+                        progressed = true;
+                    } else {
+                        rest.push((key, p));
+                    }
+                }
+                pending_phis = rest;
+            }
             if !progressed && (!pending.is_empty() || !pending_selects.is_empty()) {
                 let gnames: Vec<&str> = pending.iter().map(|(k, _)| k.as_str()).collect();
                 let snames: Vec<&str> = pending_selects.iter().map(|(k, _)| k.as_str()).collect();
@@ -1555,7 +1592,57 @@ pub fn add_flash_walks(
 
 #[cfg(test)]
 mod tests {
-    use super::is_directive;
+    use super::{is_directive, resolve_pointers, Base};
+
+    /// Two pointer phis that read each other, one through a gep
+    /// (epic-cc#1127): the optimistic round seeds both, and the gep over
+    /// the first resolves against its seed.
+    #[test]
+    fn swapped_pointer_phis_resolve_through_the_gep() {
+        let m = ir::parse(
+            "const .str i8\n\
+             const .str.1 i8\n\
+             fn main(i16) ()\n\
+             block 0:\n\
+             br 1\n\
+             block 1:\n\
+             %3 = phi ptr %4 1 @.str 0\n\
+             %4 = phi ptr %6 1 @.str.1 0\n\
+             %6 = gep %3 +1\n\
+             br 1\n",
+        );
+        let r = resolve_pointers(&m);
+        assert!(
+            matches!(r.get("main::3"), Some((Base::Slot(s, true), 0, t)) if s == "3" && t.is_empty())
+        );
+        assert!(
+            matches!(r.get("main::4"), Some((Base::Slot(s, true), 0, t)) if s == "4" && t.is_empty())
+        );
+        assert!(
+            matches!(r.get("main::6"), Some((Base::Slot(s, true), 1, t)) if s == "3" && t.is_empty())
+        );
+    }
+
+    /// Optimism never masks a broken chain: a phi arm that is neither an
+    /// address value nor a pending phi, gep, or select still refuses loud.
+    #[test]
+    #[should_panic(expected = "cyclic or unresolvable pointer chain")]
+    fn phi_with_broken_arm_still_refuses() {
+        let m = ir::parse(
+            "const .str i8\n\
+             const .str.1 i8\n\
+             fn main(i16) ()\n\
+             block 0:\n\
+             br 1\n\
+             block 1:\n\
+             %3 = phi ptr %9 1 @.str 0\n\
+             %4 = phi ptr %6 1 @.str.1 0\n\
+             %6 = gep %3 +1\n\
+             %9 = add i8 1 2\n\
+             br 1\n",
+        );
+        let _ = resolve_pointers(&m);
+    }
 
     #[test]
     fn bare_directive_matches_name_alone_or_followed_by_whitespace() {

@@ -3390,6 +3390,18 @@ impl<'m> Gen<'m> {
         missing_global_addr(self.m, self.cur_func, name)
     }
 
+    /// Whether `name` is a plain pointer parameter: its slot holds the
+    /// caller's address bytes, so a resolved move over it reads the slot
+    /// like an indirect slot does (epic-cc#1127).
+    fn is_ptr_param(&self, name: &str) -> bool {
+        self.m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .map(|f| f.params.iter().any(|p| p.name == *name && p.ptr))
+            .unwrap_or(false)
+    }
+
     /// Whether `name` is a local object in the current function: an
     /// `alloca`'s slot IS the object, so a pointer to it is that slot's
     /// own frame address rather than an address value stored in the slot
@@ -11537,56 +11549,100 @@ fn exit_bank(ends: &[Option<u8>]) -> Option<u8> {
     known
 }
 
+/// PRODL: low byte of the phi-copy cycle temp (epic-cc#1127). `MULWF`
+/// staging is the only other PROD user, and every product is consumed by
+/// the next lines of its own straight-line lowering, so PROD is dead at
+/// every block edge where phi copies emit; the ISR prologue saves PROD
+/// whenever its bodies multiply.
+const PHI_COPY_TEMP_LO: u16 = 0xFF3;
+
 /// Emits dependency-ordered phi copies for one edge: no copy clobbers a
 /// slot a later copy still reads. Back edges run readers before writers
-/// (the merge slots hold current values); forward edges run writers
-/// first (the edge defines each slot). A true cycle needs a temp
-/// register and panics: silent emission would miscompile.
+/// (merge slots hold current values); forward edges run writers first.
+/// A resolved Slot arm records its base slot, literal bases read nothing.
+/// A back-edge cycle (a loop-carried pointer swap) stages one arm through
+/// PRODL/PRODH; anything else cyclic panics instead of miscompiling.
 fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge: bool) {
-    let pending: Vec<(u16, Option<u16>, Ty, Val, bool)> = copies
+    struct Pend {
+        da: u16,
+        src: Option<u16>,
+        ty: Ty,
+        val: Val,
+        w_only: bool,
+        from_temp: bool,
+    }
+    let mut pending: Vec<Pend> = copies
         .iter()
         .map(|(dst, ty, val)| {
             let da = g.slot_addr(g.cur_func, dst).direct();
             let src = match val {
-                Val::Reg(r) if g.resolved.contains_key(&iselcore::ssa_key(g.cur_func, r)) => None,
-                Val::Reg(r) => Some(g.slot_addr(g.cur_func, r).direct()),
+                Val::Reg(r) => match g.resolved.get(&iselcore::ssa_key(g.cur_func, r)) {
+                    // A resolved Slot arm reads its base slot's bytes (the
+                    // move folds k/terms onto them); a pointer param's slot
+                    // holds an address too, while an alloca address or a
+                    // global folds to literals and reads no slot.
+                    Some((iselcore::Base::Slot(sname, indirect), _, _))
+                        if *indirect || g.is_ptr_param(sname) =>
+                    {
+                        Some(g.slot_addr(g.cur_func, sname).direct())
+                    }
+                    Some(_) => None,
+                    None => Some(g.slot_addr(g.cur_func, r).direct()),
+                },
                 _ => None,
             };
             // A W-threaded const-phi incoming (epic-cc#825) leaves its
             // byte in W for the merge block's store: only the `MOVLW`
             // emits. Every other const copy keeps the slot write.
             let w_only = matches!(val, Val::Const(_)) && g.const_w_phis.contains(dst);
-            (da, src, *ty, val.clone(), w_only)
+            Pend {
+                da,
+                src,
+                ty: *ty,
+                val: val.clone(),
+                w_only,
+                from_temp: false,
+            }
         })
         .collect();
     let n = pending.len();
     let mut emitted = vec![false; n];
     let mut emitted_count = 0usize;
+    let mut temp_live = false;
     while emitted_count < n {
         let mut progress = false;
         for i in 0..n {
             if emitted[i] {
                 continue;
             }
-            let (da, src, ty, val, w_only) = &pending[i];
-            let blocked = if *w_only {
+            let blocked = if pending[i].w_only {
                 false
             } else if back_edge {
-                (0..n).any(|j| !emitted[j] && j != i && pending[j].1 == Some(*da))
+                let da = pending[i].da;
+                (0..n).any(|j| !emitted[j] && j != i && pending[j].src == Some(da))
             } else {
-                match src {
-                    Some(s) => (0..n).any(|j| !emitted[j] && j != i && pending[j].0 == *s),
+                match pending[i].src {
+                    Some(s) => (0..n).any(|j| !emitted[j] && j != i && pending[j].da == s),
                     None => false,
                 }
             };
             if !blocked {
-                if *w_only {
-                    let Val::Const(k) = val else {
+                if pending[i].w_only {
+                    let Val::Const(k) = &pending[i].val else {
                         panic!("isel-pic18: W-only phi copy without a constant")
                     };
                     g.emit(format!("    MOVLW 0x{:02X}", ((*k & 0xFF) as u8)));
+                } else if pending[i].from_temp {
+                    for b in 0..pending[i].ty.bytes() {
+                        g.emit_copy_byte(
+                            PHI_COPY_TEMP_LO + u16::from(b),
+                            pending[i].da + u16::from(b),
+                        );
+                    }
+                    temp_live = false;
                 } else {
-                    g.emit_move_val_to_slot(val, *ty, *da);
+                    let (val, ty, da) = (pending[i].val.clone(), pending[i].ty, pending[i].da);
+                    g.emit_move_val_to_slot(&val, ty, da);
                 }
                 emitted[i] = true;
                 emitted_count += 1;
@@ -11594,7 +11650,26 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
             }
         }
         if !progress {
-            panic!("isel-pic18: cyclic phi copies not supported");
+            if !back_edge {
+                panic!("isel-pic18: cyclic phi copies not supported");
+            }
+            if temp_live {
+                panic!("isel-pic18: disjoint cyclic phi copies not supported");
+            }
+            let pick = (0..n)
+                .find(|&i| !emitted[i] && !pending[i].w_only && pending[i].src.is_some())
+                .unwrap_or_else(|| panic!("isel-pic18: cyclic phi copies not supported"));
+            if pending[pick].ty.bytes() > 2 {
+                panic!("isel-pic18: phi copy cycle wider than PROD not supported");
+            }
+            // Reader-first order kept every read of this slot pre-edge, so
+            // staging it now captures the current value; the arm replays
+            // from the temp once its destination is free.
+            let (val, ty) = (pending[pick].val.clone(), pending[pick].ty);
+            g.emit_move_val_to_slot(&val, ty, PHI_COPY_TEMP_LO);
+            pending[pick].src = Some(PHI_COPY_TEMP_LO);
+            pending[pick].from_temp = true;
+            temp_live = true;
         }
     }
 }
