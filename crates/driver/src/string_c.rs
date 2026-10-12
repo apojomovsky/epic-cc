@@ -1,9 +1,11 @@
 //! The freestanding `<string.h>` implementation, compiled as an extra
 //! translation unit when a source includes the header.
 //!
-//! Uses `size_t` index loops rather than pointer walks: an index keeps
-//! the loop-carried value an integer phi, so a pointer materialises only
-//! as a GEP over a parameter slot, the one pointer shape both backends lower.
+//! Index loops where the trip count is known up front (memcpy family,
+//! strlen): the integer phi is the shape both backends walk. `strcmp`
+//! instead runs pointer induction with a bitwise-`&` latch, which clang
+//! keeps as one block over two `phi ptr`: the PIC18 pointer walk's
+//! shape, with the last bytes live for the exit subtract.
 
 pub const STRING_C: &str = r#"#include <stddef.h>
 #include <string.h>
@@ -87,11 +89,25 @@ __attribute__((noinline)) char *strncat(char *dest, const char *src, size_t n) {
     return dest;
 }
 
+/* Bitwise `&`, not `&&`: one latch block over two pointer phis after
+ * LSR, which the PIC18 pointer walk lowers to `POSTINC` scans. A
+ * short-circuit latch splits the loop and defeats it. PIC14 keeps the
+ * index form: its backend has no pointer walk and counts the pointer
+ * version slower. */
+#ifdef _PIC18
+__attribute__((noinline)) int strcmp(const char *s1, const char *s2) {
+    size_t i = 0;
+    while ((((unsigned char)s1[i] == (unsigned char)s2[i])
+        & ((unsigned char)s1[i] != 0))) i++;
+    return (int)(unsigned char)s1[i] - (int)(unsigned char)s2[i];
+}
+#else
 __attribute__((noinline)) int strcmp(const char *s1, const char *s2) {
     size_t i = 0;
     while (s1[i] && s1[i] == s2[i]) i++;
     return (int)(unsigned char)s1[i] - (int)(unsigned char)s2[i];
 }
+#endif
 
 __attribute__((noinline)) int strncmp(const char *s1, const char *s2, size_t n) {
     size_t i = 0;

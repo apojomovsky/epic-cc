@@ -25,7 +25,7 @@ fn compile(c_path: &str) -> (PicBaseline<'_>, HashMap<String, u16>) {
     let (ll, _dep) = clang_compile(&clang, &resdir, c_path);
     let mut m = irparse::parse_ll(&ll);
     m = wholeprog::merge(m);
-    m = legalize::legalize(m);
+    m = legalize::legalize_for_core(m, device::Core::PicBaseline);
     let cg = callgraph::build(&m);
     callgraph::check_depth(&cg, device::PIC12F509.stack_depth as usize);
     let layout = alloc::allocate(&device::PIC12F509, &m, &callgraph::edges_text(&cg));
@@ -57,7 +57,7 @@ fn compile_asm_for(
     let (ll, _dep) = clang_compile(&clang, &resdir, c_path);
     let mut m = irparse::parse_ll(&ll);
     m = wholeprog::merge(m);
-    m = legalize::legalize(m);
+    m = legalize::legalize_for_core(m, device::Core::PicBaseline);
     let cg = callgraph::build(&m);
     callgraph::check_depth(&cg, device.stack_depth as usize);
     let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
@@ -77,7 +77,7 @@ fn compile_asm(c_path: &str) -> (PicBaseline<'_>, HashMap<String, u16>, String) 
     let (ll, _dep) = clang_compile(&clang, &resdir, c_path);
     let mut m = irparse::parse_ll(&ll);
     m = wholeprog::merge(m);
-    m = legalize::legalize(m);
+    m = legalize::legalize_for_core(m, device::Core::PicBaseline);
     let cg = callgraph::build(&m);
     callgraph::check_depth(&cg, device::PIC12F509.stack_depth as usize);
     let layout = alloc::allocate(&device::PIC12F509, &m, &callgraph::edges_text(&cg));
@@ -740,7 +740,7 @@ fn cmp_wide_c_runs_correctly() {
 fn compile_ll_asm(ll: &str) -> (PicBaseline<'_>, HashMap<String, u16>, String) {
     let mut m = irparse::parse_ll(ll);
     m = wholeprog::merge(m);
-    m = legalize::legalize(m);
+    m = legalize::legalize_for_core(m, device::Core::PicBaseline);
     let cg = callgraph::build(&m);
     callgraph::check_depth(&cg, device::PIC12F509.stack_depth as usize);
     let layout = alloc::allocate(&device::PIC12F509, &m, &callgraph::edges_text(&cg));

@@ -271,8 +271,8 @@ fn cases() -> Vec<Case> {
     // epic-cc#1067: the loop above covers 18F4550 and 16F877A only, so
     // the pic14e and baseline __mul_u32 routines had no cycle row. The
     // 12F509 cannot run this kernel (41 GPR bytes fit neither the 12
-    // operand/result bytes nor the 11-byte __scr), so the baseline row
-    // targets the 16F505.
+    // operand/result bytes nor the 8-byte baseline __scr, epic-cc#1179),
+    // so the baseline row targets the 16F505.
     out.push(kernel("speed-mul-u32", "16F1937", "speed-mul-u32.c"));
     out.push(kernel("speed-mul-u32", "16F505", "speed-mul-u32.c"));
     // One PID update through the vendored epic-pid: PIC18 only, like the
