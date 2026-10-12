@@ -306,16 +306,16 @@ ram_bytes = 43
 [[entry]]
 name = "speed-memcpy-32-18f4550"
 device = "18F4550"
-cycles = 1865
-flash_words = 128
+cycles = 723
+flash_words = 97
 ram_bytes = 83
 
 [[entry]]
 name = "speed-memcpy-32-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 1865
-flash_words = 128
+cycles = 723
+flash_words = 97
 ram_bytes = 83
 
 [[entry]]
@@ -336,16 +336,16 @@ ram_bytes = 84
 [[entry]]
 name = "speed-memset-32-18f4550"
 device = "18F4550"
-cycles = 1095
-flash_words = 109
+cycles = 493
+flash_words = 92
 ram_bytes = 53
 
 [[entry]]
 name = "speed-memset-32-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 1095
-flash_words = 109
+cycles = 493
+flash_words = 92
 ram_bytes = 53
 
 [[entry]]
@@ -366,16 +366,16 @@ ram_bytes = 53
 [[entry]]
 name = "speed-strlen-strcmp-18f4550"
 device = "18F4550"
-cycles = 2155
-flash_words = 215
+cycles = 2127
+flash_words = 214
 ram_bytes = 57
 
 [[entry]]
 name = "speed-strlen-strcmp-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 1955
-flash_words = 218
+cycles = 1927
+flash_words = 217
 ram_bytes = 57
 
 [[entry]]
@@ -396,16 +396,16 @@ ram_bytes = 58
 [[entry]]
 name = "speed-crc16-18f4550"
 device = "18F4550"
-cycles = 12427
-flash_words = 148
+cycles = 11819
+flash_words = 145
 ram_bytes = 52
 
 [[entry]]
 name = "speed-crc16-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 12427
-flash_words = 148
+cycles = 11819
+flash_words = 145
 ram_bytes = 52
 
 [[entry]]
