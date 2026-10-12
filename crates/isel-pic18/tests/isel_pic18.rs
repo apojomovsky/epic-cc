@@ -2529,6 +2529,28 @@ fn icmp_i16_const_lhs_is_rejected_not_silently_miscompiled() {
 }
 
 #[test]
+#[should_panic(expected = "const-LHS")]
+fn icmp_sign_zero_fused_const_lhs_is_rejected() {
+    // The fused hook calls `emit_icmp_sign_zero` directly, bypassing
+    // the entry points' guards, so the fold carries its own: a literal
+    // LHS against zero must fail loudly rather than test the byte at
+    // the literal's address.
+    let m = parse(
+        "global x i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i16 @x\n    %2 = icmp slt i16 5, 0\n    br i1 %2, yes, no\n  \
+         block yes:\n    store i8 1 @out\n    ret void\n  \
+         block no:\n    store i8 0 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("out", 0x22),
+        ("main::1", 0x24),
+        ("main::2", 0x26),
+    ]);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
+}
+
+#[test]
 fn zext_i8_to_i16_zero_fills_the_high_byte() {
     let m = parse("global a i8\nglobal out i16\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = zext i8 %1 to i16\n    store i16 %2 @out\n    ret void\n");
     let addrs = addrs(&[
@@ -4544,6 +4566,95 @@ fn a_long_const_memcpy_runs_as_one_loop() {
     assert!(
         !asm.contains("MOVFF 0xFF5, 0x110"),
         "the unrolled pairs must not coexist with the loop:\n{asm}"
+    );
+}
+
+#[test]
+fn speed_profile_unrolls_short_const_memcpy_only() {
+    // With `copy_loop` off (the `-O2` gate, epic-cc#886) an 8-byte
+    // const-source copy stays eight `TBLRD*+`+`MOVFF` pairs: the loop
+    // wins flash at roughly twice the cycles per byte, a trade the
+    // speed profile refuses like the staged-copy drain (epic-cc#883).
+    // Longer copies keep the loop: past the cap the unrolled form
+    // would spend tens of words per site for cycles no timed region
+    // observes.
+    let bytes: Vec<u8> = (0..8u8)
+        .map(|b| b.wrapping_mul(7).wrapping_add(3))
+        .collect();
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global dst i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 memcpy @dst @t 8\n\
+                 ret void\n",
+        ),
+        "t",
+        &bytes,
+    );
+    let opts = isel_pic18::Options {
+        copy_loop: false,
+        divmod_fold: false,
+        inline_mul16: false,
+    };
+    let asm = isel_pic18::select_with_opts(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("dst", 0x110)]),
+        None,
+        None,
+        None,
+        opts,
+    )
+    .0;
+    assert_eq!(
+        asm.matches("TBLRD*+").count(),
+        8,
+        "one table read per byte, no counted loop:\n{asm}"
+    );
+    // Scoped to main: `__start`'s zero-init loop also uses DECFSZ, so a
+    // whole-listing search would match the wrong loop.
+    let main_body = asm
+        .split("main:")
+        .nth(1)
+        .and_then(|rest| rest.split("RETURN").next())
+        .expect("main body");
+    assert!(
+        !main_body.contains("DECFSZ"),
+        "no counted loop with copy_loop off:\n{asm}"
+    );
+    assert!(asm.contains("MOVFF 0xFF5, 0x110"), "byte 0 inline:\n{asm}");
+    // Past the cap the loop stays even under the speed profile.
+    let big: Vec<u8> = (0..12u8)
+        .map(|b| b.wrapping_mul(7).wrapping_add(3))
+        .collect();
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global dst i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 memcpy @dst @t 12\n\
+                 ret void\n",
+        ),
+        "t",
+        &big,
+    );
+    let asm = isel_pic18::select_with_opts(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("dst", 0x110)]),
+        None,
+        None,
+        None,
+        opts,
+    )
+    .0;
+    assert_eq!(
+        asm.matches("TBLRD*+").count(),
+        1,
+        "a 12-byte copy keeps its loop under -O2:\n{asm}"
     );
 }
 
@@ -7227,9 +7338,11 @@ fn icmp_i32_eq_zero_converts_every_lane() {
 #[test]
 fn icmp_ordering_against_zero_keeps_the_carry_producing_subtract() {
     // The gate is "the consumer reads only Z", not "the literal is zero":
-    // `uge`/`ult`/`ugt`/`ule` branch on C and `slt`/`sge`/`sgt`/`sle` on
-    // N/OV, none of which `MOVF` writes. Dropping the subtract there would
-    // leave those branches reading a stale flag.
+    // `uge`/`ult`/`ugt`/`ule` branch on C and `sgt`/`sle` on N/OV, none
+    // of which `MOVF` writes. Dropping the subtract there would leave
+    // those branches reading a stale flag. `slt`/`sge` against zero test
+    // the sign bit directly and read no flag, so they keep no subtract
+    // (see `icmp_sign_zero_folds_slt_sge_against_zero`).
     for (pred, xv, expect) in [
         ("uge", 0u8, 1u8),
         ("uge", 7, 1),
@@ -7239,8 +7352,6 @@ fn icmp_ordering_against_zero_keeps_the_carry_producing_subtract() {
         ("ugt", 7, 1),
         ("ule", 0, 1),
         ("ule", 7, 0),
-        ("sge", 0xFF, 0),
-        ("slt", 0xFF, 1),
         ("sgt", 0xFF, 0),
         ("sle", 0xFF, 1),
     ] {
@@ -7265,6 +7376,109 @@ fn icmp_ordering_against_zero_keeps_the_carry_producing_subtract() {
         p.ram_mut()[0x10] = xv;
         p.run(200);
         assert_eq!(p.ram()[0x11], expect, "{pred}({xv}, 0)");
+    }
+}
+
+#[test]
+fn icmp_sign_zero_folds_slt_sge_against_zero() {
+    // `slt`/`sge` against zero decide on bit 7 alone: one `BTFSC`/`BTFSS`
+    // replaces the sign check plus borrow lanes, and no subtract runs
+    // because no emitted branch reads a flag (epic-cc#898).
+    for (pred, skip, xv, expect) in [
+        ("slt", "BTFSC", 0xFFu8, 1u8),
+        ("slt", "BTFSC", 0x7F, 0),
+        ("sge", "BTFSS", 0xFF, 0),
+        ("sge", "BTFSS", 0x7F, 1),
+    ] {
+        let m = parse(&format!(
+            "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+             %1 = load i8 @x\n    %2 = icmp {pred} i8 %1, 0\n    store i8 %2 @out\n    ret void\n"
+        ));
+        let addrs = addrs(&[
+            ("x", 0x10),
+            ("out", 0x11),
+            ("main::1", 0x12),
+            ("main::2", 0x13),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert!(
+            asm.contains(&format!("{skip} 0x012,7,A")),
+            "{pred} tests the sign bit:\n{asm}"
+        );
+        assert!(!asm.contains("SUBWF"), "{pred} keeps no subtract:\n{asm}");
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x10] = xv;
+        p.run(200);
+        assert_eq!(p.ram()[0x11], expect, "{pred}({xv}, 0)");
+    }
+}
+
+#[test]
+fn icmp_sign_zero_folds_i16_slt_against_zero() {
+    // The crc bit-test shape (`icmp slt i16 %c, 0` feeding a select):
+    // the high byte's bit 7 decides, so the materialized form is a
+    // preclear plus one skip instead of the chain (epic-cc#898).
+    let m = parse(
+        "global x i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i16 @x\n    %2 = icmp slt i16 %1, 0\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("out", 0x22),
+        ("main::1", 0x24),
+        ("main::2", 0x26),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("BTFSC"), "sign bit decides:\n{asm}");
+    assert!(asm.contains(",7,A"), "top-bit test:\n{asm}");
+    assert!(!asm.contains("SUBWF"), "no borrow lanes:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (lo, hi, expect) in [
+        (0x00u8, 0x80u8, 1u8),
+        (0xFF, 0x7F, 0),
+        (0, 0, 0),
+        (0xFF, 0xFF, 1),
+    ] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20] = lo;
+        p.ram_mut()[0x21] = hi;
+        p.run(200);
+        assert_eq!(p.ram()[0x22], expect, "slt(0x{hi:02X}{lo:02X}, 0)");
+    }
+}
+
+#[test]
+fn icmp_sign_zero_fused_branch_tests_the_bit() {
+    // A `BrCond` on `icmp slt i16 %x, 0` fuses to the bit test with the
+    // branch targets as its exits: no 0/1 byte materializes, so neither
+    // a preclear nor its `INCF` appears (epic-cc#898).
+    let m = parse(
+        "global x i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i16 @x\n    %2 = icmp slt i16 %1, 0\n    br i1 %2, yes, no\n  \
+         block yes:\n    store i8 1 @out\n    ret void\n  \
+         block no:\n    store i8 0 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("out", 0x22),
+        ("main::1", 0x24),
+        ("main::2", 0x26),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("BTFSC"), "fused bit test:\n{asm}");
+    assert!(!asm.contains("SUBWF"), "no borrow lanes:\n{asm}");
+    assert!(!asm.contains("INCF"), "no materialization:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (lo, hi, expect) in [(0x00u8, 0x80u8, 1u8), (0xFF, 0x7F, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20] = lo;
+        p.ram_mut()[0x21] = hi;
+        p.run(300);
+        assert_eq!(p.ram()[0x22], expect, "fused slt(0x{hi:02X}{lo:02X}, 0)");
     }
 }
 

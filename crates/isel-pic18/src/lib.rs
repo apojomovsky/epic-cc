@@ -32,6 +32,13 @@ const PIC18_SFR_ACCESS_LO: u16 = 0xF60;
 /// per byte. (epic-cc#486)
 const COPY_LOOP_MIN_PAIRS: usize = 6;
 
+/// Longest const-source copy the speed profile unrolls: 8 bytes cost 24
+/// words straight against ~18 for the loop plus its table share, so the
+/// worst case per site is a handful of words for the same ~3x per-byte
+/// cycle win. Longer copies keep the loop under every profile: cold
+/// tables would spend tens of words for untimed cycles (epic-cc#886).
+const CONST_COPY_O2_UNROLL_MAX: usize = 8;
+
 /// Codegen options. `copy_loop` keeps the POSTINC drain (epic-cc#486):
 /// long staged runs lower to the 9-word seeded loop, which runs about
 /// 3x slower per byte than straight `MOVFF`s. The speed profile turns it
@@ -5563,10 +5570,17 @@ impl<'m> Gen<'m> {
     /// rather than `n` unrolled `TBLRD`+`MOVFF` pairs: the table costs
     /// `ceil(n/2)` flash words of its own plus a 14-word loop, against the
     /// unrolled form's 3 words per byte (epic-cc#486's loop shape with
-    /// `TBLRD*+` as the reader). Reuses the same floor as the RAM copy
-    /// loop so both copy families switch at one place.
+    /// `TBLRD*+` as the reader). Under the speed profile short copies
+    /// still unroll for cycles (bounded by `CONST_COPY_O2_UNROLL_MAX`,
+    /// audit epic-cc#886); longer ones keep the loop under every
+    /// profile. Reuses the same floor as the RAM copy loop so both copy
+    /// families switch at one place.
     fn const_copy_loops(&self, n: u8) -> bool {
-        usize::from(n) >= COPY_LOOP_MIN_PAIRS
+        let n = usize::from(n);
+        if n < COPY_LOOP_MIN_PAIRS {
+            return false;
+        }
+        self.copy_loop || n > CONST_COPY_O2_UNROLL_MAX
     }
 
     /// `n` bytes from the const table `TBLPTR` already points at into a
@@ -8642,6 +8656,10 @@ impl<'m> Gen<'m> {
             !matches!(a, Val::Const(_)),
             "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
         );
+        if self.sign_zero_ok(&a, pred, &b, 0) {
+            self.emit_icmp_sign_zero(a, b, pred, dst, 1, fuse);
+            return;
+        }
         let (l_true, l_false, l_done);
         match fuse {
             Some((t, f)) => {
@@ -8703,6 +8721,10 @@ impl<'m> Gen<'m> {
         // second read, so those shapes keep the cascade too (epic-cc#621).
         if matches!(pred, "ult" | "uge" | "ugt" | "ule") && !self.load_w_writes_carry(&b) {
             self.emit_icmp_chain(a, b, pred, dst, 2, None);
+            return;
+        }
+        if self.sign_zero_ok(&a, pred, &b, 1) {
+            self.emit_icmp_sign_zero(a, b, pred, dst, 2, None);
             return;
         }
         if matches!(pred, "slt" | "sle" | "sgt" | "sge") && self.signed_chain_ok(&a, &b, 1) {
@@ -8889,6 +8911,82 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// Whether the sign-against-zero fold may run for these operands:
+    /// `slt`/`sge` against literal zero on a directly readable high byte
+    /// outside SFR space. The chain's own address guard decides the last
+    /// two, since a zero rhs reads no memory and writes no carry.
+    fn sign_zero_ok(&self, a: &Val, pred: &str, b: &Val, hi: u8) -> bool {
+        matches!(pred, "slt" | "sge")
+            && matches!(b, Val::Const(0))
+            && self.signed_chain_ok(a, b, hi)
+    }
+
+    /// `slt`/`sge` against literal zero as one bit test on the top byte:
+    /// a two's-complement value is negative exactly when bit 7 of its
+    /// high byte is set. The chain would spend a sign check plus borrow
+    /// lanes deciding what one `BTFSC`/`BTFSS` already knows, so this
+    /// shape bypasses it in both the fused and materializing forms.
+    /// `sle`/`sgt` against zero still need the equality case and keep
+    /// the chain, as do non-zero constants. (epic-cc#898)
+    fn emit_icmp_sign_zero(
+        &mut self,
+        a: Val,
+        b: Val,
+        pred: &str,
+        dst: &str,
+        bytes: u8,
+        fuse: Option<(String, String)>,
+    ) {
+        // Same const-LHS hazard as every other lowering: `val_addr`
+        // maps a literal to a RAM address, so a constant here would
+        // test that address's byte instead of the literal. The fused
+        // hook calls this directly, bypassing the entry points, so the
+        // guard lives here rather than inherited transitively.
+        assert!(
+            !matches!(a, Val::Const(_)),
+            "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
+        );
+        debug_assert!(matches!(pred, "slt" | "sge"));
+        debug_assert!(matches!(bytes, 1 | 2 | 4));
+        debug_assert!(matches!(b, Val::Const(0)));
+        let (l_true, l_false, l_done);
+        match fuse {
+            Some((t, f)) => {
+                l_true = t;
+                l_false = f;
+                l_done = None;
+            }
+            None => {
+                l_true = self.fresh_label();
+                l_false = self.fresh_label();
+                l_done = Some(self.fresh_label());
+            }
+        };
+        let pre = if l_done.is_some() {
+            self.bool_result_preclear(&a, &b, dst, bytes)
+        } else {
+            None
+        };
+        if let Some(d) = pre {
+            self.emit_banked("CLRF", d, "");
+        }
+        let hi = self.val_addr(&a).direct() + u16::from(bytes - 1);
+        let (acc, af) = self.operand(hi);
+        let bank = if acc == 0 { "A" } else { "B" };
+        // `BTFSC` skips the true branch when the bit is clear, `BTFSS`
+        // when it is set; either way the fall-through answers false.
+        if pred == "slt" {
+            self.emit(format!("    BTFSC 0x{af:03X},7,{bank}"));
+        } else {
+            self.emit(format!("    BTFSS 0x{af:03X},7,{bank}"));
+        }
+        self.emit(format!("    BRA {l_true}"));
+        self.emit(format!("    BRA {l_false}"));
+        if let Some(done) = l_done {
+            self.emit_materialize_bool(&l_true, &l_false, &done, dst, pre);
+        }
+    }
+
     /// Signed ordering compare as a sign check plus the unsigned borrow
     /// chain with one shared exit. Equal signs order exactly like the
     /// unsigned values, so the chain decides those; differing signs are
@@ -9059,6 +9157,10 @@ impl<'m> Gen<'m> {
         // A rhs lane load that writes STATUS,C keeps the cascade as well.
         if matches!(pred, "ult" | "uge" | "ugt" | "ule") && !self.load_w_writes_carry(&b) {
             self.emit_icmp_chain(a, b, pred, dst, 4, None);
+            return;
+        }
+        if self.sign_zero_ok(&a, pred, &b, 3) {
+            self.emit_icmp_sign_zero(a, b, pred, dst, 4, None);
             return;
         }
         if matches!(pred, "slt" | "sle" | "sgt" | "sge") && self.signed_chain_ok(&a, &b, 3) {
@@ -12443,6 +12545,11 @@ fn emit_fused_branch<'m>(
         // has no carry to hold, so the lane branches straight to the
         // exits with equality bound to its final answer.
         g.emit_icmp_byte(c.a.clone(), c.b.clone(), &c.pred, &c.dst, fuse);
+    } else if matches!(c.pred.as_str(), "slt" | "sge")
+        && matches!(c.b, Val::Const(0))
+        && g.sign_zero_ok(&c.a, &c.pred, &c.b, n - 1)
+    {
+        g.emit_icmp_sign_zero(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
     } else if matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge") {
         g.emit_icmp_signed_chain(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
     } else {

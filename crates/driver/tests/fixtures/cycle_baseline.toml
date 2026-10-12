@@ -396,16 +396,16 @@ ram_bytes = 58
 [[entry]]
 name = "speed-crc16-18f4550"
 device = "18F4550"
-cycles = 11819
-flash_words = 145
+cycles = 10404
+flash_words = 136
 ram_bytes = 52
 
 [[entry]]
 name = "speed-crc16-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 11819
-flash_words = 145
+cycles = 10404
+flash_words = 136
 ram_bytes = 52
 
 [[entry]]
@@ -546,31 +546,31 @@ ram_bytes = 53
 [[entry]]
 name = "scen-pid-update-18f4550"
 device = "18F4550"
-cycles = 766
-flash_words = 812
+cycles = 730
+flash_words = 794
 ram_bytes = 131
 
 [[entry]]
 name = "scen-pid-update-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 726
-flash_words = 818
+cycles = 690
+flash_words = 800
 ram_bytes = 131
 
 [[entry]]
 name = "scen-control-pass-18f4550"
 device = "18F4550"
-cycles = 814
-flash_words = 3946
+cycles = 778
+flash_words = 3947
 ram_bytes = 653
 
 [[entry]]
 name = "scen-control-pass-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 760
-flash_words = 4200
+cycles = 724
+flash_words = 4187
 ram_bytes = 749
 
 [[entry]]
