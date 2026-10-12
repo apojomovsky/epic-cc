@@ -4686,6 +4686,7 @@ fn speed_profile_unrolls_short_const_memcpy_only() {
         copy_loop: false,
         divmod_fold: false,
         inline_mul16: false,
+        sdiv_prescale: false,
     };
     let asm = isel_pic18::select_with_opts(
         &PIC18F4550,
