@@ -5516,6 +5516,7 @@ fn param(name: &str, width: u8) -> Param {
         ptr: false,
     }
 }
+
 /// `__mul_u32` scratch bytes per core: the classic AN526 recipe keeps its
 /// multiplier backup, counter, product and multiplicand in scratch (11),
 /// while pic14e shifts both operands in their param slots (4) and baseline
