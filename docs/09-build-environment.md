@@ -119,8 +119,9 @@ rebuild (locally or in CI) when the Dockerfile or a pin changes.
 
 Every CI and release image build runs through `scripts/warm-toolchain-cache.sh`,
 which retries when the build log reports a transient registry error: a 429 (Too
-Many Requests) from Docker Hub, or a 502/503/504 response from Docker Hub or GHCR
-(only on a line naming the registry). It fails at once on any other error.
+Many Requests) from Docker Hub on the final log line, or a 502/503/504 response
+from Docker Hub or GHCR (only on a line naming the registry). It fails at once
+on any other error.
 GitHub-hosted runners share an
 egress IP, so the ubuntu base pull can exhaust the anonymous hourly budget in any
 job, not just the warm one.
