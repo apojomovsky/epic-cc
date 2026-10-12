@@ -63,6 +63,19 @@ BARE_502_WITHOUT_REGISTRY = """\
 ERROR: failed to solve: unexpected status: 502 from mirror-proxy.internal
 """
 
+DIGEST_502_WITH_404 = """\
+#1 [internal] load build definition from Dockerfile
+ERROR: failed to solve: unexpected status: 404 from \
+  https://registry-1.docker.io/v2/library/ubuntu/manifests/sha256:aa502bb: \
+  not found
+"""
+
+BYTE_COUNT_502_WITH_STATUS = """\
+#4 exporting to ghcr.io/example/toolchain
+ERROR: failed to solve: unexpected status: downloaded 502 bytes from \
+  registry-1.docker.io
+"""
+
 
 class WarmToolchainCache(unittest.TestCase):
     def run_script(self, calls):
@@ -126,6 +139,18 @@ class WarmToolchainCache(unittest.TestCase):
 
     def test_bare_code_without_registry_fails_at_once(self):
         rc, docker_calls, sleeps = self.run_script([(BARE_502_WITHOUT_REGISTRY, 1)])
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(docker_calls, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_digest_embedded_502_with_404_fails_at_once(self):
+        rc, docker_calls, sleeps = self.run_script([(DIGEST_502_WITH_404, 1)])
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(docker_calls, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_byte_count_502_with_status_fails_at_once(self):
+        rc, docker_calls, sleeps = self.run_script([(BYTE_COUNT_502_WITH_STATUS, 1)])
         self.assertNotEqual(rc, 0)
         self.assertEqual(docker_calls, 1)
         self.assertEqual(sleeps, [])
