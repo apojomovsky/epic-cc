@@ -733,11 +733,9 @@ fn fold_span_clean(insts: &[Inst]) -> bool {
 /// `isel-pic18` (epic-cc#863). Single-use loads feeding ALU operands
 /// read the source global (`Direct`, never into `Or`), loads feeding
 /// only stores ride W (`ThreadW`), and single-use producers feeding
-/// stores compute into the destination (`forwarded`).
-///
-/// `access_safe` names globals needing no bank select; `None` folds
-/// nothing. Lane-eaten producers and icmp-adjacent loads stay out,
-/// so a dropped slot is never read twice or by a lane.
+/// stores compute into the destination (`forwarded`). A gapped load
+/// co-folds past a sister load into the same op when the b-side
+/// load leads, keeping volatile order (epic-cc#876).
 pub fn find_value_folds(
     f: &ir::Func,
     m: &Module,
@@ -784,58 +782,104 @@ pub fn find_value_folds(
             }
         }
     }
-    // Shape 1: single-use load into one ALU operand.
-    for b in &f.blocks {
-        for (ci, inst) in b.insts.iter().enumerate() {
-            let Inst::Bin(q) = inst else { continue };
-            // `Or` stays staged: its binops feed the boolean lanes, whose
-            // accumulator reads the slot. Folding it would starve the lane.
-            if !matches!(
-                q.op,
-                ir::BinOp::Add | ir::BinOp::Sub | ir::BinOp::And | ir::BinOp::Xor
-            ) {
-                continue;
-            }
-            let n = q.ty.bytes();
-            for operand in [&q.a, &q.b] {
-                let ir::Val::Reg(r) = operand else { continue };
-                if uses.get(r).copied().unwrap_or(0) != 1 {
+    // Shape 1: single-use load into one ALU operand. Two passes: the
+    // first folds over pure gaps; the second co-folds a declined load
+    // past the sister load that folded into the same op (epic-cc#876).
+    // The sister always folds first (its gap sits past the candidate
+    // on an order-compatible pair), so two passes are complete.
+    for cofold in [false, true] {
+        let mut pending: Vec<(String, LoadFold)> = Vec::new();
+        for b in &f.blocks {
+            for (ci, inst) in b.insts.iter().enumerate() {
+                let Inst::Bin(q) = inst else { continue };
+                // `Or` stays staged: its binops feed the boolean lanes, whose
+                // accumulator reads the slot. Folding it would starve the lane.
+                if !matches!(
+                    q.op,
+                    ir::BinOp::Add | ir::BinOp::Sub | ir::BinOp::And | ir::BinOp::Xor
+                ) {
                     continue;
                 }
-                let Some(&(bi, pi)) = def_at.get(r.as_str()) else {
-                    continue;
-                };
-                if f.blocks[bi].label != b.label || pi >= ci {
-                    continue;
+                let n = q.ty.bytes();
+                for operand in [&q.a, &q.b] {
+                    let ir::Val::Reg(r) = operand else { continue };
+                    if uses.get(r).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    let Some(&(bi, pi)) = def_at.get(r.as_str()) else {
+                        continue;
+                    };
+                    if f.blocks[bi].label != b.label || pi >= ci {
+                        continue;
+                    }
+                    let Inst::Load(l) = &f.blocks[bi].insts[pi] else {
+                        continue;
+                    };
+                    let Some(g) = ram_source(&l.ptr) else {
+                        continue;
+                    };
+                    // A banked source would trade its bankless `MOVFF` for a
+                    // `MOVLB` word. Only access-bank sources fold.
+                    if !safe.contains(&g) {
+                        continue;
+                    }
+                    if l.ptr_ty || l.ty.bytes() != n {
+                        continue;
+                    }
+                    if resolved.contains_key(&ssa_key(&f.name, r)) {
+                        continue;
+                    }
+                    // A lane may claim an icmp-adjacent load as its direct
+                    // field, reading the source a second time. Stay out.
+                    if matches!(b.insts.get(pi + 1), Some(Inst::Icmp(_))) {
+                        continue;
+                    }
+                    // A gap load is transparent on the co-fold pass when it
+                    // is the sister operand's fold: both backends read the b
+                    // side first, so the pair keeps program order exactly
+                    // when the b-side load leads. Past one byte, two volatile
+                    // reads would interleave, so that pair stays staged.
+                    let gap_ok =
+                        f.blocks[bi].insts[pi + 1..ci]
+                            .iter()
+                            .enumerate()
+                            .all(|(k, inst)| {
+                                if fold_gap_pure(inst) {
+                                    return true;
+                                }
+                                if !cofold {
+                                    return false;
+                                }
+                                let Inst::Load(sl) = inst else { return false };
+                                if !matches!(out.loads.get(&sl.dst), Some(LoadFold::Direct(_))) {
+                                    return false;
+                                }
+                                let cand_a = matches!(&q.a, ir::Val::Reg(x) if x == r);
+                                let sister_other = if cand_a {
+                                    matches!(&q.b, ir::Val::Reg(x) if x == &sl.dst)
+                                } else {
+                                    matches!(&q.a, ir::Val::Reg(x) if x == &sl.dst)
+                                };
+                                if !sister_other {
+                                    return false;
+                                }
+                                let spi = pi + 1 + k;
+                                if (cand_a && spi >= pi) || (!cand_a && pi >= spi) {
+                                    return false;
+                                }
+                                if n > 1 && l.volatile && sl.volatile {
+                                    return false;
+                                }
+                                true
+                            });
+                    if !gap_ok {
+                        continue;
+                    }
+                    pending.push((r.clone(), LoadFold::Direct(g)));
                 }
-                let Inst::Load(l) = &f.blocks[bi].insts[pi] else {
-                    continue;
-                };
-                let Some(g) = ram_source(&l.ptr) else {
-                    continue;
-                };
-                // A banked source would trade its bankless `MOVFF` for a
-                // `MOVLB` word. Only access-bank sources fold.
-                if !safe.contains(&g) {
-                    continue;
-                }
-                if l.ptr_ty || l.ty.bytes() != n {
-                    continue;
-                }
-                if resolved.contains_key(&ssa_key(&f.name, r)) {
-                    continue;
-                }
-                // A lane may claim an icmp-adjacent load as its direct
-                // field, reading the source a second time. Stay out.
-                if matches!(b.insts.get(pi + 1), Some(Inst::Icmp(_))) {
-                    continue;
-                }
-                if !f.blocks[bi].insts[pi + 1..ci].iter().all(fold_gap_pure) {
-                    continue;
-                }
-                out.loads.insert(r.clone(), LoadFold::Direct(g));
             }
         }
+        out.loads.extend(pending);
     }
     // Shape 2: one load fanned out to stores only. W carries the byte:
     // the gap holds nothing but the consuming stores, each of which

@@ -1044,6 +1044,19 @@ fn single_use_load_into_add_reads_the_global() {
     assert!(!asm.contains("MOVFF"), "no staged copy survives:\n{asm}");
 }
 #[test]
+fn two_loads_into_add_read_both_globals() {
+    // Co-fold (epic-cc#876): `%1` feeds the b side and leads, so the
+    // op reads `@a` into W first, then `@b` as the file operand.
+    // Neither temp is in the map, and neither may be looked up.
+    let m = parse("global a i8\nglobal b i8\nglobal c i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = add i8 %2 %1\n    store i8 %3 @c\n    ret void\n");
+    let addrs = addrs(&[("a", 0x10), ("b", 0x12), ("c", 0x11)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MOVF 0x010,W,A"), "b-side @a into W:\n{asm}");
+    assert!(asm.contains("ADDWF 0x012,W,A"), "add reads @b:\n{asm}");
+    assert!(asm.contains("MOVWF 0x011,A"), "result to @c:\n{asm}");
+    assert!(!asm.contains("MOVFF"), "no staged copy survives:\n{asm}");
+}
+#[test]
 fn store_an_i1_constant_writes_the_byte_value() {
     let m = parse(
         "global out i1\nfn main(void) ()\n  block entry:\n    store i1 1 @out\n    ret void\n",
