@@ -3495,8 +3495,11 @@ fn allocate_inner(
         }
 
         // Survivors stage: direct-only, unpinned, small enough, paying.
+        // Asm-named consts never stage: no re-copy precedes asm, so the
+        // substitution would lose its address (epic-cc#1132).
         for gname in &const_direct {
-            if const_derived.contains(gname) || demote.contains(gname) {
+            if const_derived.contains(gname) || demote.contains(gname) || const_asm.contains(gname)
+            {
                 continue;
             }
             if let Some(gl) = m.globals.iter().find(|gl| &gl.name == gname) {

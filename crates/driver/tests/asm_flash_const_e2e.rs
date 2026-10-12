@@ -66,7 +66,7 @@ fn asm_operand_small_flash_const_compiles_with_ram_copy() {
     );
     let map_text = std::fs::read_to_string(&map).expect("read map");
     assert!(
-        map_text.contains("SMALL"),
+        map_text.lines().any(|l| l.starts_with("global SMALL 0x")),
         "asm-named const SMALL must hold a RAM address, got:\n{map_text}"
     );
 }

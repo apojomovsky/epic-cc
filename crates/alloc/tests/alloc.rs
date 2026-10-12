@@ -638,16 +638,18 @@ fn const_asm_operand_is_copied_to_ram() {
 fn const_asm_operand_keeps_copy_when_direct_consts_stage() {
     // Small cores stage directly named call-arg consts through one shared
     // buffer, which has no re-copy site before asm. An asm-named const
-    // must keep its own RAM copy while the direct ones stage (epic-cc#1132).
+    // must keep its own RAM copy while the direct ones stage, even when
+    // it is itself a direct call arg (epic-cc#1132).
     let mut m = parse(
         "const c i8\n\
          const big i8\n\
-         const small i8\n\
+         const extra i8\n\
          fn main(void) ()\n\
            block entry:\n\
              call void @f(@c)\n\
              call void @f(@big)\n\
-             asm \"movf $0, W\" *m @small\n\
+             call void @f(@extra)\n\
+             asm \"movf $0, W\" *m @c\n\
              ret void\n\
          fn f(void) (p=ptr)\n\
            block entry:\n\
@@ -655,23 +657,23 @@ fn const_asm_operand_keeps_copy_when_direct_consts_stage() {
     );
     m.globals[0].size = 2; // c: [2 x i8]
     m.globals[1].size = 5; // big: [5 x i8]
-    m.globals[2].size = 10; // small: [10 x i8]
+    m.globals[2].size = 3; // extra: [3 x i8]
     let out = allocate(&PIC16F877A, &m, "edge main f\n");
     assert!(
-        !out.globals.contains_key("c") && !out.globals.contains_key("big"),
-        "direct call-arg consts must stage, not keep RAM copies"
+        !out.globals.contains_key("big") && !out.globals.contains_key("extra"),
+        "direct-only call-arg consts must stage, not keep RAM copies"
     );
     assert!(
         out.globals.contains_key("__const_stage"),
         "one shared staging buffer must be placed"
     );
     assert!(
-        out.globals.contains_key("small"),
-        "asm-named const @small must keep its RAM copy through staging"
+        out.globals.contains_key("c"),
+        "asm-named const @c must keep its RAM copy through staging"
     );
     assert!(
-        !out.const_globals.contains("small"),
-        "copied const @small must leave the flash set"
+        !out.const_globals.contains("c"),
+        "copied const @c must leave the flash set"
     );
 }
 
