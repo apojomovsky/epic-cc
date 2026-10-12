@@ -1979,6 +1979,244 @@ fn lane_chain_collapses_to_one_slot() {
     assert_eq!(out.locals["f::d1"], out.locals["f::d2"]);
 }
 
+/// Diamond-touch phi pin (epic-cc#1160): two distinct dead-after incoming
+/// regs overlap, so the merge destination shares the first arm's slot and
+/// the frame drops from three slots to two.
+#[test]
+fn diamond_phi_dst_coalesces_with_dead_incoming() {
+    let m = parse(
+        "const sink i16\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             %x = add i16 1, 2\n\
+             %y = add i16 3, 4\n\
+             br i1 %c, label %t, label %ff\n\
+           block t:\n\
+             br label %m\n\
+           block ff:\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi i16 %x t %y ff\n\
+             store i16 %p, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::x"], out.locals["f::p"]);
+    assert_ne!(out.locals["f::y"], out.locals["f::x"]);
+}
+
+/// The same diamond with both incomings read after the merge: neither arm
+/// is dead after its copy, so the destination keeps its own slot.
+#[test]
+fn diamond_phi_dst_keeps_slot_when_incomings_live_after() {
+    let m = parse(
+        "const sink i16\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             %x = add i16 1, 2\n\
+             %y = add i16 3, 4\n\
+             br i1 %c, label %t, label %ff\n\
+           block t:\n\
+             br label %m\n\
+           block ff:\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi i16 %x t %y ff\n\
+             %q = add i16 %x, %y\n\
+             store i16 %q, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::x"], out.locals["f::p"]);
+    assert_ne!(out.locals["f::y"], out.locals["f::p"]);
+}
+
+/// The width-sum gate: the pin fires (the arms are dead after), but the
+/// sharing arm is disjoint from its sibling, so pinning only trades which
+/// value holds the second slot and the sum ties. Ties keep the unpinned
+/// layout, so the destination keeps its own slot.
+#[test]
+fn diamond_phi_pin_loses_tied_width_sum() {
+    let m = parse(
+        "const sink i16\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             br i1 %c, label %t, label %ff\n\
+           block t:\n\
+             %x = add i16 1, 2\n\
+             br label %m\n\
+           block ff:\n\
+             %y = add i16 3, 4\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi i16 %x t %y ff\n\
+             store i16 %p, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::x"], out.locals["f::y"]);
+    assert_ne!(out.locals["f::x"], out.locals["f::p"]);
+}
+
+/// A diamond target defined after the earliest pred end still pins: the
+/// destination waits for the second sweep, once every target has a slot.
+/// The second arm stays live past the merge, which the pin tolerates: only
+/// the shared arm must be dead after its copies.
+#[test]
+fn diamond_phi_dst_pins_late_defined_target() {
+    let m = parse(
+        "const sink i16\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             %y = add i16 3, 4\n\
+             br i1 %c, label %a, label %b\n\
+           block a:\n\
+             br label %m\n\
+           block b:\n\
+             %x = add i16 1, 2\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi i16 %x b %y a\n\
+             store i16 %y, ptr @sink\n\
+             store i16 %p, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::x"], out.locals["f::p"]);
+    assert_ne!(out.locals["f::y"], out.locals["f::x"]);
+}
+
+/// A cyclic diamond whose target materializes in its own arm block still
+/// pins: the def rewrites the slot on every run of the copy's block, so
+/// each arrival reads fresh bytes whether the self-copy emits or skips.
+/// The sibling arm overlaps the target, so the freed slot is a strict
+/// width-sum win and the gate keeps the pinned layout.
+#[test]
+fn diamond_phi_dst_pins_same_block_target_on_cycle() {
+    let m = parse(
+        "const sink i16\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             br label %h\n\
+           block h:\n\
+             %i = phi i16 %i.next l 0 entry\n\
+             %y = add i16 %i, 2\n\
+             %w = add i16 %y, %i\n\
+             br i1 %c, label %t, label %e\n\
+           block t:\n\
+             %x = add i16 %i, 1\n\
+             br label %m\n\
+           block e:\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi i16 %x t %y e\n\
+             store i16 %p, ptr @sink\n\
+             br label %l\n\
+           block l:\n\
+             %i.next = add i16 %i, 1\n\
+             %done = icmp eq i16 %i.next, 5\n\
+             br i1 %done, label %out, label %h\n\
+           block out:\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::x"], out.locals["f::p"]);
+}
+
+/// A cyclic diamond whose target predates the loop cannot pin: the source
+/// is live into the loop, so it reaches a pred's live-out set, and its
+/// def block is not the arm block either. The destination keeps its own
+/// slot.
+#[test]
+fn diamond_phi_dst_refuses_loop_invariant_target() {
+    let m = parse(
+        "const sink i16\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             %s = add i16 1, 2\n\
+             br label %h\n\
+           block h:\n\
+             %i = phi i16 %i.next l 0 entry\n\
+             br i1 %c, label %t, label %e\n\
+           block t:\n\
+             br label %m\n\
+           block e:\n\
+             %y = add i16 %i, 9\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi i16 %s t %y e\n\
+             store i16 %p, ptr @sink\n\
+             br label %l\n\
+           block l:\n\
+             %i.next = add i16 %i, 1\n\
+             %done = icmp eq i16 %i.next, 5\n\
+             br i1 %done, label %out, label %h\n\
+           block out:\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::s"], out.locals["f::p"]);
+}
+
+/// A diamond in a function with a call stays unpinned: non-leaf frames
+/// never enter the diamond map, so spans outside the frame cannot move.
+#[test]
+fn diamond_phi_dst_keeps_slot_when_function_calls() {
+    let m = parse(
+        "const sink i16\n\
+         fn callee(void) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             %x = add i16 1, 2\n\
+             %y = add i16 3, 4\n\
+             br i1 %c, label %t, label %ff\n\
+           block t:\n\
+             br label %m\n\
+           block ff:\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi i16 %x t %y ff\n\
+             store i16 %p, ptr @sink\n\
+             call void @callee()\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::x"], out.locals["f::p"]);
+}
+
+/// A merge with two diamonds pins only the first: the second keeps its own
+/// slot even though its arms are dead after, so same-block dsts never share
+/// copy points twice over.
+#[test]
+fn diamond_phi_second_dst_in_merge_keeps_slot() {
+    let m = parse(
+        "const sink i16\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             %x = add i16 1, 2\n\
+             %y = add i16 3, 4\n\
+             %u = add i16 5, 6\n\
+             %v = add i16 7, 8\n\
+             br i1 %c, label %t, label %ff\n\
+           block t:\n\
+             br label %m\n\
+           block ff:\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi i16 %x t %y ff\n\
+             %q = phi i16 %u t %v ff\n\
+             %w = add i16 %p, %q\n\
+             store i16 %w, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::x"], out.locals["f::p"]);
+    assert_ne!(out.locals["f::u"], out.locals["f::q"]);
+    assert_ne!(out.locals["f::v"], out.locals["f::q"]);
+}
+
 /// The or-bool tail (`or` over a zexted compare, no select) pins the same
 /// way: bit 0 lands destructively on the dead accumulator.
 #[test]
