@@ -3140,6 +3140,11 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
             // `define` line, e.g. `define void @foo() { tail call ... ret void }`.
             let mut handled_inline = false;
             let mut pending_first_line: Option<String> = None;
+            // Tracks whether any `unreachable` line fed this body and whether
+            // any real instruction did. A body with only the former is the
+            // whole-program `opt` dead-body placeholder (epic-cc#1104).
+            let mut saw_unreachable = false;
+            let mut has_code = false;
             if let Some(brace_pos) = line.find('{') {
                 let after = &line[brace_pos + 1..];
                 if let Some(close_idx) = after.rfind('}') {
@@ -3180,6 +3185,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                         for pl in pseudo_lines {
                             let pl = pl.trim();
                             if pl == "unreachable" {
+                                saw_unreachable = true;
                                 continue;
                             }
                             if pl.is_empty() {
@@ -3193,10 +3199,14 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                                     &dbg,
                                     preserve_dense_switches,
                                 );
+                                has_code = true;
                                 continue;
                             }
                             // Labels inside single-line bodies are not expected
                             let insts = parse_inst(pl, &types, &mut fresh, &dbg);
+                            if !insts.is_empty() {
+                                has_code = true;
+                            }
                             blocks.last_mut().unwrap().insts.extend(insts);
                         }
                         handled_inline = true;
@@ -3210,6 +3220,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                             isr,
                             irq_priority: func_irq_priority(suffix, &attr_map),
                             naked,
+                            unreachable_body: saw_unreachable && !has_code && !naked,
                             variadic,
                         });
                         continue;
@@ -3228,7 +3239,9 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                 if let Some(first) = pending_first_line.take() {
                     let _ = &first;
                     let l = first.trim();
-                    if l != "unreachable" && !l.is_empty() {
+                    if l == "unreachable" {
+                        saw_unreachable = true;
+                    } else if !l.is_empty() {
                         if l.trim_start().starts_with("switch") {
                             let mut switch_text = l.to_string();
                             while !switch_text.contains(']') {
@@ -3250,6 +3263,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                                 &dbg,
                                 preserve_dense_switches,
                             );
+                            has_code = true;
                         } else if let Some(colon) = l.find(':') {
                             let head = &l[..colon];
                             if !head.is_empty()
@@ -3261,10 +3275,16 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                                 adopt_entry_label(&mut blocks, head, &entry_placeholder);
                             } else {
                                 let insts = parse_inst(l, &types, &mut fresh, &dbg);
+                                if !insts.is_empty() {
+                                    has_code = true;
+                                }
                                 blocks.last_mut().unwrap().insts.extend(insts);
                             }
                         } else {
                             let insts = parse_inst(l, &types, &mut fresh, &dbg);
+                            if !insts.is_empty() {
+                                has_code = true;
+                            }
                             blocks.last_mut().unwrap().insts.extend(insts);
                         }
                     }
@@ -3305,6 +3325,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                     // so a self-branch closes it safely, except `naked`,
                     // whose isel requires a pure-asm body (epic-cc#193).
                     if l == "unreachable" || l.starts_with("unreachable, !") {
+                        saw_unreachable = true;
                         if !naked {
                             let here = blocks.last().unwrap().label.clone();
                             blocks.last_mut().unwrap().insts.push(Inst::Br(Br {
@@ -3350,12 +3371,16 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                             &dbg,
                             preserve_dense_switches,
                         );
+                        has_code = true;
                         if has_trailing_brace {
                             break;
                         }
                         continue;
                     }
                     let insts = parse_inst(l, &types, &mut fresh, &dbg);
+                    if !insts.is_empty() {
+                        has_code = true;
+                    }
                     blocks.last_mut().unwrap().insts.extend(insts);
                     if has_trailing_brace {
                         break;
@@ -3369,6 +3394,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                     isr,
                     irq_priority: func_irq_priority(suffix, &attr_map),
                     naked,
+                    unreachable_body: saw_unreachable && !has_code && !naked,
                     variadic,
                 });
             }

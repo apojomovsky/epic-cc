@@ -487,6 +487,7 @@ mod tests {
             isr: false,
             irq_priority: 0,
             naked: false,
+            unreachable_body: false,
             variadic: false,
         }
     }
@@ -508,6 +509,7 @@ mod tests {
             isr: false,
             irq_priority: 0,
             naked: false,
+            unreachable_body: false,
             variadic: false,
         });
         let mut insts = vec![Inst::Alloca(Alloca {
@@ -670,6 +672,7 @@ mod tests {
             isr: false,
             irq_priority: 0,
             naked: false,
+            unreachable_body: false,
             variadic: false,
         });
         let mut insts = vec![Inst::Alloca(Alloca {
@@ -818,6 +821,7 @@ mod tests {
             isr: false,
             irq_priority: 0,
             naked: false,
+            unreachable_body: false,
             variadic: false,
         });
         let mut insts = vec![Inst::Alloca(Alloca {
@@ -873,6 +877,7 @@ mod tests {
             isr: false,
             irq_priority: 0,
             naked: false,
+            unreachable_body: false,
             variadic: false,
         });
         let mut insts = vec![Inst::Alloca(Alloca {

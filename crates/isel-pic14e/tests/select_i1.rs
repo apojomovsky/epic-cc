@@ -43,3 +43,15 @@ fn lowers_an_i1_const_store_as_one_byte() {
     assert!(asm.contains("MOVLW 0x01"), "{asm}");
     assert!(asm.contains("MOVWF 0x20"), "{asm}");
 }
+
+#[test]
+#[should_panic(expected = "unreachable-body")]
+fn live_call_to_unreachable_placeholder_is_rejected() {
+    // epic-cc#1104: mirrors the isel gate, a live call to an LLVM-proved
+    // dead body fails at compile time, never hangs at runtime.
+    let m = parse(
+        "fn endpoint(void) [unreachable] ()\n  block entry:\n    br entry\n\
+         fn main(void) ()\n  block entry:\n    call void @endpoint()\n    ret void\n",
+    );
+    let _ = select(&PIC16F1937, &m, &addrs(&[]));
+}

@@ -771,6 +771,7 @@ mod tests {
                 isr: false,
                 irq_priority: 0,
                 naked: false,
+                unreachable_body: false,
                 variadic: false,
             }],
             module_asm: vec![],
@@ -1238,6 +1239,7 @@ mod tests {
             isr: false,
             irq_priority: 0,
             naked: false,
+            unreachable_body: false,
             variadic: false,
         });
         assert!(fixed_uses(&m, pic14(), false).scratch);

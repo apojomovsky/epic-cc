@@ -1603,6 +1603,9 @@ impl<'m> Gen<'m> {
             .iter()
             .find(|f| f.name == func)
             .unwrap_or_else(|| panic!("isel: call to unknown function @{func}"));
+        if callee.unreachable_body {
+            panic!("isel: call to unreachable-body function @{func} (whole-program opt proved its body dead)");
+        }
         let named = callee.params.len();
         for (i, arg) in args.iter().enumerate() {
             if i >= named {
