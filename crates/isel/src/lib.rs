@@ -4507,13 +4507,19 @@ impl<'m> Gen<'m> {
                     // Eight straight-line passes, no loop and no BCF guard. An
                     // ADDWF carry lands in multiplier bit 7 at the RRF of pass k
                     // and reaches bit 0 no earlier than the RRF of pass k+7, after
-                    // the last BTFSC (pass 7) has read bit 0.
+                    // the last BTFSC (pass 7) has read bit 0. Pass 7 never shifts:
+                    // nothing reads the multiplier after it. No mid-run exit test:
+                    // doubling-overflow carries from early passes sit in the tested
+                    // residue bits and block the exit on ordinary operands, costing
+                    // more than the skipped passes save.
                     self.emit(format!("    CLRF 0x{r:02X}")); // r = 0
                     for pass in 0..8 {
                         self.emit(format!("    MOVF 0x{a:02X}, W")); // W = t = a << k
                         self.emit(format!("    BTFSC 0x{b:02X}, 0")); // skip add on clear bit
                         self.emit(format!("    ADDWF 0x{r:02X}, F")); // r += t, mod 256
-                        self.emit(format!("    RRF 0x{b:02X}, F")); // bk >>= 1
+                        if pass < 7 {
+                            self.emit(format!("    RRF 0x{b:02X}, F")); // bk >>= 1
+                        }
                         if pass < 7 {
                             // pass 7's t shift feeds no later pass
                             self.emit(format!("    ADDWF 0x{a:02X}, F")); // t = t + t, mod 256
