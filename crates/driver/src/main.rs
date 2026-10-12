@@ -513,7 +513,7 @@ fn main() {
     m = if device.core == device::Core::Pic18 {
         legalize::legalize_pic18(m)
     } else {
-        legalize::legalize(m)
+        legalize::legalize_for_core(m, device.core)
     };
     let cg = callgraph::build(&m);
     // A too-deep call chain is the program's fault (recursion or nesting

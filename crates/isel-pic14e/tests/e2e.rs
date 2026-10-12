@@ -32,7 +32,7 @@ fn compile(c_path: &str) -> (Pic14e, HashMap<String, u16>) {
     let (ll, _dep) = clang_compile(&clang, &resdir, c_path);
     let mut m = irparse::parse_ll(&ll);
     m = wholeprog::merge(m);
-    m = legalize::legalize(m);
+    m = legalize::legalize_for_core(m, device::Core::Pic14e);
     let cg = callgraph::build(&m);
     callgraph::check_depth(&cg, PIC16F1937.stack_depth as usize);
     let layout = alloc::allocate(&PIC16F1937, &m, &callgraph::edges_text(&cg));
@@ -66,7 +66,7 @@ fn compile_with_layout(
     let (ll, _dep) = clang_compile(&clang, &resdir, c_path);
     let mut m = irparse::parse_ll(&ll);
     m = wholeprog::merge(m);
-    m = legalize::legalize(m);
+    m = legalize::legalize_for_core(m, device::Core::Pic14e);
     let cg = callgraph::build(&m);
     callgraph::check_depth(&cg, PIC16F1937.stack_depth as usize);
     let layout = alloc::allocate(&PIC16F1937, &m, &callgraph::edges_text(&cg));
@@ -195,7 +195,7 @@ fn skip_idioms_never_land_a_movlb_inside_a_recipe_skip_pair() {
     );
     let mut m = irparse::parse_ll(&ll);
     m = wholeprog::merge(m);
-    m = legalize::legalize(m);
+    m = legalize::legalize_for_core(m, device::Core::Pic14e);
     let cg = callgraph::build(&m);
     let layout = alloc::allocate(&PIC16F1937, &m, &callgraph::edges_text(&cg));
     let mut addrs: HashMap<String, u16> = HashMap::new();
