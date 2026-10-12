@@ -1581,10 +1581,204 @@ fn run_ctors_and_erase_atexit(funcs: &mut [Func], ctors: &[String]) {
     funcs[idx].blocks[0].insts.splice(0..0, calls);
 }
 
+/// Hoist materialized constant-`getelementptr` phi arms onto their edge
+/// (epic-cc#1053). The parser materializes the arm as a Gep in the
+/// phi's own block, but the phi consumes it on the edge from P, a use
+/// the def block does not dominate. Moving the chain into P before its
+/// terminator evaluates the address where the edge starts, matching the
+/// backends' edge-copy model. Register operands cannot come from clang
+/// and have no valid edge point there, so anything else synthesized
+/// panics instead of miscompiling silently.
+fn hoist_phi_arm_geps(funcs: &mut [Func], synth: &HashSet<String>) {
+    for f in funcs {
+        hoist_phi_arm_geps_in(&mut f.blocks, synth);
+    }
+}
+
+/// The dst of a conversion-shaped inst a phi arm can wrap a constant
+/// GEP in. Anything else is either a user instruction (never moved)
+/// or a synthesized shape the hoist does not place (loud below).
+fn arm_def_dst(inst: &Inst) -> Option<&str> {
+    match inst {
+        Inst::Gep(g) => Some(&g.dst),
+        Inst::Trunc(t) => Some(&t.dst),
+        Inst::Zext(z) => Some(&z.dst),
+        Inst::Sext(s) => Some(&s.dst),
+        _ => None,
+    }
+}
+
+/// Collect the execution-ordered chain of same-block insts feeding phi
+/// arm `reg`: the constant Gep plus any `ptrtoint` conversion over it.
+/// `None` means no same-block def (a param or a value from elsewhere),
+/// which the hoist leaves alone.
+fn phi_arm_chain(
+    reg: &str,
+    h: usize,
+    pred: &str,
+    blocks: &[Block],
+    synth: &HashSet<String>,
+    chain: &mut Vec<(usize, usize)>,
+) -> Option<()> {
+    let j = blocks[h]
+        .insts
+        .iter()
+        .position(|i| arm_def_dst(i).is_some_and(|d| d == reg))?;
+    match &blocks[h].insts[j] {
+        Inst::Gep(g) => {
+            if !matches!(g.base, GepBase::Global(_)) || !g.terms.is_empty() {
+                panic!(
+                    "irparse: phi arm %{reg} from %{pred} is an inlined getelementptr with register operands; write it as an explicit instruction in %{pred}"
+                );
+            }
+            chain.push((h, j));
+        }
+        i if conv_val(i).is_some() => {
+            let inner = conv_inner(conv_val(i).unwrap(), reg, pred, synth);
+            phi_arm_chain(&inner, h, pred, blocks, synth, chain)?;
+            chain.push((h, j));
+        }
+        _ => panic!(
+            "irparse: phi arm %{reg} from %{pred} is a synthesized value the edge hoist does not place"
+        ),
+    }
+    Some(())
+}
+
+/// The converted value of a conversion-shaped inst, if it is one. Shares
+/// its match with `arm_def_dst`: the hoist moves both the constant GEP
+/// and any conversion over it, and nothing else.
+fn conv_val(inst: &Inst) -> Option<&Val> {
+    match inst {
+        Inst::Trunc(t) => Some(&t.val),
+        Inst::Zext(z) => Some(&z.val),
+        Inst::Sext(s) => Some(&s.val),
+        _ => None,
+    }
+}
+
+/// The register feeding a conversion over a phi-arm constant GEP. Only
+/// another synthesized value continues the chain; anything else is the
+/// non-constant shape the hoist rejects.
+fn conv_inner(val: &Val, reg: &str, pred: &str, synth: &HashSet<String>) -> String {
+    match val {
+        Val::Reg(inner) if synth.contains(inner) => inner.clone(),
+        _ => panic!(
+            "irparse: phi arm %{reg} from %{pred} converts a non-constant value; write it as an explicit instruction in %{pred}"
+        ),
+    }
+}
+
+/// Move one phi-arm chain from block `h` into predecessor `p`, ahead of
+/// its terminator. Names (not positions) select the chain and each move
+/// applies immediately, so later arms always scan the current layout:
+/// batching removals would shift the recorded positions of chains that
+/// share the block. Terminator-last is the block invariant every backend
+/// relies on, so a block with no trailing terminator takes the insts at
+/// its end instead of splitting whatever trails.
+fn move_chain_to_pred(blocks: &mut Vec<Block>, h: usize, p: usize, chain: &[(usize, usize)]) {
+    let names: HashSet<String> = chain
+        .iter()
+        .map(|&(_, j)| arm_def_dst(&blocks[h].insts[j]).unwrap().to_string())
+        .collect();
+    let mut moved = Vec::with_capacity(names.len());
+    let kept: Vec<Inst> = std::mem::take(&mut blocks[h].insts)
+        .into_iter()
+        .filter_map(|i| {
+            if arm_def_dst(&i).is_some_and(|d| names.contains(d)) {
+                moved.push(i);
+                None
+            } else {
+                Some(i)
+            }
+        })
+        .collect();
+    blocks[h].insts = kept;
+    let tail = blocks[p].insts.len();
+    let at = if tail > 0
+        && matches!(
+            blocks[p].insts[tail - 1],
+            Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(_, _) | Inst::Switch(_)
+        ) {
+        tail - 1
+    } else {
+        tail
+    };
+    blocks[p].insts.splice(at..at, moved);
+}
+
+fn hoist_phi_arm_geps_in(blocks: &mut Vec<Block>, synth: &HashSet<String>) {
+    let label_idx: HashMap<String, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label.clone(), i))
+        .collect();
+    // Use counts are relocation-invariant (a move neither adds nor drops
+    // a (user, used) pair), so one pre-pass serves every arm below.
+    let mut uses: HashMap<String, usize> = HashMap::new();
+    for b in blocks.iter() {
+        for i in &b.insts {
+            for v in ir::read_vals(i) {
+                if !v.is_empty() {
+                    *uses.entry(v).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    for h in 0..blocks.len() {
+        let hlabel = blocks[h].label.clone();
+        let phis: Vec<Phi> = blocks[h]
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Phi(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        for p in phis {
+            for (v, pred) in &p.incoming {
+                let Val::Reg(r) = v else { continue };
+                if pred == &hlabel || !synth.contains(r) {
+                    continue;
+                }
+                let mut chain = Vec::new();
+                if phi_arm_chain(r, h, pred, blocks, synth, &mut chain).is_none() {
+                    continue;
+                }
+                for (bh, bj) in &chain {
+                    let d = arm_def_dst(&blocks[*bh].insts[*bj]).unwrap().to_string();
+                    let mut expect = usize::from(d == *r);
+                    for (ch, cj) in &chain {
+                        if ir::read_vals(&blocks[*ch].insts[*cj]).contains(&d) {
+                            expect += 1;
+                        }
+                    }
+                    if uses.get(&d).copied().unwrap_or(0) != expect {
+                        panic!(
+                            "irparse: synthesized %{d} is shared; cannot hoist phi arm %{r} from %{pred}"
+                        );
+                    }
+                }
+                let Some(&pi) = label_idx.get(pred.as_str()) else {
+                    continue;
+                };
+                if pi == h {
+                    continue;
+                }
+                move_chain_to_pred(blocks, h, pi, &chain);
+            }
+        }
+    }
+}
+
 /// Generates fresh registers for synthesized (materialized) GEP insts.
 /// Pre-seeds with every `%name` in the module so `__gep<N>` avoids collision.
+/// `synth` records exactly the names this generator minted (never user
+/// names, the pre-seed keeps them disjoint), so later passes can tell a
+/// materialized constant apart from a user instruction with certainty.
 struct Fresh {
     used: HashSet<String>,
+    synth: HashSet<String>,
     counter: usize,
 }
 impl Fresh {
@@ -1613,7 +1807,11 @@ impl Fresh {
                 }
             }
         }
-        Fresh { used, counter: 0 }
+        Fresh {
+            used,
+            synth: HashSet::new(),
+            counter: 0,
+        }
     }
     fn reg(&mut self) -> String {
         loop {
@@ -1621,6 +1819,7 @@ impl Fresh {
             let n = format!("__gep{}", self.counter);
             if !self.used.contains(&n) {
                 self.used.insert(n.clone());
+                self.synth.insert(n.clone());
                 return n;
             }
         }
@@ -1653,6 +1852,7 @@ impl Fresh {
             let n = format!("__tmp{}", self.counter);
             if !self.used.contains(&n) {
                 self.used.insert(n.clone());
+                self.synth.insert(n.clone());
                 return n;
             }
         }
@@ -3176,6 +3376,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
     }
     resolve_aliases_and_reject(&mut funcs, &aliases);
     run_ctors_and_erase_atexit(&mut funcs, &ctors);
+    hoist_phi_arm_geps(&mut funcs, &fresh.synth);
     Module {
         globals,
         funcs,

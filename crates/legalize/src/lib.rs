@@ -515,9 +515,8 @@ fn share_bench_loops(m: Module) -> (Module, bool) {
 struct LsrDecimalSite {
     pre: usize,
     region: [usize; 3],
-    hl: String,
+    g15: String,
     v0: Val,
-    buf: String,
     exit: String,
     udiv_loc: Option<SrcLoc>,
     br_loc: Option<SrcLoc>,
@@ -747,13 +746,16 @@ fn find_lsr_decimal_sites(f: &Func) -> Vec<LsrDecimalSite> {
         let Some(Val::Reg(pnext)) = arm(pph, ll) else {
             continue;
         };
-        let Some(gep15) = hinsts.iter().find_map(|i| match i {
+        // The parser hoists the phi-arm constant onto its edge
+        // (epic-cc#1053), so the `gep @buf +15` lives in the preheader
+        // ahead of its terminator, not in the header with the phi.
+        let Some(gep15) = blocks[pre].insts.iter().find_map(|i| match i {
             Inst::Gep(g) if g.dst == g15 => Some(g),
             _ => None,
         }) else {
             continue;
         };
-        let GepBase::Global(buf) = &gep15.base else {
+        let GepBase::Global(_) = &gep15.base else {
             continue;
         };
         if gep15.k != 15 || !gep15.terms.is_empty() {
@@ -868,9 +870,8 @@ fn find_lsr_decimal_sites(f: &Func) -> Vec<LsrDecimalSite> {
         sites.push(LsrDecimalSite {
             pre,
             region,
-            hl: hl.to_string(),
+            g15: g15.clone(),
             v0: vinit,
-            buf: buf.clone(),
             exit,
             udiv_loc: udiv.loc.clone(),
             br_loc: hbr.loc.clone(),
@@ -899,18 +900,11 @@ fn share_lsr_decimal_loops(m: Module) -> (Module, bool) {
         let mut blocks = f.blocks;
         let mut dropped = vec![false; blocks.len()];
         for site in sites {
-            // A fresh GEP per site: the parser's phi-arm GEP is defined in the
-            // header, which this rewrite removes, so it cannot be reused.
-            let end = format!("__rj5_end_{}", site.hl);
+            // The hoisted phi-arm GEP already computes `@buf +15` in the
+            // preheader (epic-cc#1053): reuse it as the helper argument
+            // instead of synthesizing a second address.
             let pre = &mut blocks[site.pre];
             pre.insts.pop();
-            pre.insts.push(Inst::Gep(Gep {
-                dst: end.clone(),
-                base: GepBase::Global(site.buf),
-                k: 15,
-                terms: Vec::new(),
-                loc: None,
-            }));
             pre.insts.push(Inst::Call(Call {
                 dst: None,
                 ty: None,
@@ -924,7 +918,7 @@ fn share_lsr_decimal_loops(m: Module) -> (Module, bool) {
                     },
                     CallArg {
                         ty: None,
-                        val: Val::Reg(end),
+                        val: Val::Reg(site.g15),
                         byval: None,
                         sret: false,
                     },
