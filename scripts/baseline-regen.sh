@@ -5,7 +5,7 @@
 # makes the ladders measure-only, while regeneration must record.
 #
 # Usage: bash scripts/baseline-regen.sh (inside the container, repo root)
-set -uo pipefail
+set -euo pipefail
 
 if [ -n "${BASELINE_ARTIFACT_DIR:-}" ]; then
   echo "::error::BASELINE_ARTIFACT_DIR is set; unset it so the ladders record" >&2

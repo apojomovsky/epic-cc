@@ -85,7 +85,7 @@ jobs:
       - name: Regenerate and push
         if: steps.skip.outputs.skip != 'true'
         run: |
-          set -uo pipefail
+          set -euo pipefail
           for attempt in 1 2 3; do
             git fetch origin master
             git checkout -B baseline-regen origin/master
