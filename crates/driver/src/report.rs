@@ -914,6 +914,7 @@ mod tests {
                 bytes: vec![],
                 refs: vec![],
                 addr: None,
+                internal: false,
             }],
             funcs: vec![],
             module_asm: vec![],
@@ -1065,6 +1066,7 @@ mod tests {
             bytes: vec![],
             refs: vec![],
             addr: None,
+            internal: false,
         });
         m
     }
@@ -1229,6 +1231,7 @@ mod tests {
             bytes: vec![],
             refs: vec![],
             addr: None,
+            internal: false,
         });
         assert!(fixed_uses(&m, pic14(), false).scratch);
         m.funcs.push(Func {
