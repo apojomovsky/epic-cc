@@ -396,16 +396,16 @@ ram_bytes = 56
 [[entry]]
 name = "speed-crc16-18f4550"
 device = "18F4550"
-cycles = 10404
-flash_words = 136
+cycles = 9138
+flash_words = 131
 ram_bytes = 52
 
 [[entry]]
 name = "speed-crc16-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 10404
-flash_words = 136
+cycles = 9138
+flash_words = 131
 ram_bytes = 52
 
 [[entry]]

@@ -7635,6 +7635,151 @@ fn icmp_sign_zero_fused_branch_tests_the_bit() {
 }
 
 #[test]
+fn select_sign_zero_fuses_slt_against_zero() {
+    // The crc bit-test shape: `icmp slt i16 %x, 0` in the previous slot
+    // feeding a value select. The sign bit dispatches straight to the
+    // arms with the b-arm falling through, so no 0/1 flag byte
+    // materializes and no `BZ` re-tests it (epic-cc#1149).
+    let m = parse(
+        "global x i16\nglobal a i16\nglobal b i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i16 @x\n    %3 = load i16 @a\n    %4 = load i16 @b\n    \
+         %2 = icmp slt i16 %1, 0\n    %5 = select i1 %2 i16 %3 i16 %4\n    \
+         store i16 %5 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("a", 0x22),
+        ("b", 0x24),
+        ("out", 0x26),
+        ("main::1", 0x28),
+        ("main::3", 0x2A),
+        ("main::4", 0x2C),
+        ("main::2", 0x2E),
+        ("main::5", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("BTFSC"), "sign bit dispatches:\n{asm}");
+    assert!(asm.contains(",7,A"), "top-bit test:\n{asm}");
+    assert!(!asm.contains("BZ"), "no flag re-test:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (lo, hi, expect) in [
+        (0x00u8, 0x80u8, (0xAAu8, 0xBBu8)),
+        (0xFF, 0x7F, (0xCC, 0xDD)),
+        (0x00, 0x00, (0xCC, 0xDD)),
+    ] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20] = lo;
+        p.ram_mut()[0x21] = hi;
+        p.ram_mut()[0x22] = 0xAA;
+        p.ram_mut()[0x23] = 0xBB;
+        p.ram_mut()[0x24] = 0xCC;
+        p.ram_mut()[0x25] = 0xDD;
+        p.run(300);
+        assert_eq!(
+            (p.ram()[0x26], p.ram()[0x27]),
+            expect,
+            "fused slt(0x{hi:02X}{lo:02X}, 0)"
+        );
+    }
+}
+
+#[test]
+fn select_sign_zero_fuses_sge_against_zero() {
+    // The `sge` mirror: bit set means false, so `BTFSS` dispatches with
+    // the same fallthrough shape (epic-cc#1149).
+    let m = parse(
+        "global x i16\nglobal a i16\nglobal b i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i16 @x\n    %3 = load i16 @a\n    %4 = load i16 @b\n    \
+         %2 = icmp sge i16 %1, 0\n    %5 = select i1 %2 i16 %3 i16 %4\n    \
+         store i16 %5 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("a", 0x22),
+        ("b", 0x24),
+        ("out", 0x26),
+        ("main::1", 0x28),
+        ("main::3", 0x2A),
+        ("main::4", 0x2C),
+        ("main::2", 0x2E),
+        ("main::5", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("BTFSS"), "sign bit dispatches:\n{asm}");
+    assert!(!asm.contains("BZ"), "no flag re-test:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (lo, hi, expect) in [
+        (0x00u8, 0x80u8, (0xCCu8, 0xDDu8)),
+        (0xFF, 0x7F, (0xAA, 0xBB)),
+    ] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20] = lo;
+        p.ram_mut()[0x21] = hi;
+        p.ram_mut()[0x22] = 0xAA;
+        p.ram_mut()[0x23] = 0xBB;
+        p.ram_mut()[0x24] = 0xCC;
+        p.ram_mut()[0x25] = 0xDD;
+        p.run(300);
+        assert_eq!(
+            (p.ram()[0x26], p.ram()[0x27]),
+            expect,
+            "fused sge(0x{hi:02X}{lo:02X}, 0)"
+        );
+    }
+}
+
+#[test]
+fn select_sign_zero_keeps_flag_past_a_gap() {
+    // The fuse needs the compare in the previous slot: arm loads in
+    // between keep the materialized flag byte and its `BZ` dispatch,
+    // still deciding correctly (epic-cc#1149).
+    let m = parse(
+        "global x i16\nglobal a i16\nglobal b i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i16 @x\n    %2 = icmp slt i16 %1, 0\n    %3 = load i16 @a\n    \
+         %4 = load i16 @b\n    %5 = select i1 %2 i16 %3 i16 %4\n    \
+         store i16 %5 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("a", 0x22),
+        ("b", 0x24),
+        ("out", 0x26),
+        ("main::1", 0x28),
+        ("main::2", 0x2A),
+        ("main::3", 0x2C),
+        ("main::4", 0x2E),
+        ("main::5", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("BZ"),
+        "gapped select keeps its flag test:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (lo, hi, expect) in [
+        (0x00u8, 0x80u8, (0xAAu8, 0xBBu8)),
+        (0xFF, 0x7F, (0xCC, 0xDD)),
+    ] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20] = lo;
+        p.ram_mut()[0x21] = hi;
+        p.ram_mut()[0x22] = 0xAA;
+        p.ram_mut()[0x23] = 0xBB;
+        p.ram_mut()[0x24] = 0xCC;
+        p.ram_mut()[0x25] = 0xDD;
+        p.run(300);
+        assert_eq!(
+            (p.ram()[0x26], p.ram()[0x27]),
+            expect,
+            "gapped slt(0x{hi:02X}{lo:02X}, 0)"
+        );
+    }
+}
+
+#[test]
 fn icmp_i16_eq_zero_compares_the_high_byte_with_movf_but_keeps_its_subtract() {
     // A multi-byte equality still needs the subtract on bytes whose value
     // can make the difference, but a byte the literal leaves zero can use
