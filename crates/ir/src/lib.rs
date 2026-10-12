@@ -645,6 +645,12 @@ pub struct Global {
     /// load reads (epic-cc#154, epic-cc#443, epic-cc#460).
     pub refs: Vec<(usize, String, u16)>,
     pub addr: Option<u16>,
+    /// LLVM `internal`/`private` linkage (a C `static`): no other module,
+    /// debugger script, or harness poke can name this global, so
+    /// whole-program passes may change its width or share its byte.
+    /// Externally visible globals keep their declared width: the map and
+    /// var table expose their addresses at C type width (epic-cc#856).
+    pub internal: bool,
 }
 
 impl Global {
@@ -771,10 +777,15 @@ pub fn serialize(m: &Module) -> String {
     }
     for g in &m.globals {
         let kind = if g.is_const { "const" } else { "global" };
-        match g.addr {
-            Some(a) => out.push_str(&format!("{kind} {} {} @0x{a:02X}\n", g.name, ty_str(g.ty))),
-            None => out.push_str(&format!("{kind} {} {}\n", g.name, ty_str(g.ty))),
+        let mut line = match g.addr {
+            Some(a) => format!("{kind} {} {} @0x{a:02X}", g.name, ty_str(g.ty)),
+            None => format!("{kind} {} {}", g.name, ty_str(g.ty)),
+        };
+        if g.internal {
+            line.push_str(" internal");
         }
+        out.push_str(&line);
+        out.push('\n');
     }
     for f in &m.funcs {
         let ret = match f.ret {
@@ -1202,14 +1213,18 @@ pub fn parse(text: &str) -> Module {
         {
             let is_const = line.starts_with("const ");
             let parts: Vec<&str> = rest.split_whitespace().collect();
-            // format: <name> <ty> [@addr]
+            // format: <name> <ty> [@addr] [internal]
             let name = parts[0].to_string();
             let ty = parse_ty(parts[1]);
-            let addr = if parts.len() >= 3 {
-                parse_addr(parts[2])
-            } else {
-                None
-            };
+            let mut addr = None;
+            let mut internal = false;
+            for tok in &parts[2..] {
+                if *tok == "internal" {
+                    internal = true;
+                } else {
+                    addr = parse_addr(tok);
+                }
+            }
             globals.push(Global {
                 name,
                 ty,
@@ -1218,6 +1233,7 @@ pub fn parse(text: &str) -> Module {
                 bytes: Vec::new(),
                 addr,
                 refs: Vec::new(),
+                internal,
             });
         } else if line.starts_with("fn ") {
             let rest = &line[3..];

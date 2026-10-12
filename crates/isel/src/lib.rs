@@ -7528,6 +7528,1045 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
     g.locs.extend(vg.locs);
 }
 
+/// A counted single-block byte loop lowered with a down-counter
+/// (epic-cc#897, epic-cc#899): a preheader seed (`MOVLW K` into the
+/// counter's low slot) plus a body that re-derives every FSR setup from
+/// the count, closed by `DECFSZ count; GOTO head`. Port of the
+/// isel-pic18 FSR walk (cc#1148) for one FSR with no POSTINC: each
+/// access recomputes `FSR = base + K - count` instead of walking a
+/// pointer register.
+#[derive(Clone)]
+struct WalkLoop {
+    preheader: String,
+    exit: String,
+    /// Counter phi reg (i8/i16): its low slot is the down-counter home.
+    idx: String,
+    /// Trip count, 1..=255, so one byte holds it.
+    k: u16,
+    /// Counter low-byte slot address.
+    count_slot: u16,
+    /// Body ops in IR order.
+    body: Vec<WalkOp>,
+}
+
+#[derive(Clone)]
+enum WalkOp {
+    /// Normal arm, header inst index.
+    Emit(usize),
+    /// `FSR = base + (K - count)`, byte to its slot.
+    Load {
+        slot: u16,
+        irp: bool,
+        lit: u8,
+        loc: Option<SrcLoc>,
+    },
+    /// `FSR = base + (K - count)`, slot or literal into INDF.
+    Store {
+        src: WalkBase,
+        irp: bool,
+        lit: u8,
+        loc: Option<SrcLoc>,
+    },
+    /// `FSR = base + (K - count)`, rebuilt `vbase + (K - count)` into INDF.
+    StoreVal {
+        base: WalkBase,
+        n: u16,
+        irp: bool,
+        lit: u8,
+        loc: Option<SrcLoc>,
+    },
+}
+
+/// A byte source for a walk store: a RAM address read with `MOVF`, or a
+/// literal added with `ADDLW`.
+#[derive(Clone)]
+enum WalkBase {
+    Addr(u16),
+    Imm(u8),
+}
+
+/// What a byte-wide `Add` in a walk header is: ordinary ALU, a
+/// post-increment read (unservable), or the index-as-value chain with its
+/// base, direct or through a counter trunc.
+#[derive(Clone)]
+enum WalkAdd {
+    No,
+    PostInc,
+    Direct(Val),
+    ViaTrunc(usize, Val),
+}
+
+impl<'m> Gen<'m> {
+    /// Walk-loop pre-scan (epic-cc#897): single-block counted loops whose
+    /// index feeds only byte accesses over the pre-increment counter,
+    /// closed by an increment compared against 1..=255. Runs inside
+    /// `emit_func_body`, reading the same folds the normal arms use.
+    /// Anything the checks reject stays out and lowers as before.
+    fn find_walk_loops(g: &Gen, f: &ir::Func) -> HashMap<String, WalkLoop> {
+        let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+        for b in &f.blocks {
+            let targets: Vec<&str> = match b.insts.last() {
+                Some(Inst::Br(br)) => vec![br.target.as_str()],
+                Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+                _ => vec![],
+            };
+            for t in targets {
+                preds.entry(t).or_default().push(b.label.as_str());
+            }
+        }
+        let mut uses: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        for b in &f.blocks {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() || r.starts_with('@') {
+                        continue;
+                    }
+                    uses.entry(r).or_default().push((b.label.clone(), ii));
+                }
+            }
+        }
+        let unplaced = g.w_folds.unplaced_pic14(f);
+        let mut out = HashMap::new();
+        for b in &f.blocks {
+            if let Some(plan) = Self::walk_plan_for(g, f, b, &preds, &uses, &unplaced) {
+                out.insert(b.label.clone(), plan);
+            }
+        }
+        out
+    }
+
+    /// One header block's plan, or `None` on the first failed check. The
+    /// common no-loop blocks exit on the terminator test alone; deeper
+    /// checks run only for latch-shaped blocks.
+    fn walk_plan_for(
+        g: &Gen,
+        f: &ir::Func,
+        b: &ir::Block,
+        preds: &HashMap<&str, Vec<&str>>,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+        unplaced: &HashSet<String>,
+    ) -> Option<WalkLoop> {
+        let last = b.insts.len().checked_sub(1)?;
+        let bc = match &b.insts[last] {
+            Inst::BrCond(bc) => bc,
+            _ => return None,
+        };
+        if bc.t == bc.f {
+            return None;
+        }
+        let exit = if bc.t == b.label {
+            bc.f.clone()
+        } else if bc.f == b.label {
+            bc.t.clone()
+        } else {
+            return None;
+        };
+        let Val::Reg(cond) = &bc.cond else {
+            return None;
+        };
+        if last == 0 {
+            return None;
+        }
+        // The latch compare sits immediately before the branch, so its
+        // whole feed cone is inside this block: skipping it at emission
+        // cannot strand a cross-block reader.
+        let latch = match &b.insts[last - 1] {
+            Inst::Icmp(c) if c.dst == *cond && c.pred == "eq" => c.clone(),
+            _ => return None,
+        };
+        // A materialized second use would survive the fused branch; the
+        // walk drops the compare, so it must be the branch's alone.
+        if uses.get(&latch.dst).map(|v| v.len()) != Some(1) {
+            return None;
+        }
+        let (increg, cmp_c) = match (&latch.a, &latch.b) {
+            (Val::Reg(r), Val::Const(c)) | (Val::Const(c), Val::Reg(r)) => (r.clone(), *c),
+            _ => return None,
+        };
+        let inc_pos = b
+            .insts
+            .iter()
+            .position(|i| matches!(i, Inst::Bin(q) if q.dst == increg))?;
+        let incb = match &b.insts[inc_pos] {
+            Inst::Bin(q) => q.clone(),
+            _ => return None,
+        };
+        // Up-counting from zero, or down-counting to zero. Anything else
+        // keeps counting the old way.
+        let (cntreg, up) = match (&incb.op, &incb.a, &incb.b) {
+            (BinOp::Add, Val::Reg(q), Val::Const(1)) => (q.clone(), true),
+            (BinOp::Add, Val::Const(1), Val::Reg(q)) => (q.clone(), true),
+            (BinOp::Add, Val::Reg(q), Val::Const(-1)) => (q.clone(), false),
+            (BinOp::Sub, Val::Reg(q), Val::Const(1)) => (q.clone(), false),
+            _ => return None,
+        };
+        if cntreg == increg {
+            return None;
+        }
+        let phi = b.insts.iter().find_map(|i| match i {
+            Inst::Phi(p) if p.dst == cntreg => Some(p.clone()),
+            _ => None,
+        })?;
+        if !(phi.ty.bytes() == 1 || phi.ty.bytes() == 2) || phi.ptr {
+            return None;
+        }
+        if phi.incoming.len() != 2 {
+            return None;
+        }
+        let mut back_ok = false;
+        let mut pre: Option<String> = None;
+        let mut init_c: Option<i64> = None;
+        for (v, e) in &phi.incoming {
+            if e == &b.label {
+                if !matches!(v, Val::Reg(q) if q == &cntreg || q == &increg) {
+                    return None;
+                }
+                back_ok = true;
+            } else {
+                if pre.is_some() {
+                    return None;
+                }
+                // The seed is a literal: without the sibling's rename
+                // maps a register-held zero stays unproven and walks none.
+                let Val::Const(c) = v else {
+                    return None;
+                };
+                init_c = Some(*c);
+                pre = Some(e.clone());
+            }
+        }
+        if !back_ok {
+            return None;
+        }
+        // Up loops start at zero and exit when the increment reaches the
+        // bound; down loops exit at zero, so the start is the trip count.
+        // Zero trips would run the body 256 times under DECFSZ, so K = 0
+        // stays out.
+        let k = if up {
+            if init_c != Some(0) {
+                return None;
+            }
+            cmp_c
+        } else {
+            if cmp_c != 0 {
+                return None;
+            }
+            init_c?
+        };
+        if !(1..=255).contains(&k) {
+            return None;
+        }
+        let pre = pre?;
+        if pre == b.label || pre == exit {
+            return None;
+        }
+        // Seeds dominate the header from a preheader that unconditionally
+        // branches here; the header's only other predecessor is its own
+        // backedge.
+        let pre_block = f.blocks.iter().find(|x| x.label == pre)?;
+        if !matches!(&pre_block.insts.last(), Some(Inst::Br(br)) if br.target == b.label) {
+            return None;
+        }
+        match preds.get(b.label.as_str()) {
+            Some(ps)
+                if ps.len() == 2
+                    && ps.contains(&pre.as_str())
+                    && ps.contains(&b.label.as_str()) => {}
+            _ => return None,
+        }
+        let count_slot = *g.addrs.get(&ssa_key(&f.name, &cntreg))?;
+        Self::walk_body(
+            g, f, b, uses, unplaced, pre, exit, cntreg, increg, up, k as u16, count_slot,
+        )
+    }
+    /// Header body scan: validates every inst, builds the op list, and
+    /// proves the counter feeds only the pattern. Memory ops must be byte
+    /// accesses over the pre-increment counter; the latch, the increment,
+    /// and the index-as-value chain go dead.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_body(
+        g: &Gen,
+        f: &ir::Func,
+        b: &ir::Block,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+        unplaced: &HashSet<String>,
+        pre: String,
+        exit: String,
+        cntreg: String,
+        increg: String,
+        up: bool,
+        k: u16,
+        count_slot: u16,
+    ) -> Option<WalkLoop> {
+        let last = b.insts.len() - 1;
+        let latch_ii = last - 1;
+        let inc_ii = b
+            .insts
+            .iter()
+            .position(|i| matches!(i, Inst::Bin(q) if q.dst == increg))?;
+        let phi_ii = b.insts.iter().position(|i| match i {
+            Inst::Phi(p) => p.dst == cntreg,
+            _ => false,
+        })?;
+        let mut ctr_truncs: HashMap<String, usize> = HashMap::new();
+        for (ii, inst) in b.insts.iter().enumerate() {
+            if let Inst::Trunc(t) = inst {
+                if matches!(&t.val, Val::Reg(r) if r == &cntreg) {
+                    ctr_truncs.insert(t.dst.clone(), ii);
+                }
+            }
+        }
+        let mut body: Vec<WalkOp> = Vec::new();
+        let mut vadds: HashMap<String, (usize, Option<usize>, Val)> = HashMap::new();
+        let mut gep_users: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut term_sites: Vec<usize> = Vec::new();
+        let mut consumed_vadds: HashSet<String> = HashSet::new();
+        let mut dead: HashSet<usize> = HashSet::new();
+        for (ii, inst) in b.insts.iter().enumerate() {
+            if ii == last || ii == latch_ii || ii == inc_ii || ii == phi_ii {
+                continue;
+            }
+            if dead.contains(&ii) {
+                continue;
+            }
+            match inst {
+                Inst::Phi(p) => {
+                    if p.ptr {
+                        return None;
+                    }
+                }
+                Inst::Gep(_) => {}
+                Inst::Bin(q) => match Self::walk_value_add(
+                    &q.op,
+                    &q.a,
+                    &q.b,
+                    q.ty.bytes(),
+                    &cntreg,
+                    &increg,
+                    &ctr_truncs,
+                ) {
+                    WalkAdd::No => {
+                        if walk_mentions(&q.a, &cntreg, &increg)
+                            || walk_mentions(&q.b, &cntreg, &increg)
+                        {
+                            return None;
+                        }
+                        if !Self::walk_plain_bin(q) {
+                            return None;
+                        }
+                        body.push(WalkOp::Emit(ii));
+                    }
+                    WalkAdd::PostInc => return None,
+                    WalkAdd::Direct(base) => {
+                        // A down loop visits K..1, so no ascending
+                        // rebuild maps onto it: only counter-free
+                        // down loops walk.
+                        if !up {
+                            return None;
+                        }
+                        vadds.insert(q.dst.clone(), (ii, None, base));
+                    }
+                    WalkAdd::ViaTrunc(tii, base) => {
+                        if !up {
+                            return None;
+                        }
+                        vadds.insert(q.dst.clone(), (ii, Some(tii), base));
+                    }
+                },
+                Inst::Trunc(t) => {
+                    if matches!(&t.val, Val::Reg(r) if r == &cntreg) {
+                        // Counter trunc: feeds a value chain or nothing;
+                        // the finish proof below pins it. Never emitted.
+                    } else if matches!(&t.val, Val::Reg(r) if r == &increg) {
+                        return None;
+                    } else {
+                        body.push(WalkOp::Emit(ii));
+                    }
+                }
+                Inst::Zext(z) => {
+                    if walk_mentions(&z.val, &cntreg, &increg) {
+                        return None;
+                    }
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Sext(s) => {
+                    if walk_mentions(&s.val, &cntreg, &increg) {
+                        return None;
+                    }
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Icmp(c) => {
+                    if walk_mentions(&c.a, &cntreg, &increg)
+                        || walk_mentions(&c.b, &cntreg, &increg)
+                    {
+                        return None;
+                    }
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Select(s) => {
+                    if walk_mentions(&s.cond, &cntreg, &increg)
+                        || walk_mentions(&s.a, &cntreg, &increg)
+                        || walk_mentions(&s.b, &cntreg, &increg)
+                    {
+                        return None;
+                    }
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Load(l) => {
+                    if l.ptr.starts_with('@') {
+                        body.push(WalkOp::Emit(ii));
+                        continue;
+                    }
+                    // Down loops address base+K..base+1 while the
+                    // re-derivation visits ascending: refuse.
+                    if !up {
+                        return None;
+                    }
+                    if l.ty.bytes() != 1 || l.ptr_ty {
+                        return None;
+                    }
+                    if unplaced.contains(&l.dst) {
+                        return None;
+                    }
+                    let (irp, lit) = Self::walk_memop(
+                        g,
+                        f,
+                        &cntreg,
+                        ii,
+                        &l.ptr,
+                        k,
+                        &mut gep_users,
+                        &mut term_sites,
+                    )?;
+                    let slot = g.slot_addr(&f.name, &l.dst).direct();
+                    body.push(WalkOp::Load {
+                        slot,
+                        irp,
+                        lit,
+                        loc: l.loc.clone(),
+                    });
+                }
+                Inst::Store(s) => {
+                    if s.ptr.starts_with('@') {
+                        body.push(WalkOp::Emit(ii));
+                        continue;
+                    }
+                    // Same descending-address refusal as loads.
+                    if !up {
+                        return None;
+                    }
+                    if s.ty.bytes() != 1 {
+                        return None;
+                    }
+                    if Self::walk_stores_rom(g, f, &s.val) {
+                        return None;
+                    }
+                    if let Val::Reg(v) = &s.val {
+                        if let Some((aii, _, base)) = vadds.get(v).cloned() {
+                            if uses.get(v).map(|u| u.len()) != Some(1) {
+                                return None;
+                            }
+                            let (wbase, dead_load) = Self::walk_value_base(
+                                g, f, b, uses, unplaced, &cntreg, &increg, aii, base,
+                            )?;
+                            let (irp, lit) = Self::walk_memop(
+                                g,
+                                f,
+                                &cntreg,
+                                ii,
+                                &s.ptr,
+                                k,
+                                &mut gep_users,
+                                &mut term_sites,
+                            )?;
+                            consumed_vadds.insert(v.clone());
+                            if let Some(dii) = dead_load {
+                                dead.insert(dii);
+                            }
+                            body.push(WalkOp::StoreVal {
+                                base: wbase,
+                                n: k,
+                                irp,
+                                lit,
+                                loc: s.loc.clone(),
+                            });
+                            continue;
+                        }
+                    }
+                    if walk_mentions(&s.val, &cntreg, &increg) {
+                        return None;
+                    }
+                    let src = Self::walk_store_src(g, f, unplaced, &s.val)?;
+                    let (irp, lit) = Self::walk_memop(
+                        g,
+                        f,
+                        &cntreg,
+                        ii,
+                        &s.ptr,
+                        k,
+                        &mut gep_users,
+                        &mut term_sites,
+                    )?;
+                    body.push(WalkOp::Store {
+                        src,
+                        irp,
+                        lit,
+                        loc: s.loc.clone(),
+                    });
+                }
+                _ => return None,
+            }
+        }
+        body.retain(|op| !matches!(op, WalkOp::Emit(ii) if dead.contains(ii)));
+        Self::walk_finish(
+            b,
+            uses,
+            pre,
+            exit,
+            cntreg,
+            increg,
+            k,
+            count_slot,
+            body,
+            vadds,
+            gep_users,
+            term_sites,
+            consumed_vadds,
+            ctr_truncs,
+            phi_ii,
+            inc_ii,
+            latch_ii,
+        )
+    }
+    /// Classifies a byte-wide `Add` against the counter: either side may
+    /// hold the pre-increment counter (direct or through a trunc of it).
+    /// A post-increment read is unservable, anything else is ordinary ALU.
+    fn walk_value_add(
+        op: &BinOp,
+        a: &Val,
+        b: &Val,
+        width: u8,
+        cntreg: &str,
+        increg: &str,
+        ctr_truncs: &HashMap<String, usize>,
+    ) -> WalkAdd {
+        if *op != BinOp::Add || width != 1 {
+            return WalkAdd::No;
+        }
+        if matches!(a, Val::Reg(x) if x == cntreg) || matches!(b, Val::Reg(x) if x == cntreg) {
+            let base = if matches!(a, Val::Reg(x) if x == cntreg) {
+                b.clone()
+            } else {
+                a.clone()
+            };
+            if matches!(&base, Val::Reg(x) if x == cntreg) {
+                return WalkAdd::No;
+            }
+            return WalkAdd::Direct(base);
+        }
+        for (side, other) in [(a, b), (b, a)] {
+            if let Val::Reg(x) = side {
+                if let Some(tii) = ctr_truncs.get(x) {
+                    // The other side must be a real base: a second
+                    // counter trunc has no slot to rebuild from.
+                    if matches!(other, Val::Reg(y) if ctr_truncs.contains_key(y)) {
+                        return WalkAdd::No;
+                    }
+                    return WalkAdd::ViaTrunc(*tii, other.clone());
+                }
+            }
+        }
+        if matches!(a, Val::Reg(x) if x == increg) || matches!(b, Val::Reg(x) if x == increg) {
+            return WalkAdd::PostInc;
+        }
+        WalkAdd::No
+    }
+
+    /// Whether a non-counter `Bin` can share a walk body: pure ALU the
+    /// normal arm lowers without touching `FSR`. Anything that might
+    /// call a helper or move a pointer stays out.
+    fn walk_plain_bin(q: &ir::Bin) -> bool {
+        match q.op {
+            BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or | BinOp::Xor => true,
+            BinOp::Shl | BinOp::LShr | BinOp::AShr => {
+                matches!(q.a, Val::Const(_)) || matches!(q.b, Val::Const(_))
+            }
+            _ => false,
+        }
+    }
+
+    /// Validates one walk memory op's pointer: a counter-indexed access
+    /// over one `(base, k)` group. Records the GEP-user site the finish
+    /// proof reads. Returns the IRP bit and the setup literal.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_memop(
+        g: &Gen,
+        f: &ir::Func,
+        cntreg: &str,
+        ii: usize,
+        ptr: &str,
+        k: u16,
+        gep_users: &mut HashMap<String, Vec<usize>>,
+        term_sites: &mut Vec<usize>,
+    ) -> Option<(bool, u8)> {
+        let preg = ptr.strip_prefix('%')?;
+        let key = ssa_key(&f.name, preg);
+        if g.prov.flash.contains(&key) || g.prov.mixed.contains(&key) {
+            return None;
+        }
+        let (base, k_gep, terms) = g.resolved.get(&key)?.clone();
+        if terms.len() != 1 || terms[0].0 != 1 || terms[0].1 != cntreg {
+            return None;
+        }
+        let base_addr = match &base {
+            Base::Global(name) => {
+                if g.global_is_const(name) {
+                    return None;
+                }
+                g.global_addr(name)
+            }
+            Base::Slot(sname, indirect) => {
+                if *indirect {
+                    return None;
+                }
+                if f.params.iter().any(|p| p.name == *sname && p.ptr) {
+                    return None;
+                }
+                if g.pool_slots.contains(&ssa_key(&f.name, sname)) {
+                    return None;
+                }
+                g.slot_addr(&f.name, sname).direct()
+            }
+        };
+        let addr = base_addr.wrapping_add(k_gep);
+        let (irp, lit) = walk_span_irp(g.device, addr, k)?;
+        gep_users.entry(preg.to_string()).or_default().push(ii);
+        term_sites.push(ii);
+        Some((irp, lit))
+    }
+
+    /// Mirrors the store arm's ROM refusal: a store of a flash address
+    /// panics there, so the walk must stay out and let it panic as before.
+    fn walk_stores_rom(g: &Gen, f: &ir::Func, v: &Val) -> bool {
+        match v {
+            Val::Global(gg) => g.global_is_const(gg),
+            Val::Reg(r) => matches!(
+                g.resolved.get(&ssa_key(&f.name, r)),
+                Some((Base::Global(gg), _, _)) if g.global_is_const(gg)
+            ),
+            _ => false,
+        }
+    }
+
+    /// Resolves a walk store's value the way the normal store path reads
+    /// it: a literal, a data global's address, or a homed slot. A
+    /// slotless fold the normal arm re-reads from its global stays
+    /// readable here; thread shapes stay out.
+    fn walk_store_src(
+        g: &Gen,
+        f: &ir::Func,
+        unplaced: &HashSet<String>,
+        v: &Val,
+    ) -> Option<WalkBase> {
+        match v {
+            Val::Const(kk) => Some(WalkBase::Imm((kk & 0xFF) as u8)),
+            Val::Global(gg) => {
+                if g.global_is_const(gg) {
+                    return None;
+                }
+                Some(WalkBase::Addr(g.global_addr(gg)))
+            }
+            Val::Reg(r) => {
+                if let Some(iselcore::LoadFold::Direct(gg)) = g.w_folds.loads.get(r) {
+                    if g.global_is_const(gg) {
+                        return None;
+                    }
+                    return Some(WalkBase::Addr(g.global_addr(gg)));
+                }
+                if unplaced.contains(r) {
+                    return None;
+                }
+                if g.pool_slots.contains(&ssa_key(&f.name, r)) {
+                    return None;
+                }
+                Some(WalkBase::Addr(g.slot_addr(&f.name, r).direct()))
+            }
+        }
+    }
+
+    /// Resolves an index-as-value store's base: a literal folds into the
+    /// rebuild, a data global re-reads per iteration, and a register
+    /// reads its slot. A dead `@`-global load feeding only the chain
+    /// re-reads its global instead, so skipping it preserves the
+    /// volatile count; a shared one stays emitted and reads its slot.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_value_base(
+        g: &Gen,
+        f: &ir::Func,
+        b: &ir::Block,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+        unplaced: &HashSet<String>,
+        cntreg: &str,
+        increg: &str,
+        aii: usize,
+        base: Val,
+    ) -> Option<(WalkBase, Option<usize>)> {
+        match base {
+            Val::Const(c) => Some((WalkBase::Imm((c & 0xFF) as u8), None)),
+            Val::Global(gg) => {
+                if g.global_is_const(&gg) {
+                    return None;
+                }
+                Some((WalkBase::Addr(g.global_addr(&gg)), None))
+            }
+            Val::Reg(r) => {
+                if r == cntreg || r == increg {
+                    return None;
+                }
+                if let Some(iselcore::LoadFold::Direct(gg)) = g.w_folds.loads.get(&r) {
+                    if g.global_is_const(gg) {
+                        return None;
+                    }
+                    return Some((WalkBase::Addr(g.global_addr(gg)), None));
+                }
+                if unplaced.contains(&r) {
+                    return None;
+                }
+                if g.pool_slots.contains(&ssa_key(&f.name, &r)) {
+                    return None;
+                }
+                if let Some((lii, glob)) = Self::walk_dead_load(f, b, uses, &r, aii) {
+                    if glob.is_empty() || g.global_is_const(&glob) {
+                        return None;
+                    }
+                    return Some((WalkBase::Addr(g.global_addr(&glob)), Some(lii)));
+                }
+                Some((WalkBase::Addr(g.slot_addr(&f.name, &r).direct()), None))
+            }
+        }
+    }
+
+    /// A header `@`-global load feeding only the value chain at `aii`:
+    /// its site goes dead and the chain re-reads the global. Anything
+    /// else (shared, non-global) keeps the load emitted.
+    fn walk_dead_load(
+        f: &ir::Func,
+        b: &ir::Block,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+        r: &str,
+        aii: usize,
+    ) -> Option<(usize, String)> {
+        let _ = f;
+        let (lii, glob) = b.insts.iter().enumerate().find_map(|(ii, i)| match i {
+            Inst::Load(l) if l.dst == r => l.ptr.strip_prefix('@').map(|gg| (ii, gg.to_string())),
+            _ => None,
+        })?;
+        if uses.get(r) == Some(&vec![(b.label.clone(), aii)]) {
+            Some((lii, glob))
+        } else {
+            None
+        }
+    }
+
+    /// Walk-loop finish: consumption proofs and the plan. Everything the
+    /// walk drops (value chain, dead loads) must read nowhere else; every
+    /// counter read must sit on the pattern; every GEP must feed only
+    /// the walk memops that name it.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_finish(
+        b: &ir::Block,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+        pre: String,
+        exit: String,
+        cntreg: String,
+        increg: String,
+        k: u16,
+        count_slot: u16,
+        body: Vec<WalkOp>,
+        vadds: HashMap<String, (usize, Option<usize>, Val)>,
+        gep_users: HashMap<String, Vec<usize>>,
+        term_sites: Vec<usize>,
+        consumed_vadds: HashSet<String>,
+        ctr_truncs: HashMap<String, usize>,
+        phi_ii: usize,
+        inc_ii: usize,
+        latch_ii: usize,
+    ) -> Option<WalkLoop> {
+        let here = |ii: usize| (b.label.clone(), ii);
+        // Carried values exit only through body temps: the latch runs
+        // the backedge copies on the exiting iteration too, so a
+        // carried phi read outside the header would see one update
+        // too many.
+        for inst in &b.insts {
+            if let Inst::Phi(p) = inst {
+                if p.dst == cntreg {
+                    continue;
+                }
+                if uses
+                    .get(&p.dst)
+                    .is_some_and(|u| u.iter().any(|s| s.0 != b.label))
+                {
+                    return None;
+                }
+            }
+        }
+        // Value-adds are consumed by their store or dead.
+        for dst in vadds.keys() {
+            if consumed_vadds.contains(dst) {
+                continue;
+            }
+            if uses.get(dst).is_some_and(|u| !u.is_empty()) {
+                return None;
+            }
+        }
+        // Counter truncs feed their value-add or nothing.
+        let mut trunc_sites: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        for (dst, (aii, tii, _)) in &vadds {
+            if !consumed_vadds.contains(dst) {
+                continue;
+            }
+            if let Some(t) = tii {
+                for (treg, ti) in &ctr_truncs {
+                    if ti == t {
+                        trunc_sites
+                            .entry(treg.clone())
+                            .or_default()
+                            .push(here(*aii));
+                    }
+                }
+            }
+        }
+        for treg in ctr_truncs.keys() {
+            if let Some(u) = uses.get(treg) {
+                if !trunc_sites
+                    .get(treg)
+                    .is_some_and(|a| u.iter().all(|s| a.contains(s)))
+                {
+                    return None;
+                }
+            }
+        }
+        // GEPs feed only the walk memops that name them.
+        for inst in &b.insts {
+            if let Inst::Gep(gp) = inst {
+                let allowed = gep_users.get(&gp.dst);
+                let ok = match uses.get(&gp.dst) {
+                    None => true,
+                    Some(u) => allowed
+                        .is_some_and(|a| u.iter().all(|s| s.0 == b.label && a.contains(&s.1))),
+                };
+                if !ok {
+                    return None;
+                }
+            }
+        }
+        // Counter regs feed only the pattern: phi, increment, latch,
+        // value chain, and walk terms. GEPs emit nothing, so their term
+        // reads join the allowed sites.
+        let mut cnt_allowed: HashSet<(String, usize)> = HashSet::from([here(phi_ii), here(inc_ii)]);
+        let mut inc_allowed: HashSet<(String, usize)> =
+            HashSet::from([here(phi_ii), here(latch_ii)]);
+        for (aii, tii, _) in vadds.values() {
+            cnt_allowed.insert(here(*aii));
+            if let Some(t) = tii {
+                cnt_allowed.insert(here(*t));
+            }
+        }
+        for ii in term_sites {
+            cnt_allowed.insert(here(ii));
+        }
+        for (ii, inst) in b.insts.iter().enumerate() {
+            if matches!(inst, Inst::Gep(_)) {
+                cnt_allowed.insert(here(ii));
+                inc_allowed.insert(here(ii));
+            }
+        }
+        if uses
+            .get(&cntreg)
+            .is_some_and(|u| !u.iter().all(|s| cnt_allowed.contains(s)))
+        {
+            return None;
+        }
+        if uses
+            .get(&increg)
+            .is_some_and(|u| !u.iter().all(|s| inc_allowed.contains(s)))
+        {
+            return None;
+        }
+        Some(WalkLoop {
+            preheader: pre,
+            exit,
+            idx: cntreg,
+            k,
+            count_slot,
+            body,
+        })
+    }
+}
+
+/// Whether a value mentions either counter reg.
+fn walk_mentions(v: &Val, cntreg: &str, increg: &str) -> bool {
+    matches!(v, Val::Reg(r) if r == cntreg || r == increg)
+}
+
+/// Walk-span window check: the twin of `fsr_window` that refuses instead
+/// of panicking. Every touched byte `[addr, addr + k)` must sit in one
+/// FSR window (one IRP half, no SFR hole). Returns the IRP bit and the
+/// `(addr + k) & 0xFF` setup literal, so `MOVLW lit; SUBWF count,W`
+/// lands FSR on `addr + (K - count)` each iteration.
+fn walk_span_irp(device: &Device, addr: u16, k: u16) -> Option<(bool, u8)> {
+    // Same window derivation as `fsr_window`: the first bank extends
+    // through directly-following common RAM.
+    let mut windows: Vec<(u16, u16)> = Vec::new();
+    for (i, (lo, hi)) in device.ram_banks.iter().enumerate() {
+        let mut end = hi + 1;
+        if i == 0 {
+            if let Some((clo, chi)) = device.common_ram {
+                if clo == hi + 1 {
+                    end = chi + 1;
+                }
+            }
+        }
+        windows.push((*lo, end));
+    }
+    let win_end = if device
+        .common_ram
+        .is_some_and(|(clo, chi)| addr >= clo && addr <= chi)
+    {
+        windows.first().map(|w| w.1)?
+    } else {
+        let mut found = None;
+        for ((lo, hi), (_, we)) in device.ram_banks.iter().zip(&windows) {
+            if addr >= *lo && addr <= *hi {
+                found = Some(*we);
+                break;
+            }
+        }
+        found?
+    };
+    let end = addr.checked_add(k)?;
+    if end > win_end {
+        return None;
+    }
+    Some((((addr >> 8) & 1) == 1, ((addr + k) & 0xFF) as u8))
+}
+
+impl<'m> Gen<'m> {
+    /// Emits a walk loop's preheader seeds after the edge's phi copies:
+    /// the trip count into the counter byte, replacing the counter's
+    /// zero init. The high byte of an i16 counter keeps its preheader
+    /// value, which the walk never reads.
+    fn emit_walk_seeds(&mut self, plan: &WalkLoop) {
+        self.emit(format!("    MOVLW 0x{:02X}", plan.k as u8));
+        self.emit(format!("    MOVWF 0x{:02X}", plan.count_slot));
+    }
+
+    /// Emits a walk loop's header body ops in IR order. Carried copies
+    /// run at the latch below; the counter's own copies are dropped,
+    /// its slot already holds the trip count.
+    fn emit_walk_body(&mut self, plan: &WalkLoop, b: &ir::Block) {
+        self.call_follows = false;
+        for op in &plan.body {
+            match op {
+                WalkOp::Emit(ii) => {
+                    self.emit_inst(&b.insts[*ii]);
+                }
+                WalkOp::Load {
+                    slot,
+                    irp,
+                    lit,
+                    loc,
+                } => {
+                    self.cur_loc = loc.clone();
+                    self.emit_walk_fsr(plan, *irp, *lit);
+                    self.emit("    MOVF INDF, W".to_string());
+                    self.emit(format!("    MOVWF 0x{slot:02X}"));
+                }
+                WalkOp::Store { src, irp, lit, loc } => {
+                    self.cur_loc = loc.clone();
+                    self.emit_walk_fsr(plan, *irp, *lit);
+                    match src {
+                        WalkBase::Addr(a) => {
+                            self.emit(format!("    MOVF 0x{a:02X}, W"));
+                        }
+                        WalkBase::Imm(kk) => {
+                            self.emit(format!("    MOVLW 0x{kk:02X}"));
+                        }
+                    }
+                    self.emit("    MOVWF INDF".to_string());
+                }
+                WalkOp::StoreVal {
+                    base,
+                    n,
+                    irp,
+                    lit,
+                    loc,
+                } => {
+                    self.cur_loc = loc.clone();
+                    self.emit_walk_fsr(plan, *irp, *lit);
+                    // The up-counter is gone, so the value rebuilds from
+                    // the down-counter as `base + (K - count)`.
+                    self.emit(format!("    MOVF 0x{:02X}, W", plan.count_slot));
+                    self.emit(format!("    SUBLW 0x{:02X}", *n as u8));
+                    match base {
+                        WalkBase::Addr(a) => {
+                            self.emit(format!("    ADDWF 0x{a:02X}, W"));
+                        }
+                        WalkBase::Imm(c) => {
+                            self.emit(format!("    ADDLW 0x{c:02X}"));
+                        }
+                    }
+                    self.emit("    MOVWF INDF".to_string());
+                }
+            }
+        }
+    }
+
+    /// One walk access's FSR setup: `FSR = lit - count`. IRP rides along
+    /// because a bank-2/3 access before the loop leaves bit 7 set.
+    fn emit_walk_fsr(&mut self, plan: &WalkLoop, irp: bool, lit: u8) {
+        self.emit(if irp {
+            "    BSF STATUS, 7".to_string()
+        } else {
+            "    BCF STATUS, 7".to_string()
+        });
+        self.emit(format!("    MOVF 0x{:02X}, W", plan.count_slot));
+        self.emit(format!("    SUBLW 0x{lit:02X}"));
+        self.emit("    MOVWF FSR".to_string());
+    }
+
+    /// Emits a walk loop's latch: carried backedge copies, then the
+    /// down-counter with the exit copies on the `DECFSZ` fall-through.
+    /// Banking treats the skip pair as one unit, so no BANKSEL can land
+    /// between the test and its branch.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_walk_latch(
+        &mut self,
+        plan: &WalkLoop,
+        back_copies: &[(String, Ty, Val)],
+        exit_copies: &[(String, Ty, Val)],
+        head: &str,
+        exit: &str,
+        back_dom: bool,
+        exit_dom: bool,
+    ) {
+        let live_back: Vec<(String, Ty, Val)> = back_copies
+            .iter()
+            .filter(|(dst, _, _)| *dst != plan.idx)
+            .cloned()
+            .collect();
+        emit_phi_copies(self, &live_back, back_dom);
+        self.emit(format!("    DECFSZ 0x{:02X}, F", plan.count_slot));
+        self.emit(format!("    GOTO {head}"));
+        let live_exit: Vec<(String, Ty, Val)> = exit_copies
+            .iter()
+            .filter(|(dst, _, _)| *dst != plan.idx)
+            .cloned()
+            .collect();
+        emit_phi_copies(self, &live_exit, exit_dom);
+        self.emit(format!("    GOTO {exit}"));
+    }
+}
 /// Emit one function's body into `g.out`: runtime routines get their recipe
 /// body; ordinary functions get the block labels, phi copies, and
 /// terminators. Shared by both emission passes: pass A measures the body
@@ -7640,6 +8679,10 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
     // pred (self-loop OR separate-latch back edge) => the merge's phi slots
     // hold the current iteration's values and readers run first.
     let doms = block_dominators(f);
+    // Counted byte loops as down-counter walks (epic-cc#897): planned up
+    // front from the same folds the normal arms read, emitted whole at
+    // each header below.
+    let walk_loops = Gen::find_walk_loops(g, f);
     for (i, b) in f.blocks.iter().enumerate() {
         g.emit(format!("{}:", labels[&b.label]));
         // Pool log variant (epic-cc#817): convert the fmt slot to a
@@ -7692,6 +8735,7 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
             match i {
                 Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
                 Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(..) => terminator = Some(i),
+                _ if walk_loops.contains_key(&b.label) => {} // walk body emits whole below
                 _ => {
                     let skipped = match i {
                         Inst::Bin(bin) => collapse.as_ref().is_some_and(|c| c.and_dst == bin.dst),
@@ -7706,15 +8750,67 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
                 }
             }
         }
+        if let Some(plan) = walk_loops.get(&b.label) {
+            g.emit_walk_body(plan, b);
+        }
         if let Some(t) = terminator {
             match t {
                 Inst::Br(br) => {
                     let merge = br.target.clone();
-                    if let Some(c) = phi_copies.get(&(b.label.clone(), merge.clone())) {
+                    if let Some(plan) = walk_loops.get(&merge).filter(|p| p.preheader == b.label) {
+                        // Walk preheader: edge copies minus the counter
+                        // init, then the trip count seed.
+                        let pre_copies: Vec<(String, Ty, Val)> = phi_copies
+                            .get(&(b.label.clone(), merge.clone()))
+                            .map(|cs| {
+                                cs.iter()
+                                    .filter(|(dst, _, _)| *dst != plan.idx)
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !pre_copies.is_empty() {
+                            g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                            emit_phi_copies(g, &pre_copies, doms[&b.label].contains(&merge));
+                        }
+                        g.emit_walk_seeds(plan);
+                    } else if let Some(c) = phi_copies.get(&(b.label.clone(), merge.clone())) {
                         g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
                         emit_phi_copies(g, c, doms[&b.label].contains(&merge));
                     }
                     g.emit(format!("    GOTO {}", labels[&merge]));
+                }
+                Inst::BrCond(bc) if walk_loops.contains_key(&b.label) => {
+                    // Walk latch: the counter's own edge copies are
+                    // home-managed, every other copy runs inline.
+                    let plan = &walk_loops[&b.label];
+                    let t_copies = phi_copies.get(&(b.label.clone(), bc.t.clone()));
+                    let f_copies = phi_copies.get(&(b.label.clone(), bc.f.clone()));
+                    let (back_copies, exit_copies) = if bc.t == b.label {
+                        (t_copies, f_copies)
+                    } else {
+                        (f_copies, t_copies)
+                    };
+                    let no_idx = |cs: Option<&Vec<(String, Ty, Val)>>| -> Vec<(String, Ty, Val)> {
+                        cs.map(|v| {
+                            v.iter()
+                                .filter(|(dst, _, _)| *dst != plan.idx)
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                    };
+                    let head = labels[&b.label].clone();
+                    let exit_lbl = labels[&plan.exit].clone();
+                    g.emit_walk_latch(
+                        plan,
+                        &no_idx(back_copies),
+                        &no_idx(exit_copies),
+                        &head,
+                        &exit_lbl,
+                        doms[&b.label].contains(&b.label),
+                        doms[&b.label].contains(&plan.exit),
+                    );
                 }
                 Inst::BrCond(bc) => {
                     let lt = labels[&bc.t].clone();
@@ -9554,6 +10650,7 @@ impl ConstPool {
                 bytes: c.bytes.clone(),
                 refs: c.refs.clone(),
                 addr: None,
+                internal: true,
             })
             .collect()
     }

@@ -3659,6 +3659,7 @@ fn allocate_inner(
             bytes: vec![0u8; stage_max as usize],
             refs: Vec::new(),
             addr: None,
+            internal: true,
         });
         floating.extend(stage_holder.iter());
     }
