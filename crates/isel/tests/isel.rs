@@ -4836,25 +4836,23 @@ fn large_const_table_emits_two_entry_reader_and_16bit_caller() {
         "chunk-1 entry call:\n{asm}"
     );
     assert!(asm.contains("GOTO tmp"), "fresh .hi/.done labels:\n{asm}");
-    // Reader entry 0: PCLATH = window of t, computed jump into t. The
-    // index (W) is stashed in the fixed scratch byte across the PCLATH set
-    // (MOVLW HIGH would clobber it otherwise).
+    // Both entries go short here (each shares its base's page): the
+    // caller sets the base's full HIGH ahead of the CALL, and the entry
+    // jumps with no park and no PCLATH write of its own.
     assert!(
-        asm.contains("__read_t:\n    MOVWF 0x70"),
-        "chunk-0 reader stashes the index:\n{asm}"
+        asm.contains("__read_t:\n    ADDLW LOW(t)\n    MOVWF PCL"),
+        "chunk-0 reader jumps with no park:\n{asm}"
     );
-    assert!(asm.contains("MOVLW HIGH(t)"), "chunk-0 PCLATH set:\n{asm}");
-    assert!(asm.contains("ADDLW LOW(t)"), "chunk-0 index add:\n{asm}");
+    assert!(asm.contains("MOVLW HIGH(t)"), "chunk-0 caller set:\n{asm}");
     // Reader entry 1: window of the fresh `t_1` chunk label (t + 256).
     assert!(
-        asm.contains("__read_t_hi:\n    MOVWF 0x70"),
-        "chunk-1 reader stashes the index:\n{asm}"
+        asm.contains("__read_t_hi:\n    ADDLW LOW(t_1)\n    MOVWF PCL"),
+        "chunk-1 reader jumps with no park:\n{asm}"
     );
     assert!(
         asm.contains("MOVLW HIGH(t_1)"),
-        "chunk-1 PCLATH set:\n{asm}"
+        "chunk-1 caller set:\n{asm}"
     );
-    assert!(asm.contains("ADDLW LOW(t_1)"), "chunk-1 index add:\n{asm}");
     // Window-fit directives: `.align 256` 256-aligns the chunk-0 base and
     // `.table t 300` lets the assembler enforce the window fit loudly.
     assert!(
@@ -5042,16 +5040,11 @@ fn panics_when_user_const_collides_with_generated_reader_label() {
 #[test]
 fn small_const_table_in_nonzero_window_reads_correctly() {
     // M10 load-bearing: a const table placed past 0x100 (window 1) must be
-    // read through its reader's PCLATH set — without it the computed PCL
-    // jump would land in window 0 and return a wrong byte. A 231-byte
-    // filler table (`aaa_fill` sorts before `table`) pushes `table` past
-    // 0x100: layout = goto (1) + __start (4) + main (14) + filler
-    // reader/table (6+231) + table reader (6) -> table at 0x106. (231 is the
-    // largest filler that still fits its own 256-byte window — base 0x19 +
-    // 231 == 0x100 exactly; the assembler's `.table` directive now rejects a
-    // filler that crosses. The M11 PCLATH pairs add 6 words to main and
-    // `__start` moves to the top (+4), so the filler shrank from M10's 241.)
-    //
+    // read through its reader's PCLATH set. Layout: goto (1) + __start
+    // (4) + main (14) + filler reader (2, short) + filler table (238):
+    // the filler base 0x15 + 238 crosses 0x100, so `.align 256` pads it
+    // to 0x100. The table reader (2, short) and table (4) land at 0x1F0,
+    // window 1: in = 1 reads table[1] through the short entry.
     let m = module_with_globals(
         "global in i8\nglobal out i8\nconst aaa_fill i8\nconst table i8\nfn main(void) ()\n  block entry:\n\
            %i = load i8 @in\n    %p = gep @table +0 +1*%i\n    %v = load i8 %p\n\
@@ -5077,7 +5070,7 @@ fn small_const_table_in_nonzero_window_reads_correctly() {
                 internal: false,
                 refs: Vec::new(),
             },
-            const_table_global("aaa_fill", 231),
+            const_table_global("aaa_fill", 238),
             ir::Global {
                 name: "table".into(),
                 ty: ir::Ty::I8,
@@ -5456,10 +5449,11 @@ fn guarded_call_keeps_retval_reload() {
 
 #[test]
 fn same_page_const_read_skips_restore() {
-    // A const-table read (`CALL __read_t`) gets the same discipline: the
-    // caller sets PAGE(__read_t) before the CALL. main and the table both
-    // land in page 0, so the restore is skipped and the park reload
-    // elides too, the byte travels CALL to scratch to slot in W.
+    // A const-table read (`CALL __read_t`) gets the same discipline. main
+    // and the table both land in page 0, so the entry goes short: the
+    // caller sets HIGH(t) before the CALL, the entry jumps with no park
+    // and no PCLATH write of its own, and the restore is skipped with
+    // the park reload elided, the byte travels CALL to slot in W.
     let m = module_with_globals(
         "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n\
            %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n\
@@ -5474,9 +5468,10 @@ fn same_page_const_read_skips_restore() {
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
     // The set goes before the index computation (W = index is the reader's
-    // input — the set's MOVLW must not clobber it).
+    // input, so the set's MOVLW must not clobber it). A short entry takes
+    // the base's full HIGH, not PAGE(entry).
     assert!(
-        asm.contains("MOVLW PAGE(__read_t)\n    MOVWF PCLATH"),
+        asm.contains("MOVLW HIGH(t)\n    MOVWF PCLATH"),
         "set before CALL __read_t:\n{asm}"
     );
     // Same-page read: CALL, stash the byte, no restore, no reload.
@@ -5487,6 +5482,10 @@ fn same_page_const_read_skips_restore() {
     assert!(
         !asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
         "same-page reader restore must be skipped:\n{asm}"
+    );
+    assert!(
+        asm.contains("__read_t:\n    ADDLW LOW(t)\n    MOVWF PCL"),
+        "short entry jumps with no park:\n{asm}"
     );
 }
 
@@ -6426,13 +6425,91 @@ fn add32_reg_const_emits_four_byte_carry_chain() {
         "byte 0 const add:\n{asm}"
     );
     assert!(
-        asm.contains("    MOVF 0x21, W\n    MOVWF 0x39\n    MOVLW 0x02\n    MOVWF 0x70\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x39, F"),
-        "byte 1 const carry chain:\n{asm}"
+        asm.contains("    MOVF 0x21, W\n    MOVWF 0x39\n    MOVLW 0x02\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01\n    ADDWF 0x39, F"),
+        "byte 1 const carry folds without a park:\n{asm}"
     );
     assert!(
-        asm.contains("    MOVF 0x23, W\n    MOVWF 0x3B\n    MOVLW 0x04\n    MOVWF 0x70\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x3B, F"),
-        "byte 3 const carry chain:\n{asm}"
+        asm.contains("    MOVF 0x23, W\n    MOVWF 0x3B\n    MOVLW 0x04\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01\n    ADDWF 0x3B, F"),
+        "byte 3 const carry folds without a park:\n{asm}"
     );
+}
+
+#[test]
+fn add32_const_ff_byte_keeps_parking_fold() {
+    // epic-cc#1078: a 0xFF const byte plus carry wraps to zero, where
+    // only INCFSZ's skip keeps the true carry-out. The park stays.
+    let m = parse(
+        "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = add i32 %a, 16711681\n    store i32 %r @out\n    ret void\n",
+    );
+    // 16711681 = 0x00FF0001: byte 2 is the wrapping fold.
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert!(
+        asm.contains("    MOVF 0x22, W\n    MOVWF 0x3A\n    MOVLW 0xFF\n    MOVWF 0x70\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x3A, F"),
+        "0xFF byte keeps the parking fold:\n{asm}"
+    );
+    assert!(
+        asm.contains("    MOVF 0x21, W\n    MOVWF 0x39\n    MOVLW 0x00\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01\n    ADDWF 0x39, F"),
+        "0x00 byte folds without a park:\n{asm}"
+    );
+}
+
+#[test]
+fn add32_const_folds_simulate_carry_boundaries() {
+    // epic-cc#1078: the ADDLW folds and the kept 0xFF park must carry
+    // exactly across 0x00 and 0xFF const bytes with carry in and out.
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = add i32 %a, 65535\n    store i32 %r @out\n    ret void\n";
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
+    // 0x00FF0001 + 0x0000FFFF = 0x01000000: byte 1 wraps its 0xFF
+    // fold with carry in and out, bytes 0 and 2 fold 0x00/0xFF.
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0x01), (0x21, 0x00), (0x22, 0xFF), (0x23, 0x00)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0x00, 0x00, 0x00, 0x01],
+        "carry through 0xFF/0x00 folds"
+    );
+    // 0x00FF00FF + 0x01010101 = 0x02000200: every high byte folds
+    // 0x01 with carry in, no wrap.
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = add i32 %a, 16843009\n    store i32 %r @out\n    ret void\n";
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0xFF), (0x21, 0x00), (0x22, 0xFF), (0x23, 0x00)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0x00, 0x02, 0x00, 0x02],
+        "carry into every ADDLW fold"
+    );
+}
+
+#[test]
+fn icmp_ne_i16_folds_simulate() {
+    // epic-cc#1079: the park-free OR/XOR folds must report equality
+    // exactly, including a high-byte-only difference (314 vs 58).
+    let ir = "global x i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %c = icmp ne i16 %a, 58\n    store i8 %c @out\n    ret void\n";
+    let map = vec![
+        ("x", 0x20),
+        ("out", 0x22),
+        ("main::a", 0x29),
+        ("main::c", 0x2B),
+    ];
+    for (lo, hi, want) in [
+        (0x00u8, 0x00u8, 1),
+        (0x3Au8, 0x00u8, 0),
+        (0x3Au8, 0x01u8, 1),
+    ] {
+        let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, lo), (0x21, hi)], 0x22, 1);
+        assert_eq!(got[0], want, "ne 58 with a = 0x{hi:02X}{lo:02X}");
+    }
 }
 
 #[test]
@@ -10326,8 +10403,12 @@ fn staged_const_call_args_deliver_table_bytes_in_sim() {
         let routine = &asm[start..end];
         assert_eq!(
             routine.matches(&format!("CALL __read_{name}")).count(),
-            routine.matches(&format!("PAGE(__read_{name})")).count(),
-            "every reader CALL in __stage_{name} re-sets the entry page (the reader leaves PCLATH on the table page)"
+            routine.matches(&format!("HIGH({name})")).count(),
+            "every reader CALL in __stage_{name} sets HIGH (short entry here)"
+        );
+        assert!(
+            !routine.contains(&format!("PAGE(__read_{name})")),
+            "no PAGE set for a short entry in __stage_{name}:\n{routine}"
         );
     }
     assert!(
@@ -10459,9 +10540,12 @@ fn staged_routine_words_fold_into_later_table_window() {
     // base. main is padded so the fold fires only when the routine counts:
     // 51 words earlier the base would sit inside the window and no pad
     // would emit, and the assembler would panic on the crossing base.
+    // (Short entries moved the section earlier than the 6-word layout
+    // this pad was tuned for (epic-cc#1080); four more pad units put
+    // the fold back on the boundary.)
     let ir_text = format!(
         "global in i8\nglobal out i8\nconst t i8\nconst a i8\nfn main(void) ()\n  block entry:\n           %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n{}    ret void\n",
-        pad_body(132)
+        pad_body(136)
     );
     let m = module_with_globals(
         &ir_text,
@@ -11072,6 +11156,78 @@ fn walk_refuses_double_trunc_use() {
     );
 }
 
+#[test]
+fn icmp_ne_i16_zero_ors_file_bytes() {
+    // epic-cc#1079: `a != 0` needs no scratch park. Byte 0's load pops
+    // as dead (the byte stays addressable) and the high byte ORs the
+    // file directly, leaving Z = (a == 0) for the materialization.
+    let m = parse(
+        "global x i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %c = icmp ne i16 %a, 0\n    store i8 %c @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("out", 0x22),
+        ("main::a", 0x29),
+        ("main::c", 0x2B),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        asm.contains("    MOVF 0x2A, W\n    IORWF 0x29, W"),
+        "bytes ORed without a park:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVWF 0x70"),
+        "no scratch park for != 0:\n{asm}"
+    );
+}
+
+#[test]
+fn icmp_ne_i16_const_folds_carry_free_byte() {
+    // epic-cc#1079: `a != 0x3A` (high const byte zero). Byte 0 XORs in
+    // W and stays there; the high byte ORs the file with no park and
+    // no reload.
+    let m = parse(
+        "global x i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %c = icmp ne i16 %a, 58\n    store i8 %c @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("out", 0x22),
+        ("main::a", 0x29),
+        ("main::c", 0x2B),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        asm.contains("    MOVF 0x29, W\n    XORLW 0x3A\n    IORWF 0x2A, W"),
+        "xor stays in W, high byte ORs the file:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVWF 0x70"),
+        "no scratch park for != const:\n{asm}"
+    );
+}
+
+#[test]
+fn icmp_ne_i16_reg_reg_keeps_scratch_fold() {
+    // epic-cc#1079: `a != b` between registers still needs the park.
+    // Both bytes XOR in W, so byte 0's result has no file address
+    // while byte 1 computes; the shape is unchanged, park included.
+    let m = parse(
+        "global x i16\nglobal y i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp ne i16 %a, %b\n    store i8 %c @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x22),
+        ("out", 0x24),
+        ("main::a", 0x29),
+        ("main::b", 0x2B),
+        ("main::c", 0x2D),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        asm.contains("MOVWF 0x70"),
+        "reg-reg ne keeps its park:\n{asm}"
+    );
+}
 // epic-cc#1139: the page-fit repair must converge or fail honestly on
 // page-tight programs, never die oscillating. Two multi-block functions
 // compete for page 0 (a call across them varies restore elision with the
@@ -11137,4 +11293,50 @@ fn page_tight_perturbations_never_oscillate() {
             }
         }
     }
+}
+
+#[test]
+fn cross_page_reader_keeps_parking_entry() {
+    // epic-cc#1080: a reader whose base lands in the next page stays
+    // full. main is padded so the section starts at 0x7FA: the 6-word
+    // entry fits page 0 unpinned, but its base crosses to 0x800, so
+    // the caller sets PAGE(entry) and the entry parks the index
+    // across its own PCLATH write. Re-tune the pad if main changes
+    // length (same discipline as the page-tail pin test).
+    let ir_text = format!(
+        "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n{}    ret void\n",
+        pad_body(675)
+    );
+    let m = module_with_globals(&ir_text, vec![const_table_global("t", 10)]);
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::i", 0x25),
+        ("main::v", 0x26),
+        ("main::a", 0x27),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert_eq!(
+        label_addr(&asm, "__read_t"),
+        0x7FA,
+        "entry must sit at the page tail:\n{asm}"
+    );
+    assert_eq!(
+        label_addr(&asm, "t"),
+        0x800,
+        "base must cross to the next page:\n{asm}"
+    );
+    assert!(
+        asm.contains("__read_t:\n    MOVWF 0x70\n    MOVLW HIGH(t)\n    MOVWF PCLATH\n    MOVF 0x70, W\n    ADDLW LOW(t)\n    MOVWF PCL"),
+        "full entry parks the index:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW PAGE(__read_t)\n    MOVWF PCLATH"),
+        "caller sets the entry page:\n{asm}"
+    );
+    assert_eq!(
+        sim_run_asm(&asm, &[(0x20, 1)], 0x21),
+        1,
+        "table[1] = 1 through the full entry:\n{asm}"
+    );
 }

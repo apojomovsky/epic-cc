@@ -199,6 +199,12 @@ struct Gen<'m> {
     /// the page assignment); `Some` in pass B, where a same-page restore is
     /// skipped.
     page_of: Option<&'m HashMap<String, usize>>,
+    /// Short-reader entries and their table bases (epic-cc#1080): a short
+    /// entry shares its base's page, so its caller sets the full
+    /// `HIGH(base)` and the entry jumps with no PCLATH write of its own.
+    /// `None` in pass A (every entry emits full, sizing the section);
+    /// `Some` in pass B, where short entries shrink to two words.
+    short_bases: Option<&'m HashMap<String, String>>,
     /// Pool log variant (epic-cc#817): emitting `__epic_log_pool`, whose
     /// slots hold (in-chunk index, chunk id) pairs instead of addresses.
     /// Loads through `pool_slots` read via the matching pool reader;
@@ -408,6 +414,20 @@ impl<'m> Gen<'m> {
             self.emit(format!("    MOVLW PAGE({})", self.cur_func));
             self.emit("    MOVWF PCLATH".to_string());
         }
+    }
+
+    /// The PCLATH set before a const-table CALL. A short entry shares
+    /// its base's page, so the caller loads the base's full `HIGH`:
+    /// the CALL reads only bits 4:3 (the entry's page, equal by
+    /// placement), and the entry's computed jump inherits the rest.
+    /// Any other entry takes `PAGE(entry)` for the CALL and sets its
+    /// own page on arrival. Pass A always takes the latter (epic-cc#1080).
+    fn emit_reader_set(&mut self, entry: &str) {
+        match self.short_bases.as_ref().and_then(|m| m.get(entry)) {
+            Some(base) => self.emit(format!("    MOVLW HIGH({base})")),
+            None => self.emit(format!("    MOVLW PAGE({entry})")),
+        }
+        self.emit("    MOVWF PCLATH".to_string());
     }
 
     /// Whether `name` is a local object in the current function: an
@@ -921,8 +941,7 @@ impl<'m> Gen<'m> {
         dst: Option<u16>,
         index: impl FnOnce(&mut Self),
     ) {
-        self.emit(format!("    MOVLW PAGE(__read_{name})"));
-        self.emit("    MOVWF PCLATH".to_string());
+        self.emit_reader_set(&format!("__read_{name}"));
         index(self);
         self.emit(format!("    CALL __read_{name}"));
         let target = format!("__read_{name}");
@@ -988,8 +1007,7 @@ impl<'m> Gen<'m> {
     /// plus the constant offset, the byte returns in W. Skips the trailing
     /// jump for a lone chunk.
     fn emit_pool_chunk(&mut self, chunk: &str, slot: u16, kk: u8, l_done: &str, close: bool) {
-        self.emit(format!("    MOVLW PAGE(__read_{chunk})"));
-        self.emit("    MOVWF PCLATH".to_string());
+        self.emit_reader_set(&format!("__read_{chunk}"));
         self.emit(format!("    MOVF 0x{slot:02X}, W"));
         if kk != 0 {
             self.emit(format!("    ADDLW 0x{kk:02X}"));
@@ -1373,8 +1391,7 @@ impl<'m> Gen<'m> {
         // survives the restore via the hi temp.
         let chunk_call = |g: &mut Self, c: usize, l_done: &str| {
             let e = entry(c);
-            g.emit(format!("    MOVLW PAGE({e})"));
-            g.emit("    MOVWF PCLATH".to_string());
+            g.emit_reader_set(&e);
             g.emit(format!("    MOVF 0x{:02X}, W", g.retval_lo));
             g.emit(format!("    CALL {e}"));
             g.emit_w_store(g.scratch);
@@ -1426,8 +1443,7 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                     self.emit(format!("    BTFSC 0x{:02X}, 0", self.scratch));
                     self.emit(format!("    GOTO {l_hi}"));
-                    self.emit(format!("    MOVLW PAGE(__read_{name})"));
-                    self.emit("    MOVWF PCLATH".to_string());
+                    self.emit_reader_set(&format!("__read_{name}"));
                     self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                     self.emit(format!("    CALL __read_{name}"));
                     self.emit_w_store(self.scratch);
@@ -1435,8 +1451,7 @@ impl<'m> Gen<'m> {
                     self.emit_w_load(self.scratch);
                     self.emit(format!("    GOTO {l_done}"));
                     self.emit(format!("{l_hi}:"));
-                    self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
-                    self.emit("    MOVWF PCLATH".to_string());
+                    self.emit_reader_set(&format!("__read_{name}_hi"));
                     self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                     self.emit(format!("    CALL __read_{name}_hi"));
                     self.emit_w_store(self.scratch);
@@ -1504,8 +1519,7 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                     self.emit(format!("    BTFSC 0x{:02X}, 0", self.scratch));
                     self.emit(format!("    GOTO {l_hi}"));
-                    self.emit(format!("    MOVLW PAGE(__read_{name})"));
-                    self.emit("    MOVWF PCLATH".to_string());
+                    self.emit_reader_set(&format!("__read_{name}"));
                     self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                     self.emit(format!("    CALL __read_{name}"));
                     self.emit_w_store(self.scratch);
@@ -1513,8 +1527,7 @@ impl<'m> Gen<'m> {
                     self.emit_w_load(self.scratch);
                     self.emit(format!("    GOTO {l_done}"));
                     self.emit(format!("{l_hi}:"));
-                    self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
-                    self.emit("    MOVWF PCLATH".to_string());
+                    self.emit_reader_set(&format!("__read_{name}_hi"));
                     self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                     self.emit(format!("    CALL __read_{name}_hi"));
                     self.emit_w_store(self.scratch);
@@ -1833,29 +1846,103 @@ impl<'m> Gen<'m> {
     }
 
     /// Set the Z flag to (a == b) without disturbing other flags. For
-    /// multi-byte widths (i16/i32), the XORs of every byte pair are
-    /// accumulated in the fixed `scratch` byte, leaving Z set exactly when
-    /// every byte was equal.
+    /// multi-byte widths the byte-pair XORs are ORed together, leaving Z
+    /// set exactly when every byte was equal. The running OR lives in W,
+    /// in `scratch` (a real XOR needs W while the OR needs a file
+    /// operand), or in byte 0's own slot (a skipped zero-XOR over a
+    /// plain load leaves the byte addressable, so its load pops as
+    /// dead). Only MOVF/XORWF/XORLW/IORWF/MOVWF run here, so C and DC
+    /// survive for the equality-then-carry composites.
     fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty) {
         let n = ty.bytes();
+        let pre_load = self.out.len();
         self.emit_load_byte(a, 0);
+        let single0 = self.out.len() == pre_load + 1;
+        let load0 = single0.then(|| self.out.last().cloned()).flatten();
+        let pre_xor = self.out.len();
         self.emit_xor_byte_unless_nop(b, 0);
-        // The accumulation's last store is dead: every scratch reader
-        // writes it first in its own sequence (pointer accumulation, FSR
-        // setup, const-reader dispatch, sub borrow folds), and materialize
-        // branches on the live Z without reloading scratch. Only the IORWF
-        // inputs (every byte but the last) still store.
-        if n > 1 {
-            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-        }
+        // W holds byte 0's XOR, unless this is multi-byte and the XOR
+        // skipped over a plain GPR load: the byte stays addressable in
+        // its slot, so the dead load pops and later bytes OR against
+        // the file directly. Single-byte compares keep the load: no
+        // later IORWF re-reads the file, so popping would drop the
+        // value entirely.
+        let mut file_acc = if n > 1 && self.out.len() == pre_xor {
+            load0
+                .as_deref()
+                .and_then(|l| self.gpr_movf_addr(l))
+                .inspect(|_| {
+                    self.out.pop();
+                    self.locs.pop();
+                })
+        } else {
+            None
+        };
         for i in 1..n {
-            self.emit_load_byte(a, i);
-            self.emit_xor_byte_unless_nop(b, i);
-            self.emit(format!("    IORWF 0x{:02X}, W", self.scratch));
-            if i + 1 < n {
-                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+            match file_acc {
+                Some(f) => {
+                    self.emit_load_byte(a, i);
+                    self.emit_xor_byte_unless_nop(b, i);
+                    self.emit(format!("    IORWF 0x{f:02X}, W"));
+                    file_acc = None;
+                }
+                None => {
+                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    let pre_ld = self.out.len();
+                    self.emit_load_byte(a, i);
+                    let single = self.out.len() == pre_ld + 1;
+                    let load = single.then(|| self.out.last().cloned()).flatten();
+                    let pre_xor = self.out.len();
+                    self.emit_xor_byte_unless_nop(b, i);
+                    // A skipped zero-XOR over a plain GPR load needs
+                    // neither the park nor the load: pop both and OR the
+                    // file byte straight into the running OR in W.
+                    if self.out.len() == pre_xor {
+                        if let Some(g) = load.as_deref().and_then(|l| self.gpr_movf_addr(l)) {
+                            let park = format!("    MOVWF 0x{:02X}", self.scratch);
+                            if self.out.len() >= 2
+                                && self.out[self.out.len() - 1] == format!("    MOVF 0x{g:02X}, W")
+                                && self.out[self.out.len() - 2] == park
+                            {
+                                self.out.pop();
+                                self.locs.pop();
+                                self.out.pop();
+                                self.locs.pop();
+                                self.emit(format!("    IORWF 0x{g:02X}, W"));
+                                continue;
+                            }
+                        }
+                    }
+                    self.emit(format!("    IORWF 0x{:02X}, W", self.scratch));
+                }
             }
         }
+    }
+
+    /// The slot a line loads into W, when it is a single plain `MOVF` of
+    /// a banked GPR byte: a side-effect-free RAM read, safe to drop
+    /// while the value stays addressable, or to reuse as an `IORWF`
+    /// file operand. Membership in the device's `ram_banks` keeps SFRs
+    /// out, and the common-RAM low-7-bit slice keeps the scratch,
+    /// retval, and ISR-save bytes (and their bank mirrors) out.
+    /// Anything else (adopted W, literals, FSR/INDF) refuses.
+    fn gpr_movf_addr(&self, line: &str) -> Option<u16> {
+        let rest = line.strip_prefix("    MOVF 0x")?.strip_suffix(", W")?;
+        let addr = u16::from_str_radix(rest, 16).ok()?;
+        if !self
+            .device
+            .ram_banks
+            .iter()
+            .any(|(lo, hi)| *lo <= addr && addr <= *hi)
+        {
+            return None;
+        }
+        if let Some((clo, _)) = self.device.common_ram {
+            if addr & 0x7F >= clo & 0x7F {
+                return None;
+            }
+        }
+        Some(addr)
     }
 
     /// Whether the tail just emitted witnesses Z == (W == 0) right now: an
@@ -2125,9 +2212,18 @@ impl<'m> Gen<'m> {
                     Val::Const(k) => {
                         let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
                         self.emit(format!("    MOVLW 0x{kb:02X}"));
-                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                        self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                        self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                        // The borrow folds into the constant in W, not through
+                        // a scratch copy: `k + 1` never wraps except at 0xFF,
+                        // where only INCFSZ's skip keeps the true borrow-out
+                        // (epic-cc#1078).
+                        if kb == 0xFF {
+                            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                            self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                            self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                        } else {
+                            self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                            self.emit("    ADDLW 0x01".to_string());
+                        }
                     }
                     _ => {
                         self.emit_load_cmp_byte(b, i, signed, high);
@@ -2140,7 +2236,6 @@ impl<'m> Gen<'m> {
             }
         }
     }
-
     /// The multi-byte (n > 1, i16 and i32) const-LHS (SUBLW) borrow chain:
     /// W holds the b byte (+ borrow), SUBLW subtracts it from the const
     /// byte. Same wrap-correct folds as `emit_cmp_c_file_lhs_wide`; the
@@ -2788,9 +2883,17 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVF 0x{:02X}, W", ra + u16::from(i)));
                     self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
                     self.emit(format!("    MOVLW 0x{kb:02X}"));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                    self.emit("    BTFSC STATUS, 0 ; C".to_string());
-                    self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                    // The carry folds into the constant in W, not through a
+                    // scratch copy: `k + 1` never wraps except at 0xFF, where
+                    // only INCFSZ's skip keeps the true carry-out (epic-cc#1078).
+                    if kb == 0xFF {
+                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                        self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                        self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                    } else {
+                        self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                        self.emit("    ADDLW 0x01".to_string());
+                    }
                     self.emit(format!("    ADDWF 0x{:02X}, F", dst + u16::from(i)));
                 }
             }
@@ -7689,6 +7792,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         bool_temps: HashSet::new(),
         tmp: &mut *g.tmp,
         page_of: g.page_of,
+        short_bases: g.short_bases,
         pool_log: true,
         pool_active: g.pool_active,
         pool_slots: slots,
@@ -10296,20 +10400,13 @@ pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec
     }
 }
 
-/// The const-table section's reader entries and the page PCLATH<4:3> holds
-/// after each CALL returns: a reader writes `MOVLW HIGH(<base>); MOVWF
-/// PCLATH` before its computed jump, so PCLATH's page bits are the TABLE
-/// BASE's page (`<name>` for single/chunk-0 reads, `<name>_1` for chunk-1
-/// reads): not `PAGE(__read_<name>)`, the page the caller set (the entry
-/// itself can sit in a different page than its base, e.g. a reader at
-/// 0x7FA with a 256-aligned base at 0x800). The caller's restore after the
-/// call is needed iff that page differs from its own, so this is the map
-/// `emit_pclath_restore` consults. The section's pass-A placement is used:
-/// it sits right after the last function, and pass B re-pins the section to
-/// this exact start with a leading `.org` whenever the pass-B elision would
-/// move a reader base across a page boundary (see the pass-B note in
-/// `select`), so no reader base can drift across a page boundary between
-/// the passes: the pages hold in the final text.
+/// Reader entries and the page PCLATH<4:3> holds after each CALL: a
+/// full reader writes HIGH(base) itself and a short entry's caller
+/// sets it, so both leave the TABLE BASE's page (not PAGE(entry): an
+/// entry can sit in another page than its base). Restores are needed
+/// iff that page differs from the caller's. Pass-A placement is used;
+/// pass B re-pins to this start on any base-page or short-decision
+/// drift, so the map holds in the final text.
 fn reader_pages(
     consts: &[&ir::Global],
     staged: &HashSet<String>,
@@ -10329,6 +10426,23 @@ fn reader_pages(
         }
     }
     pages
+}
+
+/// Short-reader entries and their table bases, for pass-B callers: a
+/// short entry shares its base's page (decided in `place_consts`), so
+/// its caller sets the full `HIGH(base)` and the entry jumps with no
+/// PCLATH write of its own. Only short entries appear here; anything
+/// absent keeps the `PAGE(entry)` set and the 6-word entry.
+fn short_entries(places: &[ConstPlace]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for p in places {
+        for (c, ch) in p.chunks.iter().enumerate() {
+            if ch.short {
+                map.insert(chunk_entry(&p.name, c), chunk_base(&p.name, c));
+            }
+        }
+    }
+    map
 }
 
 /// The word address a single-entry (<= 255 byte) const table's base must
@@ -10362,20 +10476,62 @@ struct ConstPlace {
     chunks: Vec<ChunkPlace>,
 }
 
-/// One table chunk: its 6-word reader entry address and its base address.
-/// `pin` emits `.org reader_at` before the entry, keeping it wholly in one
-/// page; `align` emits `.align 256` before the table.
+/// One table chunk: its reader entry address and its base address. A
+/// short entry (epic-cc#1080) is 2 words (`ADDLW LOW(base); MOVWF PCL`,
+/// the caller's `HIGH(base)` set already holds the jump's page), else
+/// the entry is 6 words with its own PCLATH write. `pin` emits `.org
+/// reader_at` before the entry, keeping it wholly in one page; `align`
+/// emits `.align 256` before the table.
 struct ChunkPlace {
     reader_at: usize,
     base_at: usize,
     align: bool,
     pin: bool,
+    short: bool,
+}
+
+/// Words of a reader entry: 2 short, 6 with the PCLATH-switch park.
+fn reader_len(short: bool) -> usize {
+    if short {
+        2
+    } else {
+        6
+    }
+}
+
+/// Reader entry and chunk-base labels for chunk `c` of const `name`,
+/// matching the table emitter.
+fn chunk_entry(name: &str, c: usize) -> String {
+    if c == 0 {
+        format!("__read_{name}")
+    } else if c == 1 {
+        format!("__read_{name}_hi")
+    } else {
+        format!("__read_{name}_hi{c}")
+    }
+}
+
+/// Table-base label for chunk `c` of const `name`, matching the table
+/// emitter: chunk 0 sits at `name`, later chunks at `name_1`, `name_2`,
+/// and so on.
+fn chunk_base(name: &str, c: usize) -> String {
+    if c == 0 {
+        name.to_string()
+    } else if c == 1 {
+        format!("{name}_1")
+    } else {
+        format!("{name}_{c}")
+    }
 }
 
 /// Lay out the const section from `start`: staged routines (nominal length
-/// plus measured banking growth), 6-word readers page-pinned when they
-/// would straddle, tables window-aligned. Chunked tables keep today's
-/// shape (aligned chunk 0, +256c chunks, readers after the table).
+/// plus measured banking growth), readers page-pinned when they would
+/// straddle, tables window-aligned. Chunked tables keep today's shape
+/// (aligned chunk 0, +256c chunks, readers after the table). A reader
+/// whose base lands in its own 2K page goes short (its caller sets the
+/// full `HIGH(base)`, so the entry needs no PCLATH write); the layout
+/// carries the short lengths throughout, so modeled and emitted
+/// addresses agree exactly.
 fn place_consts(
     consts: &[&ir::Global],
     staged: &HashSet<String>,
@@ -10395,46 +10551,73 @@ fn place_consts(
             0
         };
         // A reader straddling a page boundary moves to the next page start.
-        // The entry itself is branchless, but its CALL's PAGE() set and the
+        // The entry itself is branchless, but its CALL's set and the
         // caller's post-call restore assume one page (epic-cc#844).
-        let pin_reader = |at: usize| -> (usize, bool) {
-            if at / 0x800 != (at + 5) / 0x800 {
+        let pin_reader = |at: usize, len: usize| -> (usize, bool) {
+            if at / 0x800 != (at + len - 1) / 0x800 {
                 ((at + 0x7FF) & !0x7FF, true)
             } else {
                 (at, false)
             }
         };
+        // Short when entry and base share a page: the caller's full
+        // HIGH(base) set then covers both the CALL and the computed
+        // jump. Tried with the 2-word entry first (its base sits 4
+        // words earlier, so strictly more pairs qualify); otherwise
+        // the 6-word entry with its own PCLATH write.
         let mut at = addr + slen;
         let mut chunks = Vec::new();
         if size >= 256 {
             let n_chunks = ((size + 255) / 256).max(2);
-            let (reader, pin) = pin_reader(at);
-            let base0 = ((reader + 6) + 255) & !255;
+            let (r2, p2) = pin_reader(at, 2);
+            let b2 = ((r2 + 2) + 255) & !255;
+            let short0 = r2 / 0x800 == b2 / 0x800;
+            let (reader, pin, base0) = if short0 {
+                (r2, p2, b2)
+            } else {
+                let (r6, p6) = pin_reader(at, 6);
+                let b6 = ((r6 + 6) + 255) & !255;
+                (r6, p6, b6)
+            };
             chunks.push(ChunkPlace {
                 reader_at: reader,
                 base_at: base0,
-                align: base0 != reader + 6,
+                align: base0 != reader + reader_len(short0),
                 pin,
+                short: short0,
             });
             at = base0 + size;
             for c in 1..n_chunks {
-                let (r, p) = pin_reader(at);
+                let base = base0 + 256 * c;
+                let (r2, p2) = pin_reader(at, 2);
+                let short = r2 / 0x800 == base / 0x800;
+                let (r, p) = if short { (r2, p2) } else { pin_reader(at, 6) };
                 chunks.push(ChunkPlace {
                     reader_at: r,
-                    base_at: base0 + 256 * c,
+                    base_at: base,
                     align: false,
                     pin: p,
+                    short,
                 });
-                at = r + 6;
+                at = r + reader_len(short);
             }
         } else {
-            let (reader, pin) = pin_reader(at);
-            let base = window_align(reader + 6, size);
+            let (r2, p2) = pin_reader(at, 2);
+            let b2 = window_align(r2 + 2, size);
+            let short = r2 / 0x800 == b2 / 0x800;
+            let (reader, pin, base) = if short {
+                (r2, p2, b2)
+            } else {
+                let (r6, p6) = pin_reader(at, 6);
+                let b6 = window_align(r6 + 6, size);
+                (r6, p6, b6)
+            };
             chunks.push(ChunkPlace {
                 reader_at: reader,
                 base_at: base,
-                align: base != reader + 6,
+                align: base != reader + reader_len(short),
                 pin,
+                short,
             });
             at = base + size;
         }
@@ -10534,13 +10717,23 @@ fn measure_section_units(banked: &str) -> (HashMap<String, usize>, HashMap<Strin
 }
 
 /// Check the emitted section against the banked, peepholed final text: each
-/// reader is 6 words inside one page, each staged routine is its modeled
-/// length, each table base fits its window. A mismatch panics loudly here
-/// instead of miscompiling or tripping the assembler's assert (epic-cc#844).
+/// reader is its modeled length (2 short, 6 with the park) inside one
+/// page, each staged routine is its modeled length, each table base fits
+/// its window. A mismatch panics loudly here instead of miscompiling or
+/// tripping the assembler's assert (epic-cc#844).
 fn verify_section_model(places: &[ConstPlace], banked: &str) {
     let lens: HashMap<&str, usize> = places
         .iter()
         .map(|p| (p.name.as_str(), p.staged_len))
+        .collect();
+    let want_reader: HashMap<String, usize> = places
+        .iter()
+        .flat_map(|p| {
+            p.chunks
+                .iter()
+                .enumerate()
+                .map(|(c, ch)| (chunk_entry(&p.name, c), reader_len(ch.short)))
+        })
         .collect();
     let mut org = 0usize;
     let mut cur: Option<(bool, String, usize, usize)> = None;
@@ -10558,9 +10751,10 @@ fn verify_section_model(places: &[ConstPlace], banked: &str) {
                 );
             } else {
                 let last = start + words.saturating_sub(1);
+                let want = want_reader.get(&name).copied().unwrap_or(6);
                 assert!(
-                    words == 6,
-                    "isel: const reader {name} is {words} words, not 6: the section model no longer matches banking"
+                    words == want,
+                    "isel: const reader {name} is {words} words, not {want}: the section model no longer matches banking"
                 );
                 assert!(
                     start / 0x800 == last / 0x800,
@@ -10658,12 +10852,19 @@ fn emit_const_section(
                 .expect("isel: staged const with no staging buffer in map");
             out.push(format!("__stage_{}:", g.name));
             locs.push(None);
-            // The reader sets PCLATH to HIGH(base) on entry, which can
+            // A full reader sets PCLATH to HIGH(base) on entry, which can
             // differ from its own entry page (straddling table), so every
             // CALL re-sets the entry page: a single hoisted set would
-            // misbranch from the second byte on.
+            // misbranch from the second byte on. A short chunk-0 reader
+            // takes the base's full HIGH instead (same word count either
+            // way, so both passes measure the same lengths).
+            let stage_set = if place.chunks[0].short {
+                format!("    MOVLW HIGH({})", g.name)
+            } else {
+                format!("    MOVLW PAGE(__read_{})", g.name)
+            };
             for i in 0..g.bytes.len() {
-                out.push(format!("    MOVLW PAGE(__read_{})", g.name));
+                out.push(stage_set.clone());
                 locs.push(None);
                 out.push("    MOVWF PCLATH".to_string());
                 locs.push(None);
@@ -10696,23 +10897,33 @@ fn emit_const_section(
             "isel: const @{} table of {size} bytes exceeds the 65535-byte 16-bit index bound",
             g.name
         );
-        // `MOVLW HIGH` clobbers W, so the incoming index (W = byte index)
-        // is stashed in the fixed scratch byte (0x70, free at a const
-        // read) across the PCLATH set, then reloaded for the computed jump.
-        let reader = |out: &mut Vec<String>, locs: &mut Vec<Option<SrcLoc>>, base: &str| {
-            out.push(format!("    MOVWF 0x{:02X}", scratch));
-            locs.push(None);
-            out.push(format!("    MOVLW HIGH({base})"));
-            locs.push(None);
-            out.push("    MOVWF PCLATH".to_string());
-            locs.push(None);
-            out.push(format!("    MOVF 0x{:02X}, W", scratch));
-            locs.push(None);
-            out.push(format!("    ADDLW LOW({base})"));
-            locs.push(None);
-            out.push("    MOVWF PCL".to_string());
-            locs.push(None);
-        };
+        // A full entry parks the incoming index (W = byte index) in the
+        // fixed scratch byte across its own PCLATH set (`MOVLW HIGH`
+        // clobbers W), then reloads it for the computed jump. A short
+        // entry shares its base's page, so the caller's `HIGH(base)` set
+        // already holds the jump's page: the index jumps straight in.
+        let reader =
+            |out: &mut Vec<String>, locs: &mut Vec<Option<SrcLoc>>, base: &str, short: bool| {
+                if short {
+                    out.push(format!("    ADDLW LOW({base})"));
+                    locs.push(None);
+                    out.push("    MOVWF PCL".to_string());
+                    locs.push(None);
+                    return;
+                }
+                out.push(format!("    MOVWF 0x{scratch:02X}"));
+                locs.push(None);
+                out.push(format!("    MOVLW HIGH({base})"));
+                locs.push(None);
+                out.push("    MOVWF PCLATH".to_string());
+                locs.push(None);
+                out.push(format!("    MOVF 0x{scratch:02X}, W"));
+                locs.push(None);
+                out.push(format!("    ADDLW LOW({base})"));
+                locs.push(None);
+                out.push("    MOVWF PCL".to_string());
+                locs.push(None);
+            };
         // A pinned reader moves to the next page start: the `.org` pad keeps
         // the entry wholly in one page (epic-cc#844).
         let pin = |out: &mut Vec<String>, locs: &mut Vec<Option<SrcLoc>>, ch: &ChunkPlace| {
@@ -10731,7 +10942,7 @@ fn emit_const_section(
             pin(&mut out, &mut locs, &place.chunks[0]);
             out.push(format!("__read_{}:", g.name));
             locs.push(None);
-            reader(&mut out, &mut locs, &g.name);
+            reader(&mut out, &mut locs, &g.name, place.chunks[0].short);
             if place.chunks[0].align {
                 out.push("    .align 256".to_string());
                 locs.push(None);
@@ -10783,7 +10994,7 @@ fn emit_const_section(
                 pin(&mut out, &mut locs, &place.chunks[c]);
                 out.push(format!("{entry}:"));
                 locs.push(None);
-                reader(&mut out, &mut locs, &chunk_label);
+                reader(&mut out, &mut locs, &chunk_label, place.chunks[c].short);
             }
         } else {
             // Single-entry table (<= 255 bytes): a base that would cross
@@ -10794,7 +11005,7 @@ fn emit_const_section(
             pin(&mut out, &mut locs, &place.chunks[0]);
             out.push(format!("__read_{}:", g.name));
             locs.push(None);
-            reader(&mut out, &mut locs, &g.name);
+            reader(&mut out, &mut locs, &g.name, place.chunks[0].short);
             if place.chunks[0].align {
                 out.push("    .align 256".to_string());
                 locs.push(None);
@@ -11322,6 +11533,7 @@ pub fn select_with_opts(
                 bool_temps: HashSet::new(),
                 tmp: &mut tmp,
                 page_of: None,
+                short_bases: None,
                 pool_log: false,
                 pool_active,
                 pool_slots: HashSet::new(),
@@ -11557,6 +11769,7 @@ pub fn select_with_opts(
                     bool_temps: HashSet::new(),
                     tmp: &mut tmp2,
                     page_of: None,
+                    short_bases: None,
                     pool_log: false,
                     pool_active,
                     pool_slots: HashSet::new(),
@@ -11777,10 +11990,20 @@ pub fn select_with_opts(
             let banked = banking::assign_banks(device, &m2.join("\n"));
             let peeped = peephole::optimize(&banked);
             let (stage_actual, reader_actual) = measure_section_units(&peeped);
+            let want: HashMap<String, usize> = nominal
+                .iter()
+                .flat_map(|p| {
+                    p.chunks
+                        .iter()
+                        .enumerate()
+                        .map(|(c, ch)| (chunk_entry(&p.name, c), reader_len(ch.short)))
+                })
+                .collect();
             for (entry, words) in &reader_actual {
+                let want = want.get(entry).copied().unwrap_or(6);
                 assert!(
-                    *words == 6,
-                    "isel: const reader {entry} is {words} words post-banking, not 6"
+                    *words == want,
+                    "isel: const reader {entry} is {words} words post-banking, not {want}"
                 );
             }
             let mut lens = HashMap::new();
@@ -11804,6 +12027,11 @@ pub fn select_with_opts(
         for (entry, page) in reader_pages(&consts, staged, &staged_len, table_start) {
             pages.insert(entry, page);
         }
+        // Short-reader bases for pass-B callers, from the same placement
+        // (epic-cc#1080). The drift pin below re-anchors the section to
+        // this start when the measured start would decide differently,
+        // so the map always agrees with the emitted entries.
+        let short_map = short_entries(&place_consts(&consts, staged, &staged_len, table_start));
         // Pool log variant (epic-cc#817): emitted inside the callee's own
         // extent, so it shares the callee's page and routed same-page calls
         // elide the restore. Absent when the pool table stays out, like the variant.
@@ -11894,6 +12122,7 @@ pub fn select_with_opts(
                                 bool_temps: HashSet::new(),
                                 tmp: &mut tmp,
                                 page_of: Some(&pages),
+                                short_bases: Some(&short_map),
                                 pool_log: false,
                                 pool_active,
                                 pool_slots: HashSet::new(),
@@ -12005,10 +12234,20 @@ pub fn select_with_opts(
                 // re-anchors to the map-consistent `table_start`).
                 let pages_a = reader_pages(&consts, staged, &staged_len, table_start);
                 let pages_b = reader_pages(&consts, staged, &staged_len, start);
+                let shorts_a =
+                    short_entries(&place_consts(&consts, staged, &staged_len, table_start));
+                let shorts_b = short_entries(&place_consts(&consts, staged, &staged_len, start));
+                // A short decision flips exactly when an entry and its
+                // base stop sharing a page, which a base-page-only
+                // comparison can miss (an entry crossing alone). The
+                // pass-B callers already emitted against `shorts_a`, so
+                // any flip re-anchors to `table_start` like a page
+                // drift does.
                 let drift = pages_a
                     .iter()
                     .zip(&pages_b)
-                    .any(|((_, pa), (_, pb))| pa != pb);
+                    .any(|((_, pa), (_, pb))| pa != pb)
+                    || shorts_a != shorts_b;
                 if drift {
                     out.push(format!("    org 0x{table_start:04X}"));
                     locs.push(None);
