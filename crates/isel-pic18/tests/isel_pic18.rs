@@ -9919,6 +9919,452 @@ fn walk_refuses_two_accesses_to_one_pointer() {
 }
 
 #[test]
+fn nul_walk_scans_global_to_terminator_with_up_counter() {
+    // A `while (buf[i])` loop walks `POSTINC0` instead of re-seeding
+    // per byte: one `LFSR` up front, then a read plus the NUL test per
+    // step, with the counter kept in place for the exit read
+    // (epic-cc#1151).
+    let m = parse(
+        "global buf i8\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %g = gep @buf +0 +1*%i\n\
+             %v = load i8 %g\n\
+             %c = icmp eq i8 %v, 0\n\
+             %r = add i16 %i, 1\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             store i16 %i @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("out", 0x040),
+        ("main::i", 0x050),
+        ("main::v", 0x052),
+        ("main::r", 0x054),
+        ("main::c", 0x056),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("LFSR 0, 0x020"), "pointer seed:\n{asm}");
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(lp.contains("MOVF 0xFEE,W,A"), "walk reads POSTINC0:\n{lp}");
+    assert!(asm.contains("INCF 0x050,F,A"), "up-counter kept:\n{asm}");
+    assert!(!lp.contains("LFSR"), "no per-step seed:\n{lp}");
+    assert!(!lp.contains("MOVFF 0xFEF"), "no per-step INDF read:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    for (bytes, want) in [(b"hello\x00".as_slice(), 5), (b"\x00".as_slice(), 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        for (k, b) in bytes.iter().enumerate() {
+            p.ram_mut()[0x20 + k] = *b;
+        }
+        p.run(4000);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x40], want, "length of {bytes:?}");
+        assert_eq!(p.ram()[0x41], 0, "length fits one byte here");
+    }
+}
+
+#[test]
+fn nul_walk_seeds_param_pair_without_static_part() {
+    // The same scan over a pointer parameter copies the slot pair
+    // into the FSR instead of a literal seed: strlen's shape
+    // (epic-cc#1151).
+    let m = parse(
+        "global buf i8\n\
+         global out i16\n\
+         fn scan(i16) (p=ptr)\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %g = gep %p +0 +1*%i\n\
+             %v = load i8 %g\n\
+             %c = icmp eq i8 %v, 0\n\
+             %r = add i16 %i, 1\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             ret i16 %i\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %n = call i16 @scan(@buf)\n\
+             store i16 %n @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("out", 0x040),
+        ("scan::p", 0x050),
+        ("scan::i", 0x052),
+        ("scan::v", 0x054),
+        ("scan::r", 0x056),
+        ("scan::c", 0x058),
+        ("main::n", 0x05A),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let seed_site = block_section(&asm, "scan");
+    assert!(
+        seed_site.contains("MOVFF 0x050, 0xFE9"),
+        "seed copies the param pair in the preheader:\n{seed_site}"
+    );
+    let lp = block_section(&asm, "scan_Lloop");
+    assert!(lp.contains("MOVF 0xFEE,W,A"), "walk reads POSTINC0:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for (k, b) in b"hello\x00".iter().enumerate() {
+        p.ram_mut()[0x20 + k] = *b;
+    }
+    p.run(4000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x40], 5, "strlen of hello");
+    assert_eq!(p.ram()[0x41], 0, "length fits one byte here");
+}
+
+#[test]
+fn nul_walk_refuses_second_access_in_header() {
+    // A header richer than one load plus the latch (here a second
+    // read with an add/store consumer) keeps the normal lowering and
+    // still counts the right bytes (epic-cc#1151).
+    let m = parse(
+        "global buf i8\n\
+         global out i16\n\
+         global tmp i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %g = gep @buf +0 +1*%i\n\
+             %v = load i8 %g\n\
+             %h = gep @buf +1 +1*%i\n\
+             %w = load i8 %h\n\
+             %c = icmp eq i8 %v, 0\n\
+             %x = add i8 %v, %w\n\
+             %r = add i16 %i, 1\n\
+             store i8 %x @tmp\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             store i16 %i @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("out", 0x040),
+        ("tmp", 0x042),
+        ("main::i", 0x050),
+        ("main::v", 0x052),
+        ("main::h", 0x054),
+        ("main::w", 0x056),
+        ("main::c", 0x058),
+        ("main::x", 0x05A),
+        ("main::r", 0x05C),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(
+        !lp.contains("MOVF 0xFEE,W,A"),
+        "no NUL walk with two accesses:\n{lp}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for (k, b) in b"hi\x00".iter().enumerate() {
+        p.ram_mut()[0x20 + k] = *b;
+    }
+    p.run(4000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x40], 2, "length of hi");
+}
+
+#[test]
+fn stride_walk_tiles_two_accesses_over_step_four() {
+    // A step-4 counted loop reading a halfword at +0 and a byte at +3
+    // walks one pointer: the halfword reads two `POSTINC`s, the gap
+    // byte reads and discards, and the down-counter closes the 8 trips
+    // (epic-cc#1152).
+    let m = parse(
+        "global rec i8\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %iv = phi i16 %nv loop 0 entry\n\
+             %s = phi i16 %ns loop 0 entry\n\
+             %g0 = gep @rec +0 +1*%iv\n\
+             %id = load i16 %g0\n\
+             %a = add i16 %s, %id\n\
+             %g3 = gep @rec +3 +1*%iv\n\
+             %vv = load i8 %g3\n\
+             %x = zext i8 %vv to i16\n\
+             %ns = add i16 %a, %x\n\
+             %nv = add i16 %iv, 4\n\
+             %c = icmp eq i16 %nv, 32\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             store i16 %ns @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("rec", 0x020),
+        ("out", 0x040),
+        ("main::iv", 0x050),
+        ("main::s", 0x052),
+        ("main::id", 0x054),
+        ("main::a", 0x056),
+        ("main::vv", 0x058),
+        ("main::x", 0x05A),
+        ("main::ns", 0x05C),
+        ("main::nv", 0x05E),
+        ("main::c", 0x060),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("LFSR 0, 0x020"), "pointer seed:\n{asm}");
+    assert!(asm.contains("MOVLW 0x08"), "trip count:\n{asm}");
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(lp.contains("MOVF 0xFEE,W,A"), "dead gap skips:\n{lp}");
+    assert!(lp.contains("DECFSZ"), "down-counter latch:\n{lp}");
+    assert!(!lp.contains("LFSR"), "no per-step seed:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let mut want = 0u16;
+    for k in 0..8u16 {
+        let id = 0x100 + k;
+        let val = 0x10 + k;
+        p.ram_mut()[0x20 + usize::from(k * 4)] = (id & 0xFF) as u8;
+        p.ram_mut()[0x20 + usize::from(k * 4) + 1] = (id >> 8) as u8;
+        p.ram_mut()[0x20 + usize::from(k * 4) + 2] = 0xAA;
+        p.ram_mut()[0x20 + usize::from(k * 4) + 3] = val as u8;
+        want = want.wrapping_add(id + val);
+    }
+    p.run(8000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x40], (want & 0xFF) as u8, "sum low");
+    assert_eq!(p.ram()[0x41], (want >> 8) as u8, "sum high");
+}
+
+#[test]
+fn stride_walk_refuses_descending_access_order() {
+    // `POSTINC` only advances, so a later access behind the cursor
+    // keeps the normal lowering and still sums the right cells
+    // (epic-cc#1152).
+    let m = parse(
+        "global rec i8\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %iv = phi i16 %nv loop 0 entry\n\
+             %s = phi i16 %ns loop 0 entry\n\
+             %g3 = gep @rec +3 +1*%iv\n\
+             %vv = load i8 %g3\n\
+             %g0 = gep @rec +0 +1*%iv\n\
+             %id = load i16 %g0\n\
+             %x = zext i8 %vv to i16\n\
+             %a = add i16 %s, %x\n\
+             %ns = add i16 %a, %id\n\
+             %nv = add i16 %iv, 4\n\
+             %c = icmp eq i16 %nv, 32\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             store i16 %ns @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("rec", 0x020),
+        ("out", 0x040),
+        ("main::iv", 0x050),
+        ("main::s", 0x052),
+        ("main::vv", 0x054),
+        ("main::id", 0x056),
+        ("main::x", 0x058),
+        ("main::a", 0x05A),
+        ("main::ns", 0x05C),
+        ("main::nv", 0x05E),
+        ("main::c", 0x060),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(!lp.contains("DECFSZ"), "no stride latch:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let mut want = 0u16;
+    for k in 0..8u16 {
+        let id = 0x100 + k;
+        let val = 0x10 + k;
+        p.ram_mut()[0x20 + usize::from(k * 4)] = (id & 0xFF) as u8;
+        p.ram_mut()[0x20 + usize::from(k * 4) + 1] = (id >> 8) as u8;
+        p.ram_mut()[0x20 + usize::from(k * 4) + 2] = 0xAA;
+        p.ram_mut()[0x20 + usize::from(k * 4) + 3] = val as u8;
+        want = want.wrapping_add(id + val);
+    }
+    p.run(20000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x40], (want & 0xFF) as u8, "sum low");
+    assert_eq!(p.ram()[0x41], (want >> 8) as u8, "sum high");
+}
+
+#[test]
+fn ptr_walk_scans_two_pointers_to_mismatch_or_nul() {
+    // A dual `phi ptr` loop latched on `a == b && a != 0` walks both
+    // pointers: one `LFSR` each up front, latched `POSTINC` reads per
+    // step, the exit reading the last bytes (epic-cc#1151).
+    let m = parse(
+        "global s1 i8\n\
+         global s2 i8\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %p1 = phi ptr %b1 loop @s1 entry\n\
+             %p2 = phi ptr %b2 loop @s2 entry\n\
+             %a = load i8 %p1\n\
+             %b = load i8 %p2\n\
+             %e = icmp eq i8 %a, %b\n\
+             %z = icmp ne i8 %a, 0\n\
+             %c = and i1 %e, %z\n\
+             %b1 = gep %p1 +1\n\
+             %b2 = gep %p2 +1\n\
+             br i1 %c, loop, exit\n\
+           block exit:\n\
+             %x = zext i8 %a to i16\n\
+             %y = zext i8 %b to i16\n\
+             %d = sub i16 %x, %y\n\
+             store i16 %d @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("s1", 0x020),
+        ("s2", 0x030),
+        ("out", 0x040),
+        ("main::p1", 0x050),
+        ("main::p2", 0x052),
+        ("main::a", 0x054),
+        ("main::b", 0x055),
+        ("main::e", 0x056),
+        ("main::z", 0x057),
+        ("main::c", 0x058),
+        ("main::b1", 0x05A),
+        ("main::b2", 0x05C),
+        ("main::x", 0x05E),
+        ("main::y", 0x060),
+        ("main::d", 0x062),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("LFSR 0"), "first pointer seed:\n{asm}");
+    assert!(asm.contains("LFSR 1"), "second pointer seed:\n{asm}");
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(lp.contains("MOVFF 0xFEE"), "walk reads POSTINC0:\n{lp}");
+    assert!(lp.contains("MOVFF 0xFE6"), "walk reads POSTINC1:\n{lp}");
+    assert!(!lp.contains("LFSR"), "no per-step seed:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    // (s1, s2, want): equal, mismatch both signs, NUL either side.
+    let cases: &[(&[u8], &[u8], u16)] = &[
+        (b"hello\x00", b"hello\x00", 0),
+        (b"hexlo\x00", b"hello\x00", 0x000C),
+        (b"hello\x00", b"hexlo\x00", 0xFFF4),
+        (b"hi\x00", b"hix", 0xFF88),
+        (b"hix", b"hi\x00", 0x0078),
+    ];
+    for (s1, s2, want) in cases {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        for (k, b) in s1.iter().enumerate() {
+            p.ram_mut()[0x20 + k] = *b;
+        }
+        for (k, b) in s2.iter().enumerate() {
+            p.ram_mut()[0x30 + k] = *b;
+        }
+        p.run(4000);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(
+            p.ram()[0x40],
+            (want & 0xFF) as u8,
+            "diff low of {s1:?} {s2:?}"
+        );
+        assert_eq!(
+            p.ram()[0x41],
+            (want >> 8) as u8,
+            "diff high of {s1:?} {s2:?}"
+        );
+    }
+}
+
+#[test]
+fn ptr_walk_refuses_or_latch() {
+    // The latch must conjoin the legs: a disjunctive latch keeps the
+    // normal lowering and still compares the right bytes (epic-cc#1151).
+    let m = parse(
+        "global s1 i8\n\
+         global s2 i8\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %p1 = phi ptr %b1 loop @s1 entry\n\
+             %p2 = phi ptr %b2 loop @s2 entry\n\
+             %a = load i8 %p1\n\
+             %b = load i8 %p2\n\
+             %e = icmp eq i8 %a, %b\n\
+             %z = icmp ne i8 %a, 0\n\
+             %c = or i1 %e, %z\n\
+             %b1 = gep %p1 +1\n\
+             %b2 = gep %p2 +1\n\
+             br i1 %c, loop, exit\n\
+           block exit:\n\
+             %x = zext i8 %a to i16\n\
+             %y = zext i8 %b to i16\n\
+             %d = sub i16 %x, %y\n\
+             store i16 %d @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("s1", 0x020),
+        ("s2", 0x030),
+        ("out", 0x040),
+        ("main::p1", 0x050),
+        ("main::p2", 0x052),
+        ("main::a", 0x054),
+        ("main::b", 0x055),
+        ("main::e", 0x056),
+        ("main::z", 0x057),
+        ("main::c", 0x058),
+        ("main::b1", 0x05A),
+        ("main::b2", 0x05C),
+        ("main::x", 0x05E),
+        ("main::y", 0x060),
+        ("main::d", 0x062),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVFF 0xFEE") && !asm.contains("MOVFF 0xFE6"),
+        "no pointer walk on an or latch:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    // Inputs that exit on the first step (a NUL against a nonzero
+    // byte fails both legs), so the verdict needs no walk reasoning.
+    p.ram_mut()[0x20] = 0;
+    p.ram_mut()[0x30] = 0x78;
+    p.run(4000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x40], 0x88, "0 - 0x78 low");
+    assert_eq!(p.ram()[0x41], 0xFF, "0 - 0x78 high");
+}
+
+#[test]
 fn walk_refuses_down_loop_with_indexed_access() {
     // A down-counting loop visits base+k down while the walk visits
     // base+k+0 up, so indexed down loops keep the normal lowering and

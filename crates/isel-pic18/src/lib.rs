@@ -253,6 +253,16 @@ enum WalkOp {
         fsr: u8,
         loc: Option<SrcLoc>,
     },
+    /// Two-byte load for strided walks: two `POSTINC` reads into a slot
+    /// pair, low byte first.
+    Load16 {
+        slot_lo: u16,
+        fsr: u8,
+        loc: Option<SrcLoc>,
+    },
+    /// Dead stride byte: a `POSTINC` read discarded from `W`, keeping the
+    /// pointer on the tiling the accesses proved.
+    Skip { fsr: u8 },
 }
 /// A byte source for a walk store: a RAM address read with `MOVFF`, or a
 /// literal for the op's literal position (`MOVLW` for plain stores, the
@@ -271,6 +281,53 @@ enum WalkAdd {
     PostInc,
     Direct(Val),
     ViaTrunc(usize, Val),
+}
+/// A NUL-terminated single-block byte loop (epic-cc#1151): `while (base[i])`
+/// with an integer counter becomes a preheader seed plus a body that reads
+/// `POSTINC` and exits on the NUL. The counter stays a real up-count (kept
+/// in its home, exit reads stay sound), so only the address recompute and
+/// the latch collapse. Strlen is the kernel; strcmp needs two pointers.
+#[derive(Clone)]
+struct NulWalk {
+    preheader: String,
+    exit: String,
+    /// Counter phi reg (i8/i16): filtered from backedge copies, its slot
+    /// carries the in-place increment.
+    idx: String,
+    /// Counter width in bytes: one `INCF`, or the pair with the Z-tested
+    /// carry into the high home.
+    width: u8,
+    /// Counter low-byte slot address.
+    count_slot: u16,
+    seed: NulSeed,
+    /// True when the back edge is taken with Z set (the latch tested
+    /// equal against zero there).
+    cont_on_zero: bool,
+}
+/// A NUL walk's pointer seed: a static address for globals and frame
+/// arrays, or a param slot pair holding the base for pointer params.
+#[derive(Clone)]
+enum NulSeed {
+    Imm(u16),
+    SlotPair(u16),
+}
+/// A two-pointer data-exit loop (epic-cc#1151): `strcmp`'s shape, two
+/// `phi ptr` bumped in place with the exit reading the last bytes.
+/// Seeds ride the FSRs; the pointer homes keep only dead init copies.
+#[derive(Clone)]
+struct PtrWalk {
+    preheader: String,
+    exit: String,
+    /// `(phi, fsr, seed)` in FSR order: FSR0 then FSR1.
+    ptrs: [(String, u8, u16); 2],
+    /// Load homes in FSR order: the exit block reads the last bytes.
+    slots: [u16; 2],
+    /// Exit when Z is set after the `a-b` subtract (the equality leg
+    /// demanded `ne`), else when clear.
+    ab_exit_on_z: bool,
+    /// Zero-tested load home, and whether its leg exits on Z.
+    r_slot: u16,
+    r_exit_on_z: bool,
 }
 
 struct Gen<'m> {
@@ -3440,6 +3497,9 @@ impl<'m> Gen<'m> {
             match op {
                 WalkOp::Emit(_) => {}
                 WalkOp::Load { fsr, .. } => hits[*fsr as usize] += 1,
+                // Strided plans bypass this epilogue (they tile in their
+                // own scan), so these arms only keep the match exhaustive.
+                WalkOp::Load16 { fsr, .. } | WalkOp::Skip { fsr } => hits[*fsr as usize] += 1,
                 WalkOp::Store { fsr, .. } | WalkOp::StoreVal { fsr, .. } => {
                     hits[*fsr as usize] += 1;
                 }
@@ -3499,6 +3559,21 @@ impl<'m> Gen<'m> {
                 WalkOp::Load { slot, fsr, loc, .. } => {
                     self.cur_loc = loc.clone();
                     self.emit(format!("    MOVFF 0x{:03X}, 0x{slot:03X}", postinc(*fsr)));
+                }
+                WalkOp::Load16 { slot_lo, fsr, loc } => {
+                    self.cur_loc = loc.clone();
+                    self.emit(format!(
+                        "    MOVFF 0x{:03X}, 0x{slot_lo:03X}",
+                        postinc(*fsr)
+                    ));
+                    self.emit(format!(
+                        "    MOVFF 0x{:03X}, 0x{:03X}",
+                        postinc(*fsr),
+                        slot_lo.wrapping_add(1)
+                    ));
+                }
+                WalkOp::Skip { fsr } => {
+                    self.emit(format!("    MOVF 0x{:03X},W,A", postinc(*fsr)));
                 }
                 WalkOp::Store { src, fsr, loc, .. } => {
                     self.cur_loc = loc.clone();
@@ -3577,6 +3652,1264 @@ impl<'m> Gen<'m> {
         }
         self.emit(format!("    MOVLW 0x{:02X}", plan.k as u8));
         self.emit_w_store(plan.count_slot);
+    }
+    /// Per-function NUL-walk pre-scan: headers shaped `while (base[i])`
+    /// with a lone integer counter. Runs with the counted scan, over the
+    /// same claim sets, so a loop both shapes accept stays counted (the
+    /// down-counter latch is cheaper than test-plus-branch).
+    fn find_nul_walks(g: &Gen, f: &Func) -> HashMap<String, NulWalk> {
+        let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut order: HashMap<&str, usize> = HashMap::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            order.insert(b.label.as_str(), bi);
+            let targets: Vec<&str> = match b.insts.last() {
+                Some(Inst::Br(br)) => vec![br.target.as_str()],
+                Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+                _ => vec![],
+            };
+            for t in targets {
+                preds.entry(t).or_default().push(b.label.as_str());
+            }
+        }
+        let mut uses: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        for b in &f.blocks {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() || r.starts_with('@') {
+                        continue;
+                    }
+                    uses.entry(r).or_default().push((b.label.clone(), ii));
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        for b in &f.blocks {
+            if let Some(plan) = Self::nul_plan_for(g, f, b, &preds, &order, &uses) {
+                out.insert(b.label.clone(), plan);
+            }
+        }
+        out
+    }
+    /// One header block's NUL plan, or `None` on the first failed check.
+    /// The body holds exactly one phi (the counter), one GEP, one byte
+    /// load, the counter increment, and the NUL latch: anything else (a
+    /// carried sum, a second access) keeps the normal arms.
+    fn nul_plan_for(
+        g: &Gen,
+        f: &Func,
+        b: &Block,
+        preds: &HashMap<&str, Vec<&str>>,
+        order: &HashMap<&str, usize>,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+    ) -> Option<NulWalk> {
+        let last = b.insts.len().checked_sub(1)?;
+        let bc = match &b.insts[last] {
+            Inst::BrCond(bc) => bc,
+            _ => return None,
+        };
+        if bc.t == bc.f {
+            return None;
+        }
+        let back_to_t = bc.t == b.label;
+        let back_to_f = bc.f == b.label;
+        if back_to_t == back_to_f {
+            return None;
+        }
+        let exit = if back_to_t {
+            bc.f.clone()
+        } else {
+            bc.t.clone()
+        };
+        let Val::Reg(cond) = &bc.cond else {
+            return None;
+        };
+        if last < 2 {
+            return None;
+        }
+        // The latch tests the loaded byte against zero, so the walk reads
+        // it straight from `W` with no home and drops the compare. It sits
+        // wherever clang left it (before or after the increment); dataflow,
+        // not position, ties it to the load.
+        let mut latch_ii = None;
+        for (ii, inst) in b.insts.iter().enumerate().take(last) {
+            if matches!(inst, Inst::Icmp(c) if c.dst == *cond) {
+                if latch_ii.is_some() {
+                    return None;
+                }
+                latch_ii = Some(ii);
+            }
+        }
+        let latch_ii = latch_ii?;
+        let latch = match &b.insts[latch_ii] {
+            Inst::Icmp(c) if c.pred == "eq" || c.pred == "ne" => c.clone(),
+            _ => return None,
+        };
+        if uses.get(&latch.dst).map(|v| v.len()) != Some(1) {
+            return None;
+        }
+        let loadreg = match (&latch.a, &latch.b) {
+            (Val::Reg(r), Val::Const(0)) | (Val::Const(0), Val::Reg(r)) => r.clone(),
+            _ => return None,
+        };
+        let mut phi_ii = None;
+        let mut gep_ii = None;
+        let mut load_ii = None;
+        let mut inc_ii = None;
+        for (ii, inst) in b.insts.iter().enumerate().take(last) {
+            if ii == latch_ii {
+                continue;
+            }
+            match inst {
+                Inst::Phi(_) => {
+                    if phi_ii.is_some() {
+                        return None;
+                    }
+                    phi_ii = Some(ii);
+                }
+                Inst::Gep(_) => {
+                    if gep_ii.is_some() {
+                        return None;
+                    }
+                    gep_ii = Some(ii);
+                }
+                Inst::Load(_) => {
+                    if load_ii.is_some() {
+                        return None;
+                    }
+                    load_ii = Some(ii);
+                }
+                Inst::Bin(_) => {
+                    if inc_ii.is_some() {
+                        return None;
+                    }
+                    inc_ii = Some(ii);
+                }
+                _ => return None,
+            }
+        }
+        let (phi_ii, gep_ii, load_ii, inc_ii) = match (phi_ii, gep_ii, load_ii, inc_ii) {
+            (Some(p), Some(gp), Some(l), Some(i)) => (p, gp, l, i),
+            _ => return None,
+        };
+        let cntreg = match &b.insts[phi_ii] {
+            Inst::Phi(p) => {
+                if !(p.ty.bytes() == 1 || p.ty.bytes() == 2) || p.ptr {
+                    return None;
+                }
+                if p.incoming.len() != 2 {
+                    return None;
+                }
+                p.clone()
+            }
+            _ => return None,
+        };
+        let width = cntreg.ty.bytes();
+        let gep = match &b.insts[gep_ii] {
+            Inst::Gep(gp) => gp.clone(),
+            _ => return None,
+        };
+        // The load is the walk's read: a plain byte through the header
+        // GEP, feeding only the latch.
+        match &b.insts[load_ii] {
+            Inst::Load(l) => {
+                if l.dst != loadreg || l.ty.bytes() != 1 || l.ptr_ty || l.volatile {
+                    return None;
+                }
+                if l.ptr != format!("%{}", gep.dst) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        if uses.get(&loadreg) != Some(&vec![(b.label.clone(), latch_ii)]) {
+            return None;
+        }
+        if uses.get(&gep.dst).map(|v| v.as_slice()) != Some(&[(b.label.clone(), load_ii)][..]) {
+            return None;
+        }
+        // The increment feeds the backedge alone: the walk keeps it in
+        // the counter home, so no reader may name the incremented value.
+        let increg = match &b.insts[inc_ii] {
+            Inst::Bin(q) => {
+                if q.ty.bytes() != width {
+                    return None;
+                }
+                let ok = match (&q.op, &q.a, &q.b) {
+                    (ir::BinOp::Add, Val::Reg(c), Val::Const(1)) => c == &cntreg.dst,
+                    (ir::BinOp::Add, Val::Const(1), Val::Reg(c)) => c == &cntreg.dst,
+                    _ => false,
+                };
+                if !ok || q.dst == cntreg.dst {
+                    return None;
+                }
+                q.dst.clone()
+            }
+            _ => return None,
+        };
+        if uses
+            .get(&increg)
+            .is_some_and(|u| u != &vec![(b.label.clone(), phi_ii)])
+        {
+            return None;
+        }
+        let mut back_ok = false;
+        let mut pre: Option<String> = None;
+        let mut init_c: Option<i64> = None;
+        for (v, e) in &cntreg.incoming {
+            if e == &b.label {
+                let bv = g.fold_reg(v);
+                if bv != Val::Reg(cntreg.dst.clone()) && bv != Val::Reg(increg.clone()) {
+                    return None;
+                }
+                back_ok = true;
+            } else {
+                if pre.is_some() {
+                    return None;
+                }
+                let init = match v {
+                    Val::Const(c) => *c,
+                    _ => match g.fold_reg(v) {
+                        Val::Const(c) => c,
+                        _ => return None,
+                    },
+                };
+                init_c = Some(init);
+                pre = Some(e.clone());
+            }
+        }
+        if !back_ok {
+            return None;
+        }
+        let init_c = init_c?;
+        let pre = pre?;
+        if pre == b.label || pre == exit {
+            return None;
+        }
+        // A second increment folded into the counter home would compute
+        // into it mid-loop and corrupt the walk's in-place count.
+        if g.phi_fold.get(&increg).is_some_and(|p| p != &cntreg.dst) {
+            return None;
+        }
+        for inst in &b.insts {
+            if let Inst::Bin(q) = inst {
+                if q.dst != increg && g.phi_fold.get(&q.dst).is_some_and(|p| p == &cntreg.dst) {
+                    return None;
+                }
+            }
+        }
+        let pre_block = f.blocks.iter().find(|x| x.label == pre)?;
+        if !matches!(&pre_block.insts.last(), Some(Inst::Br(br)) if br.target == b.label) {
+            return None;
+        }
+        let (Some(&pi), Some(&hi)) = (order.get(pre.as_str()), order.get(b.label.as_str())) else {
+            return None;
+        };
+        if pi >= hi {
+            return None;
+        }
+        match preds.get(b.label.as_str()) {
+            Some(ps)
+                if ps.len() == 2
+                    && ps.contains(&pre.as_str())
+                    && ps.contains(&b.label.as_str()) => {}
+            _ => return None,
+        }
+        // The counter keeps its value on every path, so exit-block
+        // readers stay sound; any other stray reader refuses the walk.
+        let here = |ii: usize| (b.label.clone(), ii);
+        let allowed: HashSet<(String, usize)> =
+            HashSet::from([here(phi_ii), here(inc_ii), here(gep_ii)]);
+        if uses
+            .get(&cntreg.dst)
+            .is_some_and(|u| u.iter().any(|s| !allowed.contains(s) && s.0 != exit))
+        {
+            return None;
+        }
+        let count_slot = *g.addrs.get(&iselcore::ssa_key(&f.name, &cntreg.dst))?;
+        let seed = Self::nul_seed(g, f, &gep.dst, &cntreg.dst, init_c)?;
+        Some(NulWalk {
+            preheader: pre,
+            exit,
+            idx: cntreg.dst,
+            width,
+            count_slot,
+            seed,
+            cont_on_zero: back_to_t == (latch.pred == "eq"),
+        })
+    }
+    /// Resolves a NUL walk's pointer seed: a static address for data
+    /// globals and frame arrays, or the param slot pair for a pointer
+    /// base. The counted walk only serves globals; NUL loops over a
+    /// parameter (strlen) are the kernel, so slots join here.
+    fn nul_seed(g: &Gen, f: &Func, gep_dst: &str, cntreg: &str, init_c: i64) -> Option<NulSeed> {
+        let key = iselcore::ssa_key(&f.name, gep_dst);
+        if g.prov.flash.contains(&key) || g.prov.mixed.contains(&key) {
+            return None;
+        }
+        let (base, k, terms) = g.resolved.get(&key)?.clone();
+        // The walk visits base+k+init upward one byte per trip, so only
+        // the pre-increment counter indexes it; any other term walks a
+        // different sequence.
+        if terms.len() != 1 || terms[0].0 != 1 || terms[0].1 != cntreg {
+            return None;
+        }
+        let first = init_c.wrapping_add(i64::from(k)) as u16;
+        match &base {
+            Base::Global(name) => {
+                if g.global_is_const(name) {
+                    return None;
+                }
+                Some(NulSeed::Imm(g.global_addr(name).wrapping_add(first)))
+            }
+            Base::Slot(sname, indirect) => {
+                let holds_addr = *indirect
+                    || g.m
+                        .funcs
+                        .iter()
+                        .find(|fu| fu.name == f.name)
+                        .map(|fu| fu.params.iter().any(|p| p.name == *sname && p.ptr))
+                        .unwrap_or(false);
+                if holds_addr {
+                    // The runtime address rides in the slot pair; folding
+                    // a nonzero static part needs an add the seed skips,
+                    // so only a zero-based walk qualifies.
+                    if k != 0 || init_c != 0 {
+                        return None;
+                    }
+                    let lo = *g.addrs.get(&iselcore::ssa_key(&f.name, sname))?;
+                    Some(NulSeed::SlotPair(lo))
+                } else {
+                    let lo = *g.addrs.get(&iselcore::ssa_key(&f.name, sname))?;
+                    Some(NulSeed::Imm(lo.wrapping_add(first)))
+                }
+            }
+        }
+    }
+    /// Emits a NUL walk's preheader seed after the edge's phi copies:
+    /// one `LFSR` for a static base, or the param pair copied into the
+    /// FSR. The counter init rides the normal edge copies, which the
+    /// call site keeps whole (unlike the counted walk's home-managed
+    /// counter).
+    fn emit_nul_seeds(&mut self, plan: &NulWalk) {
+        match plan.seed {
+            NulSeed::Imm(a) => {
+                self.emit(format!("    LFSR 0, 0x{:03X}", a & 0xFFF));
+            }
+            NulSeed::SlotPair(lo) => {
+                self.emit(format!("    MOVFF 0x{lo:03X}, 0xFE9"));
+                self.emit(format!("    MOVFF 0x{:03X}, 0xFEA", lo.wrapping_add(1)));
+            }
+        }
+        self.fsr0_holds = None;
+    }
+    /// Emits a NUL walk's header: the `POSTINC` read with the NUL test
+    /// branching over the exit copies, then the carried backedge copies
+    /// and the in-place counter increment before looping back. The test
+    /// precedes the increment, so the exiting iteration leaves the
+    /// counter holding the trip count the exit block reads.
+    fn emit_nul_loop(
+        &mut self,
+        plan: &NulWalk,
+        head: &str,
+        exit: &str,
+        back_copies: &[(String, Ty, Val)],
+        exit_copies: &[(String, Ty, Val)],
+        back_dom: bool,
+        exit_dom: bool,
+    ) {
+        self.emit("    MOVF 0xFEE,W,A".to_string());
+        let cont = self.fresh_label();
+        if plan.cont_on_zero {
+            self.emit(format!("    BZ {cont}"));
+        } else {
+            self.emit(format!("    BNZ {cont}"));
+        }
+        emit_phi_copies(self, exit_copies, exit_dom);
+        self.emit(format!("    BRA {exit}"));
+        self.emit_label(&cont);
+        let live_back: Vec<(String, Ty, Val)> = back_copies
+            .iter()
+            .filter(|(dst, _, _)| *dst != plan.idx)
+            .cloned()
+            .collect();
+        emit_phi_copies(self, &live_back, back_dom);
+        self.bsr_dirty = false;
+        self.emit_banked("INCF", plan.count_slot, ",F");
+        if plan.width == 2 {
+            self.emit("    BTFSC 0xFD8,2,A".to_string());
+            self.emit_banked("INCF", plan.count_slot.wrapping_add(1), ",F");
+        }
+        self.emit(format!("    BRA {head}"));
+        self.fsr0_holds = None;
+    }
+    /// Per-function strided-walk pre-scan (epic-cc#1152): counted loops
+    /// stepping 2..=8 over one pointer whose accesses tile the stride.
+    /// Builds a `WalkLoop` directly, so the counted scan and its proofs
+    /// stay untouched; the shared seeds, latch, and edge copies emit it.
+    fn find_stride_walks(g: &Gen, f: &Func) -> HashMap<String, WalkLoop> {
+        let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut order: HashMap<&str, usize> = HashMap::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            order.insert(b.label.as_str(), bi);
+            let targets: Vec<&str> = match b.insts.last() {
+                Some(Inst::Br(br)) => vec![br.target.as_str()],
+                Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+                _ => vec![],
+            };
+            for t in targets {
+                preds.entry(t).or_default().push(b.label.as_str());
+            }
+        }
+        let mut uses: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        for b in &f.blocks {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() || r.starts_with('@') {
+                        continue;
+                    }
+                    uses.entry(r).or_default().push((b.label.clone(), ii));
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        for b in &f.blocks {
+            if let Some(plan) = Self::stride_plan_for(g, f, b, &preds, &order, &uses) {
+                out.insert(b.label.clone(), plan);
+            }
+        }
+        out
+    }
+    /// One header block's stride plan, or `None` on the first failed
+    /// check. The latch steps the counter by the stride; every load
+    /// tiles it in IR order, gaps filled with dead skips. Anything else
+    /// (stores, a second pointer, untiled offsets) keeps the old arms.
+    fn stride_plan_for(
+        g: &Gen,
+        f: &Func,
+        b: &Block,
+        preds: &HashMap<&str, Vec<&str>>,
+        order: &HashMap<&str, usize>,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+    ) -> Option<WalkLoop> {
+        let last = b.insts.len().checked_sub(1)?;
+        let bc = match &b.insts[last] {
+            Inst::BrCond(bc) => bc,
+            _ => return None,
+        };
+        if bc.t == bc.f {
+            return None;
+        }
+        let exit = if bc.t == b.label {
+            bc.f.clone()
+        } else if bc.f == b.label {
+            bc.t.clone()
+        } else {
+            return None;
+        };
+        let Val::Reg(cond) = &bc.cond else {
+            return None;
+        };
+        if last == 0 {
+            return None;
+        }
+        let latch = match &b.insts[last - 1] {
+            Inst::Icmp(c) if c.dst == *cond && c.pred == "eq" => c.clone(),
+            _ => return None,
+        };
+        if uses.get(&latch.dst).map(|v| v.len()) != Some(1) {
+            return None;
+        }
+        let (increg, bound) = match (&latch.a, &latch.b) {
+            (Val::Reg(r), Val::Const(c)) | (Val::Const(c), Val::Reg(r)) => (r.clone(), *c),
+            _ => return None,
+        };
+        let inc_pos = b
+            .insts
+            .iter()
+            .position(|i| matches!(i, Inst::Bin(q) if q.dst == increg))?;
+        let incb = match &b.insts[inc_pos] {
+            Inst::Bin(q) => q.clone(),
+            _ => return None,
+        };
+        // Up by the stride only: a step of 1 belongs to the counted
+        // scan, and a down walk visits the wrong order for tiling.
+        let (cntreg, stride) = match (&incb.op, &incb.a, &incb.b) {
+            (ir::BinOp::Add, Val::Reg(q), Val::Const(s))
+            | (ir::BinOp::Add, Val::Const(s), Val::Reg(q))
+                if *s >= 2 && *s <= 8 =>
+            {
+                (q.clone(), *s as u16)
+            }
+            _ => return None,
+        };
+        if cntreg == increg {
+            return None;
+        }
+        let phi = b.insts.iter().find_map(|i| match i {
+            Inst::Phi(p) if p.dst == cntreg => Some(p.clone()),
+            _ => None,
+        })?;
+        if !(phi.ty.bytes() == 1 || phi.ty.bytes() == 2) || phi.ptr {
+            return None;
+        }
+        if phi.incoming.len() != 2 {
+            return None;
+        }
+        let mut back_ok = false;
+        let mut pre: Option<String> = None;
+        let mut init_c: Option<i64> = None;
+        for (v, e) in &phi.incoming {
+            if e == &b.label {
+                let bv = g.fold_reg(v);
+                if bv != Val::Reg(cntreg.clone()) && bv != Val::Reg(increg.clone()) {
+                    return None;
+                }
+                back_ok = true;
+            } else {
+                if pre.is_some() {
+                    return None;
+                }
+                let init = match v {
+                    Val::Const(c) => *c,
+                    _ => match g.fold_reg(v) {
+                        Val::Const(c) => c,
+                        _ => return None,
+                    },
+                };
+                init_c = Some(init);
+                pre = Some(e.clone());
+            }
+        }
+        if !back_ok || init_c != Some(0) {
+            return None;
+        }
+        // Whole trips only: a partial last stride would walk short.
+        if bound <= 0 || bound % i64::from(stride) != 0 {
+            return None;
+        }
+        let trips = bound / i64::from(stride);
+        if !(1..=255).contains(&trips) {
+            return None;
+        }
+        let pre = pre?;
+        if pre == b.label || pre == exit {
+            return None;
+        }
+        if g.phi_fold.get(&increg).is_some_and(|p| p != &cntreg) {
+            return None;
+        }
+        for inst in &b.insts {
+            if let Inst::Bin(q) = inst {
+                if q.dst != increg && g.phi_fold.get(&q.dst).is_some_and(|p| p == &cntreg) {
+                    return None;
+                }
+            }
+        }
+        let pre_block = f.blocks.iter().find(|x| x.label == pre)?;
+        if !matches!(&pre_block.insts.last(), Some(Inst::Br(br)) if br.target == b.label) {
+            return None;
+        }
+        let (Some(&pi), Some(&hi)) = (order.get(pre.as_str()), order.get(b.label.as_str())) else {
+            return None;
+        };
+        if pi >= hi {
+            return None;
+        }
+        match preds.get(b.label.as_str()) {
+            Some(ps)
+                if ps.len() == 2
+                    && ps.contains(&pre.as_str())
+                    && ps.contains(&b.label.as_str()) => {}
+            _ => return None,
+        }
+        let count_slot = *g.addrs.get(&iselcore::ssa_key(&f.name, &cntreg))?;
+        Self::stride_body(
+            g,
+            f,
+            b,
+            uses,
+            pre,
+            exit,
+            cntreg,
+            increg,
+            stride,
+            trips as u16,
+            count_slot,
+        )
+    }
+    /// Stride body scan: validates every inst, tiles the accesses, and
+    /// proves the counter feeds only the pattern. Pure ALU (including
+    /// widenings) emits normally against the walked slots; the latch,
+    /// the increment, and the GEPs go dead.
+    fn stride_body(
+        g: &Gen,
+        f: &Func,
+        b: &Block,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+        pre: String,
+        exit: String,
+        cntreg: String,
+        increg: String,
+        stride: u16,
+        trips: u16,
+        count_slot: u16,
+    ) -> Option<WalkLoop> {
+        let last = b.insts.len() - 1;
+        let latch_ii = last - 1;
+        let inc_ii = b
+            .insts
+            .iter()
+            .position(|i| matches!(i, Inst::Bin(q) if q.dst == increg))?;
+        let phi_ii = b
+            .insts
+            .iter()
+            .position(|i| matches!(i, Inst::Phi(p) if p.dst == cntreg))?;
+        let width = match &b.insts[phi_ii] {
+            Inst::Phi(p) => p.ty.bytes(),
+            _ => return None,
+        };
+        match &b.insts[inc_ii] {
+            Inst::Bin(q) if q.ty.bytes() == width => {}
+            _ => return None,
+        }
+        let latch_dst = match &b.insts[latch_ii] {
+            Inst::Icmp(c) => c.dst.clone(),
+            _ => return None,
+        };
+        let mut body: Vec<WalkOp> = Vec::new();
+        let mut gep_dsts: Vec<String> = Vec::new();
+        for inst in &b.insts {
+            if let Inst::Gep(gp) = inst {
+                gep_dsts.push(gp.dst.clone());
+            }
+        }
+        let mut load_sites: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut load_dsts: Vec<String> = Vec::new();
+        let mut base: Option<u16> = None;
+        let mut cursor: u16 = 0;
+        let mut stage_pairs: usize = 0;
+        let here = |ii: usize| (b.label.clone(), ii);
+        for (ii, inst) in b.insts.iter().enumerate() {
+            if ii == last || ii == latch_ii || ii == inc_ii {
+                continue;
+            }
+            match inst {
+                Inst::Phi(p) => {
+                    if p.dst == cntreg {
+                        continue;
+                    }
+                    // A carried reduction stays only when its arms never
+                    // name a dropped value: the increment, the latch, or
+                    // an address the walk consumes. The counter proof
+                    // below already bars the counter itself.
+                    for (v, _) in &p.incoming {
+                        if let Val::Reg(r) = v {
+                            if r == &increg || r == &latch_dst || gep_dsts.contains(r) {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                Inst::Gep(_) => {}
+                Inst::Bin(q) => {
+                    if !Self::walk_plain_bin(q) {
+                        return None;
+                    }
+                    // The increment is skipped above, so any remaining
+                    // counter read would observe the down-counter.
+                    if ir::read_vals(inst)
+                        .iter()
+                        .any(|r| r == &cntreg || r == &increg)
+                    {
+                        return None;
+                    }
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Trunc(t) => {
+                    if ir::read_vals(inst)
+                        .iter()
+                        .any(|r| r == &cntreg || r == &increg)
+                    {
+                        return None;
+                    }
+                    stage_pairs += usize::from(t.to.bytes());
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Zext(z) => {
+                    if ir::read_vals(inst)
+                        .iter()
+                        .any(|r| r == &cntreg || r == &increg)
+                    {
+                        return None;
+                    }
+                    stage_pairs += usize::from(z.to.bytes());
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Sext(s) => {
+                    if ir::read_vals(inst)
+                        .iter()
+                        .any(|r| r == &cntreg || r == &increg)
+                    {
+                        return None;
+                    }
+                    stage_pairs += usize::from(s.to.bytes());
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Icmp(_) => {
+                    if ir::read_vals(inst)
+                        .iter()
+                        .any(|r| r == &cntreg || r == &increg)
+                    {
+                        return None;
+                    }
+                    stage_pairs += 1;
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Select(s) => {
+                    if ir::read_vals(inst)
+                        .iter()
+                        .any(|r| r == &cntreg || r == &increg)
+                    {
+                        return None;
+                    }
+                    stage_pairs += usize::from(s.ty.bytes());
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Load(l) => {
+                    if l.ptr.starts_with('@') || l.ptr_ty || l.volatile {
+                        return None;
+                    }
+                    if l.ty.bytes() != 1 && l.ty.bytes() != 2 {
+                        return None;
+                    }
+                    if g.lane_consumed.contains(&l.dst)
+                        || g.w_folds.loads.contains_key(&l.dst)
+                        || g.bin_w_srcs.contains(&l.dst)
+                        || g.tablat_fwd.contains(&l.dst)
+                        || g.store_fwd.contains_key(&l.dst)
+                        || g.store_consumed.contains(&l.dst)
+                    {
+                        return None;
+                    }
+                    let (rel, fsr) = Self::stride_memop(g, f, &cntreg, &mut base, &l.ptr)?;
+                    let key = l.ptr.strip_prefix('%').unwrap_or(&l.ptr).to_string();
+                    load_sites.entry(key).or_default().push(ii);
+                    load_dsts.push(l.dst.clone());
+                    let w = l.ty.bytes();
+                    // Tiling runs in IR order: `POSTINC` only advances,
+                    // so an access behind the cursor is unservable and a
+                    // gap ahead fills with dead skips. The stride cap
+                    // bounds the skip run.
+                    if rel < cursor {
+                        return None;
+                    }
+                    for _ in cursor..rel {
+                        body.push(WalkOp::Skip { fsr });
+                    }
+                    cursor = rel + u16::from(w);
+                    if cursor > stride {
+                        return None;
+                    }
+                    let slot = *g.addrs.get(&iselcore::ssa_key(&f.name, &l.dst))?;
+                    if w == 1 {
+                        body.push(WalkOp::Load {
+                            slot,
+                            fsr,
+                            dst: l.dst.clone(),
+                            loc: l.loc.clone(),
+                        });
+                    } else {
+                        body.push(WalkOp::Load16 {
+                            slot_lo: slot,
+                            fsr,
+                            loc: l.loc.clone(),
+                        });
+                    }
+                }
+                _ => return None,
+            }
+        }
+        // The tiling must consume the whole stride: a short last step
+        // would leave the pointer behind for the next trip.
+        let base = base?;
+        if cursor != stride {
+            return None;
+        }
+        // GEPs feed only the walk loads that name them.
+        for (ptr, sites) in &load_sites {
+            let ok = uses
+                .get(ptr)
+                .is_some_and(|u| u.iter().all(|s| s.0 == b.label && sites.contains(&s.1)));
+            if !ok {
+                return None;
+            }
+        }
+        let mut cnt_allowed: HashSet<(String, usize)> = HashSet::from([here(phi_ii), here(inc_ii)]);
+        for (ii, inst) in b.insts.iter().enumerate() {
+            if matches!(inst, Inst::Gep(_)) {
+                cnt_allowed.insert(here(ii));
+            }
+        }
+        if uses
+            .get(&cntreg)
+            .is_some_and(|u| !u.iter().all(|s| cnt_allowed.contains(s)))
+        {
+            return None;
+        }
+        if uses
+            .get(&increg)
+            .is_some_and(|u| !u.iter().all(|s| *s == here(phi_ii) || *s == here(latch_ii)))
+        {
+            return None;
+        }
+        // Walked bytes stay sound wherever the normal lowering serves
+        // them: the header reads the current step, the exit the last.
+        for dst in &load_dsts {
+            if uses
+                .get(dst)
+                .is_some_and(|u| u.iter().any(|s| s.0 != b.label && s.0 != exit))
+            {
+                return None;
+            }
+        }
+        let mut pairs = stage_pairs;
+        for inst in &b.insts {
+            if let Inst::Phi(p) = inst {
+                if p.dst != cntreg {
+                    pairs += usize::from(p.ty.bytes());
+                }
+            }
+        }
+        if pairs >= COPY_LOOP_MIN_PAIRS {
+            return None;
+        }
+        Some(WalkLoop {
+            preheader: pre,
+            exit,
+            idx: cntreg,
+            k: trips,
+            count_slot,
+            ptrs: vec![WalkPtr { fsr: 0, seed: base }],
+            body,
+        })
+    }
+    /// Validates one strided access: a data-global address over the
+    /// stride counter, returning its static offset. The single base
+    /// across accesses pins the walk to one pointer.
+    fn stride_memop(
+        g: &Gen,
+        f: &Func,
+        cntreg: &str,
+        base: &mut Option<u16>,
+        ptr: &str,
+    ) -> Option<(u16, u8)> {
+        let preg = ptr.strip_prefix('%')?;
+        let key = iselcore::ssa_key(&f.name, preg);
+        if g.prov.flash.contains(&key) || g.prov.mixed.contains(&key) {
+            return None;
+        }
+        let (bs, k, terms) = g.resolved.get(&key)?.clone();
+        if terms.len() != 1 || terms[0].0 != 1 || terms[0].1 != cntreg {
+            return None;
+        }
+        let Base::Global(name) = &bs else {
+            return None;
+        };
+        if g.global_is_const(name) {
+            return None;
+        }
+        let addr = g.global_addr(name);
+        match base {
+            Some(b) if *b != addr => return None,
+            Some(_) => {}
+            None => *base = Some(addr),
+        }
+        Some((k, 0))
+    }
+    /// Per-function pointer-walk pre-scan: single-block dual `phi ptr`
+    /// loops latched on `a == b && r != 0`. Same position and inputs as
+    /// the other walk scans.
+    fn find_ptr_walks(g: &Gen, f: &Func) -> HashMap<String, PtrWalk> {
+        let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut order: HashMap<&str, usize> = HashMap::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            order.insert(b.label.as_str(), bi);
+            let targets: Vec<&str> = match b.insts.last() {
+                Some(Inst::Br(br)) => vec![br.target.as_str()],
+                Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+                _ => vec![],
+            };
+            for t in targets {
+                preds.entry(t).or_default().push(b.label.as_str());
+            }
+        }
+        let mut uses: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        for b in &f.blocks {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() || r.starts_with('@') {
+                        continue;
+                    }
+                    uses.entry(r).or_default().push((b.label.clone(), ii));
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        for b in &f.blocks {
+            if let Some(plan) = Self::ptr_plan_for(g, f, b, &preds, &order, &uses) {
+                out.insert(b.label.clone(), plan);
+            }
+        }
+        out
+    }
+    /// One header block's pointer plan, or `None` on the first failed
+    /// check. Exactly two pointer phis, two loads, two GEP bumps, the
+    /// equality and zero-test compares feeding one `and` latch.
+    fn ptr_plan_for(
+        g: &Gen,
+        f: &Func,
+        b: &Block,
+        preds: &HashMap<&str, Vec<&str>>,
+        order: &HashMap<&str, usize>,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+    ) -> Option<PtrWalk> {
+        let last = b.insts.len().checked_sub(1)?;
+        let bc = match &b.insts[last] {
+            Inst::BrCond(bc) => bc,
+            _ => return None,
+        };
+        if bc.t == bc.f || bc.t != b.label {
+            return None;
+        }
+        let exit = bc.f.clone();
+        let Val::Reg(cond) = &bc.cond else {
+            return None;
+        };
+        // The latch conjunction feeds the branch alone.
+        let and_ii = b
+            .insts
+            .iter()
+            .position(|i| matches!(i, Inst::Bin(q) if q.dst == *cond))?;
+        let and = match &b.insts[and_ii] {
+            Inst::Bin(q) if q.op == ir::BinOp::And => q.clone(),
+            _ => return None,
+        };
+        let (leg_a, leg_b) = match (&and.a, &and.b) {
+            (Val::Reg(x), Val::Reg(y)) => (x.clone(), y.clone()),
+            _ => return None,
+        };
+        if uses.get(&and.dst).map(|v| v.len()) != Some(1) {
+            return None;
+        }
+        let mut phis: Vec<(usize, ir::Phi)> = Vec::new();
+        let mut geps: Vec<(usize, ir::Gep)> = Vec::new();
+        let mut loads: Vec<(usize, ir::Load)> = Vec::new();
+        let mut icmps: Vec<(usize, Icmp)> = Vec::new();
+        for (ii, inst) in b.insts.iter().enumerate().take(last) {
+            match inst {
+                Inst::Phi(p) => phis.push((ii, p.clone())),
+                Inst::Gep(gp) => geps.push((ii, gp.clone())),
+                Inst::Load(l) => loads.push((ii, l.clone())),
+                Inst::Icmp(c) => icmps.push((ii, c.clone())),
+                Inst::Bin(q) if q.dst == and.dst => {}
+                _ => return None,
+            }
+        }
+        if phis.len() != 2 || geps.len() != 2 || loads.len() != 2 || icmps.len() != 2 {
+            return None;
+        }
+        for (_, p) in &phis {
+            if !p.ptr || p.incoming.len() != 2 {
+                return None;
+            }
+        }
+        // Each load reads straight through one phi, phi order fixing
+        // the FSR assignment.
+        let mut lid: [Option<usize>; 2] = [None, None];
+        for (li, (_, l)) in loads.iter().enumerate() {
+            if l.ty.bytes() != 1 || l.ptr_ty || l.volatile {
+                return None;
+            }
+            if l.ptr.starts_with('@') {
+                return None;
+            }
+            if g.lane_consumed.contains(&l.dst)
+                || g.w_folds.loads.contains_key(&l.dst)
+                || g.bin_w_srcs.contains(&l.dst)
+                || g.tablat_fwd.contains(&l.dst)
+                || g.store_fwd.contains_key(&l.dst)
+                || g.store_consumed.contains(&l.dst)
+            {
+                return None;
+            }
+            let preg = l.ptr.strip_prefix('%').unwrap_or(&l.ptr);
+            let pi = phis.iter().position(|(_, p)| p.dst == preg)?;
+            if lid[pi].is_some() {
+                return None;
+            }
+            lid[pi] = Some(li);
+        }
+        let here = |ii: usize| (b.label.clone(), ii);
+        // Each bump advances its own phi by one byte.
+        let mut gid: [Option<usize>; 2] = [None, None];
+        for (gi, (_, gp)) in geps.iter().enumerate() {
+            let base = match &gp.base {
+                ir::GepBase::Reg(r) => r.clone(),
+                _ => return None,
+            };
+            let pi = phis.iter().position(|(_, p)| p.dst == base)?;
+            if gp.k != 1 || !gp.terms.is_empty() || gid[pi].is_some() {
+                return None;
+            }
+            gid[pi] = Some(gi);
+        }
+        // Backedges carry the bump; entries seed constant bases.
+        let mut seeds: [(String, u8, u16); 2] = [(); 2].map(|()| (String::new(), 0, 0));
+        for (pi, (_, p)) in phis.iter().enumerate() {
+            let mut back_ok = false;
+            let mut seed: Option<u16> = None;
+            for (v, e) in &p.incoming {
+                if e == &b.label {
+                    let bv = g.fold_reg(v);
+                    let good = bv == Val::Reg(p.dst.clone())
+                        || geps.iter().any(|(_, gp)| {
+                            Some(gp.dst.clone())
+                                == match &bv {
+                                    Val::Reg(r) => Some(r.clone()),
+                                    _ => None,
+                                }
+                        });
+                    if !good {
+                        return None;
+                    }
+                    back_ok = true;
+                } else {
+                    if seed.is_some() {
+                        return None;
+                    }
+                    match v {
+                        Val::Global(gg) => {
+                            if g.global_is_const(gg) {
+                                return None;
+                            }
+                            seed = Some(g.global_addr(gg));
+                        }
+                        _ => match g.fold_reg(v) {
+                            Val::Global(gg) => {
+                                if g.global_is_const(&gg) {
+                                    return None;
+                                }
+                                seed = Some(g.global_addr(&gg));
+                            }
+                            _ => return None,
+                        },
+                    }
+                }
+            }
+            if !back_ok {
+                return None;
+            }
+            seeds[pi] = (p.dst.clone(), pi as u8, seed?);
+        }
+        // The two legs: equality over both bytes, zero-test over one.
+        let ab = icmps.iter().find(|(_, c)| {
+            (c.dst == leg_a || c.dst == leg_b) && matches!((&c.a, &c.b), (Val::Reg(_), Val::Reg(_)))
+        })?;
+        let zt = icmps.iter().find(|(_, c)| {
+            (c.dst == leg_a || c.dst == leg_b)
+                && matches!(
+                    (&c.a, &c.b),
+                    (Val::Reg(_), Val::Const(0)) | (Val::Const(0), Val::Reg(_))
+                )
+        })?;
+        if ab.0 == zt.0 {
+            return None;
+        }
+        let (ar, br_) = match (&ab.1.a, &ab.1.b) {
+            (Val::Reg(x), Val::Reg(y)) => (x.clone(), y.clone()),
+            _ => return None,
+        };
+        if ab.1.pred != "eq" && ab.1.pred != "ne" {
+            return None;
+        }
+        if zt.1.pred != "eq" && zt.1.pred != "ne" {
+            return None;
+        }
+        let zr = match (&zt.1.a, &zt.1.b) {
+            (Val::Reg(r), Val::Const(0)) | (Val::Const(0), Val::Reg(r)) => r.clone(),
+            _ => return None,
+        };
+        let la = &loads[lid[0]?].1.dst;
+        let lb = &loads[lid[1]?].1.dst;
+        if !((ar == *la && br_ == *lb) || (ar == *lb && br_ == *la)) {
+            return None;
+        }
+        if zr != *la && zr != *lb {
+            return None;
+        }
+        if uses.get(&ab.1.dst).map(|v| v.as_slice()) != Some(&[here(and_ii)][..]) {
+            return None;
+        }
+        if uses.get(&zt.1.dst).map(|v| v.as_slice()) != Some(&[here(and_ii)][..]) {
+            return None;
+        }
+        let pre = {
+            let mut pre: Option<String> = None;
+            for (_, p) in &phis {
+                for (_, e) in &p.incoming {
+                    if e != &b.label {
+                        if pre.as_ref().is_some_and(|q| q != e) {
+                            return None;
+                        }
+                        pre = Some(e.clone());
+                    }
+                }
+            }
+            pre?
+        };
+        if pre == b.label || pre == exit {
+            return None;
+        }
+        let pre_block = f.blocks.iter().find(|x| x.label == pre)?;
+        if !matches!(&pre_block.insts.last(), Some(Inst::Br(br)) if br.target == b.label) {
+            return None;
+        }
+        let (Some(&pi), Some(&hi)) = (order.get(pre.as_str()), order.get(b.label.as_str())) else {
+            return None;
+        };
+        if pi >= hi {
+            return None;
+        }
+        match preds.get(b.label.as_str()) {
+            Some(ps)
+                if ps.len() == 2
+                    && ps.contains(&pre.as_str())
+                    && ps.contains(&b.label.as_str()) => {}
+            _ => return None,
+        }
+        // Dropped values read nowhere else: GEPs and the latch legs
+        // serve the walk alone, pointers the walk loads and bumps.
+        for (_, gp) in &geps {
+            let ok = uses.get(&gp.dst).is_some_and(|u| {
+                u.len() == 1 && u[0].0 == b.label && phis.iter().any(|(pii, _)| u[0].1 == *pii)
+            });
+            if !ok {
+                return None;
+            }
+        }
+        for (_, p) in &phis {
+            let key = iselcore::ssa_key(&f.name, &p.dst);
+            if g.prov.flash.contains(&key) || g.prov.mixed.contains(&key) {
+                return None;
+            }
+        }
+        // Pointers feed only the walk loads, their bumps, and the phi.
+        // Loaded bytes stay sound wherever the normal lowering serves
+        // them: the header reads the current step, the exit the last.
+        for (pii, (phiii, p)) in phis.iter().enumerate() {
+            let ok = uses.get(&p.dst).is_some_and(|u| {
+                u.iter().all(|s| {
+                    s.0 == b.label
+                        && (Some(s.1) == lid[pii].map(|li| loads[li].0)
+                            || Some(s.1) == gid[pii].map(|gi| geps[gi].0)
+                            || s.1 == *phiii)
+                })
+            });
+            if !ok {
+                return None;
+            }
+        }
+        for li in lid.iter().flatten() {
+            let dst = &loads[*li].1.dst;
+            if uses
+                .get(dst)
+                .is_some_and(|u| u.iter().any(|s| s.0 != b.label && s.0 != exit))
+            {
+                return None;
+            }
+        }
+        let mut slots = [0u16; 2];
+        for (pi, li) in lid.iter().enumerate() {
+            slots[pi] = *g
+                .addrs
+                .get(&iselcore::ssa_key(&f.name, &loads[(*li)?].1.dst))?;
+        }
+        let r_slot = if zr == *la { slots[0] } else { slots[1] };
+        Some(PtrWalk {
+            preheader: pre,
+            exit,
+            ptrs: seeds,
+            slots,
+            ab_exit_on_z: ab.1.pred == "eq",
+            r_slot,
+            r_exit_on_z: zt.1.pred == "ne",
+        })
+    }
+    /// Emits a pointer walk's preheader seeds after the edge's phi
+    /// copies: one `LFSR` per pointer. The pointer homes keep their
+    /// init copies; nothing reads them after the seed.
+    fn emit_ptr_seeds(&mut self, plan: &PtrWalk) {
+        for (_, fsr, seed) in &plan.ptrs {
+            self.emit(format!("    LFSR {fsr}, 0x{:03X}", seed & 0xFFF));
+        }
+        self.fsr0_holds = None;
+    }
+    /// Emits a pointer walk's header: latched `POSTINC` reads on both
+    /// FSRs, the equality leg, then the zero leg, each branching to one
+    /// shared exit stub. The pointers carry themselves, so their
+    /// backedge copies filter out like a home-managed counter.
+    fn emit_ptr_loop(
+        &mut self,
+        plan: &PtrWalk,
+        head: &str,
+        exit: &str,
+        back_copies: &[(String, Ty, Val)],
+        exit_copies: &[(String, Ty, Val)],
+        back_dom: bool,
+        exit_dom: bool,
+    ) {
+        // Both legs share one exit stub: the copies run once whatever
+        // leg leaves, and a copy-free exit branches straight there.
+        let out = if exit_copies.is_empty() {
+            exit.to_string()
+        } else {
+            self.fresh_label()
+        };
+        self.emit(format!("    MOVFF 0xFEE, 0x{:03X}", plan.slots[0]));
+        self.emit(format!("    MOVFF 0xFE6, 0x{:03X}", plan.slots[1]));
+        let (aa, af) = self.operand(plan.slots[0]);
+        let abit = if aa == 0 { "A" } else { "B" };
+        self.emit(format!("    MOVF 0x{af:03X},W,{abit}"));
+        let (ba, bf) = self.operand(plan.slots[1]);
+        let bbit = if ba == 0 { "A" } else { "B" };
+        self.emit(format!("    SUBWF 0x{bf:03X},W,{bbit}"));
+        if plan.ab_exit_on_z {
+            self.emit(format!("    BNZ {out}"));
+        } else {
+            self.emit(format!("    BZ {out}"));
+        }
+        let (ra, rf) = self.operand(plan.r_slot);
+        let rbit = if ra == 0 { "A" } else { "B" };
+        self.emit(format!("    MOVF 0x{rf:03X},W,{rbit}"));
+        if plan.r_exit_on_z {
+            self.emit(format!("    BZ {out}"));
+        } else {
+            self.emit(format!("    BNZ {out}"));
+        }
+        let live_back: Vec<(String, Ty, Val)> = back_copies
+            .iter()
+            .filter(|(dst, _, _)| plan.ptrs.iter().all(|(p, _, _)| p != dst))
+            .cloned()
+            .collect();
+        emit_phi_copies(self, &live_back, back_dom);
+        self.bsr_dirty = false;
+        self.emit(format!("    BRA {head}"));
+        if !exit_copies.is_empty() {
+            self.emit_label(&out);
+            emit_phi_copies(self, exit_copies, exit_dom);
+            self.emit(format!("    BRA {exit}"));
+        }
+        self.fsr0_holds = None;
     }
 
     /// In-place literal-add pre-scan (epic-cc#767): same-home `Add`/`Sub`
@@ -14162,7 +15495,17 @@ pub fn select_with_opts(
         }
         // Counted byte loops as FSR walks (epic-cc#896): runs last, after
         // every fold and claim set the shape checks read.
-        let walk_loops = Gen::find_walk_loops(&g, f);
+        let mut walk_loops = Gen::find_walk_loops(&g, f);
+        // Strided walks (epic-cc#1152) build the same plan type, so they
+        // merge here: the shared seeds, latch, and edge copies emit them.
+        // A header both scans accept keeps the counted form.
+        for (label, plan) in Gen::find_stride_walks(&g, f) {
+            walk_loops.entry(label).or_insert(plan);
+        }
+        // NUL-terminated walks (epic-cc#1151): same position, same inputs.
+        let nul_walks = Gen::find_nul_walks(&g, f);
+        // Pointer walks (epic-cc#1151, strcmp): same position, same inputs.
+        let ptr_walks = Gen::find_ptr_walks(&g, f);
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
         // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
@@ -14373,6 +15716,8 @@ pub fn select_with_opts(
                     // A walk header's body emits whole in its latch arm
                     // below; only the terminator is captured here.
                     _ if walk_loops.contains_key(&b.label) => {}
+                    _ if nul_walks.contains_key(&b.label) => {}
+                    _ if ptr_walks.contains_key(&b.label) => {}
                     Inst::Icmp(c) if fused.as_ref().is_some_and(|fc| fc.icmp.dst == c.dst) => {}
                     Inst::Load(l)
                         if fused
@@ -14403,6 +15748,30 @@ pub fn select_with_opts(
                             .unwrap_or_default();
                         emit_phi_copies(&mut g, &pre_copies, doms[&b.label].contains(&merge));
                         g.emit_walk_seeds(plan);
+                    } else if let Some(plan) =
+                        nul_walks.get(&merge).filter(|p| p.preheader == b.label)
+                    {
+                        // NUL preheader: every edge copy runs (the counter
+                        // init included), then the pointer seed.
+                        if let Some(c) = phi_copies.get(&(b.label.clone(), merge.clone())) {
+                            emit_phi_copies(&mut g, c, doms[&b.label].contains(&merge));
+                        }
+                        g.emit_nul_seeds(plan);
+                    } else if let Some(plan) =
+                        ptr_walks.get(&merge).filter(|p| p.preheader == b.label)
+                    {
+                        // Pointer preheader: the pointer homes keep only
+                        // dead init copies (the FSRs carry the walk), so
+                        // they filter like the backedge copies below.
+                        if let Some(c) = phi_copies.get(&(b.label.clone(), merge.clone())) {
+                            let live: Vec<(String, Ty, Val)> = c
+                                .iter()
+                                .filter(|(dst, _, _)| plan.ptrs.iter().all(|(p, _, _)| p != dst))
+                                .cloned()
+                                .collect();
+                            emit_phi_copies(&mut g, &live, doms[&b.label].contains(&merge));
+                        }
+                        g.emit_ptr_seeds(plan);
                     } else if let Some(c) = phi_copies.get(&(b.label.clone(), merge.clone())) {
                         emit_phi_copies(&mut g, c, doms[&b.label].contains(&merge));
                     }
@@ -14418,8 +15787,13 @@ pub fn select_with_opts(
                     // consumer: lower it here so its exits are the branch
                     // edges, skipping the 0/1 slot entirely.
                     let fused_icmp = fused.as_ref().map(|fc| &fc.icmp);
-                    match (walk_loops.get(&b.label), fused_icmp) {
-                        (Some(plan), _) => {
+                    match (
+                        walk_loops.get(&b.label),
+                        nul_walks.get(&b.label),
+                        ptr_walks.get(&b.label),
+                        fused_icmp,
+                    ) {
+                        (Some(plan), _, _, _) => {
                             // Walk latch: the counter's own edge copies are
                             // home-managed, every other copy runs inline.
                             let (back_copies, exit_copies) = if bc.t == b.label {
@@ -14451,7 +15825,69 @@ pub fn select_with_opts(
                                 doms[&b.label].contains(&plan.exit),
                             );
                         }
-                        (None, Some(c)) => emit_fused_branch(
+                        (_, Some(plan), _, _) => {
+                            // home-kept by the in-place increment, every
+                            // other copy runs inline on its edge.
+                            let (back_copies, exit_copies) = if bc.t == b.label {
+                                (&t_copies, &f_copies)
+                            } else {
+                                (&f_copies, &t_copies)
+                            };
+                            let no_idx =
+                                |cs: &Option<Vec<(String, Ty, Val)>>| -> Vec<(String, Ty, Val)> {
+                                    cs.as_ref()
+                                        .map(|v| {
+                                            v.iter()
+                                                .filter(|(dst, _, _)| *dst != plan.idx)
+                                                .cloned()
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
+                                };
+                            let head = labels[&b.label].clone();
+                            let exit_lbl = labels[&plan.exit].clone();
+                            g.emit_nul_loop(
+                                plan,
+                                &head,
+                                &exit_lbl,
+                                &no_idx(back_copies),
+                                exit_copies.as_deref().unwrap_or(&[]),
+                                doms[&b.label].contains(&b.label),
+                                doms[&b.label].contains(&plan.exit),
+                            );
+                        }
+                        (_, _, Some(plan), _) => {
+                            // Pointer latch: both pointers ride their FSRs,
+                            // so their backedge copies filter out and the
+                            // exit runs whole on the shared stub.
+                            let no_ptr =
+                                |cs: &Option<Vec<(String, Ty, Val)>>| -> Vec<(String, Ty, Val)> {
+                                    cs.as_ref()
+                                        .map(|v| {
+                                            v.iter()
+                                                .filter(|(dst, _, _)| {
+                                                    plan.ptrs.iter().all(|(p, _, _)| p != dst)
+                                                })
+                                                .cloned()
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
+                                };
+                            // The scan pins the back edge to `t`.
+                            let (back_copies, exit_copies) = (&t_copies, &f_copies);
+                            let head = labels[&b.label].clone();
+                            let exit_lbl = labels[&plan.exit].clone();
+                            g.emit_ptr_loop(
+                                plan,
+                                &head,
+                                &exit_lbl,
+                                &no_ptr(back_copies),
+                                &no_ptr(exit_copies),
+                                doms[&b.label].contains(&b.label),
+                                doms[&b.label].contains(&plan.exit),
+                            );
+                        }
+                        (None, None, None, Some(c)) => emit_fused_branch(
                             &mut g,
                             c,
                             &lt,
@@ -14461,7 +15897,7 @@ pub fn select_with_opts(
                             doms[&b.label].contains(&bc.t),
                             doms[&b.label].contains(&bc.f),
                         ),
-                        (None, None) => {
+                        (None, None, None, None) => {
                             // Same hazard class as `Select`'s cond (the select guard, see
                             // `emit_inst`'s `Inst::Select` arm): `emit_load_w`'s
                             // `Val::Const` arm emits only `MOVLW`, which does not
