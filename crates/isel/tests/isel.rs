@@ -7818,10 +7818,12 @@ fn isr_emits_vector_entry_prologue_epilogue() {
         "the vector pad to word 4:\n{asm}"
     );
     assert!(
+        // No page-0 set follows the saves: this body has no CALL or GOTO, so
+        // the set would be overwritten by the epilogue restore before any read.
         asm.contains(
-            "    org 0x0004\nisr:\n    MOVWF 0x75\n    SWAPF 0x75, F\n    SWAPF STATUS, W\n    MOVWF 0x76\n    MOVF PCLATH, W\n    MOVWF 0x77\n    MOVF FSR, W\n    MOVWF 0x78\n    MOVF 0x71, W\n    MOVWF 0x79\n    MOVF 0x72, W\n    MOVWF 0x7A\n    MOVF 0x73, W\n    MOVWF 0x7B\n    MOVF 0x74, W\n    MOVWF 0x7C\n    MOVF 0x70, W\n    MOVWF 0x7D\n    MOVLW 0x00\n    MOVWF PCLATH"
+            "    org 0x0004\nisr:\n    MOVWF 0x75\n    SWAPF 0x75, F\n    SWAPF STATUS, W\n    MOVWF 0x76\n    MOVF PCLATH, W\n    MOVWF 0x77\n    MOVF FSR, W\n    MOVWF 0x78\n    MOVF 0x71, W\n    MOVWF 0x79\n    MOVF 0x72, W\n    MOVWF 0x7A\n    MOVF 0x73, W\n    MOVWF 0x7B\n    MOVF 0x74, W\n    MOVWF 0x7C\n    MOVF 0x70, W\n    MOVWF 0x7D\n    MOVF 0x20, W"
         ),
-        "the 20-line save prologue (W/STATUS/PCLATH/FSR/retval x4/scratch), right after the vector pad:\n{asm}"
+        "the save prologue (W/STATUS/PCLATH/FSR/retval x4/scratch), right after the vector pad:\n{asm}"
     );
     assert!(
         asm.contains(

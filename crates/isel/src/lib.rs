@@ -7898,7 +7898,7 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
     if f.name == LOG_POOL_CALLEE && !g.pool_log && !g.pool.chunks.is_empty() {
         emit_log_pool_variant(g, f);
     }
-    // Dead PCLATH sets: a set pair that the next set overwrites before any read.
+    // Dead PCLATH sets: a set pair that a later write overwrites before any read.
     drop_dead_pclath_sets(&mut g.out, &mut g.locs, body_start);
 }
 
@@ -7918,33 +7918,37 @@ fn is_pclath_set(out: &[String], k: usize) -> bool {
         && out[k + 1].trim() == "MOVWF PCLATH"
 }
 
-/// Drops a PCLATH set that the next set overwrites before any use: a
-/// `MOVLW X; MOVWF PCLATH` pair directly followed by another such pair.
-/// Only lines at or after `start` are touched, and inline asm is skipped
-/// because its text is user-authored. A pair whose nearest preceding
-/// instruction is a skip stays: removing it would let the skip land on
-/// the next pair's `MOVLW`.
+/// Drops a PCLATH set a later write overwrites before any read. A `MOVLW X;
+/// MOVWF PCLATH` pair runs only on fall-through, and the scan below crosses
+/// only neutral lines, so reaching another `MOVWF PCLATH` first proves no
+/// read observes the pair. Any control transfer or other PCLATH/PCL mention
+/// keeps it, as do user asm and a skip-targeted pair (dropping it would move
+/// the skip's target).
 fn drop_dead_pclath_sets(out: &mut Vec<String>, locs: &mut Vec<Option<SrcLoc>>, start: usize) {
-    let mut drop = vec![false; out.len()];
+    let mut asm = vec![false; out.len()];
     let mut in_asm = false;
-    for k in start..out.len() {
-        let t = out[k].trim_start();
+    for (k, line) in out.iter().enumerate() {
+        let t = line.trim_start();
         if t.starts_with("; --- asm start ---") {
             in_asm = true;
-            continue;
-        }
-        if t.starts_with("; --- asm end ---") {
+        } else if t.starts_with("; --- asm end ---") {
             in_asm = false;
-            continue;
+        } else {
+            asm[k] = in_asm;
         }
-        if in_asm || !is_pclath_set(out, k) || !is_pclath_set(out, k + 2) {
+    }
+    let mut drop = vec![false; out.len()];
+    for k in start..out.len() {
+        if asm[k] || !is_pclath_set(out, k) {
             continue;
         }
         if prev_instruction(out, k).is_some_and(is_skip_line) {
             continue;
         }
-        drop[k] = true;
-        drop[k + 1] = true;
+        if pclath_overwritten_before_read(out, &asm, k + 2) {
+            drop[k] = true;
+            drop[k + 1] = true;
+        }
     }
     let mut idx = 0;
     out.retain(|_| {
@@ -7956,6 +7960,49 @@ fn drop_dead_pclath_sets(out: &mut Vec<String>, locs: &mut Vec<Option<SrcLoc>>, 
         idx += 1;
         !drop[idx - 1]
     });
+}
+
+/// Whether the next PCLATH touch at or after `from` is an overwriting write.
+/// Labels, blanks, comments, and directives are neutral: a branch into the
+/// middle skips the dropped pair instead of observing it.
+fn pclath_overwritten_before_read(out: &[String], asm: &[bool], mut j: usize) -> bool {
+    while j < out.len() {
+        let t = out[j].trim_start();
+        if t.starts_with("; --- asm ") || asm[j] {
+            return false;
+        }
+        if out[j].trim() == "MOVWF PCLATH" {
+            return true;
+        }
+        if t.starts_with(';') || t.ends_with(':') {
+            j += 1;
+            continue;
+        }
+        if is_control_line(t) || mentions_pcl(t) {
+            return false;
+        }
+        j += 1;
+    }
+    false
+}
+
+/// Whether `line` transfers control or leaves the function. CALL and GOTO
+/// read PCLATH for the target page, so both keep a preceding set.
+fn is_control_line(line: &str) -> bool {
+    ["CALL", "GOTO", "RETURN", "RETFIE", "RETLW"]
+        .iter()
+        .any(|s| {
+            line.starts_with(s)
+                && (line.len() == s.len() || line[s.len()..].starts_with([' ', '\t']))
+        })
+}
+
+/// Whether `line` names PCL or PCLATH: a `MOVF PCLATH, W` save and a computed
+/// `MOVWF PCL` jump both read it. The overwriting `MOVWF PCLATH` itself is
+/// matched before this runs, so it never reaches here.
+fn mentions_pcl(line: &str) -> bool {
+    line.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|w| w == "PCL" || w == "PCLATH")
 }
 
 /// The nearest line before `out[k]` that is an instruction. Blank lines,
@@ -10699,11 +10746,116 @@ mod dead_pclath_tests {
     }
 
     #[test]
-    fn intervening_line_keeps_the_set() {
-        let src = [
+    fn set_overwritten_past_neutral_lines_is_dropped() {
+        let out = run(&[
             "    MOVLW 0x00",
             "    MOVWF PCLATH",
             "    NOP",
+            "    MOVF 0x30, W",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+            "    CALL g",
+        ]);
+        assert_eq!(
+            out,
+            [
+                "    NOP",
+                "    MOVF 0x30, W",
+                "    MOVLW PAGE(f)",
+                "    MOVWF PCLATH",
+                "    CALL g"
+            ]
+        );
+    }
+
+    #[test]
+    fn label_between_pair_and_next_write_still_drops() {
+        // A branch into the middle skips the pair, so the label is neutral.
+        let out = run(&[
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "L1:",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+            "    CALL g",
+        ]);
+        assert_eq!(
+            out,
+            ["L1:", "    MOVLW PAGE(f)", "    MOVWF PCLATH", "    CALL g"]
+        );
+    }
+
+    #[test]
+    fn restore_before_straight_line_code_and_next_set_is_dropped() {
+        // The post-call restore shape from the encoder listing (epic-cc#1073).
+        let out = run(&[
+            "    CALL h",
+            "    MOVWF 0x33",
+            "    MOVF 0x71, W",
+            "    MOVWF 0x32",
+            "    MOVLW PAGE(c)",
+            "    MOVWF PCLATH",
+            "    MOVF 0x30, W",
+            "    MOVWF 0x3D",
+            "    MOVLW PAGE(h)",
+            "    MOVWF PCLATH",
+            "    CALL h",
+        ]);
+        assert_eq!(
+            out,
+            [
+                "    CALL h",
+                "    MOVWF 0x33",
+                "    MOVF 0x71, W",
+                "    MOVWF 0x32",
+                "    MOVF 0x30, W",
+                "    MOVWF 0x3D",
+                "    MOVLW PAGE(h)",
+                "    MOVWF PCLATH",
+                "    CALL h"
+            ]
+        );
+    }
+
+    #[test]
+    fn bare_context_restore_write_also_kills_the_pair() {
+        let out = run(&[
+            "    MOVLW PAGE(c)",
+            "    MOVWF PCLATH",
+            "    MOVF 0x77, W",
+            "    MOVWF PCLATH",
+        ]);
+        assert_eq!(out, ["    MOVF 0x77, W", "    MOVWF PCLATH"]);
+    }
+
+    #[test]
+    fn skip_between_pair_and_next_write_still_drops() {
+        // The skip target below the dropped pair keeps its alignment.
+        let out = run(&[
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "    BTFSC 0x20, 0",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+            "    CALL g",
+        ]);
+        assert_eq!(
+            out,
+            [
+                "    BTFSC 0x20, 0",
+                "    MOVLW PAGE(f)",
+                "    MOVWF PCLATH",
+                "    CALL g"
+            ]
+        );
+    }
+
+    #[test]
+    fn computed_goto_between_keeps_the_pair() {
+        let src = [
+            "    MOVLW HIGH(t)",
+            "    MOVWF PCLATH",
+            "    MOVWF PCL",
             "    MOVLW PAGE(f)",
             "    MOVWF PCLATH",
         ];
@@ -10711,15 +10863,57 @@ mod dead_pclath_tests {
     }
 
     #[test]
-    fn label_between_restore_and_next_set_keeps_pair() {
-        // The label breaks the adjacent-set match, so the pair is conservatively kept.
+    fn pclath_save_between_keeps_the_pair() {
         let src = [
-            "    MOVLW 0x00",
+            "    MOVLW PAGE(c)",
             "    MOVWF PCLATH",
-            "L1:",
+            "    MOVF PCLATH, W",
             "    MOVLW PAGE(f)",
             "    MOVWF PCLATH",
         ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn return_between_keeps_the_pair() {
+        let src = [
+            "    MOVLW PAGE(c)",
+            "    MOVWF PCLATH",
+            "    RETURN",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn retlw_table_between_keeps_the_pair() {
+        let src = [
+            "    MOVLW HIGH(t)",
+            "    MOVWF PCLATH",
+            "    RETLW 0x00",
+            "    MOVLW PAGE(f)",
+            "    MOVWF PCLATH",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn asm_start_between_keeps_the_pair() {
+        let src = [
+            "    MOVLW 0x00",
+            "    MOVWF PCLATH",
+            "; --- asm start ---",
+            "    MOVLW 0x01",
+            "    MOVWF PCLATH",
+            "; --- asm end ---",
+        ];
+        assert_eq!(run(&src), src);
+    }
+
+    #[test]
+    fn no_later_touch_keeps_the_pair() {
+        let src = ["    MOVLW 0x00", "    MOVWF PCLATH", "    NOP"];
         assert_eq!(run(&src), src);
     }
 
