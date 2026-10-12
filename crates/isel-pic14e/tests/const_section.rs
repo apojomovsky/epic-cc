@@ -28,6 +28,7 @@ fn const_table_global(name: &str, size: usize) -> ir::Global {
         bytes,
         refs: Vec::new(),
         addr: None,
+        internal: false,
     }
 }
 
@@ -113,6 +114,7 @@ fn staged_routine_words_fold_into_later_table_window() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                internal: false,
                 refs: Vec::new(),
             },
             ir::Global {
@@ -122,6 +124,7 @@ fn staged_routine_words_fold_into_later_table_window() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                internal: false,
                 refs: Vec::new(),
             },
             const_table_global("t", 48),
@@ -176,6 +179,7 @@ fn const_reader_at_page_tail_pins_to_next_page() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                internal: false,
                 refs: Vec::new(),
             },
             ir::Global {
@@ -185,6 +189,7 @@ fn const_reader_at_page_tail_pins_to_next_page() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                internal: false,
                 refs: Vec::new(),
             },
             const_table_global("t", 60),
@@ -243,6 +248,7 @@ fn three_chunk_table_followup_base_counts_all_chunks() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                internal: false,
                 refs: Vec::new(),
             },
             ir::Global {
@@ -252,6 +258,7 @@ fn three_chunk_table_followup_base_counts_all_chunks() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                internal: false,
                 refs: Vec::new(),
             },
             ir::Global {
@@ -262,6 +269,7 @@ fn three_chunk_table_followup_base_counts_all_chunks() {
                 bytes: (0..600).map(|i| (i % 251) as u8).collect(),
                 refs: Vec::new(),
                 addr: None,
+                internal: false,
             },
             const_table_global("t", 48),
         ],
@@ -316,6 +324,7 @@ fn panics_on_staged_const_over_255_bytes() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                internal: false,
                 refs: Vec::new(),
             },
         ],

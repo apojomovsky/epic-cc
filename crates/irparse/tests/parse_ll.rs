@@ -17,6 +17,10 @@ define dso_local void @main() {
 fn parses_array_and_const_globals_and_gep() {
     let m = parse_ll(GEP_ARRAY);
     assert_eq!(m.globals.len(), 2);
+    // `dso_local` is externally visible: whole-program passes must not
+    // narrow or pack these (epic-cc#856).
+    assert!(!m.globals[0].internal);
+    assert!(!m.globals[1].internal);
 
     // @ram = global [8 x i8] zeroinitializer
     match &m.globals[0] {
@@ -28,6 +32,7 @@ fn parses_array_and_const_globals_and_gep() {
             bytes,
             refs: _,
             addr,
+            internal: _,
         } => {
             assert_eq!(name, "ram");
             assert_eq!(*ty, ir::Ty::I8);
@@ -48,6 +53,7 @@ fn parses_array_and_const_globals_and_gep() {
             bytes,
             refs: _,
             addr,
+            internal: _,
         } => {
             assert_eq!(name, "table");
             assert_eq!(*ty, ir::Ty::I8);
@@ -83,6 +89,24 @@ fn parses_array_and_const_globals_and_gep() {
         }
         other => panic!("expected Gep, got {other:?}"),
     }
+}
+
+/// `internal` (and `private`) linkage marks compiler-owned globals for
+/// the narrowing and packing passes; everything else stays externally
+/// visible (epic-cc#856).
+#[test]
+fn internal_linkage_marks_compiler_owned_globals() {
+    let src = "@a = internal global i16 0, align 2\n\
+               @b = private global i8 0, align 1\n\
+               @c = dso_local global i16 0, align 2\n\
+               define dso_local void @main() {\n\
+                 ret void\n\
+               }\n";
+    let m = parse_ll(src);
+    assert_eq!(m.globals.len(), 3);
+    assert!(m.globals[0].internal);
+    assert!(m.globals[1].internal);
+    assert!(!m.globals[2].internal);
 }
 
 // LLVM prints a table byte 0x5C (`\`) as the `\\` escape (not `\5C`), so a
@@ -1259,6 +1283,7 @@ fn const_array_300_bytes_parses() {
             bytes,
             refs: _,
             addr,
+            internal: _,
         } => {
             assert_eq!(name, "table");
             assert_eq!(*ty, ir::Ty::I8);
@@ -1297,6 +1322,7 @@ fn const_array_i32_elements_parse_to_le_bytes() {
             bytes,
             refs: _,
             addr,
+            internal: _,
         } => {
             assert_eq!(name, "itable");
             assert_eq!(*ty, ir::Ty::I32);
@@ -1335,6 +1361,7 @@ fn const_array_float_elements_parse_to_le_bytes() {
             bytes,
             refs: _,
             addr,
+            internal: _,
         } => {
             assert_eq!(name, "ftable");
             assert_eq!(*ty, ir::Ty::F32);
@@ -1371,6 +1398,7 @@ fn const_array_600_bytes_parses() {
             bytes,
             refs: _,
             addr,
+            internal: _,
         } => {
             assert_eq!(name, "big");
             assert_eq!(*ty, ir::Ty::I8);

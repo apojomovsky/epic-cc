@@ -2900,8 +2900,15 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
             if after.starts_with("external ") {
                 continue;
             }
-            let (is_const, rest) = if let Some(i) = after.find("global ") {
-                (false, &after[i + "global ".len()..])
+            // Linkage rides ahead of the kind keyword (`@g = internal
+            // global ...`, `@s = private constant ...`). Whole-program
+            // passes use it to tell compiler-owned globals (safe to
+            // narrow or pack) from externally visible ones (epic-cc#856).
+            let (is_const, rest, internal) = if let Some(i) = after.find("global ") {
+                let internal = after[..i]
+                    .split_whitespace()
+                    .any(|t| t == "internal" || t == "private");
+                (false, &after[i + "global ".len()..], internal)
             } else if let Some(i) = after.find("constant ") {
                 // A C++ vtable (`_ZTV*`, Itanium ABI prefix) rides the
                 // ADR-010 flash path like any const table: the slot load
@@ -2909,7 +2916,13 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                 // which isel-pic18 serves with a TBLPTR seeded from the
                 // vptr value (flash-pointer provenance, epic-cc#832).
                 // Other backends reject C++ dispatch loudly (PIC18-only).
-                (true, &after[i + "constant ".len()..])
+                (
+                    true,
+                    &after[i + "constant ".len()..],
+                    after[..i]
+                        .split_whitespace()
+                        .any(|t| t == "internal" || t == "private"),
+                )
             } else {
                 continue;
             };
@@ -3080,6 +3093,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                 bytes,
                 refs,
                 addr,
+                internal,
             });
             continue;
         }

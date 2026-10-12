@@ -12,6 +12,7 @@ fn cg(name: &str, bytes: &[u8], refs: Vec<(usize, String, u16)>) -> ir::Global {
         bytes: bytes.to_vec(),
         refs,
         addr: None,
+        internal: true,
     }
 }
 
@@ -131,6 +132,7 @@ fn pool_chunk_refs_emit_rebased_through_select() {
         bytes: vec![0],
         refs: Vec::new(),
         addr: None,
+        internal: false,
     };
     let mut m = ir::parse("fn main(void) ()\n  block 0:\n    ret void\n");
     m.globals = vec![

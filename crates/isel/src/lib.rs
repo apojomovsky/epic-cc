@@ -9554,6 +9554,7 @@ impl ConstPool {
                 bytes: c.bytes.clone(),
                 refs: c.refs.clone(),
                 addr: None,
+                internal: true,
             })
             .collect()
     }

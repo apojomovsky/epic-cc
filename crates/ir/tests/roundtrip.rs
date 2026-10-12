@@ -79,9 +79,23 @@ fn gep_and_sized_globals_roundtrip() {
         size: 8,
         bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
         refs: Vec::new(),
+        internal: false,
     };
     assert_eq!(g.size, 8);
     assert_eq!(g.bytes, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+}
+
+#[test]
+fn internal_linkage_roundtrips() {
+    let m = parse("global g i16 internal\nconst t i8\nfn main(void) ()\n");
+    assert!(m.globals[0].internal);
+    assert!(!m.globals[1].internal);
+    let out = serialize(&m);
+    assert!(
+        out.contains("global g i16 internal"),
+        "missing marker\n---\n{out}"
+    );
+    assert_eq!(serialize(&parse(&out)), out, "stable fixed point");
 }
 
 #[test]

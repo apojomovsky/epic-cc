@@ -1102,6 +1102,7 @@ fn const_300_byte_table_gets_no_ram_address_and_layout_unchanged() {
             size: 300, // [300 x i8] const table (u16 size)
             bytes: vec![0u8; 300],
             addr: None,
+            internal: false,
             refs: Vec::new(),
         },
     );
