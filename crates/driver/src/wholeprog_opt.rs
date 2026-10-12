@@ -390,11 +390,54 @@ fn mentions_value(line: &str, tok: &str) -> bool {
     })
 }
 
+/// Whether one `getelementptr` line has a constant global as its base
+/// operand and the parameter in its index operands. Merely mentioning
+/// both on one line is not enough: a fixed-slot table address passed
+/// alongside the parameter indexes nothing.
+fn gep_indexes_param(
+    line: &str,
+    tok: &str,
+    const_globals: &std::collections::HashSet<&str>,
+) -> bool {
+    let Some(at) = line.find("getelementptr") else {
+        return false;
+    };
+    let rest = &line[at + "getelementptr".len()..];
+    let operands = match rest.find('(') {
+        // Constant-expression form: operands sit inside the parens.
+        Some(open) => {
+            let mut depth = 0i32;
+            let mut close = None;
+            for (i, c) in rest[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else { return false };
+            &rest[open + 1..close]
+        }
+        None => rest,
+    };
+    let segs = split_top_level(operands);
+    segs.len() >= 3
+        && const_globals
+            .iter()
+            .any(|g| mentions_value(&segs[1], &format!("@{g}")))
+        && segs[2..].iter().any(|s| mentions_value(s, tok))
+}
+
 /// Whether the parameter at `pos` indexes a constant global in the
-/// body: a `getelementptr` off a `constant` whose index list mentions
-/// the parameter. That shape folds to literal field values once the
-/// argument is a literal, so the duplicated body collapses. A constant
-/// that only bounds a loop or picks a branch has no such guarantee and
+/// body. That shape folds to literal field values once the argument
+/// is a literal, so the duplicated body collapses. A constant that
+/// only bounds a loop or picks a branch has no such guarantee and
 /// keeps the shared body (the menu demo's serial writer regressed on
 /// exactly that shape).
 fn indexes_constant_table(
@@ -410,13 +453,9 @@ fn indexes_constant_table(
     if !tok.starts_with('%') {
         return false;
     }
-    lines[f.start..=f.end].iter().any(|line| {
-        line.contains("getelementptr")
-            && mentions_value(line, tok)
-            && const_globals
-                .iter()
-                .any(|g| mentions_value(line, &format!("@{g}")))
-    })
+    lines[f.start..=f.end]
+        .iter()
+        .any(|line| gep_indexes_param(line, tok, const_globals))
 }
 fn always_inline_candidates(ll_text: &str, aggressive: bool) -> Vec<String> {
     let lines: Vec<&str> = ll_text.lines().collect();
@@ -493,48 +532,139 @@ fn always_inline_candidates(ll_text: &str, aggressive: bool) -> Vec<String> {
         }
     }
 
-    funcs
+    let mut singles: Vec<String> = Vec::new();
+    let mut multis: Vec<String> = Vec::new();
+    for (fi, f) in funcs.iter().enumerate() {
+        if f.is_entry
+            || address_taken.contains(f.name.as_str())
+            || noinline.contains(f.name.as_str())
+        {
+            continue;
+        }
+        let Some(sites) = call_sites.get(f.name.as_str()) else {
+            continue;
+        };
+        if sites.len() == 1 {
+            let caller = sites[0];
+            if caller == usize::MAX {
+                continue;
+            }
+            if funcs[caller].is_entry
+                && (!aggressive || f.end - f.start + 1 > MAX_ENTRY_INLINE_LINES)
+            {
+                continue;
+            }
+            singles.push(f.name.clone());
+            continue;
+        }
+        if sites.len() > MAX_CONST_ARG_INLINE_SITES
+            || f.end - f.start + 1 > MAX_CONST_ARG_INLINE_LINES
+        {
+            continue;
+        }
+        if sites
+            .iter()
+            .any(|&caller| caller == usize::MAX || caller == fi || funcs[caller].is_entry)
+        {
+            continue;
+        }
+        let define = lines[f.start];
+        let Some(params) = define.find('(').and_then(|o| list_arguments(define, o)) else {
+            continue;
+        };
+        let Some(args) = site_args.get(f.name.as_str()) else {
+            continue;
+        };
+        if varying_constant_positions(&params, args)
+            .iter()
+            .any(|&pos| indexes_constant_table(&lines, f, &params, pos, &const_globals))
+        {
+            multis.push(f.name.clone());
+        }
+    }
+
+    // A multi-site body that calls a marked function, or is called by
+    // another multi-site body, duplicates past its own caps when the
+    // marked callees expand inside each copy. One reached from an
+    // entry through a chain of marked functions lands in the entry
+    // frame the direct-caller check above meant to keep it out of.
+    // Drop those to a fixpoint: unmarking one can clear another.
+    let index_of: std::collections::HashMap<&str, usize> = funcs
         .iter()
         .enumerate()
-        .filter(|(_, f)| !f.is_entry)
-        .filter(|(_, f)| !address_taken.contains(f.name.as_str()))
-        .filter(|(_, f)| !noinline.contains(f.name.as_str()))
-        .filter_map(|(fi, f)| {
-            let sites = call_sites.get(f.name.as_str())?;
-            if sites.len() == 1 {
-                let caller = sites[0];
-                if caller == usize::MAX {
-                    return None;
+        .map(|(i, f)| (f.name.as_str(), i))
+        .collect();
+    let callees_of = |name: &str| -> Vec<String> {
+        let Some(&idx) = index_of.get(name) else {
+            return Vec::new();
+        };
+        call_sites
+            .iter()
+            .filter(|(_, callers)| callers.contains(&idx))
+            .map(|(callee, _)| callee.to_string())
+            .collect()
+    };
+    loop {
+        let marked: std::collections::HashSet<&str> = singles
+            .iter()
+            .chain(multis.iter())
+            .map(String::as_str)
+            .collect();
+        let multi_set: std::collections::HashSet<&str> =
+            multis.iter().map(String::as_str).collect();
+        // Candidates an entry caller pulls in, then candidates those
+        // pull in, in turn: the aggressive tier folds the first kind
+        // into the entry, and the rest follow it there.
+        let mut entry_bound: std::collections::HashSet<&str> = Default::default();
+        loop {
+            let mut grew = false;
+            for name in &marked {
+                if entry_bound.contains(name) {
+                    continue;
                 }
-                if funcs[caller].is_entry {
-                    if !aggressive {
-                        return None;
-                    }
-                    if f.end - f.start + 1 > MAX_ENTRY_INLINE_LINES {
-                        return None;
-                    }
+                let pulled = call_sites.get(name).is_some_and(|callers| {
+                    callers.iter().any(|&c| {
+                        c != usize::MAX
+                            && (funcs[c].is_entry || entry_bound.contains(funcs[c].name.as_str()))
+                    })
+                });
+                if pulled {
+                    entry_bound.insert(name);
+                    grew = true;
                 }
-                return Some(f.name.clone());
             }
-            if sites.len() > MAX_CONST_ARG_INLINE_SITES
-                || f.end - f.start + 1 > MAX_CONST_ARG_INLINE_LINES
-            {
-                return None;
+            if !grew {
+                break;
             }
-            if sites
-                .iter()
-                .any(|&caller| caller == usize::MAX || caller == fi || funcs[caller].is_entry)
-            {
-                return None;
-            }
-            let define = lines[f.start];
-            let params = list_arguments(define, define.find('(')?)?;
-            let args = site_args.get(f.name.as_str())?;
-            varying_constant_positions(&params, args)
-                .iter()
-                .any(|&pos| indexes_constant_table(&lines, f, &params, pos, &const_globals))
-                .then(|| f.name.clone())
-        })
+        }
+        let violators: std::collections::HashSet<String> = multis
+            .iter()
+            .filter(|m| {
+                entry_bound.contains(m.as_str())
+                    || callees_of(m).iter().any(|c| marked.contains(c.as_str()))
+                    || call_sites.get(m.as_str()).is_some_and(|callers| {
+                        callers
+                            .iter()
+                            .any(|&c| c != usize::MAX && multi_set.contains(funcs[c].name.as_str()))
+                    })
+            })
+            .cloned()
+            .collect();
+        if violators.is_empty() {
+            break;
+        }
+        multis.retain(|m| !violators.contains(m));
+    }
+
+    let keep: std::collections::HashSet<&str> = singles
+        .iter()
+        .chain(multis.iter())
+        .map(String::as_str)
+        .collect();
+    funcs
+        .iter()
+        .filter(|f| keep.contains(f.name.as_str()))
+        .map(|f| f.name.clone())
         .collect()
 }
 
@@ -800,6 +930,97 @@ define internal void @shared(i16 noundef %0) #0 {
             always_inline_candidates(ll, false),
             vec!["shared".to_string()],
             "every site passes a literal and the literals differ, so each caller folds its own copy"
+        );
+    }
+
+    #[test]
+    fn always_inline_leaves_a_constant_merely_mentioned_on_a_gep_line() {
+        let ll = "\
+@table = internal constant [16 x i8] zeroinitializer
+define internal void @a() #0 {
+  tail call void @shared(i16 noundef 4)
+  ret void
+}
+define internal void @b() #0 {
+  tail call void @shared(i16 noundef 9)
+  ret void
+}
+define internal void @shared(i16 noundef %0) #0 {
+  %1 = getelementptr inbounds [16 x i8], ptr @table, i16 0, i16 0
+  %2 = load i8, ptr %1
+  %3 = add i16 %0, 1
+  ret void
+}
+";
+        assert!(
+            always_inline_candidates(ll, false).is_empty(),
+            "the table address is fixed and the parameter only rides along, nothing folds"
+        );
+    }
+
+    #[test]
+    fn always_inline_leaves_a_multi_call_site_chain() {
+        let ll = "\
+@table = internal constant [16 x i8] zeroinitializer
+define internal void @a() #0 {
+  tail call void @outer(i16 noundef 4)
+  ret void
+}
+define internal void @b() #0 {
+  tail call void @outer(i16 noundef 9)
+  tail call void @inner(i16 noundef 3)
+  ret void
+}
+define internal void @c() #0 {
+  tail call void @inner(i16 noundef 5)
+  ret void
+}
+define internal void @outer(i16 noundef %0) #0 {
+  %1 = getelementptr inbounds [16 x i8], ptr @table, i16 0, i16 %0
+  %2 = load i8, ptr %1
+  tail call void @inner(i16 noundef 3)
+  ret void
+}
+define internal void @inner(i16 noundef %0) #0 {
+  %1 = getelementptr inbounds [16 x i8], ptr @table, i16 0, i16 %0
+  %2 = load i8, ptr %1
+  ret void
+}
+";
+        assert!(
+            always_inline_candidates(ll, false).is_empty(),
+            "marked copies inside marked copies duplicate past either body's own caps"
+        );
+    }
+
+    #[test]
+    fn always_inline_leaves_a_multi_call_site_behind_an_entry_fold() {
+        let ll = "\
+@table = internal constant [16 x i8] zeroinitializer
+define dso_local i16 @main() #0 {
+  tail call void @mid()
+  ret i16 0
+}
+define internal void @mid() #0 {
+  tail call void @shared(i16 noundef 4)
+  tail call void @shared(i16 noundef 9)
+  ret void
+}
+define internal void @shared(i16 noundef %0) #0 {
+  %1 = getelementptr inbounds [16 x i8], ptr @table, i16 0, i16 %0
+  %2 = load i8, ptr %1
+  ret void
+}
+";
+        assert_eq!(
+            always_inline_candidates(ll, false),
+            vec!["shared".to_string()],
+            "at the default tier mid stays out of line, so shared folds into an ordinary frame"
+        );
+        assert_eq!(
+            always_inline_candidates(ll, true),
+            vec!["mid".to_string()],
+            "at the aggressive tier mid folds into main, so shared must not follow it there"
         );
     }
 
