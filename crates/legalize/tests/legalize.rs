@@ -3830,6 +3830,248 @@ fn keeps_zext_snapshot_used_as_indirect_target() {
     );
 }
 
+#[test]
+fn destrengthens_strided_seed_loop() {
+    // epic-cc#1169: a post-LSR seed loop (pointer phi stepping by one,
+    // counter stepping by 7, latch against 224) becomes a unit-stride
+    // counted loop with a byte value recurrence, which the walk serves.
+    let m = parse(
+        "global seed i8\nglobal buf i8\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %lsr.iv1 = phi ptr %scevgep 1 @buf 0\n    %lsr.iv = phi i16 %lsr.iv.next 1 0 0\n    %2 = load volatile i8 @seed\n    %3 = trunc i16 %lsr.iv to i8\n    %tmp = add i8 %2 %3\n    store i8 %tmp %lsr.iv1\n    %lsr.iv.next = add i16 %lsr.iv 7\n    %scevgep = gep %lsr.iv1 +1\n    %4 = icmp eq i16 %lsr.iv.next 224\n    br i1 %4 done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(!text.contains("phi ptr"), "pointer phi is gone:\n{text}");
+    assert!(!text.contains("scevgep"), "step GEP is gone:\n{text}");
+    assert!(
+        text.contains("%c0 = phi i16 0 0 %c1 1"),
+        "unit counter from zero:\n{text}"
+    );
+    assert!(
+        text.contains("%c2 = phi i8 0 0 %c3 1"),
+        "byte value recurrence:\n{text}"
+    );
+    assert!(
+        text.contains("%c4 = gep @buf +0 +1*%c0"),
+        "unit GEP over the counter:\n{text}"
+    );
+    assert!(
+        text.contains("%c1 = add i16 %c0 1"),
+        "unit increment:\n{text}"
+    );
+    assert!(
+        text.contains("%c3 = add i8 %c2 7"),
+        "recurrence steps by the stride:\n{text}"
+    );
+    assert!(
+        text.contains("%4 = icmp eq i16 %c1 32"),
+        "latch counts units:\n{text}"
+    );
+    assert!(
+        text.contains("%tmp = add i8 %2 %c2"),
+        "value reads the recurrence:\n{text}"
+    );
+    assert!(
+        text.contains("store i8 %tmp %c4"),
+        "store through the unit GEP:\n{text}"
+    );
+}
+
+#[test]
+fn destrengthens_unit_stride_pointer_loop() {
+    // A stride-one pointer loop keeps its trunc, retargeted at the unit
+    // counter, with no value recurrence.
+    let m = parse(
+        "global buf i8\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %p = phi ptr %g 1 @buf 0\n    %i = phi i16 %inc 1 0 0\n    %t = trunc i16 %i to i8\n    store i8 %t %p\n    %inc = add i16 %i 1\n    %g = gep %p +1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(!text.contains("phi ptr"), "pointer phi is gone:\n{text}");
+    assert!(
+        text.contains("%t = trunc i16 %c0 to i8"),
+        "trunc retargets at the unit counter:\n{text}"
+    );
+    assert!(
+        !text.contains("phi i8"),
+        "no value recurrence for stride one:\n{text}"
+    );
+    assert!(
+        text.contains("%c = icmp eq i16 %c1 4"),
+        "latch counts units:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strided_loop_with_indivisible_bound() {
+    // 225 is not a multiple of 7, so the latch never lands on a whole
+    // trip count: the loop keeps its LSR form.
+    let m = parse(
+        "global seed i8\nglobal buf i8\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %lsr.iv1 = phi ptr %scevgep 1 @buf 0\n    %lsr.iv = phi i16 %lsr.iv.next 1 0 0\n    %2 = load volatile i8 @seed\n    %3 = trunc i16 %lsr.iv to i8\n    %tmp = add i8 %2 %3\n    store i8 %tmp %lsr.iv1\n    %lsr.iv.next = add i16 %lsr.iv 7\n    %scevgep = gep %lsr.iv1 +1\n    %4 = icmp eq i16 %lsr.iv.next 225\n    br i1 %4 done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("phi ptr"),
+        "indivisible bound keeps the LSR form:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strided_loop_with_counter_exit_read() {
+    // The counter escapes to the exit block, so no unit counter can
+    // replace it: the loop keeps its LSR form.
+    let m = parse(
+        "global seed i8\nglobal buf i8\nglobal out i16\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %lsr.iv1 = phi ptr %scevgep 1 @buf 0\n    %lsr.iv = phi i16 %lsr.iv.next 1 0 0\n    %2 = load volatile i8 @seed\n    %3 = trunc i16 %lsr.iv to i8\n    %tmp = add i8 %2 %3\n    store i8 %tmp %lsr.iv1\n    %lsr.iv.next = add i16 %lsr.iv 7\n    %scevgep = gep %lsr.iv1 +1\n    %4 = icmp eq i16 %lsr.iv.next 224\n    br i1 %4 done 1\n  block done:\n    store i16 %lsr.iv @out\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("phi ptr"),
+        "escaping counter keeps the LSR form:\n{text}"
+    );
+}
+
+#[test]
+fn rotates_strcmp_idiom_into_nul_shape() {
+    // epic-cc#1170: the `strcmp` idiom (primed entry, carried byte,
+    // bottom pre-load) rotates so the header loads both current bytes
+    // and the latch tests the current byte for NUL: the two-block
+    // NUL-walk shape.
+    let m = parse(
+        "global s1 i8\nglobal s2 i8\nfn strcmp(i16) (0=ptr, 1=ptr)\n  block 2:\n    %3 = load i8 @s1\n    %4 = icmp eq i8 %3 0\n    br i1 %4 .loopexit .preheader\n  block .preheader:\n    %5 = phi i8 %12 10 %3 2\n    %6 = phi i16 %11 10 0 2\n    %7 = gep @s2 +0 +1*%6\n    %8 = load i8 %7\n    %9 = icmp eq i8 %5 %8\n    br i1 %9 10 ..loopexit_crit_edge\n  block 10:\n    %11 = add i16 %6 1\n    %__gep3 = gep @s1 +1\n    %scevgep = gep %__gep3 +0 +1*%6\n    %12 = load i8 %scevgep\n    %13 = icmp eq i8 %12 0\n    br i1 %13 .loopexit .preheader\n  block ..loopexit_crit_edge:\n    %14 = zext i8 %5 to i16\n    br .loopexit\n  block .loopexit:\n    %15 = phi i16 0 2 %6 ..loopexit_crit_edge %11 10\n    %16 = phi i16 0 2 %14 ..loopexit_crit_edge 0 10\n    %17 = gep @s2 +0 +1*%15\n    %18 = load i8 %17\n    %19 = zext i8 %18 to i16\n    %20 = sub i16 %16 %19\n    ret i16 %20\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("%c0 = gep @s1 +0 +1*%6"),
+        "header gains the s1 GEP:\n{text}"
+    );
+    assert!(
+        text.contains("%5 = load i8 %c0"),
+        "carried name becomes the header load:\n{text}"
+    );
+    assert!(!text.contains("scevgep"), "pre-load chain is gone:\n{text}");
+    assert!(
+        text.contains("%13 = icmp eq i8 %5 0"),
+        "latch tests the current byte:\n{text}"
+    );
+    assert!(
+        text.contains("%15 = phi i16 %6 ..loopexit_crit_edge %6 10"),
+        "exit index names the homed counter:\n{text}"
+    );
+    assert!(
+        !text.contains("br i1 %4 .loopexit .preheader"),
+        "prime dissolves into a plain branch:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strcmp_over_const_string() {
+    // FSR cannot read flash: a const base keeps the carried form.
+    let m = parse(
+        "const s1 i8\nglobal s2 i8\nfn strcmp(i16) (0=ptr, 1=ptr)\n  block 2:\n    %3 = load i8 @s1\n    %4 = icmp eq i8 %3 0\n    br i1 %4 .loopexit .preheader\n  block .preheader:\n    %5 = phi i8 %12 10 %3 2\n    %6 = phi i16 %11 10 0 2\n    %7 = gep @s2 +0 +1*%6\n    %8 = load i8 %7\n    %9 = icmp eq i8 %5 %8\n    br i1 %9 10 ..loopexit_crit_edge\n  block 10:\n    %11 = add i16 %6 1\n    %__gep3 = gep @s1 +1\n    %scevgep = gep %__gep3 +0 +1*%6\n    %12 = load i8 %scevgep\n    %13 = icmp eq i8 %12 0\n    br i1 %13 .loopexit .preheader\n  block ..loopexit_crit_edge:\n    %14 = zext i8 %5 to i16\n    br .loopexit\n  block .loopexit:\n    %15 = phi i16 0 2 %6 ..loopexit_crit_edge %11 10\n    %16 = phi i16 0 2 %14 ..loopexit_crit_edge 0 10\n    %17 = gep @s2 +0 +1*%15\n    %18 = load i8 %17\n    %19 = zext i8 %18 to i16\n    %20 = sub i16 %16 %19\n    ret i16 %20\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("scevgep"),
+        "const base keeps the carried form:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strcmp_with_exit_tail_read() {
+    // The exit tail names the pre-loaded byte directly, which the
+    // rotation deletes: the idiom keeps the carried form.
+    let m = parse(
+        "global s1 i8\nglobal s2 i8\nfn strcmp(i16) (0=ptr, 1=ptr)\n  block 2:\n    %3 = load i8 @s1\n    %4 = icmp eq i8 %3 0\n    br i1 %4 .loopexit .preheader\n  block .preheader:\n    %5 = phi i8 %12 10 %3 2\n    %6 = phi i16 %11 10 0 2\n    %7 = gep @s2 +0 +1*%6\n    %8 = load i8 %7\n    %9 = icmp eq i8 %5 %8\n    br i1 %9 10 ..loopexit_crit_edge\n  block 10:\n    %11 = add i16 %6 1\n    %__gep3 = gep @s1 +1\n    %scevgep = gep %__gep3 +0 +1*%6\n    %12 = load i8 %scevgep\n    %13 = icmp eq i8 %12 0\n    br i1 %13 .loopexit .preheader\n  block ..loopexit_crit_edge:\n    %14 = zext i8 %5 to i16\n    br .loopexit\n  block .loopexit:\n    %15 = phi i16 0 2 %6 ..loopexit_crit_edge %11 10\n    %16 = phi i16 0 2 %14 ..loopexit_crit_edge 0 10\n    %21 = add i8 %12 %5\n    %17 = gep @s2 +0 +1*%15\n    %18 = load i8 %17\n    %19 = zext i8 %18 to i16\n    %20 = sub i16 %16 %19\n    ret i16 %20\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("scevgep"),
+        "exit tail read keeps the carried form:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strided_loop_with_wide_bound() {
+    // An i8 counter with a 400 bound wraps past the latch value while
+    // the rewrite would count 200 whole trips: the loop keeps its LSR
+    // form.
+    let m = parse(
+        "global buf i8\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %p = phi ptr %g 1 @buf 0\n    %i = phi i8 %inc 1 0 0\n    store i8 9 %p\n    %inc = add i8 %i 2\n    %g = gep %p +1\n    %c = icmp eq i8 %inc 400\n    br i1 %c done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("phi ptr"),
+        "wide bound keeps the LSR form:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strided_loop_with_wide_step() {
+    // The pointer advances by two per trip, so no unit GEP maps onto
+    // it: the loop keeps its LSR form.
+    let m = parse(
+        "global buf i8\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %p = phi ptr %g 1 @buf 0\n    %i = phi i16 %inc 1 0 0\n    store i8 9 %p\n    %inc = add i16 %i 1\n    %g = gep %p +2\n    %c = icmp eq i16 %inc 4\n    br i1 %c done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("phi ptr"),
+        "wide step keeps the LSR form:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strided_loop_with_wide_memop() {
+    // A two-byte load through the pointer has no unit byte form: the
+    // loop keeps its LSR form.
+    let m = parse(
+        "global buf i8\nglobal out i16\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %p = phi ptr %g 1 @buf 0\n    %i = phi i16 %inc 1 0 0\n    %x = load i16 %p\n    store i16 %x @out\n    %inc = add i16 %i 1\n    %g = gep %p +1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("phi ptr"),
+        "wide memop keeps the LSR form:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strided_loop_with_counter_alu_use() {
+    // The counter feeds a plain add outside the pattern, which the
+    // unit counter cannot serve: the loop keeps its LSR form.
+    let m = parse(
+        "global buf i8\nglobal out i16\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %p = phi ptr %g 1 @buf 0\n    %i = phi i16 %inc 1 0 0\n    store i8 9 %p\n    %q = add i16 %i 5\n    store i16 %q @out\n    %inc = add i16 %i 1\n    %g = gep %p +1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("phi ptr"),
+        "counter ALU use keeps the LSR form:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strided_loop_with_volatile_store() {
+    // MMIO stays on the carried form like every sibling matcher, even
+    // though the re-addressing preserves count and order.
+    let m = parse(
+        "global buf i8\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %p = phi ptr %g 1 @buf 0\n    %i = phi i16 %inc 1 0 0\n    store volatile i8 9 %p\n    %inc = add i16 %i 1\n    %g = gep %p +1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("phi ptr"),
+        "volatile store keeps the LSR form:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strcmp_with_nonzero_entry_arm() {
+    // The rerouted prime-NUL case delivers index zero, so a nonzero
+    // entry arm would change the value: the idiom keeps the carried
+    // form.
+    let m = parse(
+        "global s1 i8\nglobal s2 i8\nfn strcmp(i16) (0=ptr, 1=ptr)\n  block 2:\n    %3 = load i8 @s1\n    %4 = icmp eq i8 %3 0\n    br i1 %4 .loopexit .preheader\n  block .preheader:\n    %5 = phi i8 %12 10 %3 2\n    %6 = phi i16 %11 10 0 2\n    %7 = gep @s2 +0 +1*%6\n    %8 = load i8 %7\n    %9 = icmp eq i8 %5 %8\n    br i1 %9 10 ..loopexit_crit_edge\n  block 10:\n    %11 = add i16 %6 1\n    %__gep3 = gep @s1 +1\n    %scevgep = gep %__gep3 +0 +1*%6\n    %12 = load i8 %scevgep\n    %13 = icmp eq i8 %12 0\n    br i1 %13 .loopexit .preheader\n  block ..loopexit_crit_edge:\n    %14 = zext i8 %5 to i16\n    br .loopexit\n  block .loopexit:\n    %15 = phi i16 7 2 %6 ..loopexit_crit_edge %11 10\n    %16 = phi i16 0 2 %14 ..loopexit_crit_edge 0 10\n    %17 = gep @s2 +0 +1*%15\n    %18 = load i8 %17\n    %19 = zext i8 %18 to i16\n    %20 = sub i16 %16 %19\n    ret i16 %20\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("scevgep"),
+        "nonzero entry arm keeps the carried form:\n{text}"
+    );
+}
+
 /// Widening-product narrowing (epic-cc#1174): `mul i32` over two
 /// `sext i16 -> i32` operands becomes `call i32 @__mul_s16` on the i16
 /// sources, the orphaned sexts drop, and `__mul_u32` is not injected.
