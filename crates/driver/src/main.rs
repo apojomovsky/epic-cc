@@ -23,6 +23,7 @@ use clang_discovery::{resolve_clang, resolve_llvm_link, resolve_opt};
 use driver::clang;
 use driver::clang_discovery;
 use driver::cli;
+use driver::const_window;
 use driver::diag;
 use std::collections::HashMap;
 use std::path::Path;
@@ -621,6 +622,12 @@ fn main() {
             let (asm, l) = banking::assign_banks_with_locs(device, &asm, &locs);
             locs = l;
             let (asm, l) = peephole::optimize_with_locs(&asm, &locs);
+            locs = l;
+            // Const-table window repair (epic-cc#879): isel folds table bases
+            // at its pre-schedule section start, and schedule's reordering
+            // shifts banking's BANKSEL count after that decision. Walk the
+            // final addresses and pad any table drifted across its window.
+            let (asm, l) = const_window::repair_with_locs(&asm, &locs);
             locs = l;
 
             // The page assignment ran on pre-banking sizes; banking inserts
