@@ -3445,3 +3445,141 @@ fn unreachable_marker_survives_legalize() {
         "marker must survive the text boundary:\n{text}"
     );
 }
+
+/// epic-cc#1159: a zext-fed snapshot masked and zero-tested narrows to its
+/// source width. The PIR1 dispatch shape (`zext i8 %pir` feeding two
+/// low-byte masks, each tested against zero) becomes i8 throughout and the
+/// zext disappears, so alloc colors a 1-byte live-across-call value.
+#[test]
+fn narrows_zext_snapshot_to_demanded_width() {
+    let m = parse(
+        "global pir i8\n\
+         fn snap(void) ()\n\
+           block entry:\n\
+             %14 = load i8 @pir\n\
+             %15 = zext i8 %14 to i16\n\
+             %16 = and i16 %15 2\n\
+             %17 = icmp eq i16 %16 0\n\
+             %28 = and i16 %15 16\n\
+             %29 = icmp eq i16 %28 0\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("%16 = and i8 %14 2"),
+        "mask runs at the source width:\n{text}"
+    );
+    assert!(
+        text.contains("%17 = icmp eq i8 %16 0"),
+        "zero test follows the mask down:\n{text}"
+    );
+    assert!(
+        text.contains("%28 = and i8 %14 16"),
+        "every mask section narrows, not just the first:\n{text}"
+    );
+    assert!(!text.contains("zext"), "the snapshot is gone:\n{text}");
+}
+
+/// A zext with a use outside the mask-and-zero-test shape keeps the wide
+/// form: the store below observes the full i16, so narrowing would drop a
+/// live high byte.
+#[test]
+fn keeps_zext_snapshot_with_a_non_mask_use() {
+    let m = parse(
+        "global pir i8\nglobal out i16\n\
+         fn snap(void) ()\n\
+           block entry:\n\
+             %14 = load i8 @pir\n\
+             %15 = zext i8 %14 to i16\n\
+             %16 = and i16 %15 2\n\
+             %17 = icmp eq i16 %16 0\n\
+             store i16 %15 @out\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("%15 = zext i8 %14 to i16"),
+        "the escaping snapshot stays wide:\n{text}"
+    );
+    assert!(
+        text.contains("%16 = and i16 %15 2"),
+        "its masks stay wide with it:\n{text}"
+    );
+}
+
+/// A mask touching the high byte vetoes the whole chain: the `and 512`
+/// result is not decided by the low byte, so the zext must stay to feed it.
+#[test]
+fn keeps_zext_snapshot_with_a_wide_mask() {
+    let m = parse(
+        "global pir i8\n\
+         fn snap(void) ()\n\
+           block entry:\n\
+             %14 = load i8 @pir\n\
+             %15 = zext i8 %14 to i16\n\
+             %16 = and i16 %15 2\n\
+             %17 = icmp eq i16 %16 0\n\
+             %18 = and i16 %15 512\n\
+             %19 = icmp eq i16 %18 0\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("%15 = zext i8 %14 to i16"),
+        "one wide mask keeps the snapshot:\n{text}"
+    );
+    assert!(
+        text.contains("%16 = and i16 %15 2"),
+        "even the narrow masks stay wide with it:\n{text}"
+    );
+}
+
+/// A test against nonzero vetoes: `icmp eq %and, 5` is outside the proven
+/// zero-test shape, so the chain keeps the wide form.
+#[test]
+fn keeps_zext_snapshot_with_a_nonzero_test() {
+    let m = parse(
+        "global pir i8\n\
+         fn snap(void) ()\n\
+           block entry:\n\
+             %14 = load i8 @pir\n\
+             %15 = zext i8 %14 to i16\n\
+             %16 = and i16 %15 2\n\
+             %17 = icmp eq i16 %16 5\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("%15 = zext i8 %14 to i16"),
+        "a nonzero test keeps the snapshot:\n{text}"
+    );
+}
+
+/// A zext used as an indirect call target keeps the wide form: the target
+/// address is the full 2-byte value, so narrowing would drop a live byte.
+/// The veto scan reads the call target directly because this pass runs
+/// before `fill_indirect_callees` fills `callees` (an empty `callees` list
+/// would otherwise hide the use).
+#[test]
+fn keeps_zext_snapshot_used_as_indirect_target() {
+    let m = parse(
+        "global pir i8\n\
+         fn snap(void) ()\n\
+           block entry:\n\
+             %14 = load i8 @pir\n\
+             %15 = zext i8 %14 to i16\n\
+             %16 = and i16 %15 2\n\
+             %17 = icmp eq i16 %16 0\n\
+             call void %15()\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("%15 = zext i8 %14 to i16"),
+        "a call target keeps its snapshot:\n{text}"
+    );
+    assert!(
+        text.contains("%16 = and i16 %15 2"),
+        "its masks stay wide with it:\n{text}"
+    );
+}

@@ -94,7 +94,8 @@ fn legalize_inner(m: Module, pic18: bool) -> Module {
     } else {
         (m, false)
     };
-    let mut m = narrow_div_rem_tails(m);
+    let m = narrow_div_rem_tails(m);
+    let mut m = narrow_zext_snapshots(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
     if udec {
@@ -1602,6 +1603,220 @@ fn narrow_div_rem_tails(m: Module) -> Module {
                     }
                     if drop.contains(d) {
                         continue;
+                    }
+                }
+                insts.push(inst);
+            }
+            blocks.push(Block {
+                label: b.label,
+                insts,
+            });
+        }
+        funcs.push(Func {
+            name: f.name,
+            ret: f.ret,
+            params: f.params,
+            blocks,
+            isr: f.isr,
+            irq_priority: f.irq_priority,
+            naked: f.naked,
+            unreachable_body: f.unreachable_body,
+            variadic: f.variadic,
+        });
+    }
+    Module {
+        globals: m.globals,
+        funcs,
+        module_asm: m.module_asm,
+    }
+}
+
+/// Narrow a zero-extended snapshot to its source width when every use
+/// observes only the source bytes (epic-cc#1159). clang promotes
+/// `pir1 & MASK` to `and i16 (zext i8 %pir1), MASK`, and the shared
+/// snapshot survives `-O1` to sit live across the indirect dispatch
+/// calls. Every `and` masks the low byte only and every consumer tests
+/// against zero, so the high byte (zero by zext) is unobserved. Fires
+/// only on the exact shape; anything else keeps the wide form.
+fn narrow_zext_snapshots(m: Module) -> Module {
+    fn int_bits(ty: Ty) -> Option<u32> {
+        match ty {
+            Ty::I1 => Some(1),
+            Ty::I8 => Some(8),
+            Ty::I16 => Some(16),
+            Ty::I32 => Some(32),
+            Ty::I64 | Ty::F32 => None,
+        }
+    }
+    // The `and` arm matching `<reg> <op> <const>` in either order.
+    fn and_reg_const(bin: &Bin, r: &str) -> Option<i64> {
+        if bin.op != BinOp::And {
+            return None;
+        }
+        match (&bin.a, &bin.b) {
+            (Val::Reg(x), Val::Const(k)) if x == r => Some(*k),
+            (Val::Const(k), Val::Reg(x)) if x == r => Some(*k),
+            _ => None,
+        }
+    }
+    // The `icmp` matching `eq|ne <reg>, 0` in either arm order.
+    fn zero_test(icmp: &Icmp, r: &str) -> Option<()> {
+        if icmp.pred != "eq" && icmp.pred != "ne" {
+            return None;
+        }
+        match (&icmp.a, &icmp.b) {
+            (Val::Reg(x), Val::Const(0)) if x == r => Some(()),
+            (Val::Const(0), Val::Reg(x)) if x == r => Some(()),
+            _ => None,
+        }
+    }
+    // Every SSA register an instruction reads, for the veto scans. Adds
+    // the call target to `inst_reads`: this pass runs before
+    // `fill_indirect_callees`, so `callees` is still empty and the shared
+    // helper never reports the target. A direct callee name cannot equal
+    // a numeric SSA dst, so only a genuine indirect-target use vetoes.
+    fn reads(inst: &Inst, r: &str) -> bool {
+        if let Inst::Call(c) = inst {
+            if c.func == r {
+                return true;
+            }
+        }
+        inst_reads(inst).iter().any(|x| x == r)
+    }
+    let mut funcs = Vec::with_capacity(m.funcs.len());
+    for f in m.funcs {
+        let zexts: Vec<(String, Ty, String, Ty)> = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| match i {
+                Inst::Zext(z) => match &z.val {
+                    Val::Reg(src) => Some((z.dst.clone(), z.from, src.clone(), z.to)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        // Narrowed `and` dst -> (zext dst, zext source, source width). The
+        // zext dst names the arm to substitute; the scan guarantees one arm
+        // reads it and the other is the fitting constant.
+        let mut narrow_and: HashMap<String, (String, String, Ty)> = HashMap::new();
+        let mut narrow_icmp: HashMap<String, Ty> = HashMap::new();
+        let mut drop: HashSet<String> = HashSet::new();
+        // Narrowed `icmp` dst -> source width; dropped zext dsts. The scans
+        // read every instruction through `inst_reads`, so an unlisted use
+        // (phi, call arg, store) vetoes rather than escapes.
+        for (zdst, from, src, to) in &zexts {
+            let (Some(fb), Some(tb)) = (int_bits(*from), int_bits(*to)) else {
+                continue;
+            };
+            if tb <= fb {
+                continue;
+            }
+            let mut ands: Vec<String> = Vec::new();
+            let mut good = false;
+            'scan: for ub in &f.blocks {
+                for u in &ub.insts {
+                    if !reads(u, zdst) {
+                        continue;
+                    }
+                    good = true;
+                    let Inst::Bin(bin) = u else {
+                        good = false;
+                        break 'scan;
+                    };
+                    if bin.ty != *to {
+                        good = false;
+                        break 'scan;
+                    }
+                    let Some(k) = and_reg_const(bin, zdst) else {
+                        good = false;
+                        break 'scan;
+                    };
+                    let v = (k as u64) & ((1u64 << tb) - 1);
+                    if v >= (1u64 << fb) {
+                        good = false;
+                        break 'scan;
+                    }
+                    ands.push(bin.dst.clone());
+                }
+            }
+            if !good || ands.is_empty() {
+                continue;
+            }
+            for a in &ands {
+                for ub in &f.blocks {
+                    for u in &ub.insts {
+                        if !reads(u, a) {
+                            continue;
+                        }
+                        let Inst::Icmp(icmp) = u else {
+                            good = false;
+                            break;
+                        };
+                        if icmp.ty != *to || zero_test(icmp, a).is_none() {
+                            good = false;
+                            break;
+                        }
+                    }
+                    if !good {
+                        break;
+                    }
+                }
+                if !good {
+                    break;
+                }
+            }
+            if !good {
+                continue;
+            }
+            for a in ands {
+                narrow_and.insert(a.clone(), (zdst.clone(), src.clone(), *from));
+                for ub in &f.blocks {
+                    for u in &ub.insts {
+                        if let Inst::Icmp(icmp) = u {
+                            if reads(u, &a) {
+                                narrow_icmp.insert(icmp.dst.clone(), *from);
+                            }
+                        }
+                    }
+                }
+            }
+            drop.insert(zdst.clone());
+        }
+        if drop.is_empty() {
+            funcs.push(f);
+            continue;
+        }
+        let mut blocks = Vec::with_capacity(f.blocks.len());
+        for b in f.blocks {
+            let mut insts: Vec<Inst> = Vec::with_capacity(b.insts.len());
+            for inst in b.insts {
+                if let Some(d) = inst_dst(&inst) {
+                    if drop.contains(d) {
+                        continue;
+                    }
+                    if let Inst::Bin(bin) = &inst {
+                        if let Some((zreg, src, from)) = narrow_and.get(d) {
+                            let mut bin = bin.clone();
+                            bin.ty = *from;
+                            let sub = Val::Reg(src.clone());
+                            if bin.a == Val::Reg(zreg.clone()) {
+                                bin.a = sub;
+                            } else {
+                                bin.b = sub;
+                            }
+                            insts.push(Inst::Bin(bin));
+                            continue;
+                        }
+                    }
+                    if let Inst::Icmp(icmp) = &inst {
+                        if let Some(from) = narrow_icmp.get(d) {
+                            let mut icmp = icmp.clone();
+                            icmp.ty = *from;
+                            insts.push(Inst::Icmp(icmp));
+                            continue;
+                        }
                     }
                 }
                 insts.push(inst);
