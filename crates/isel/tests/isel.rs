@@ -10756,3 +10756,86 @@ fn walk_index_value_store_writes_in_sim() {
         "rebuilt values ascend with the index:\n{asm}"
     );
 }
+
+#[test]
+fn walk_down_copy_writes_high_to_low_in_sim() {
+    // A down-counted copy visits index K..1, so dst[8] must equal
+    // src[8] and dst[0] must stay untouched.
+    use pic14_sim::Pic14;
+    let m = parse(
+        "global src i8\nglobal dst i8\nfn main(void) ()\n  block entry:\n    br loop\n  block loop:\n    %k = phi i8 8 entry %dec loop\n    %p1 = gep @src +0 +1*%k\n    %x = load i8 %p1\n    %p2 = gep @dst +0 +1*%k\n    store i8 %x %p2\n    %dec = add i8 %k -1\n    %d = icmp eq i8 %dec 0\n    br i1 %d done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("src", 0x20u16),
+        ("dst", 0x30),
+        ("main::k", 0x25),
+        ("main::x", 0x27),
+        ("main::dec", 0x2A),
+        ("main::d", 0x2B),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    for o in 0..9 {
+        p.ram_mut()[0x20 + o] = 10 + o as u8;
+    }
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    assert_eq!(p.ram()[0x38], 18, "down copy reaches the top byte:\n{asm}");
+    assert_eq!(p.ram()[0x30], 0, "down copy skips index zero:\n{asm}");
+}
+
+#[test]
+fn walk_carried_phi_exit_reads_last_backedge_in_sim() {
+    // The exit block reads the carried phi itself, whose home must
+    // still hold the last backedge write, not the exiting update.
+    use pic14_sim::Pic14;
+    let m = parse(
+        "global buf i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %s = phi i8 0 entry %acc loop\n    %p = gep @buf +0 +1*%i\n    %x = load i8 %p\n    %acc = add i8 %x %s\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done loop\n  block done:\n    store i8 %s @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("out", 0x21),
+        ("main::i", 0x25),
+        ("main::s", 0x27),
+        ("main::x", 0x28),
+        ("main::acc", 0x29),
+        ("main::inc", 0x2A),
+        ("main::c", 0x2B),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    for (o, v) in [1u8, 2, 3, 4].iter().enumerate() {
+        p.ram_mut()[0x20 + o] = *v;
+    }
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    assert_eq!(
+        p.ram()[0x21],
+        6,
+        "exit phi holds the last backedge write (1+2+3):\n{asm}"
+    );
+}
+
+#[test]
+fn walk_refuses_double_trunc_use() {
+    // `t + t` over one counter trunc has no single base to rebuild
+    // from, and the trunc never materializes a slot to read.
+    let m = parse(
+        "global buf i8\nfn main(void) ()\n  block entry:\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p = gep @buf +0 +1*%i\n    %t = trunc i16 %i to i8\n    %v = add i8 %t %t\n    store i8 %v %p\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 16\n    br i1 %c done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("main::i", 0x25),
+        ("main::t", 0x27),
+        ("main::v", 0x28),
+        ("main::inc", 0x2A),
+        ("main::c", 0x2B),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("DECFSZ 0x25, F"),
+        "no walk on a doubled trunc:\n{asm}"
+    );
+}

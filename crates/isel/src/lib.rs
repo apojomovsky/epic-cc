@@ -7776,7 +7776,7 @@ impl<'m> Gen<'m> {
         }
         let count_slot = *g.addrs.get(&ssa_key(&f.name, &cntreg))?;
         Self::walk_body(
-            g, f, b, uses, unplaced, pre, exit, cntreg, increg, k as u16, count_slot,
+            g, f, b, uses, unplaced, pre, exit, cntreg, increg, up, k as u16, count_slot,
         )
     }
     /// Header body scan: validates every inst, builds the op list, and
@@ -7794,6 +7794,7 @@ impl<'m> Gen<'m> {
         exit: String,
         cntreg: String,
         increg: String,
+        up: bool,
         k: u16,
         count_slot: u16,
     ) -> Option<WalkLoop> {
@@ -7857,9 +7858,18 @@ impl<'m> Gen<'m> {
                     }
                     WalkAdd::PostInc => return None,
                     WalkAdd::Direct(base) => {
+                        // A down loop visits K..1, so no ascending
+                        // rebuild maps onto it: only counter-free
+                        // down loops walk.
+                        if !up {
+                            return None;
+                        }
                         vadds.insert(q.dst.clone(), (ii, None, base));
                     }
                     WalkAdd::ViaTrunc(tii, base) => {
+                        if !up {
+                            return None;
+                        }
                         vadds.insert(q.dst.clone(), (ii, Some(tii), base));
                     }
                 },
@@ -7907,6 +7917,11 @@ impl<'m> Gen<'m> {
                         body.push(WalkOp::Emit(ii));
                         continue;
                     }
+                    // Down loops address base+K..base+1 while the
+                    // re-derivation visits ascending: refuse.
+                    if !up {
+                        return None;
+                    }
                     if l.ty.bytes() != 1 || l.ptr_ty {
                         return None;
                     }
@@ -7935,6 +7950,10 @@ impl<'m> Gen<'m> {
                     if s.ptr.starts_with('@') {
                         body.push(WalkOp::Emit(ii));
                         continue;
+                    }
+                    // Same descending-address refusal as loads.
+                    if !up {
+                        return None;
                     }
                     if s.ty.bytes() != 1 {
                         return None;
@@ -8048,6 +8067,11 @@ impl<'m> Gen<'m> {
         for (side, other) in [(a, b), (b, a)] {
             if let Val::Reg(x) = side {
                 if let Some(tii) = ctr_truncs.get(x) {
+                    // The other side must be a real base: a second
+                    // counter trunc has no slot to rebuild from.
+                    if matches!(other, Val::Reg(y) if ctr_truncs.contains_key(y)) {
+                        return WalkAdd::No;
+                    }
                     return WalkAdd::ViaTrunc(*tii, other.clone());
                 }
             }
@@ -8269,6 +8293,23 @@ impl<'m> Gen<'m> {
         latch_ii: usize,
     ) -> Option<WalkLoop> {
         let here = |ii: usize| (b.label.clone(), ii);
+        // Carried values exit only through body temps: the latch runs
+        // the backedge copies on the exiting iteration too, so a
+        // carried phi read outside the header would see one update
+        // too many.
+        for inst in &b.insts {
+            if let Inst::Phi(p) = inst {
+                if p.dst == cntreg {
+                    continue;
+                }
+                if uses
+                    .get(&p.dst)
+                    .is_some_and(|u| u.iter().any(|s| s.0 != b.label))
+                {
+                    return None;
+                }
+            }
+        }
         // Value-adds are consumed by their store or dead.
         for dst in vadds.keys() {
             if consumed_vadds.contains(dst) {
