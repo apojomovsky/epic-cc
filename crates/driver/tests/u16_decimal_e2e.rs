@@ -14,6 +14,12 @@
 //! call, and the simulator checks the ASCII digits plus the count for
 //! values up to 10 digits.
 //!
+//! epic-cc#1055 extends the coverage to the shared right-justified tails:
+//! `bench-u16-dec-rj5.c` carries the menu-redraw shape (backward digits
+//! plus blank fill), `legalize_pic18` shares both width-5 sites as one
+//! `__udec_u16_rj5` call each, and the simulator checks the rendered
+//! line for blank-fill and digit boundaries.
+//!
 //! `in` is a zero-initialized global, so `__start` clears it before main.
 //! Seeding must therefore happen after the clear: the asm listing gives the
 //! `__start` window length, and the sim is advanced past it to main's entry
@@ -212,5 +218,77 @@ fn the_shared_u32_digit_loop_stores_the_right_digits() {
         assert_eq!(got, [want.clone(), want.clone()], "digits of {v}");
         let counts: Vec<u8> = ns.iter().map(|&a| p.ram()[a]).collect();
         assert_eq!(counts, [want.len() as u8; 2], "counts of {v}");
+    }
+}
+
+#[test]
+fn the_shared_rj5_tails_render_right_justified() {
+    let dir = std::env::temp_dir();
+    let asm_path = dir.join(format!("rj5dec_{}.asm", std::process::id()));
+    let hex_path = dir.join(format!("rj5dec_{}.hex", std::process::id()));
+    for (emit, path) in [(Some("asm"), &asm_path), (None, &hex_path)] {
+        let mut args: Vec<String> = vec![
+            "tests/fixtures/size-bench/bench-u16-dec-rj5.c".into(),
+            "--device".into(),
+            "18f4550".into(),
+            "-o".into(),
+            path.display().to_string(),
+        ];
+        if let Some(f) = emit {
+            args.extend(["--emit".into(), f.to_string()]);
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+            .args(&args)
+            .output()
+            .expect("run driver");
+        assert!(
+            out.status.success(),
+            "driver ({emit:?}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let asm = std::fs::read_to_string(&asm_path).unwrap();
+    let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let _ = std::fs::remove_file(&asm_path);
+    let _ = std::fs::remove_file(&hex_path);
+    assert_eq!(
+        asm.matches("CALL __udec_u16_rj5").count(),
+        2,
+        "both width-5 tails are shared, not expanded:\n{asm}"
+    );
+    let start = start_steps(&asm);
+    let equ = |name: &str| -> usize {
+        asm.lines()
+            .find_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix(name)?.strip_prefix(" equ ")?;
+                usize::from_str_radix(rest.trim_start_matches("0x"), 16).ok()
+            })
+            .unwrap_or_else(|| panic!("no `{name} equ` in listing"))
+    };
+    let (va, vb, vc) = (equ("vin_a"), equ("vin_b"), equ("vin_c"));
+    let buf = equ("g_line_buf");
+    let poke16 = |p: &mut pic14_sim::Pic18, a: usize, v: u16| {
+        p.ram_mut()[a] = (v & 0xFF) as u8;
+        p.ram_mut()[a + 1] = (v >> 8) as u8;
+    };
+    // The status inputs stay fixed; the about tail varies across the
+    // blank-fill and digit boundaries. The about redraw rebuilds the
+    // whole line, so the final buffer is fully determined by vin_c.
+    for v in [0u16, 7, 42, 999, 12345, 65535] {
+        let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+        for _ in 0..start {
+            p.step();
+        }
+        poke16(&mut p, va, 12345);
+        poke16(&mut p, vb, 0);
+        poke16(&mut p, vc, v);
+        p.run(200_000);
+        assert!(p.halted(), "program must run to completion for {v}");
+        let mut want = b"EEwr:      ".to_vec();
+        want.extend_from_slice(format!("{v:>5}").as_bytes());
+        want.push(0);
+        let got: Vec<u8> = (0..17).map(|i| p.ram()[buf + i]).collect();
+        assert_eq!(got, want, "rendered line for {v}");
     }
 }
