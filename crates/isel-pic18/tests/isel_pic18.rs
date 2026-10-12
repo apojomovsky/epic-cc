@@ -9529,9 +9529,9 @@ fn walk_counter_only_loop_keeps_body_and_counts_down() {
 
 #[test]
 fn walk_refuses_post_increment_indexed_access() {
-    // `buf[i + 1]` indexes one ahead of the walk's `base+k+0..K-1`
-    // visit order, so the loop keeps its normal lowering and still
-    // copies the right cells (epic-cc#896).
+    // The latch increment itself indexes one ahead of the walk's
+    // `base+k+0..K-1` visit order, so the loop keeps its normal
+    // lowering and still sums the right cells (epic-cc#896).
     let m = parse(
         "global buf i8\n\
          global out i8\n\
@@ -9539,14 +9539,13 @@ fn walk_refuses_post_increment_indexed_access() {
            block entry:\n\
              br loop\n\
            block loop:\n\
-             %i = phi i16 %n loop 0 entry\n\
+             %i = phi i16 %r loop 0 entry\n\
              %s = phi i8 %a loop 0 entry\n\
              %r = add i16 %i, 1\n\
              %g = gep @buf +0 +1*%r\n\
              %v = load i8 %g\n\
              %a = add i8 %s %v\n\
-             %n = add i16 %i, 1\n\
-             %c = icmp eq i16 %n, 11\n\
+             %c = icmp eq i16 %r, 11\n\
              br i1 %c, exit, loop\n\
            block exit:\n\
              store i8 %a @out\n\
@@ -9558,11 +9557,9 @@ fn walk_refuses_post_increment_indexed_access() {
         ("main::i", 0x050),
         ("main::s", 0x052),
         ("main::r", 0x054),
-        ("main::g", 0x056),
-        ("main::v", 0x058),
-        ("main::a", 0x05A),
-        ("main::n", 0x05C),
-        ("main::c", 0x05E),
+        ("main::v", 0x056),
+        ("main::a", 0x058),
+        ("main::c", 0x05A),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     let lp = block_section(&asm, "main_Lloop");
