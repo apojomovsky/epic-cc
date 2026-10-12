@@ -3388,7 +3388,7 @@ fn sim_run_bytes_o2(
         fast_divmod: true,
         fast_mul_u8: true,
     };
-    let (asm, _, _) = select_with_opts(
+    let (asm, _, _, _) = select_with_opts(
         &PIC16F877A,
         &m,
         &addrs(&map_refs(map)),
@@ -3849,7 +3849,7 @@ fn mul_u8_unrolled_body_matches_wrapping_mul() {
         fast_divmod: true,
         fast_mul_u8: true,
     };
-    let (asm, _, _) = select_with_opts(
+    let (asm, _, _, _) = select_with_opts(
         &PIC16F877A,
         &m,
         &addrs(&map_refs(&map)),
@@ -5440,7 +5440,7 @@ fn split_function_spans_pages_and_runs_in_sim() {
         ("helper::x", 0x40),
         ("helper::r", 0x41),
     ]);
-    let (asm, _, chunks) = isel::select_with_locs(
+    let (asm, _, chunks, _) = isel::select_with_locs(
         &PIC16F877A,
         &m,
         &addrs,
@@ -10941,4 +10941,71 @@ fn walk_refuses_double_trunc_use() {
         !asm.contains("DECFSZ 0x25, F"),
         "no walk on a doubled trunc:\n{asm}"
     );
+}
+
+// epic-cc#1139: the page-fit repair must converge or fail honestly on
+// page-tight programs, never die oscillating. Two multi-block functions
+// compete for page 0 (a call across them varies restore elision with the
+// layout, the alternation fuel); perturbations of a few words sweep the
+// packings around exactly-full pages.
+fn page_tight_module(main_pad: usize, work_pad: usize) -> (ir::Module, HashMap<String, u16>) {
+    fn pads(n: usize, v: &str) -> String {
+        let mut s = String::new();
+        for _ in 0..n {
+            s.push_str(&format!("    %{v} = add i8 %{v}, 1\n"));
+        }
+        s
+    }
+    let mut text = String::from(
+        "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @in\n    %d = add i8 %a, 0\n",
+    );
+    text.push_str(&pads(main_pad, "d"));
+    for b in 1..4 {
+        text.push_str(&format!("    br m{b}\n  block m{b}:\n"));
+        text.push_str(&pads(main_pad, "d"));
+    }
+    text.push_str("    %t = call i8 @work(i8 %d)\n    store i8 %t @out\n    ret void\n");
+    text.push_str("fn work(i8) (x)\n  block entry:\n    %e = add i8 %x, 0\n");
+    text.push_str(&pads(work_pad, "e"));
+    text.push_str("    br w1\n  block w1:\n");
+    text.push_str(&pads(work_pad, "e"));
+    text.push_str("    %r = add i8 %e, 1\n    ret i8 %r\n");
+    let m = parse(&text);
+    let map = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::a", 0x25),
+        ("main::d", 0x26),
+        ("main::t", 0x27),
+        ("work::x", 0x30),
+        ("work::e", 0x31),
+        ("work::r", 0x32),
+    ]);
+    (m, map)
+}
+
+#[test]
+fn page_tight_perturbations_never_oscillate() {
+    for main_pad in [660usize, 670, 680, 690, 700] {
+        for work_pad in [80usize, 120, 160, 200] {
+            let (m, map) = page_tight_module(main_pad, work_pad);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                select(&PIC16F877A, &m, &map)
+            }));
+            match outcome {
+                Ok(_) => {}
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    assert!(
+                        !msg.contains("oscillat"),
+                        "main_pad={main_pad} work_pad={work_pad} oscillated: {msg}"
+                    );
+                }
+            }
+        }
+    }
 }

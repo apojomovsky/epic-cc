@@ -112,7 +112,8 @@ fn split_function_spans_pages_and_runs_in_sim() {
         ("helper::x", 0x40),
         ("helper::r", 0x41),
     ]);
-    let (asm, _, chunks) = isel_pic14e::select_with_locs(&PIC16F1937, &m, &addrs, &HashSet::new());
+    let (asm, _, chunks, _) =
+        isel_pic14e::select_with_locs(&PIC16F1937, &m, &addrs, &HashSet::new());
     let entries = chunks.get("main").expect("main must split");
     assert!(
         entries.len() >= 2,
@@ -219,7 +220,8 @@ fn split_const_read(table_size: usize, idx: u16) -> (u8, u8) {
         ("main::v", 0x26),
         ("main::a", 0x27),
     ]);
-    let (asm, _, chunks) = isel_pic14e::select_with_locs(&PIC16F1937, &m, &addrs, &HashSet::new());
+    let (asm, _, chunks, _) =
+        isel_pic14e::select_with_locs(&PIC16F1937, &m, &addrs, &HashSet::new());
     assert!(
         chunks.get("main").is_some_and(|c| c.len() >= 2),
         "main must split"

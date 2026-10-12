@@ -112,7 +112,8 @@ fn full_pages_fit_and_run_in_sim() {
     addrs.extend(layout.locals.clone());
     let in_addr = addrs["in"];
     let out_addr = addrs["out"];
-    let (asm, _, chunks) = isel_pic14e::select_with_locs(&PIC16F1937, &m, &addrs, &HashSet::new());
+    let (asm, _, chunks, _) =
+        isel_pic14e::select_with_locs(&PIC16F1937, &m, &addrs, &HashSet::new());
     let entries = chunks.get("main").expect("main must split");
     assert!(
         entries.len() >= 3,
