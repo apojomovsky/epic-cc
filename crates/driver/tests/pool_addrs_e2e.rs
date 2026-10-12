@@ -1,8 +1,10 @@
 //! Pool addresses and RAM-copy gating (epic-cc#816): with
-//! `--const-pool` the direct-arg string consts (the encoder-sim log
-//! shape) carry no RAM copies and materialize as pool addresses, while
-//! the mixed-use const keeps its copy. Unflagged output keeps every
-//! copy. The sim behavior proof itself lands in epic-cc#817.
+//! `--const-pool` the direct-arg string consts carry no per-const RAM
+//! copies (they stage through the shared buffer, since `consume` hands
+//! its pointer to strlen), while the mixed-use const keeps its copy.
+//! No site reads through the pool, so no chunk emits (epic-cc#1088).
+//! Unflagged output keeps every copy. The sim behavior proof itself
+//! lands in epic-cc#817.
 
 use std::process::Command;
 
@@ -54,7 +56,7 @@ fn staged(map: &str) -> Vec<&str> {
 }
 
 #[test]
-fn pool_addrs_gate_copies_and_rewrite_addresses() {
+fn pool_addrs_gates_copies_and_omits_unread_table() {
     let (asm, map) = build("flagged", &["--const-pool"]);
     let gs = globals(&map);
     let cs = consts(&map);
@@ -74,13 +76,11 @@ fn pool_addrs_gate_copies_and_rewrite_addresses() {
         !cs.contains(&"mixed"),
         "mixed-use const leaves the flash set: {cs:?}"
     );
+    // epic-cc#1088: every literal stages and mixed keeps its copy, so
+    // no site reads through the pool and no chunk emits.
     assert!(
-        asm.contains("__const_pool:"),
-        "pool chunk is emitted:\n{asm}"
-    );
-    assert!(
-        asm.contains("LOW(__const_pool"),
-        "direct const args materialize pool addresses:\n{asm}"
+        !asm.contains("__const_pool"),
+        "no pool table, reader, or reference expected:\n{asm}"
     );
     // consume() hands its pointer to strlen, which reads the bytes, so the
     // literals stage a RAM copy (epic-cc#1026); the mixed const keeps its own.
