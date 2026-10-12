@@ -235,6 +235,12 @@ struct Gen<'m> {
     /// it, so a stale belief survives only across adjacent `emit_w_*` calls
     /// within one function (epic-cc#214, epic-cc#217).
     w_holds: Option<u16>,
+    /// Whether RAM at `w_holds` actually holds W's value. A deferred or
+    /// adopted temp sets `w_holds` without committing, so a store skip
+    /// needs this too: skipping on an uncommitted belief drops a value
+    /// no later reader can see (epic-cc#1030). Reload skips need no
+    /// commitment, they reuse W itself.
+    w_committed: bool,
     /// Per-function read counts keyed `{func}::{ssa}`, from `read_vals`
     /// over every instruction. A count of 1 marks a lane temporary whose
     /// single consumer can take it straight from W (see deferred_store).
@@ -288,6 +294,7 @@ impl<'m> Gen<'m> {
     fn emit(&mut self, s: impl Into<String>) {
         self.flush_deferred();
         self.w_holds = None;
+        self.w_committed = false;
         self.z_rel = None;
         self.out.push(s.into());
         self.locs.push(self.cur_loc.clone());
@@ -304,6 +311,7 @@ impl<'m> Gen<'m> {
                 self.out.push(format!("    MOVWF 0x{slot:02X}"));
                 self.locs.push(self.cur_loc.clone());
                 self.w_holds = Some(slot);
+                self.w_committed = true;
             }
         }
     }
@@ -332,12 +340,14 @@ impl<'m> Gen<'m> {
             self.deferred_store = None;
             self.emit(format!("    MOVWF 0x{addr:02X}"));
             self.mark_w(addr);
+            self.w_committed = true;
             self.z_rel = None;
             return;
         }
         self.flush_deferred();
-        if self.w_holds != Some(addr) {
+        if self.w_holds != Some(addr) || !self.w_committed {
             self.emit(format!("    MOVWF 0x{addr:02X}"));
+            self.w_committed = true;
         }
         self.mark_w(addr);
         // The skipped-MOVWF path never hits `emit`, so the flag relation
@@ -359,12 +369,14 @@ impl<'m> Gen<'m> {
             self.deferred_store = None;
             self.deferred_uses = self.deferred_uses.saturating_sub(1);
             self.w_holds = Some(addr);
+            self.w_committed = false;
             self.z_rel = None;
             return;
         }
         self.flush_deferred();
         if self.w_holds != Some(addr) {
             self.emit(format!("    MOVF 0x{addr:02X}, W"));
+            self.w_committed = true;
         }
         self.mark_w(addr);
         // Same reason as emit_w_store: a skipped MOVF skips its `emit`, so
@@ -2610,6 +2622,7 @@ impl<'m> Gen<'m> {
             self.deferred_store = Some(dst);
             self.deferred_uses = 1;
             self.w_holds = Some(dst);
+            self.w_committed = false;
         } else {
             self.emit_w_store(dst);
         }
@@ -3350,6 +3363,7 @@ impl<'m> Gen<'m> {
             // Float callees keep the reload (see `call_returns_in_w`).
             if Self::call_returns_in_w(func) {
                 self.w_holds = Some(self.retval_lo + u16::from(t.bytes()) - 1);
+                self.w_committed = true;
             }
             // Copy the retval region (0x71..0x71+bytes-1, up to 0x74 for
             // i32) into dst ahead of the restore: the copy is MOVF/MOVWF
@@ -3749,7 +3763,8 @@ impl<'m> Gen<'m> {
                 let da = self.slot_addr(self.cur_func, &z.dst).direct();
                 for i in 0..z.from.bytes() {
                     self.emit_load_byte(&z.val, i);
-                    self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
+                    // W holds the loaded byte, so a copy onto its own slot collapses (epic-cc#1030).
+                    self.emit_w_store(da + u16::from(i));
                 }
                 for i in z.from.bytes()..z.to.bytes() {
                     self.emit(format!("    CLRF 0x{:02X}", da + u16::from(i)));
@@ -3768,7 +3783,8 @@ impl<'m> Gen<'m> {
                 let da = self.slot_addr(self.cur_func, &p.dst).direct();
                 for i in 0..p.from.bytes() {
                     self.emit_load_byte(&p.val, i);
-                    self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
+                    // Same W-cache collapse as zext above (epic-cc#1030).
+                    self.emit_w_store(da + u16::from(i));
                 }
             }
             Inst::Sext(x) => {
@@ -3788,7 +3804,8 @@ impl<'m> Gen<'m> {
                 // Copy the low bytes unchanged.
                 for i in 0..x.from.bytes() {
                     self.emit_load_byte(&x.val, i);
-                    self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
+                    // Same W-cache collapse as zext above (epic-cc#1030).
+                    self.emit_w_store(da + u16::from(i));
                 }
                 // Fill the high bytes with the source's sign bit: test the
                 // MSB of the source's high byte, then MOVLW 0xFF (set) or
@@ -3818,7 +3835,8 @@ impl<'m> Gen<'m> {
                 let da = self.slot_addr(self.cur_func, &t.dst).direct();
                 for i in 0..t.to.bytes() {
                     self.emit_load_byte(&t.val, i);
-                    self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
+                    // Same W-cache collapse as zext above (epic-cc#1030).
+                    self.emit_w_store(da + u16::from(i));
                 }
                 if t.to == Ty::I1 {
                     // Every i1 consumer tests the whole byte for nonzero, so
@@ -7514,6 +7532,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         global_addrs: g.global_addrs,
         w_folds: g.w_folds.clone(),
         w_holds: None,
+        w_committed: false,
         use_count: HashMap::new(),
         deferred_store: None,
         deferred_uses: 0,
@@ -11055,6 +11074,7 @@ pub fn select_with_opts(
                 global_addrs: &global_addrs,
                 w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
                 w_holds: None,
+                w_committed: false,
                 use_count: HashMap::new(),
                 deferred_store: None,
                 deferred_uses: 0,
@@ -11289,6 +11309,7 @@ pub fn select_with_opts(
                     global_addrs: &global_addrs,
                     w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
                     w_holds: None,
+                    w_committed: false,
                     use_count: HashMap::new(),
                     deferred_store: None,
                     deferred_uses: 0,
@@ -11625,6 +11646,7 @@ pub fn select_with_opts(
                                 global_addrs: &global_addrs,
                                 w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
                                 w_holds: None,
+                                w_committed: false,
                                 use_count: HashMap::new(),
                                 deferred_store: None,
                                 deferred_uses: 0,
