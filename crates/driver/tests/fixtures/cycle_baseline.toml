@@ -141,16 +141,16 @@ ram_bytes = 24
 [[entry]]
 name = "speed-divmod-i8-16f877a"
 device = "16F877A"
-cycles = 826
-flash_words = 184
+cycles = 822
+flash_words = 180
 ram_bytes = 24
 
 [[entry]]
 name = "speed-divmod-i8-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 826
-flash_words = 184
+cycles = 822
+flash_words = 180
 ram_bytes = 24
 
 [[entry]]
@@ -351,16 +351,16 @@ ram_bytes = 47
 [[entry]]
 name = "speed-memset-32-16f877a"
 device = "16F877A"
-cycles = 749
-flash_words = 86
+cycles = 747
+flash_words = 84
 ram_bytes = 47
 
 [[entry]]
 name = "speed-memset-32-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 749
-flash_words = 86
+cycles = 747
+flash_words = 84
 ram_bytes = 47
 
 [[entry]]
@@ -381,16 +381,16 @@ ram_bytes = 57
 [[entry]]
 name = "speed-strlen-strcmp-16f877a"
 device = "16F877A"
-cycles = 2700
-flash_words = 280
+cycles = 2682
+flash_words = 275
 ram_bytes = 57
 
 [[entry]]
 name = "speed-strlen-strcmp-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 2700
-flash_words = 280
+cycles = 2682
+flash_words = 275
 ram_bytes = 57
 
 [[entry]]
@@ -411,16 +411,16 @@ ram_bytes = 52
 [[entry]]
 name = "speed-crc16-16f877a"
 device = "16F877A"
-cycles = 14970
-flash_words = 200
+cycles = 11130
+flash_words = 185
 ram_bytes = 54
 
 [[entry]]
 name = "speed-crc16-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 14970
-flash_words = 200
+cycles = 11130
+flash_words = 185
 ram_bytes = 54
 
 [[entry]]
@@ -441,16 +441,16 @@ ram_bytes = 10
 [[entry]]
 name = "speed-switch16-16f877a"
 device = "16F877A"
-cycles = 71
-flash_words = 100
+cycles = 70
+flash_words = 99
 ram_bytes = 11
 
 [[entry]]
 name = "speed-switch16-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 71
-flash_words = 100
+cycles = 70
+flash_words = 99
 ram_bytes = 11
 
 [[entry]]
@@ -531,16 +531,16 @@ ram_bytes = 53
 [[entry]]
 name = "speed-pid-step-16f877a"
 device = "16F877A"
-cycles = 1265
-flash_words = 362
+cycles = 1259
+flash_words = 356
 ram_bytes = 53
 
 [[entry]]
 name = "speed-pid-step-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 1265
-flash_words = 362
+cycles = 1259
+flash_words = 356
 ram_bytes = 53
 
 [[entry]]
