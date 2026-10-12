@@ -353,7 +353,7 @@ name = "speed-memset-32-16f877a"
 device = "16F877A"
 cycles = 749
 flash_words = 86
-ram_bytes = 53
+ram_bytes = 47
 
 [[entry]]
 name = "speed-memset-32-16f877a"
@@ -361,7 +361,7 @@ device = "16F877A"
 profile = "O2"
 cycles = 749
 flash_words = 86
-ram_bytes = 53
+ram_bytes = 47
 
 [[entry]]
 name = "speed-strlen-strcmp-18f4550"
