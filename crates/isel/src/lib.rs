@@ -2492,6 +2492,33 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_end}:"));
     }
 
+    /// The `SelectFold` diamond: same copy arms as `emit_select`, but the
+    /// test is a direct `BTFSC`/`BTFSS` on the folded source's slot. The
+    /// folded `and`/`icmp` never emitted, so a pending deferred store to
+    /// the `and` slot has no consumer left and drops, mirroring the
+    /// branch collapse. The first `emit` flushes any other pending store.
+    fn emit_select_fold(&mut self, s: &ir::Select, fold: &SelectFold) {
+        if let Some(a) = &fold.and_dst {
+            let and_slot = self.slot_addr(self.cur_func, a).direct();
+            if self.deferred_store == Some(and_slot) {
+                self.deferred_store = None;
+                self.deferred_uses = 0;
+            }
+        }
+        self.cur_loc = s.loc.clone();
+        let da = self.slot_addr(self.cur_func, &s.dst).direct();
+        let l_else = self.fresh_label();
+        let l_end = self.fresh_label();
+        let skip = if fold.taken_on_set { "BTFSS" } else { "BTFSC" };
+        self.emit(format!("    {skip} 0x{:02X}, {}", fold.slot, fold.bit));
+        self.emit(format!("    GOTO {l_else}"));
+        self.emit_move_val_to_slot(&s.a, s.ty, da);
+        self.emit(format!("    GOTO {l_end}"));
+        self.emit(format!("{l_else}:"));
+        self.emit_move_val_to_slot(&s.b, s.ty, da);
+        self.emit(format!("{l_end}:"));
+    }
+
     /// A fresh local label for intra-block jumps (select branches). The
     /// counter lives at module scope so labels are unique across functions.
     fn fresh_label(&mut self) -> String {
@@ -4944,9 +4971,10 @@ impl<'m> Gen<'m> {
                 let (bk_lo, bk_hi, cnt) = (scr, scr + 1, scr + 2);
                 let r = [scr + 3, scr + 4, scr + 5, scr + 6];
                 let t = [scr + 7, scr + 8, scr + 9, scr + 10];
+                // Only r needs a zero init: every t byte is overwritten by
+                // the a copy below before the loop reads it.
                 for i in 0..4 {
                     self.emit(format!("    CLRF 0x{:02X}", r[i]));
-                    self.emit(format!("    CLRF 0x{:02X}", t[i]));
                 }
                 for i in 0..4u16 {
                     self.emit(format!("    MOVF 0x{:02X}, W", a + i));
@@ -7311,6 +7339,49 @@ fn emit_isr_epilogue(
     g.emit("    RETFIE".to_string());
 }
 
+/// Slot and bit for a direct single-bit test of `%x_name`'s absolute bit
+/// `bit` within its `width_bytes` value. The source must be shared (2+
+/// uses, so its store committed and the slot still holds it at any later
+/// read) and live in banked GPR outside the ISR-shared common area and
+/// the retval window. A slotless source bails instead of panicking.
+fn bit_test_slot(
+    g: &Gen,
+    func: &str,
+    x_name: &str,
+    bit: u32,
+    width_bytes: u8,
+) -> Option<(u16, u8)> {
+    if bit >= u32::from(width_bytes) * 8 {
+        return None;
+    }
+    if g.use_count
+        .get(&ssa_key(func, x_name))
+        .copied()
+        .unwrap_or(0)
+        < 2
+    {
+        return None;
+    }
+    let slot = g.addrs.get(&ssa_key(func, x_name)).copied()? + u16::from((bit / 8) as u8);
+    let in_gpr = g
+        .device
+        .ram_banks
+        .iter()
+        .any(|w| slot >= w.0 && slot <= w.1);
+    let in_common = g
+        .device
+        .common_ram
+        .is_some_and(|w| slot >= w.0 && slot <= w.1);
+    let in_ret = g
+        .device
+        .fixed_retval
+        .is_some_and(|w| slot >= w.0 && slot <= w.1);
+    if !in_gpr || in_common || in_ret {
+        return None;
+    }
+    Some((slot, (bit % 8) as u8))
+}
+
 /// A branch testing one bit of a RAM slot directly: an adjacent
 /// `and`-single-bit, `icmp eq/ne 0`, `brcond` triple whose middle values
 /// are branch-only collapses to `BTFSS slot,bit`, skipping the AND, the
@@ -7379,11 +7450,8 @@ fn find_bit_test_collapse(
         return None;
     }
     let bit = mask.trailing_zeros();
-    if bit >= u32::from(and.ty.bytes()) * 8 {
-        return None;
-    }
     let uses = |name: &str| g.use_count.get(&ssa_key(func, name)).copied().unwrap_or(0);
-    if uses(&icmp.dst) != 1 || uses(&and.dst) != 1 || uses(x_name) < 2 {
+    if uses(&icmp.dst) != 1 || uses(&and.dst) != 1 {
         return None;
     }
     if phi_copies.contains_key(&(b.label.clone(), br.t.clone())) {
@@ -7392,29 +7460,125 @@ fn find_bit_test_collapse(
     if phi_copies.contains_key(&(b.label.clone(), br.f.clone())) {
         return None;
     }
-    let slot = g.slot_addr(func, x_name).direct();
-    let in_gpr = g
-        .device
-        .ram_banks
-        .iter()
-        .any(|w| slot >= w.0 && slot <= w.1);
-    let in_common = g
-        .device
-        .common_ram
-        .is_some_and(|w| slot >= w.0 && slot <= w.1);
-    let in_ret = g
-        .device
-        .fixed_retval
-        .is_some_and(|w| slot >= w.0 && slot <= w.1);
-    if !in_gpr || in_common || in_ret {
-        return None;
-    }
+    let (slot, bit) = bit_test_slot(g, func, x_name, bit, and.ty.bytes())?;
     Some(BitTestCollapse {
         and_dst: and.dst.clone(),
         icmp_dst: icmp.dst.clone(),
-        slot: slot + u16::from((bit / 8) as u8),
-        bit: (bit % 8) as u8,
+        slot,
+        bit,
         taken_on_set: icmp.pred == "ne",
+    })
+}
+
+/// A value `select` on a directly testable bit: the folded `icmp` (plus
+/// the `and` in the mask shape) never emits, and the diamond tests the
+/// source slot with `BTFSC`/`BTFSS` instead of reloading the i1. Selects
+/// have no edges, so unlike the branch collapse no phi-copy restriction
+/// applies. Keyed by the select's index in its block.
+struct SelectFold {
+    and_dst: Option<String>,
+    icmp_dst: String,
+    slot: u16,
+    bit: u8,
+    /// True when cond holds exactly when the bit is set (`ne`, `slt`).
+    taken_on_set: bool,
+}
+
+/// A same-block `and` or `icmp` definition a select fold can consume.
+enum FoldDef<'b> {
+    And(usize, &'b ir::Bin),
+    Cmp(usize, &'b ir::Icmp),
+}
+
+fn find_select_folds(g: &Gen, func: &str, b: &ir::Block) -> HashMap<usize, SelectFold> {
+    let mut defs: HashMap<&str, FoldDef> = HashMap::new();
+    let mut folds = HashMap::new();
+    let uses = |name: &str| g.use_count.get(&ssa_key(func, name)).copied().unwrap_or(0);
+    for (idx, inst) in b.insts.iter().enumerate() {
+        match inst {
+            Inst::Bin(bin) if bin.op == BinOp::And => {
+                defs.insert(bin.dst.as_str(), FoldDef::And(idx, bin));
+            }
+            Inst::Icmp(ic) => {
+                defs.insert(ic.dst.as_str(), FoldDef::Cmp(idx, ic));
+            }
+            Inst::Select(s) if !s.ptr => {
+                if let Val::Reg(c) = &s.cond {
+                    if let Some(fold) = select_fold_at(g, func, &defs, &uses, idx, c) {
+                        folds.insert(idx, fold);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    folds
+}
+
+/// The fold for one `select`, or `None`: cond is a single-use `icmp`
+/// that is either `slt`/`sge` against zero (a sign-bit test, the crc
+/// inner-loop shape) or `eq`/`ne` against zero over a single-use
+/// single-bit `and`. Both defs must sit earlier in the same block.
+fn select_fold_at(
+    g: &Gen,
+    func: &str,
+    defs: &HashMap<&str, FoldDef>,
+    uses: &impl Fn(&str) -> u32,
+    idx: usize,
+    c: &str,
+) -> Option<SelectFold> {
+    let (icmp_idx, icmp) = match defs.get(c) {
+        Some(FoldDef::Cmp(j, ic)) if *j < idx && uses(c) == 1 => (*j, *ic),
+        _ => return None,
+    };
+    let (x_name, bit, width, taken_on_set, and_dst) = match icmp.pred.as_str() {
+        "slt" | "sge" => {
+            // Signed compare against zero with the value on the left:
+            // `x < 0` holds exactly when the top bit is set. A const
+            // LHS (`0 < x`, i.e. `x > 0`) is a different predicate.
+            let Val::Reg(x) = &icmp.a else {
+                return None;
+            };
+            if !matches!(&icmp.b, Val::Const(0)) {
+                return None;
+            }
+            let width = icmp.ty.bytes();
+            (x, u32::from(width) * 8 - 1, width, icmp.pred == "slt", None)
+        }
+        "eq" | "ne" => {
+            let a_name = match (&icmp.a, &icmp.b) {
+                (Val::Reg(a), Val::Const(0)) | (Val::Const(0), Val::Reg(a)) => a,
+                _ => return None,
+            };
+            let (_, and) = match defs.get(a_name.as_str()) {
+                Some(FoldDef::And(k, and)) if *k < icmp_idx && uses(a_name) == 1 => (*k, *and),
+                _ => return None,
+            };
+            let (x, mask) = match (&and.a, &and.b) {
+                (Val::Reg(x), Val::Const(m)) | (Val::Const(m), Val::Reg(x)) => (x, *m),
+                _ => return None,
+            };
+            if mask <= 0 || mask & (mask - 1) != 0 {
+                return None;
+            }
+            let width = and.ty.bytes();
+            (
+                x,
+                mask.trailing_zeros(),
+                width,
+                icmp.pred == "ne",
+                Some(a_name.clone()),
+            )
+        }
+        _ => return None,
+    };
+    let (slot, bit) = bit_test_slot(g, func, x_name, bit, width)?;
+    Some(SelectFold {
+        and_dst,
+        icmp_dst: c.to_string(),
+        slot,
+        bit,
+        taken_on_set,
     })
 }
 
@@ -8493,12 +8657,32 @@ impl<'m> Gen<'m> {
     /// Emits a walk loop's header body ops in IR order. Carried copies
     /// run at the latch below; the counter's own copies are dropped,
     /// its slot already holds the trip count.
-    fn emit_walk_body(&mut self, plan: &WalkLoop, b: &ir::Block) {
+    fn emit_walk_body(
+        &mut self,
+        plan: &WalkLoop,
+        b: &ir::Block,
+        select_folds: &HashMap<usize, SelectFold>,
+    ) {
         self.call_follows = false;
         for op in &plan.body {
             match op {
                 WalkOp::Emit(ii) => {
-                    self.emit_inst(&b.insts[*ii]);
+                    if let Inst::Select(s) = &b.insts[*ii] {
+                        if let Some(fold) = select_folds.get(ii) {
+                            self.emit_select_fold(s, fold);
+                            continue;
+                        }
+                    }
+                    let folded_tmp = match &b.insts[*ii] {
+                        Inst::Bin(bin) => select_folds
+                            .values()
+                            .any(|f| f.and_dst.as_deref() == Some(bin.dst.as_str())),
+                        Inst::Icmp(ic) => select_folds.values().any(|f| f.icmp_dst == ic.dst),
+                        _ => false,
+                    };
+                    if !folded_tmp {
+                        self.emit_inst(&b.insts[*ii]);
+                    }
                 }
                 WalkOp::Load {
                     slot,
@@ -8757,6 +8941,14 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
         }
         let mut terminator = None;
         let collapse = find_bit_test_collapse(g, &f.name, b, &phi_copies);
+        let select_folds = find_select_folds(g, &f.name, b);
+        let mut folded_tmps: HashSet<String> = HashSet::new();
+        for f in select_folds.values() {
+            if let Some(a) = &f.and_dst {
+                folded_tmps.insert(a.clone());
+            }
+            folded_tmps.insert(f.icmp_dst.clone());
+        }
         // Same route as `emit_inst` into `emit_call` (`_delay` is inlined, an unresolved
         // callee takes the trap loop): the trap's `GOTO` sets no PCLATH, so it may not follow.
         let direct_call = |g: &Gen, n: &Inst| matches!(n, Inst::Call(c) if c.callees.is_empty() && c.func != "_delay" && g.is_function(&c.func));
@@ -8765,10 +8957,19 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
                 Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
                 Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(..) => terminator = Some(i),
                 _ if walk_loops.contains_key(&b.label) => {} // walk body emits whole below
+                Inst::Select(s) if select_folds.contains_key(&idx) => {
+                    g.emit_select_fold(s, &select_folds[&idx]);
+                }
                 _ => {
                     let skipped = match i {
-                        Inst::Bin(bin) => collapse.as_ref().is_some_and(|c| c.and_dst == bin.dst),
-                        Inst::Icmp(ic) => collapse.as_ref().is_some_and(|c| c.icmp_dst == ic.dst),
+                        Inst::Bin(bin) => {
+                            collapse.as_ref().is_some_and(|c| c.and_dst == bin.dst)
+                                || folded_tmps.contains(&bin.dst)
+                        }
+                        Inst::Icmp(ic) => {
+                            collapse.as_ref().is_some_and(|c| c.icmp_dst == ic.dst)
+                                || folded_tmps.contains(&ic.dst)
+                        }
                         _ => false,
                     };
                     if !skipped {
@@ -8780,7 +8981,7 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
             }
         }
         if let Some(plan) = walk_loops.get(&b.label) {
-            g.emit_walk_body(plan, b);
+            g.emit_walk_body(plan, b, &select_folds);
         }
         if let Some(t) = terminator {
             match t {
@@ -9573,8 +9774,8 @@ enum FitVerdict {
 /// (the next pass plans their chunks), over-limit chunks are re-split from
 /// real block sizes, page-level overflow re-places everything with the
 /// measured reals, and a backward section pin re-lays the section at the
-/// measured code end. A repair state that repeats a previous one cannot make
-/// progress, so it fails instead of oscillating.
+/// measured code end. A repeated repair state splits one participant first
+/// (the escalation below) and only fails when nothing splittable remains.
 fn assess_fit(
     device: &Device,
     m: &Module,
@@ -9751,27 +9952,47 @@ fn assess_fit(
         next.entries.insert(owner.clone(), entries);
         next.chunk_sizes.extend(chunk_sizes);
     }
-    // Fixed point that still fails: measured sizes reproduce this layout, so
-    // another re-place cannot help. Split the function spilling past a
-    // backward page anchor instead; its tail moves off the full page. This
-    // only fires where the seen-check below would panic, so converging
-    // programs never take it, and each firing grows force_split, so the
-    // escalation terminates. A repeat with the owner split falls through.
+    // Fixed point or 2-cycle that still fails: measured sizes reproduce a
+    // seen layout, so another re-place cannot help. Split one participant
+    // instead: the spiller past a backward page anchor first (its tail
+    // moves off the full page), else a page-straddling owner (its chunks
+    // place independently, breaking the alternation). This only fires
+    // where the seen-check below would panic, so converging programs never
+    // take it, and each firing grows force_split, so the escalation
+    // terminates. A repeat with every candidate split falls through.
     if next.force_split == rep.force_split
         && next.entries == rep.entries
         && next.section_base == rep.section_base
         && replace
     {
-        let spill = layout
+        let mut candidates: Vec<(u8, String)> = layout
             .backward_orgs
             .iter()
             .zip(layout.backward_spillers.iter())
             .filter(|((target, _), _)| *target != table_start)
-            .find_map(|(_, name)| {
+            .filter_map(|(_, name)| {
                 owner_of(name)
                     .filter(|(owner, _)| splittable(owner) && !next.force_split.contains(owner))
-            });
-        if let Some((owner, _)) = spill {
+            })
+            .map(|(owner, _)| (0, owner))
+            .collect();
+        for e in &layout.extents {
+            if e.end <= e.start {
+                continue;
+            }
+            let last = e.end - 1;
+            if !e.has_branch || last / 0x800 == e.start / 0x800 {
+                continue;
+            }
+            if let Some((owner, _)) = owner_of(&e.name) {
+                if splittable(&owner) && !next.force_split.contains(&owner) {
+                    candidates.push((1, owner));
+                }
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        if let Some((_, owner)) = candidates.into_iter().next() {
             next.force_split.insert(owner);
         }
     }
@@ -10306,6 +10527,28 @@ fn place_consts(
             staged_len: slen,
             chunks,
         });
+    }
+    out
+}
+
+/// Modeled page of every const-table chunk base, in emission order: the
+/// `(base label, base page)` pairs the driver re-checks after its own
+/// passes (epic-cc#1137). Built from the emission `places`, so it matches
+/// the elision map by construction. Base labels repeat the emitter's rule
+/// (`name`, `name_1`, `name_2`, ...).
+fn table_base_pages(consts: &[&ir::Global], places: &[ConstPlace]) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for (g, place) in consts.iter().zip(places.iter()) {
+        for (c, ch) in place.chunks.iter().enumerate() {
+            let label = if c == 0 {
+                g.name.clone()
+            } else if c == 1 {
+                format!("{}_1", g.name)
+            } else {
+                format!("{}_{}", g.name, c)
+            };
+            out.push((label, ch.base_at / 0x800));
+        }
     }
     out
 }
@@ -10930,14 +11173,21 @@ impl Default for Options {
 /// through banking/peephole to build the address-to-line table. The third
 /// return maps each cross-page function to its ordered chunk entry labels
 /// (epic-cc#841); empty when nothing spans pages. The driver passes it to
-/// `verify_page_fit_split`, which checks each chunk as its own extent.
+/// `verify_page_fit_split`, which checks each chunk as its own extent. The
+/// fourth return maps each const-table chunk base label to its modeled
+/// page; the driver re-checks it after its own passes (epic-cc#1137).
 pub fn select_with_locs(
     device: &Device,
     m: &Module,
     addrs: &HashMap<String, u16>,
     staged: &HashSet<String>,
     pool: &ConstPool,
-) -> (String, Vec<Option<SrcLoc>>, HashMap<String, Vec<String>>) {
+) -> (
+    String,
+    Vec<Option<SrcLoc>>,
+    HashMap<String, Vec<String>>,
+    Vec<(String, usize)>,
+) {
     select_with_opts(device, m, addrs, staged, pool, Options::default())
 }
 
@@ -10952,7 +11202,12 @@ pub fn select_with_opts(
     staged: &HashSet<String>,
     pool: &ConstPool,
     opts: Options,
-) -> (String, Vec<Option<SrcLoc>>, HashMap<String, Vec<String>>) {
+) -> (
+    String,
+    Vec<Option<SrcLoc>>,
+    HashMap<String, Vec<String>>,
+    Vec<(String, usize)>,
+) {
     let mut out: Vec<String> = Vec::new();
     let mut locs: Vec<Option<SrcLoc>> = Vec::new();
     // The device's interrupt vector(s) (the hardware pushes the return PC
@@ -11937,7 +12192,8 @@ pub fn select_with_opts(
                     .into_iter()
                     .map(|(name, plan)| (name, plan.entries))
                     .collect();
-                return (out.join("\n"), locs, chunks);
+                let base_pages = table_base_pages(&consts, &places);
+                return (out.join("\n"), locs, chunks, base_pages);
             }
             FitVerdict::Again(next) => {
                 rep = next;
@@ -12278,5 +12534,96 @@ mod dead_pclath_tests {
                 "    CALL h"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod fit_repair_tests {
+    use super::{assess_fit, FitVerdict, Repair};
+    use device::PIC16F877A;
+    use std::collections::HashMap;
+
+    fn module() -> ir::Module {
+        ir::parse(
+            "fn f(void) ()\n  block entry:\n    ret void\nfn g(void) ()\n  block entry:\n    ret void\n",
+        )
+    }
+
+    // Straight-line words no pass folds: varied immediates and rotating
+    // bank-0 stores, so banking adds nothing and peephole keeps every word.
+    fn words(n: usize) -> String {
+        let mut s = String::new();
+        for i in 0..n {
+            s.push_str(&format!(
+                "    MOVLW 0x{:02X}\n    MOVWF 0x{:02X}\n",
+                i % 256,
+                0x20 + (i % 16)
+            ));
+        }
+        s
+    }
+
+    // Two placements of the same functions with different measured sizes.
+    // Layout A crosses in f, layout B in g; each re-place proposes the
+    // other layout's sizes, so the third assessment repeats the first.
+    fn layout_a() -> String {
+        format!(
+            "    org 0x0600\nf:\n{}    GOTO f\ng:\n{}    GOTO g\n    end\n",
+            words(500),
+            words(50)
+        )
+    }
+
+    fn layout_b() -> String {
+        format!(
+            "    org 0x0600\nf:\n{}    GOTO f\ng:\n{}    GOTO g\n    end\n",
+            words(200),
+            words(350)
+        )
+    }
+
+    fn assess(asm: &str, rep: &Repair) -> FitVerdict {
+        assess_fit(&PIC16F877A, &module(), asm, &HashMap::new(), 0x1800, rep)
+    }
+
+    fn again(rep: &Repair, asm: &str) -> Repair {
+        match assess(asm, rep) {
+            FitVerdict::Again(next) => next,
+            FitVerdict::Fit => panic!("layout must need repair, got Fit"),
+            FitVerdict::Broken(msg) => panic!("layout must need repair, got Broken: {msg}"),
+            FitVerdict::NoConverge(msg) => panic!("layout must need repair, got NoConverge: {msg}"),
+        }
+    }
+
+    #[test]
+    fn two_cycle_escalates_by_splitting_the_crosser() {
+        let rep0 = Repair::default();
+        let rep1 = again(&rep0, &layout_a());
+        let rep2 = again(&rep1, &layout_b());
+        match assess(&layout_a(), &rep2) {
+            FitVerdict::Again(next) => assert!(
+                next.force_split.contains("f"),
+                "the repeat must split the crossing function f"
+            ),
+            FitVerdict::NoConverge(msg) => {
+                panic!("a 2-cycle must escalate, not die oscillating: {msg}")
+            }
+            FitVerdict::Fit => panic!("a 2-cycle must not report Fit"),
+            FitVerdict::Broken(msg) => panic!("a 2-cycle must escalate, not break: {msg}"),
+        }
+    }
+
+    #[test]
+    fn repeat_with_every_crosser_split_fails_honestly() {
+        let mut rep0 = Repair::default();
+        rep0.force_split.insert("f".to_string());
+        rep0.force_split.insert("g".to_string());
+        let rep1 = again(&rep0, &layout_a());
+        match assess(&layout_a(), &rep1) {
+            FitVerdict::NoConverge(_) => {}
+            FitVerdict::Again(_) => panic!("no splittable crosser remains, must not escalate"),
+            FitVerdict::Fit => panic!("a repeat must not report Fit"),
+            FitVerdict::Broken(msg) => panic!("exhaustion must not break: {msg}"),
+        }
     }
 }

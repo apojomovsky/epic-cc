@@ -6452,6 +6452,28 @@ fn place_consts(
     out
 }
 
+/// Modeled page of every const-table chunk base, in emission order: the
+/// `(base label, base page)` pairs the driver re-checks after its own
+/// passes (epic-cc#1137). Built from the emission `places`, so it matches
+/// the elision map by construction. Base labels repeat the emitter's rule
+/// (`name`, `name_1`, `name_2`, ...).
+fn table_base_pages(consts: &[&ir::Global], places: &[ConstPlace]) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for (g, place) in consts.iter().zip(places.iter()) {
+        for (c, ch) in place.chunks.iter().enumerate() {
+            let label = if c == 0 {
+                g.name.clone()
+            } else if c == 1 {
+                format!("{}_1", g.name)
+            } else {
+                format!("{}_{}", g.name, c)
+            };
+            out.push((label, ch.base_at / 0x800));
+        }
+    }
+    out
+}
+
 /// Post-banking word counts of the section's generated routines in `banked`:
 /// `__stage_` extents and `__read_` extents, counting emitted words only.
 /// Directives and pads belong to neither unit; untracked labels (table
@@ -6912,13 +6934,20 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
 
 /// Extends `select` with per-line source locations for the driver address
 /// table. Marks generated lines with `None`. The chunk map lists each split
-/// function's entries in chunk order, for `verify_page_fit_split`.
+/// function's entries in chunk order, for `verify_page_fit_split`. The
+/// fourth return maps each const-table chunk base label to its modeled
+/// page; the driver re-checks it after its own passes (epic-cc#1137).
 pub fn select_with_locs(
     device: &Device,
     m: &Module,
     addrs: &HashMap<String, u16>,
     staged: &HashSet<String>,
-) -> (String, Vec<Option<SrcLoc>>, HashMap<String, Vec<String>>) {
+) -> (
+    String,
+    Vec<Option<SrcLoc>>,
+    HashMap<String, Vec<String>>,
+    Vec<(String, usize)>,
+) {
     let mut out: Vec<String> = Vec::new();
     let mut locs: Vec<Option<SrcLoc>> = Vec::new();
     // Emits the ISR first at the hardware vector: the vector is the entry,
@@ -7572,7 +7601,8 @@ pub fn select_with_locs(
         .iter()
         .map(|(name, plan)| (name.clone(), plan.iter().map(|(l, _)| l.clone()).collect()))
         .collect();
-    (out.join("\n"), locs, chunks)
+    let base_pages = table_base_pages(&consts, &places);
+    (out.join("\n"), locs, chunks, base_pages)
 }
 
 /// Re-exports the address-map parser from `iselcore`. Keeps the backend

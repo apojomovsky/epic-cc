@@ -513,7 +513,7 @@ fn main() {
     m = if device.core == device::Core::Pic18 {
         legalize::legalize_pic18(m)
     } else {
-        legalize::legalize(m)
+        legalize::legalize_for_core(m, device.core)
     };
     let cg = callgraph::build(&m);
     // A too-deep call chain is the program's fault (recursion or nesting
@@ -551,6 +551,9 @@ fn main() {
     // PIC14 and PIC14E arms below, empty for every other core; the
     // page-fit check reads it.
     let mut chunks: HashMap<String, Vec<String>> = HashMap::new();
+    // Modeled const-table base pages (epic-cc#1137): filled by the PIC14
+    // and PIC14E arms below; the window repair re-checks them.
+    let mut base_pages: Vec<(String, usize)> = Vec::new();
     let (asm, mut locs) = match device.core {
         device::Core::Pic14 => {
             // Pooled string table (epic-cc#815, addresses and gating per
@@ -570,9 +573,10 @@ fn main() {
                 fast_divmod: is_o2,
                 fast_mul_u8: is_o2,
             };
-            let (asm, locs, c) =
+            let (asm, locs, c, b) =
                 isel::select_with_opts(device, &m, &addrs, &layout.staged_consts, &pool, opts);
             chunks = c;
+            base_pages = b;
             (asm, locs)
         }
         device::Core::Pic18 => {
@@ -601,9 +605,10 @@ fn main() {
             )
         }
         device::Core::Pic14e => {
-            let (asm, locs, c) =
+            let (asm, locs, c, b) =
                 isel_pic14e::select_with_locs(device, &m, &addrs, &layout.staged_consts);
             chunks = c;
+            base_pages = b;
             (asm, locs)
         }
         device::Core::PicBaseline => isel_pic_baseline::select_with_locs(device, &m, &addrs),
@@ -630,7 +635,10 @@ fn main() {
             // at its pre-schedule section start, and schedule's reordering
             // shifts banking's BANKSEL count after that decision. Walk the
             // final addresses and pad any table drifted across its window.
-            let (asm, l) = const_window::repair_with_locs(&asm, &locs);
+            // A base drifted across a page boundary still fits its window,
+            // so the pads stay silent: re-check each final base against
+            // isel's modeled page (epic-cc#1137).
+            let (asm, l) = const_window::repair_with_locs(&asm, &locs, &base_pages);
             locs = l;
 
             // The page assignment ran on pre-banking sizes; banking inserts

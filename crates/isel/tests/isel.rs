@@ -654,6 +654,135 @@ fn brcond_collapses_ne_triple_with_inverted_skip() {
     assert_branch(&asm, "BTFSS 0x25, 2", "main_Lend", "main_Lthen");
     assert!(!asm.contains("ANDLW 0x04"), "AND skipped:\n{asm}");
 }
+
+#[test]
+fn select_folds_slt_sign_test() {
+    // The crc inner-loop shape: `icmp slt` over a shared i16 feeds a
+    // value select. The sign compare and the i1 materialize vanish,
+    // leaving a direct test of the source's top bit.
+    let m = parse(
+        "global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %c = load i16 @in\n    %s = shl i16 %c 1\n    %x = xor i16 %s 4129\n    %t = icmp slt i16 %c 0\n    %n = select i1 %t i16 %x i16 %s\n    store i16 %n @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x22),
+        ("main::c", 0x25),
+        ("main::s", 0x27),
+        ("main::x", 0x29),
+        ("main::t", 0x2B),
+        ("main::n", 0x2D),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(asm.contains("BTFSS 0x26, 7"), "sign test:\n{asm}");
+    assert!(!asm.contains("SUBWF"), "slt compare gone:\n{asm}");
+    assert!(!asm.contains("MOVWF 0x2B"), "materialize gone:\n{asm}");
+    // Polarity: set bit means cond holds means the true arm (%x), so the
+    // fall-through copies land before the else label and the %s copies
+    // after it. Presence alone cannot catch an inverted diamond.
+    let else_pos = asm.find("tmp0:").expect("else label:\n{asm}");
+    let (head, tail) = asm.split_at(else_pos);
+    assert!(head.contains("MOVWF 0x2D"), "true arm first:\n{asm}");
+    assert!(head.contains("MOVF 0x2A, W"), "true arm copies %x:\n{asm}");
+    assert!(tail.contains("MOVF 0x27, W"), "false arm copies %s:\n{asm}");
+}
+
+#[test]
+fn select_folds_and_eq_mask_test() {
+    // `and`-single-bit plus `icmp eq 0` feeding a select: the mask, the
+    // compare, and the materialize vanish. `eq` holds when the bit is
+    // clear, so the skip is BTFSC.
+    let m = parse(
+        "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %f = load i8 @in\n    %a = and i8 %f, 4\n    %c = icmp eq i8 %a, 0\n    %s = select i1 %c i8 10 i8 20\n    store i8 %f @out\n    store i8 %s @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::f", 0x25),
+        ("main::a", 0x26),
+        ("main::c", 0x27),
+        ("main::s", 0x28),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(asm.contains("BTFSC 0x25, 2"), "mask test:\n{asm}");
+    assert!(!asm.contains("ANDLW 0x04"), "AND skipped:\n{asm}");
+    assert!(!asm.contains("MOVWF 0x27"), "materialize skipped:\n{asm}");
+    let else_pos = asm.find("tmp0:").expect("else label:\n{asm}");
+    let true_copy = asm.find("MOVLW 0x0A").expect("true arm copy:\n{asm}");
+    let false_copy = asm.find("MOVLW 0x14").expect("false arm copy:\n{asm}");
+    assert!(true_copy < else_pos, "true arm first:\n{asm}");
+    assert!(else_pos < false_copy, "false arm second:\n{asm}");
+}
+
+#[test]
+fn select_fold_refused_when_cond_shared() {
+    // The sign compare also feeds a branch, so two consumers need the
+    // materialized i1: no fold, the compare stays.
+    let m = parse(
+        "global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %c = load i16 @in\n    %s = shl i16 %c 1\n    %x = xor i16 %s 1\n    %t = icmp slt i16 %c 0\n    %n = select i1 %t i16 %x i16 %s\n    br i1 %t then end\n  block then:\n    store i16 %n @out\n    br end\n  block end:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x22),
+        ("main::c", 0x25),
+        ("main::s", 0x27),
+        ("main::x", 0x29),
+        ("main::t", 0x2B),
+        ("main::n", 0x2D),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(asm.contains("SUBWF"), "shared compare stays:\n{asm}");
+    assert!(!asm.contains("BTFSS 0x26, 7"), "no direct test:\n{asm}");
+}
+
+#[test]
+fn select_fold_refused_for_const_lhs_sign_compare() {
+    // `0 < %c` (`%c > 0`) is not a sign-bit test: the fold must not
+    // fire, the compare stays.
+    let m = parse(
+        "global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %c = load i16 @in\n    %s = shl i16 %c 1\n    %x = xor i16 %s 1\n    %t = icmp slt i16 0, %c\n    %n = select i1 %t i16 %x i16 %s\n    store i16 %n @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x22),
+        ("main::c", 0x25),
+        ("main::s", 0x27),
+        ("main::x", 0x29),
+        ("main::t", 0x2B),
+        ("main::n", 0x2D),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        asm.contains("MOVWF 0x2B"),
+        "const-LHS materialize stays:\n{asm}"
+    );
+    assert!(!asm.contains("BTFSS 0x26, 7"), "no direct test:\n{asm}");
+}
+
+#[test]
+fn walk_body_select_folds_sign_test() {
+    // Same slt-plus-select shape inside a down-counter walk body: the
+    // fold fires on the walk's Emit path too, not just plain blocks.
+    let m = parse(
+        "global cv i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %c0 = load i16 @cv\n    br loop\n  block loop:\n    %k = phi i8 8 entry %dec loop\n    %c = phi i16 %c0 entry %nxt loop\n    %s = shl i16 %c 1\n    %x = xor i16 %s 4129\n    %t = icmp slt i16 %c 0\n    %nxt = select i1 %t i16 %x i16 %s\n    %dec = add i8 %k -1\n    %d = icmp eq i8 %dec 0\n    br i1 %d done loop\n  block done:\n    store i16 %nxt @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("cv", 0x20u16),
+        ("out", 0x22),
+        ("main::c0", 0x28),
+        ("main::k", 0x25),
+        ("main::c", 0x2A),
+        ("main::s", 0x2C),
+        ("main::x", 0x2E),
+        ("main::t", 0x30),
+        ("main::nxt", 0x31),
+        ("main::dec", 0x33),
+        ("main::d", 0x34),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(asm.contains("DECFSZ 0x25, F"), "still a walk:\n{asm}");
+    assert!(asm.contains("BTFSS 0x2B, 7"), "sign test:\n{asm}");
+    assert!(!asm.contains("SUBWF"), "slt compare gone:\n{asm}");
+}
 #[test]
 fn select_labels_are_unique_across_functions() {
     // Two functions, each containing a select. Fresh labels are file-scoped
@@ -3388,7 +3517,7 @@ fn sim_run_bytes_o2(
         fast_divmod: true,
         fast_mul_u8: true,
     };
-    let (asm, _, _) = select_with_opts(
+    let (asm, _, _, _) = select_with_opts(
         &PIC16F877A,
         &m,
         &addrs(&map_refs(map)),
@@ -3849,7 +3978,7 @@ fn mul_u8_unrolled_body_matches_wrapping_mul() {
         fast_divmod: true,
         fast_mul_u8: true,
     };
-    let (asm, _, _) = select_with_opts(
+    let (asm, _, _, _) = select_with_opts(
         &PIC16F877A,
         &m,
         &addrs(&map_refs(&map)),
@@ -5440,7 +5569,7 @@ fn split_function_spans_pages_and_runs_in_sim() {
         ("helper::x", 0x40),
         ("helper::r", 0x41),
     ]);
-    let (asm, _, chunks) = isel::select_with_locs(
+    let (asm, _, chunks, _) = isel::select_with_locs(
         &PIC16F877A,
         &m,
         &addrs,
@@ -10941,4 +11070,71 @@ fn walk_refuses_double_trunc_use() {
         !asm.contains("DECFSZ 0x25, F"),
         "no walk on a doubled trunc:\n{asm}"
     );
+}
+
+// epic-cc#1139: the page-fit repair must converge or fail honestly on
+// page-tight programs, never die oscillating. Two multi-block functions
+// compete for page 0 (a call across them varies restore elision with the
+// layout, the alternation fuel); perturbations of a few words sweep the
+// packings around exactly-full pages.
+fn page_tight_module(main_pad: usize, work_pad: usize) -> (ir::Module, HashMap<String, u16>) {
+    fn pads(n: usize, v: &str) -> String {
+        let mut s = String::new();
+        for _ in 0..n {
+            s.push_str(&format!("    %{v} = add i8 %{v}, 1\n"));
+        }
+        s
+    }
+    let mut text = String::from(
+        "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @in\n    %d = add i8 %a, 0\n",
+    );
+    text.push_str(&pads(main_pad, "d"));
+    for b in 1..4 {
+        text.push_str(&format!("    br m{b}\n  block m{b}:\n"));
+        text.push_str(&pads(main_pad, "d"));
+    }
+    text.push_str("    %t = call i8 @work(i8 %d)\n    store i8 %t @out\n    ret void\n");
+    text.push_str("fn work(i8) (x)\n  block entry:\n    %e = add i8 %x, 0\n");
+    text.push_str(&pads(work_pad, "e"));
+    text.push_str("    br w1\n  block w1:\n");
+    text.push_str(&pads(work_pad, "e"));
+    text.push_str("    %r = add i8 %e, 1\n    ret i8 %r\n");
+    let m = parse(&text);
+    let map = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::a", 0x25),
+        ("main::d", 0x26),
+        ("main::t", 0x27),
+        ("work::x", 0x30),
+        ("work::e", 0x31),
+        ("work::r", 0x32),
+    ]);
+    (m, map)
+}
+
+#[test]
+fn page_tight_perturbations_never_oscillate() {
+    for main_pad in [660usize, 670, 680, 690, 700] {
+        for work_pad in [80usize, 120, 160, 200] {
+            let (m, map) = page_tight_module(main_pad, work_pad);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                select(&PIC16F877A, &m, &map)
+            }));
+            match outcome {
+                Ok(_) => {}
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    assert!(
+                        !msg.contains("oscillat"),
+                        "main_pad={main_pad} work_pad={work_pad} oscillated: {msg}"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -11,16 +11,28 @@
 //! addresses and inserts `.align 256` ahead of any table that would cross.
 //! One forward pass is exact: pads only move later content forward, and
 //! every later table is checked at its padded address. Fitting layouts
-//! pass through byte-identical, so the size ladder never moves.
+//! pass through byte-identical, so the size ladder never moves. A table
+//! base that drifts across a page boundary while still fitting its window
+//! is invisible to the pads but fatal to the reader-page restore map, so
+//! each final base is also checked against isel's modeled page (epic-cc#1137).
 
 use ir::SrcLoc;
 use iselcore::is_directive;
+use std::collections::HashMap;
 
 /// The repaired text plus a parallel per-line source-location vector, kept
 /// index-aligned with the returned text: an inserted `.align` carries
 /// `None` like every other compiler-generated line. Runs on the PIC14 and
 /// PIC14E arms alike, whose `.table`/`.align` shapes are identical.
-pub fn repair_with_locs(asm: &str, locs: &[Option<SrcLoc>]) -> (String, Vec<Option<SrcLoc>>) {
+/// `base_pages` is isel's modeled `(chunk base label, base page)` list:
+/// every final base must sit in its modeled page, or a restore elided for
+/// the modeled page leaves PCLATH on the wrong one. A drifted base fails
+/// loudly here instead of miscompiling (epic-cc#1137).
+pub fn repair_with_locs(
+    asm: &str,
+    locs: &[Option<SrcLoc>],
+    base_pages: &[(String, usize)],
+) -> (String, Vec<Option<SrcLoc>>) {
     let lines: Vec<&str> = asm.lines().collect();
     assert!(
         locs.len() == lines.len(),
@@ -38,6 +50,9 @@ pub fn repair_with_locs(asm: &str, locs: &[Option<SrcLoc>]) -> (String, Vec<Opti
     let mut reader: Option<(String, usize)> = None;
     let mut padded = false;
     let mut ended = false;
+    // Final word address of every label, so modeled table bases can be
+    // checked against isel's pages after the pads move later content.
+    let mut bases: HashMap<String, usize> = HashMap::new();
     let close_reader = |reader: &mut Option<(String, usize)>, end: usize, check: bool| {
         if let Some((name, start)) = reader.take() {
             if check && end > start {
@@ -83,6 +98,7 @@ pub fn repair_with_locs(asm: &str, locs: &[Option<SrcLoc>]) -> (String, Vec<Opti
                 if label.starts_with("__read_") {
                     reader = Some((label.to_string(), org));
                 }
+                bases.insert(label.to_string(), org);
                 out.push(raw.to_string());
                 out_locs.push(locs[i].clone());
                 if !rest.is_empty() {
@@ -137,6 +153,15 @@ pub fn repair_with_locs(asm: &str, locs: &[Option<SrcLoc>]) -> (String, Vec<Opti
         org += 1;
     }
     close_reader(&mut reader, org, padded);
+    for (label, page) in base_pages {
+        let at = bases.get(label.as_str()).unwrap_or_else(|| {
+            panic!("const-window repair lost modeled table base {label}: the final text has no such label")
+        });
+        assert!(
+            at / 0x800 == *page,
+            "const table {label} drifted from its modeled page {page} to 0x{at:04X}: the reader-page restore map cannot follow"
+        );
+    }
     let mut text = out.join("\n");
     if asm.ends_with('\n') {
         text.push('\n');
@@ -193,7 +218,7 @@ mod tests {
         // next boundary, the emitter's own shape, and the bytes land.
         let asm =
             format!("{}    org 0x0000\n{}", HDR, filler(0xEA)) + &table_unit("t", 35, &[1; 35]);
-        let (fixed, fixed_locs) = repair_with_locs(&asm, &locs_for(&asm));
+        let (fixed, fixed_locs) = repair_with_locs(&asm, &locs_for(&asm), &[]);
         assert!(
             fixed.contains("    .align 256\n    .table t 35"),
             "pad:\n{fixed}"
@@ -215,7 +240,7 @@ mod tests {
         let asm =
             format!("{}    org 0x0000\n{}", HDR, filler(0xD7)) + &table_unit("t", 35, &[2; 35]);
         assert_eq!(((0xD7 + 6) & 0xFF) + 35, 0x100, "fixture fits exactly");
-        let (fixed, _) = repair_with_locs(&asm, &locs_for(&asm));
+        let (fixed, _) = repair_with_locs(&asm, &locs_for(&asm), &[]);
         assert_eq!(fixed, asm, "no-op");
     }
 
@@ -227,7 +252,7 @@ mod tests {
         let asm = format!("{}    org 0x0000\n{}", HDR, filler(0xEA))
             + &table_unit("t", 64, &[1; 64])
             + &table_unit("u", 200, &[4; 35]);
-        let (fixed, _) = repair_with_locs(&asm, &locs_for(&asm));
+        let (fixed, _) = repair_with_locs(&asm, &locs_for(&asm), &[]);
         assert_eq!(
             fixed.matches("    .align 256").count(),
             2,
@@ -245,7 +270,7 @@ mod tests {
         for _ in 0..44 {
             asm.push_str("    RETLW 0x03\n");
         }
-        let (fixed, _) = repair_with_locs(&asm, &locs_for(&asm));
+        let (fixed, _) = repair_with_locs(&asm, &locs_for(&asm), &[]);
         assert!(
             fixed.contains("    .align 256\n    .table big 300"),
             "pad:\n{fixed}"
@@ -260,13 +285,70 @@ mod tests {
         // reader-page restore map no longer holds: fail loudly instead.
         let asm =
             format!("{}    org 0x0000\n{}", HDR, filler(0x7EA)) + &table_unit("t", 35, &[1; 35]);
-        let _ = repair_with_locs(&asm, &locs_for(&asm));
+        let _ = repair_with_locs(&asm, &locs_for(&asm), &[]);
     }
 
     #[test]
     #[should_panic(expected = "backward .org")]
     fn backward_org_fails_loudly() {
         let asm = "    org 0x0100\n    MOVLW 0x00\n    org 0x00F0\n    end\n";
-        let _ = repair_with_locs(asm, &locs_for(asm));
+        let _ = repair_with_locs(asm, &locs_for(asm), &[]);
+    }
+
+    /// The word address a bare label sits at, the assembler's pass-1 count.
+    fn base_of(asm: &str, want: &str) -> usize {
+        let mut org = 0usize;
+        for raw in asm.lines() {
+            let line = raw.split(';').next().unwrap_or("").trim();
+            if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("org ") {
+                org = parse_num(rest.trim());
+                continue;
+            }
+            if is_directive(line, "end") {
+                break;
+            }
+            if let Some(l) = line.strip_suffix(':') {
+                if l.trim() == want {
+                    return org;
+                }
+                continue;
+            }
+            if line.contains(" equ ") || line.starts_with(".align ") || line.starts_with(".table ")
+            {
+                continue;
+            }
+            org += 1;
+        }
+        panic!("label {want} not found");
+    }
+
+    #[test]
+    #[should_panic(expected = "drifted from its modeled page")]
+    fn drifted_base_across_page_fails_loudly() {
+        // isel modeled this section 6 words lower (reader_a at 0x7E6, so
+        // base a=0x7EC page 0 and base b=0x7FA page 0): schedule growth
+        // drifted it here. Table b now sits at 0x800, page 1, while still
+        // fitting its window, so the pads stay silent; the base-page check
+        // fails loudly instead of miscompiling b's callers (epic-cc#1137).
+        let asm = format!("{}    org 0x07EC\n{}", HDR, table_unit("a", 8, &[1; 8]))
+            + &table_unit("b", 4, &[2; 4]);
+        let model = [("a".to_string(), 0), ("b".to_string(), 0)];
+        let _ = repair_with_locs(&asm, &locs_for(&asm), &model);
+    }
+
+    #[test]
+    fn modeled_bases_pass_through_untouched() {
+        // The modeled layout itself: both bases sit in page 0 as modeled,
+        // so the check passes and the text is byte-identical.
+        let asm = format!("{}    org 0x07E6\n{}", HDR, table_unit("a", 8, &[1; 8]))
+            + &table_unit("b", 4, &[2; 4]);
+        let model = [("a".to_string(), 0), ("b".to_string(), 0)];
+        assert_eq!(base_of(&asm, "a"), 0x7EC, "fixture base a");
+        assert_eq!(base_of(&asm, "b"), 0x7FA, "fixture base b");
+        let (fixed, _) = repair_with_locs(&asm, &locs_for(&asm), &model);
+        assert_eq!(fixed, asm, "no-op");
     }
 }

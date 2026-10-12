@@ -210,7 +210,10 @@ fn pic_baseline_d2_banked_direct_and_indf_ordering_clean() {
     let mut placed = None;
     for pads in 18..=25 {
         let prog = d2_program(pads);
-        let m = legalize::legalize(wholeprog::merge(ir::parse(&prog.ir_text)));
+        let m = legalize::legalize_for_core(
+            wholeprog::merge(ir::parse(&prog.ir_text)),
+            device::Core::PicBaseline,
+        );
         let cg = callgraph::build(&m);
         let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             alloc::allocate(&PIC12F509, &m, &callgraph::edges_text(&cg))
