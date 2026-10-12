@@ -103,9 +103,20 @@ fn legalize_inner(m: Module, pic18: bool, core: device::Core) -> Module {
         (m, false)
     };
     let m = narrow_div_rem_tails(m);
+    // Widening products narrow on classic PIC14 only: the other cores keep
+    // `__mul_u32` and have no `__mul_s16` recipe. Runs before the lowering
+    // loop so the loop never sees the wide multiply it would route to u32.
+    let (m, wide_mul) = if core == device::Core::Pic14 {
+        narrow_widening_mul(m)
+    } else {
+        (m, false)
+    };
     let mut m = narrow_zext_snapshots(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
+    if wide_mul {
+        used.push("__mul_s16".to_string());
+    }
     if udec {
         used.push("__udec_u32".to_string());
     }
@@ -1637,6 +1648,128 @@ fn narrow_div_rem_tails(m: Module) -> Module {
         funcs,
         module_asm: m.module_asm,
     }
+}
+
+/// Narrow a widening product to a signed 16x16 -> 32 call (epic-cc#1174).
+/// clang widens both Q8.8 factors (`sext i16 -> i32`) before `mul i32`,
+/// which pays two sign-extension diamonds plus a 32-iteration `__mul_u32`.
+/// The product of two i16 values always fits i32, so `__mul_s16` (two i16
+/// params, i32 result) computes it with a 16-iteration loop and a sign
+/// correction. Sexts with surviving uses stay; the sweep drops only defs
+/// the rewrite orphaned.
+fn narrow_widening_mul(m: Module) -> (Module, bool) {
+    let mut funcs = Vec::with_capacity(m.funcs.len());
+    let mut fired = false;
+    for f in m.funcs {
+        let mut sexts: HashMap<String, String> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Sext(x) = inst {
+                    if x.from == Ty::I16 && x.to == Ty::I32 {
+                        if let Val::Reg(src) = &x.val {
+                            sexts.insert(x.dst.clone(), src.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if sexts.is_empty() {
+            funcs.push(f);
+            continue;
+        }
+        let mut narrowed = false;
+        let mut blocks = Vec::with_capacity(f.blocks.len());
+        for b in f.blocks {
+            let mut insts = Vec::with_capacity(b.insts.len());
+            for inst in b.insts {
+                if let Inst::Bin(bin) = &inst {
+                    if bin.op == BinOp::Mul && bin.ty == Ty::I32 {
+                        if let (Val::Reg(a), Val::Reg(b)) = (&bin.a, &bin.b) {
+                            if let (Some(sa), Some(sb)) = (sexts.get(a), sexts.get(b)) {
+                                let mkarg = |s: &String| CallArg {
+                                    ty: Some(Ty::I16),
+                                    val: Val::Reg(s.clone()),
+                                    byval: None,
+                                    sret: false,
+                                };
+                                insts.push(Inst::Call(Call {
+                                    dst: Some(bin.dst.clone()),
+                                    ty: Some(Ty::I32),
+                                    func: "__mul_s16".to_string(),
+                                    args: vec![mkarg(sa), mkarg(sb)],
+                                    callees: Vec::new(),
+                                    loc: None,
+                                }));
+                                narrowed = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                insts.push(inst);
+            }
+            blocks.push(Block {
+                label: b.label,
+                insts,
+            });
+        }
+        if !narrowed {
+            funcs.push(Func {
+                name: f.name,
+                ret: f.ret,
+                params: f.params,
+                blocks,
+                isr: f.isr,
+                irq_priority: f.irq_priority,
+                naked: f.naked,
+                unreachable_body: f.unreachable_body,
+                variadic: f.variadic,
+            });
+            continue;
+        }
+        fired = true;
+        let mut live: HashSet<String> = HashSet::new();
+        for b in &blocks {
+            for inst in &b.insts {
+                live.extend(inst_reads(inst));
+            }
+        }
+        let mut swept = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            let mut insts = Vec::with_capacity(b.insts.len());
+            for inst in b.insts {
+                if let Inst::Sext(x) = &inst {
+                    if x.from == Ty::I16 && x.to == Ty::I32 && !live.contains(&x.dst) {
+                        continue;
+                    }
+                }
+                insts.push(inst);
+            }
+            swept.push(Block {
+                label: b.label,
+                insts,
+            });
+        }
+        funcs.push(Func {
+            name: f.name,
+            ret: f.ret,
+            params: f.params,
+            blocks: swept,
+            isr: f.isr,
+            irq_priority: f.irq_priority,
+            naked: f.naked,
+            unreachable_body: f.unreachable_body,
+            variadic: f.variadic,
+        });
+    }
+    (
+        Module {
+            globals: m.globals,
+            funcs,
+            module_asm: m.module_asm,
+        },
+        fired,
+    )
 }
 
 /// Narrow a zero-extended snapshot to its source width when every use
@@ -5592,6 +5725,10 @@ fn routine_func(name: &str, core: device::Core) -> Func {
     let (ret, params, scr) = match name {
         "__mul_u8" => (Ty::I8, vec![param("a", 1), param("b", 1)], 1),
         "__mul_u16" => (Ty::I16, vec![param("a", 2), param("b", 2)], 2),
+        // Signed widening product (epic-cc#1174): two i16 params, i32
+        // result. `r`@0-3 (32-bit running product), `t_hi`@4-5 (the
+        // multiplicand's high half: its low half shifts in the `a` slot).
+        "__mul_s16" => (Ty::I32, vec![param("a", 2), param("b", 2)], 6),
         "__mul_u32" => (
             Ty::I32,
             vec![param("a", 4), param("b", 4)],

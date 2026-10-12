@@ -3829,3 +3829,114 @@ fn keeps_zext_snapshot_used_as_indirect_target() {
         "its masks stay wide with it:\n{text}"
     );
 }
+
+/// Widening-product narrowing (epic-cc#1174): `mul i32` over two
+/// `sext i16 -> i32` operands becomes `call i32 @__mul_s16` on the i16
+/// sources, the orphaned sexts drop, and `__mul_u32` is not injected.
+#[test]
+fn narrows_sext_mul_to_signed_wide_call() {
+    let m = parse(
+        "global in i16\n\
+         global out i32\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load i16 @in\n\
+             %b = load i16 @in\n\
+             %x = sext i16 %a to i32\n\
+             %y = sext i16 %b to i32\n\
+             %m = mul i32 %x, %y\n\
+             store i32 %m @out\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("%m = call i32 @__mul_s16(i16 %a, i16 %b)"),
+        "the wide multiply must narrow to the i16 sources:\n{text}"
+    );
+    assert!(
+        !text.contains("sext i16"),
+        "orphaned sexts must drop:\n{text}"
+    );
+    assert!(
+        text.contains("fn __mul_s16(i32) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 6"),
+        "the widening routine must inject with its 6-byte frame:\n{text}"
+    );
+    assert!(
+        !text.contains("__mul_u32"),
+        "no 32-bit multiply may remain:\n{text}"
+    );
+}
+
+/// The narrowing keeps a sext read elsewhere and leaves non-widening
+/// multiplies on `__mul_u32`: only orphaned sexts drop.
+#[test]
+fn narrowing_keeps_shared_sexts_and_plain_wide_muls() {
+    let m = parse(
+        "global in i16\n\
+         global in32 i32\n\
+         global out i32\n\
+         global out2 i32\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load i16 @in\n\
+             %b = load i16 @in\n\
+             %w = load i32 @in32\n\
+             %x = sext i16 %a to i32\n\
+             %y = sext i16 %b to i32\n\
+             %m = mul i32 %x, %y\n\
+             %p = mul i32 %x, %w\n\
+             store i32 %m @out\n\
+             store i32 %x @out2\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("%m = call i32 @__mul_s16(i16 %a, i16 %b)"),
+        "the widening multiply must narrow:\n{text}"
+    );
+    assert!(
+        text.contains("%p = call i32 @__mul_u32(i32 %x, i32 %w)"),
+        "the half-plain multiply stays 32-bit:\n{text}"
+    );
+    assert!(
+        text.contains("%x = sext i16 %a to i32"),
+        "the stored sext must survive:\n{text}"
+    );
+    assert!(
+        !text.contains("%y = sext"),
+        "the orphaned sext must drop:\n{text}"
+    );
+}
+
+/// Other cores keep the wide form: only classic PIC14 has a `__mul_s16`
+/// recipe, so PIC18 (and pic14e/baseline through the same gate) still
+/// lower to `__mul_u32` with the sexts intact.
+#[test]
+fn widening_mul_stays_wide_off_pic14() {
+    let src = "global in i16\n\
+         global out i32\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load i16 @in\n\
+             %b = load i16 @in\n\
+             %x = sext i16 %a to i32\n\
+             %y = sext i16 %b to i32\n\
+             %m = mul i32 %x, %y\n\
+             store i32 %m @out\n\
+             ret void\n";
+    for core in [
+        device::Core::Pic18,
+        device::Core::Pic14e,
+        device::Core::PicBaseline,
+    ] {
+        let text = ir::serialize(&legalize::legalize_for_core(parse(src), core));
+        assert!(
+            text.contains("%m = call i32 @__mul_u32(i32 %x, i32 %y)"),
+            "core {core:?} must keep the 32-bit multiply:\n{text}"
+        );
+        assert!(
+            !text.contains("__mul_s16"),
+            "core {core:?} must not reference the classic-only routine:\n{text}"
+        );
+    }
+}

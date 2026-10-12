@@ -697,6 +697,7 @@ pub fn is_runtime_routine(name: &str) -> bool {
         base,
         "__mul_u8"
             | "__mul_u16"
+            | "__mul_s16"
             | "__mul_u32"
             | "__udivmod_u8"
             | "__udiv_u8"
