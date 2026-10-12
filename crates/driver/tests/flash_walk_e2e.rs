@@ -141,6 +141,20 @@ fn flash_walk_two_runtime_indices_reads_program_memory_on_p18() {
     assert!(halted);
 }
 
+/// Two runtime indices over one flash table take the TBLPTR shift-add chain
+/// (epic-cc#1126). The row stride (8) makes the chain win on `a`, and the
+/// skip path adds `b`: `TABLE[2][3]` is flat byte 19.
+#[test]
+fn flash_walk_two_runtime_indices_chain_reads_program_memory_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_two_index_chain.c");
+    assert_eq!(
+        ram[map_addr(&map, "out")],
+        19,
+        "chain term plus skipped term must land on TABLE[2][3]"
+    );
+    assert!(halted);
+}
+
 /// Storing a ROM address into RAM has no RAM form: a later load through the
 /// slot reads RAM at that address (epic-cc#1101). Covers a runtime index and a
 /// constant base, both refused rather than silently read as zero.
