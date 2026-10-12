@@ -29,8 +29,8 @@ ram_bytes = 11
 name = "speed-mul-u8-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 56
-flash_words = 66
+cycles = 55
+flash_words = 65
 ram_bytes = 11
 
 [[entry]]
@@ -134,8 +134,8 @@ ram_bytes = 24
 name = "speed-divmod-i8-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 660
-flash_words = 175
+cycles = 492
+flash_words = 197
 ram_bytes = 24
 
 [[entry]]
@@ -194,8 +194,8 @@ ram_bytes = 29
 name = "speed-divmod-i16-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 624
-flash_words = 163
+cycles = 616
+flash_words = 185
 ram_bytes = 29
 
 [[entry]]
@@ -254,8 +254,8 @@ ram_bytes = 53
 name = "speed-divmod-i32-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 1864
-flash_words = 267
+cycles = 1680
+flash_words = 297
 ram_bytes = 53
 
 [[entry]]
@@ -308,7 +308,7 @@ name = "speed-memcpy-32-18f4550"
 device = "18F4550"
 cycles = 723
 flash_words = 97
-ram_bytes = 83
+ram_bytes = 77
 
 [[entry]]
 name = "speed-memcpy-32-18f4550"
@@ -316,7 +316,7 @@ device = "18F4550"
 profile = "O2"
 cycles = 723
 flash_words = 97
-ram_bytes = 83
+ram_bytes = 77
 
 [[entry]]
 name = "speed-memcpy-32-16f877a"
@@ -338,7 +338,7 @@ name = "speed-memset-32-18f4550"
 device = "18F4550"
 cycles = 493
 flash_words = 92
-ram_bytes = 53
+ram_bytes = 47
 
 [[entry]]
 name = "speed-memset-32-18f4550"
@@ -346,7 +346,7 @@ device = "18F4550"
 profile = "O2"
 cycles = 493
 flash_words = 92
-ram_bytes = 53
+ram_bytes = 47
 
 [[entry]]
 name = "speed-memset-32-16f877a"
@@ -383,7 +383,7 @@ name = "speed-strlen-strcmp-16f877a"
 device = "16F877A"
 cycles = 2700
 flash_words = 280
-ram_bytes = 58
+ram_bytes = 57
 
 [[entry]]
 name = "speed-strlen-strcmp-16f877a"
@@ -391,7 +391,7 @@ device = "16F877A"
 profile = "O2"
 cycles = 2700
 flash_words = 280
-ram_bytes = 58
+ram_bytes = 57
 
 [[entry]]
 name = "speed-crc16-18f4550"
@@ -503,15 +503,15 @@ name = "speed-u16-dec-16f877a"
 device = "16F877A"
 cycles = 2633
 flash_words = 134
-ram_bytes = 33
+ram_bytes = 29
 
 [[entry]]
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 1850
-flash_words = 284
-ram_bytes = 33
+cycles = 1845
+flash_words = 283
+ram_bytes = 29
 
 [[entry]]
 name = "speed-pid-step-18f4550"
@@ -561,17 +561,17 @@ ram_bytes = 131
 [[entry]]
 name = "scen-control-pass-18f4550"
 device = "18F4550"
-cycles = 778
-flash_words = 3947
-ram_bytes = 653
+cycles = 775
+flash_words = 3937
+ram_bytes = 638
 
 [[entry]]
 name = "scen-control-pass-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 724
-flash_words = 4187
-ram_bytes = 749
+cycles = 725
+flash_words = 4193
+ram_bytes = 678
 
 [[entry]]
 name = "speed-isr-18f4550-latency"
@@ -606,29 +606,29 @@ ram_bytes = 29
 [[entry]]
 name = "speed-isr-16f877a-latency"
 device = "16F877A"
-cycles = 24
-flash_words = 80
+cycles = 22
+flash_words = 78
 ram_bytes = 21
 
 [[entry]]
 name = "speed-isr-16f877a-roundtrip"
 device = "16F877A"
-cycles = 47
-flash_words = 80
+cycles = 45
+flash_words = 78
 ram_bytes = 21
 
 [[entry]]
 name = "speed-isr-16f877a-latency"
 device = "16F877A"
 profile = "O2"
-cycles = 24
-flash_words = 80
+cycles = 22
+flash_words = 78
 ram_bytes = 21
 
 [[entry]]
 name = "speed-isr-16f877a-roundtrip"
 device = "16F877A"
 profile = "O2"
-cycles = 47
-flash_words = 80
+cycles = 45
+flash_words = 78
 ram_bytes = 21
