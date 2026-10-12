@@ -493,6 +493,43 @@ fn cases() -> Vec<Case> {
             .collect(),
         },
         Case {
+            // epic-cc#878: the `epic-encoder` sim slice, the same file set
+            // `encoder_sim_const_pool_e2e` links (TU order included), built
+            // with `--const-pool` per POOL_ROWS: the plain `-O2` build
+            // overflows flash, so only the pooled build links all profiles.
+            name: "hal-pic16-encoder-sim-16f877a",
+            device: "16F877A",
+            includes: [
+                "hal/pic14/16f87xa/include/epiccc",
+                "hal/pic14/16f87xa/include",
+                "hal/pic14/core/include",
+                "common/include",
+                "lib/tick/include",
+                "lib/encoder/include",
+                "lib/serial/include",
+            ]
+            .iter()
+            .map(|d| fixture(&format!("{encoder_full}/{d}")))
+            .collect(),
+            defines: vec!["PIC16F877A", "FOSC_HZ=20000000", "__EPIC_CC__"],
+            inputs: [
+                "hal/pic14/core/src/peripherals/pic14_timer2.c",
+                "hal/pic14/core/src/peripherals/pic14_usart.c",
+                "hal/pic14/core/src/core/pic14_irq.c",
+                "hal/pic14/16f87xa/src/core/pic16_irq_table.c",
+                "hal/pic14/core/src/epiccc/pic16_isr_vector.c",
+                "hal/pic14/core/src/epiccc/pic16_irq_dispatch_serial_tick_epiccc.c",
+                "hal/pic14/16f87xa/src/mdb/pic16_harness_mdb.c",
+                "lib/tick/src/epic_tick.c",
+                "lib/encoder/src/encoder.c",
+                "lib/encoder/tests/sim_encoder.c",
+                "config.c",
+            ]
+            .iter()
+            .map(|f| fixture(&format!("{encoder_full}/{f}")))
+            .collect(),
+        },
+        Case {
             name: "hal-pic18-menu-demo-18f4550",
             device: "18F4550",
             includes: [
@@ -694,6 +731,12 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// Rows built with `--const-pool` (epic-cc#878): the encoder sim's string
+/// load only fits flash with pooled const tables. Name-matched so the
+/// `Case` struct stays flag-free; renaming a listed row breaks its build
+/// loudly (the plain `-O2` sim overflows flash), never silently.
+const POOL_ROWS: &[&str] = &["hal-pic16-encoder-sim-16f877a"];
+
 /// Run `epic-cc` for `c` under `profile` (`"Os"` is the default flags,
 /// anything else is passed as `-O<profile>`) and return its size-report
 /// stderr text. A failing profile build fails the test: every profile
@@ -715,6 +758,9 @@ fn measure(c: &Case, profile: &str) -> String {
     }
     for d in &c.defines {
         cmd.arg("-D").arg(d);
+    }
+    if POOL_ROWS.contains(&c.name) {
+        cmd.arg("--const-pool");
     }
     cmd.arg("-o").arg(&hex_path);
     cmd.args(&c.inputs);

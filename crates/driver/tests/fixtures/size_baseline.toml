@@ -172,6 +172,12 @@ flash_words = 5279
 ram_bytes = 326
 
 [[entry]]
+name = "hal-pic16-encoder-sim-16f877a"
+device = "16F877A"
+flash_words = 6881
+ram_bytes = 299
+
+[[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
 flash_words = 8667
