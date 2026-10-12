@@ -19,6 +19,7 @@
 //! renders the gap as explicit `fill 0x0000, 2` words so the two HEX files
 //! align byte-for-byte.
 use asm::assemble_file_to_hex;
+use iselcore::is_directive;
 use std::process::Command;
 
 fn gpasm() -> String {
@@ -48,7 +49,7 @@ fn to_gpasm_src(src: &str) -> String {
             org = target;
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             out.push(raw.to_string());
             break;
         }

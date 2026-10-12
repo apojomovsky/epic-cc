@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 device = { path = "../device" }
+iselcore = { path = "../iselcore" }
 
 [dev-dependencies]
 pic14-sim = { path = "../sim" }

@@ -223,10 +223,12 @@ fn fixture(p: &str) -> PathBuf {
 }
 
 fn kernel(stem: &str, device: &'static str, file: &str) -> Case {
-    let suffix = if device == "18F4550" {
-        "18f4550"
-    } else {
-        "16f877a"
+    let suffix = match device {
+        "18F4550" => "18f4550",
+        "16F877A" => "16f877a",
+        "16F1937" => "16f1937",
+        "16F505" => "16f505",
+        _ => panic!("cycle ladder: no row suffix for device {device}"),
     };
     Case {
         name: format!("{stem}-{suffix}"),
@@ -266,6 +268,13 @@ fn cases() -> Vec<Case> {
         out.push(kernel(stem, "18F4550", file));
         out.push(kernel(stem, "16F877A", file));
     }
+    // epic-cc#1067: the loop above covers 18F4550 and 16F877A only, so
+    // the pic14e and baseline __mul_u32 routines had no cycle row. The
+    // 12F509 cannot run this kernel (41 GPR bytes fit neither the 12
+    // operand/result bytes nor the 11-byte __scr), so the baseline row
+    // targets the 16F505.
+    out.push(kernel("speed-mul-u32", "16F1937", "speed-mul-u32.c"));
+    out.push(kernel("speed-mul-u32", "16F505", "speed-mul-u32.c"));
     // One PID update through the vendored epic-pid: PIC18 only, like the
     // demo it comes from.
     out.push(Case {
@@ -369,6 +378,9 @@ fn cases() -> Vec<Case> {
 trait MarkSim {
     fn step_one(&mut self);
     fn ram_byte(&self, addr: usize) -> u8;
+    fn cycles(&self) -> u64;
+    fn halted(&self) -> bool;
+    fn run(&mut self, max_steps: usize) -> usize;
 }
 
 impl MarkSim for pic14_sim::Pic18 {
@@ -378,6 +390,15 @@ impl MarkSim for pic14_sim::Pic18 {
     fn ram_byte(&self, addr: usize) -> u8 {
         self.ram()[addr]
     }
+    fn cycles(&self) -> u64 {
+        self.cycles()
+    }
+    fn halted(&self) -> bool {
+        self.halted()
+    }
+    fn run(&mut self, max_steps: usize) -> usize {
+        self.run(max_steps)
+    }
 }
 
 impl MarkSim for pic14_sim::Pic14 {
@@ -386,6 +407,51 @@ impl MarkSim for pic14_sim::Pic14 {
     }
     fn ram_byte(&self, addr: usize) -> u8 {
         self.ram()[addr]
+    }
+    fn cycles(&self) -> u64 {
+        self.cycles()
+    }
+    fn halted(&self) -> bool {
+        self.halted()
+    }
+    fn run(&mut self, max_steps: usize) -> usize {
+        self.run(max_steps)
+    }
+}
+
+impl MarkSim for pic14_sim::Pic14e {
+    fn step_one(&mut self) {
+        self.step();
+    }
+    fn ram_byte(&self, addr: usize) -> u8 {
+        self.ram()[addr]
+    }
+    fn cycles(&self) -> u64 {
+        self.cycles()
+    }
+    fn halted(&self) -> bool {
+        self.halted()
+    }
+    fn run(&mut self, max_steps: usize) -> usize {
+        self.run(max_steps)
+    }
+}
+
+impl MarkSim for pic14_sim::PicBaseline<'_> {
+    fn step_one(&mut self) {
+        self.step();
+    }
+    fn ram_byte(&self, addr: usize) -> u8 {
+        self.ram()[addr]
+    }
+    fn cycles(&self) -> u64 {
+        self.cycles()
+    }
+    fn halted(&self) -> bool {
+        self.halted()
+    }
+    fn run(&mut self, max_steps: usize) -> usize {
+        self.run(max_steps)
     }
 }
 /// Compile `c` under `profile` (`"Os"` is the default flags, anything
@@ -463,6 +529,8 @@ fn expected_results(name: &str) -> Vec<(&'static str, Vec<u8>)> {
     let stem = name
         .strip_suffix("-18f4550")
         .or_else(|| name.strip_suffix("-16f877a"))
+        .or_else(|| name.strip_suffix("-16f1937"))
+        .or_else(|| name.strip_suffix("-16f505"))
         .unwrap_or(name);
     match stem {
         // 200/13 = 15 rem 5.
@@ -518,25 +586,48 @@ fn result_mismatch(map: &str, name: &str, read: impl Fn(usize) -> u8) -> Option<
 /// instead of stopping at the first. Kernels must halt afterwards.
 fn measure_marks(hex: &str, map: &str, device: &str, name: &str) -> (u64, Option<String>) {
     let addr = map_addr(map, "bench_mark");
-    if device == "18F4550" {
-        let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(hex));
-        step_to_mark(&mut p, addr, 1, name);
-        let c1 = p.cycles();
-        step_to_mark(&mut p, addr, 2, name);
-        let c2 = p.cycles();
-        p.run(5_000_000);
-        assert!(p.halted(), "{name}: kernel must halt");
-        (c2 - c1, result_mismatch(map, name, |a| p.ram_byte(a)))
-    } else {
-        let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(hex));
-        step_to_mark(&mut p, addr, 1, name);
-        let c1 = p.cycles();
-        step_to_mark(&mut p, addr, 2, name);
-        let c2 = p.cycles();
-        p.run(5_000_000);
-        assert!(p.halted(), "{name}: kernel must halt");
-        (c2 - c1, result_mismatch(map, name, |a| p.ram_byte(a)))
+    match device {
+        "18F4550" => timed_marks(
+            &mut pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(hex)),
+            addr,
+            map,
+            name,
+        ),
+        // The 1937 runs the pic14e core, so its own sim and HEX layout.
+        "16F1937" => timed_marks(
+            &mut pic14_sim::Pic14e::with_device(
+                &device::PIC16F1937,
+                pic14_sim::parse_hex_pic14e(hex),
+            ),
+            addr,
+            map,
+            name,
+        ),
+        // Baseline core: 12-bit words over an 8-bit file map.
+        "16F505" => timed_marks(
+            &mut pic14_sim::PicBaseline::with_device(&device::PIC16F505, pic14_sim::parse_hex(hex)),
+            addr,
+            map,
+            name,
+        ),
+        // Classic PIC14 (16F877A and kin): Pic14::new is 877A geometry.
+        _ => timed_marks(
+            &mut pic14_sim::Pic14::new(pic14_sim::parse_hex(hex)),
+            addr,
+            map,
+            name,
+        ),
     }
+}
+
+fn timed_marks(p: &mut impl MarkSim, addr: usize, map: &str, name: &str) -> (u64, Option<String>) {
+    step_to_mark(p, addr, 1, name);
+    let c1 = p.cycles();
+    step_to_mark(p, addr, 2, name);
+    let c2 = p.cycles();
+    p.run(5_000_000);
+    assert!(p.halted(), "{name}: kernel must halt");
+    (c2 - c1, result_mismatch(map, name, |a| p.ram_byte(a)))
 }
 
 fn step_to_mark(p: &mut impl MarkSim, addr: usize, value: u8, name: &str) {
