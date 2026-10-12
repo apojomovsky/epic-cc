@@ -554,6 +554,9 @@ fn expected_results(name: &str) -> Vec<(&'static str, Vec<u8>)> {
         "speed-mul-u16" => vec![("r", vec![132, 161])],
         // 0x12345678*0x9ABCDEF1 mod 2^32 = 0x366176F8.
         "speed-mul-u32" => vec![("r", vec![248, 118, 97, 54])],
+        // Q8.8 step: err = 40, integrator = 2560 >> 8 = 10, output =
+        // (10240 >> 8) + 10 = 50 (epic-cc#1174 pins the narrowed path).
+        "speed-pid-step" => vec![("output", vec![50, 0]), ("integrator", vec![10, 0])],
         // (0xABCD << 5) >> 5 = 0x03CD; (0x12345678 << 19) >> 19 = 0x1678.
         "speed-shift" => vec![("r16", vec![205, 3]), ("r32", vec![120, 22, 0, 0])],
         // 48293 decimal digits, least significant first.
