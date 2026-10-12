@@ -88,6 +88,42 @@ fn phi_swap_flash_strings_refused_on_pic14() {
     );
 }
 
+/// The flash-string swap never reaches the backend on pic14e and baseline:
+/// string literals keep no RAM address there, so lowering refuses loudly
+/// at slot lookup instead of staging flash addresses. These pins guard
+/// that gate: a future change that RAM-copies consts there must route
+/// walks correctly or refuse with its own message, never read RAM at a
+/// flash address silently.
+#[test]
+fn phi_swap_flash_strings_refused_on_pic14e() {
+    expect_refusal("p16f1937", "no address for @.str");
+}
+
+#[test]
+fn phi_swap_flash_strings_refused_on_pic_baseline() {
+    expect_refusal("p12f509", "no address for @.str");
+}
+
+fn expect_refusal(device: &str, needle: &str) {
+    let hex_path = std::env::temp_dir().join(format!(
+        "phi_swap_refused_{device}_{}.hex",
+        std::process::id()
+    ));
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args(["--device", device, "-o"])
+        .arg(&hex_path)
+        .arg("tests/fixtures/flash_walk_swap.c")
+        .output()
+        .expect("run driver");
+    let _ = std::fs::remove_file(&hex_path);
+    assert!(!out.status.success(), "a flash walk must fail the build");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(needle),
+        "the error must name the missing address: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 fn run_pic14e(hex: &[u8]) -> (Vec<u8>, bool) {
     let hex = String::from_utf8(hex.to_vec()).unwrap();
     let mut p =
