@@ -9490,8 +9490,8 @@ enum FitVerdict {
 /// (the next pass plans their chunks), over-limit chunks are re-split from
 /// real block sizes, page-level overflow re-places everything with the
 /// measured reals, and a backward section pin re-lays the section at the
-/// measured code end. A repair state that repeats a previous one cannot make
-/// progress, so it fails instead of oscillating.
+/// measured code end. A repeated repair state splits one participant first
+/// (the escalation below) and only fails when nothing splittable remains.
 fn assess_fit(
     device: &Device,
     m: &Module,
@@ -9668,27 +9668,47 @@ fn assess_fit(
         next.entries.insert(owner.clone(), entries);
         next.chunk_sizes.extend(chunk_sizes);
     }
-    // Fixed point that still fails: measured sizes reproduce this layout, so
-    // another re-place cannot help. Split the function spilling past a
-    // backward page anchor instead; its tail moves off the full page. This
-    // only fires where the seen-check below would panic, so converging
-    // programs never take it, and each firing grows force_split, so the
-    // escalation terminates. A repeat with the owner split falls through.
+    // Fixed point or 2-cycle that still fails: measured sizes reproduce a
+    // seen layout, so another re-place cannot help. Split one participant
+    // instead: the spiller past a backward page anchor first (its tail
+    // moves off the full page), else a page-straddling owner (its chunks
+    // place independently, breaking the alternation). This only fires
+    // where the seen-check below would panic, so converging programs never
+    // take it, and each firing grows force_split, so the escalation
+    // terminates. A repeat with every candidate split falls through.
     if next.force_split == rep.force_split
         && next.entries == rep.entries
         && next.section_base == rep.section_base
         && replace
     {
-        let spill = layout
+        let mut candidates: Vec<(u8, String)> = layout
             .backward_orgs
             .iter()
             .zip(layout.backward_spillers.iter())
             .filter(|((target, _), _)| *target != table_start)
-            .find_map(|(_, name)| {
+            .filter_map(|(_, name)| {
                 owner_of(name)
                     .filter(|(owner, _)| splittable(owner) && !next.force_split.contains(owner))
-            });
-        if let Some((owner, _)) = spill {
+            })
+            .map(|(owner, _)| (0, owner))
+            .collect();
+        for e in &layout.extents {
+            if e.end <= e.start {
+                continue;
+            }
+            let last = e.end - 1;
+            if !e.has_branch || last / 0x800 == e.start / 0x800 {
+                continue;
+            }
+            if let Some((owner, _)) = owner_of(&e.name) {
+                if splittable(&owner) && !next.force_split.contains(&owner) {
+                    candidates.push((1, owner));
+                }
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        if let Some((_, owner)) = candidates.into_iter().next() {
             next.force_split.insert(owner);
         }
     }
@@ -10223,6 +10243,28 @@ fn place_consts(
             staged_len: slen,
             chunks,
         });
+    }
+    out
+}
+
+/// Modeled page of every const-table chunk base, in emission order: the
+/// `(base label, base page)` pairs the driver re-checks after its own
+/// passes (epic-cc#1137). Built from the emission `places`, so it matches
+/// the elision map by construction. Base labels repeat the emitter's rule
+/// (`name`, `name_1`, `name_2`, ...).
+fn table_base_pages(consts: &[&ir::Global], places: &[ConstPlace]) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for (g, place) in consts.iter().zip(places.iter()) {
+        for (c, ch) in place.chunks.iter().enumerate() {
+            let label = if c == 0 {
+                g.name.clone()
+            } else if c == 1 {
+                format!("{}_1", g.name)
+            } else {
+                format!("{}_{}", g.name, c)
+            };
+            out.push((label, ch.base_at / 0x800));
+        }
     }
     out
 }
@@ -10847,14 +10889,21 @@ impl Default for Options {
 /// through banking/peephole to build the address-to-line table. The third
 /// return maps each cross-page function to its ordered chunk entry labels
 /// (epic-cc#841); empty when nothing spans pages. The driver passes it to
-/// `verify_page_fit_split`, which checks each chunk as its own extent.
+/// `verify_page_fit_split`, which checks each chunk as its own extent. The
+/// fourth return maps each const-table chunk base label to its modeled
+/// page; the driver re-checks it after its own passes (epic-cc#1137).
 pub fn select_with_locs(
     device: &Device,
     m: &Module,
     addrs: &HashMap<String, u16>,
     staged: &HashSet<String>,
     pool: &ConstPool,
-) -> (String, Vec<Option<SrcLoc>>, HashMap<String, Vec<String>>) {
+) -> (
+    String,
+    Vec<Option<SrcLoc>>,
+    HashMap<String, Vec<String>>,
+    Vec<(String, usize)>,
+) {
     select_with_opts(device, m, addrs, staged, pool, Options::default())
 }
 
@@ -10869,7 +10918,12 @@ pub fn select_with_opts(
     staged: &HashSet<String>,
     pool: &ConstPool,
     opts: Options,
-) -> (String, Vec<Option<SrcLoc>>, HashMap<String, Vec<String>>) {
+) -> (
+    String,
+    Vec<Option<SrcLoc>>,
+    HashMap<String, Vec<String>>,
+    Vec<(String, usize)>,
+) {
     let mut out: Vec<String> = Vec::new();
     let mut locs: Vec<Option<SrcLoc>> = Vec::new();
     // The device's interrupt vector(s) (the hardware pushes the return PC
@@ -11854,7 +11908,8 @@ pub fn select_with_opts(
                     .into_iter()
                     .map(|(name, plan)| (name, plan.entries))
                     .collect();
-                return (out.join("\n"), locs, chunks);
+                let base_pages = table_base_pages(&consts, &places);
+                return (out.join("\n"), locs, chunks, base_pages);
             }
             FitVerdict::Again(next) => {
                 rep = next;
@@ -12195,5 +12250,96 @@ mod dead_pclath_tests {
                 "    CALL h"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod fit_repair_tests {
+    use super::{assess_fit, FitVerdict, Repair};
+    use device::PIC16F877A;
+    use std::collections::HashMap;
+
+    fn module() -> ir::Module {
+        ir::parse(
+            "fn f(void) ()\n  block entry:\n    ret void\nfn g(void) ()\n  block entry:\n    ret void\n",
+        )
+    }
+
+    // Straight-line words no pass folds: varied immediates and rotating
+    // bank-0 stores, so banking adds nothing and peephole keeps every word.
+    fn words(n: usize) -> String {
+        let mut s = String::new();
+        for i in 0..n {
+            s.push_str(&format!(
+                "    MOVLW 0x{:02X}\n    MOVWF 0x{:02X}\n",
+                i % 256,
+                0x20 + (i % 16)
+            ));
+        }
+        s
+    }
+
+    // Two placements of the same functions with different measured sizes.
+    // Layout A crosses in f, layout B in g; each re-place proposes the
+    // other layout's sizes, so the third assessment repeats the first.
+    fn layout_a() -> String {
+        format!(
+            "    org 0x0600\nf:\n{}    GOTO f\ng:\n{}    GOTO g\n    end\n",
+            words(500),
+            words(50)
+        )
+    }
+
+    fn layout_b() -> String {
+        format!(
+            "    org 0x0600\nf:\n{}    GOTO f\ng:\n{}    GOTO g\n    end\n",
+            words(200),
+            words(350)
+        )
+    }
+
+    fn assess(asm: &str, rep: &Repair) -> FitVerdict {
+        assess_fit(&PIC16F877A, &module(), asm, &HashMap::new(), 0x1800, rep)
+    }
+
+    fn again(rep: &Repair, asm: &str) -> Repair {
+        match assess(asm, rep) {
+            FitVerdict::Again(next) => next,
+            FitVerdict::Fit => panic!("layout must need repair, got Fit"),
+            FitVerdict::Broken(msg) => panic!("layout must need repair, got Broken: {msg}"),
+            FitVerdict::NoConverge(msg) => panic!("layout must need repair, got NoConverge: {msg}"),
+        }
+    }
+
+    #[test]
+    fn two_cycle_escalates_by_splitting_the_crosser() {
+        let rep0 = Repair::default();
+        let rep1 = again(&rep0, &layout_a());
+        let rep2 = again(&rep1, &layout_b());
+        match assess(&layout_a(), &rep2) {
+            FitVerdict::Again(next) => assert!(
+                next.force_split.contains("f"),
+                "the repeat must split the crossing function f"
+            ),
+            FitVerdict::NoConverge(msg) => {
+                panic!("a 2-cycle must escalate, not die oscillating: {msg}")
+            }
+            FitVerdict::Fit => panic!("a 2-cycle must not report Fit"),
+            FitVerdict::Broken(msg) => panic!("a 2-cycle must escalate, not break: {msg}"),
+        }
+    }
+
+    #[test]
+    fn repeat_with_every_crosser_split_fails_honestly() {
+        let mut rep0 = Repair::default();
+        rep0.force_split.insert("f".to_string());
+        rep0.force_split.insert("g".to_string());
+        let rep1 = again(&rep0, &layout_a());
+        match assess(&layout_a(), &rep1) {
+            FitVerdict::NoConverge(_) => {}
+            FitVerdict::Again(_) => panic!("no splittable crosser remains, must not escalate"),
+            FitVerdict::Fit => panic!("a repeat must not report Fit"),
+            FitVerdict::Broken(msg) => panic!("exhaustion must not break: {msg}"),
+        }
     }
 }
