@@ -8536,6 +8536,30 @@ fn assess_fit(
         next.entries.insert(owner.clone(), entries);
         next.chunk_sizes.extend(chunk_sizes);
     }
+    // Fixed point that still fails: measured sizes reproduce this layout, so
+    // another re-place cannot help. Split the function spilling past a
+    // backward page anchor instead; its tail moves off the full page. This
+    // only fires where the seen-check below would panic, so converging
+    // programs never take it, and each firing grows force_split, so the
+    // escalation terminates. A repeat with the owner split falls through.
+    if next.force_split == rep.force_split
+        && next.entries == rep.entries
+        && next.section_base == rep.section_base
+        && replace
+    {
+        let spill = layout
+            .backward_orgs
+            .iter()
+            .zip(layout.backward_spillers.iter())
+            .filter(|((target, _), _)| *target != table_start)
+            .find_map(|(_, name)| {
+                owner_of(name)
+                    .filter(|(owner, _)| splittable(owner) && !next.force_split.contains(owner))
+            });
+        if let Some((owner, _)) = spill {
+            next.force_split.insert(owner);
+        }
+    }
     if next.force_split == rep.force_split
         && next.entries == rep.entries
         && next.section_base == rep.section_base
@@ -8765,6 +8789,10 @@ struct FitExtent {
 struct FitLayout {
     extents: Vec<FitExtent>,
     backward_orgs: Vec<(usize, usize)>,
+    /// Names of the extents open at each backward `.org`, in detection
+    /// order: the spilling extent's true end is the reported address, which
+    /// its clamped `end` hides, so repair reads the owner here.
+    backward_spillers: Vec<String>,
 }
 
 /// Labels that open their own checked extent: every function, `__start`, the
@@ -8811,6 +8839,7 @@ fn measure_fit_layout(asm: &str, targets: &HashSet<String>) -> FitLayout {
     let mut layout = FitLayout {
         extents: Vec::new(),
         backward_orgs: Vec::new(),
+        backward_spillers: Vec::new(),
     };
     let mut org = 0usize;
     let mut cur: Option<FitExtent> = None;
@@ -8827,10 +8856,13 @@ fn measure_fit_layout(asm: &str, targets: &HashSet<String>) -> FitLayout {
         }
         if let Some(rest) = line.strip_prefix("org ") {
             let target = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
-            close(&mut cur, target, &mut layout);
             if target < org {
                 layout.backward_orgs.push((target, org));
+                layout
+                    .backward_spillers
+                    .push(cur.as_ref().map(|e| e.name.clone()).unwrap_or_default());
             }
+            close(&mut cur, target, &mut layout);
             org = target;
             continue;
         }
