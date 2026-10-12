@@ -11,6 +11,7 @@ fn global(name: &str, size: usize) -> Global {
         size: size as u16,
         bytes: vec![0; size],
         addr: None,
+        internal: false,
         refs: Vec::new(),
     }
 }

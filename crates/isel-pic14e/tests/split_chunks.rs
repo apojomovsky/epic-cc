@@ -188,6 +188,7 @@ fn split_const_read(table_size: usize, idx: u16) -> (u8, u8) {
             bytes: vec![0, 0],
             refs: Vec::new(),
             addr: None,
+            internal: false,
         },
         ir::Global {
             name: "out".into(),
@@ -197,6 +198,7 @@ fn split_const_read(table_size: usize, idx: u16) -> (u8, u8) {
             bytes: vec![0],
             refs: Vec::new(),
             addr: None,
+            internal: false,
         },
         ir::Global {
             name: "t".into(),
@@ -206,6 +208,7 @@ fn split_const_read(table_size: usize, idx: u16) -> (u8, u8) {
             bytes,
             refs: Vec::new(),
             addr: None,
+            internal: false,
         },
     ];
     let addrs = addrs(&[

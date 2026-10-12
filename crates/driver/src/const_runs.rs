@@ -360,6 +360,7 @@ fn table_store_runs(m: &mut Module) {
                     bytes,
                     refs,
                     addr: None,
+                    internal: true,
                 };
                 let (dst_val, setup) = addr_val(&run.root, run.start, &f.name, ctr);
                 let last = run.members.last().expect("run has members").idx;
@@ -569,6 +570,7 @@ mod tests {
             bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
             refs: Vec::new(),
             addr: None,
+            internal: false,
         });
         m.funcs.push(main_func(vec![
             Inst::Alloca(Alloca {
@@ -616,6 +618,7 @@ mod tests {
             bytes: vec![0; 8],
             refs: Vec::new(),
             addr: None,
+            internal: false,
         });
         m.funcs.push(main_func(vec![
             Inst::Alloca(Alloca {

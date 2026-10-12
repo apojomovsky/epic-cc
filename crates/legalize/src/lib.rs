@@ -2647,6 +2647,7 @@ fn fuse_divmod_pairs(funcs: &mut [Func], globals: &mut Vec<Global>, used: &mut V
                 bytes: vec![0u8; w.bytes() as usize],
                 refs: Vec::new(),
                 addr: None,
+                internal: true,
             });
         }
         if !used.iter().any(|u| u == combined) {
