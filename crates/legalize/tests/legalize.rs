@@ -3810,3 +3810,18 @@ fn refuses_strided_loop_with_volatile_store() {
         "volatile store keeps the LSR form:\n{text}"
     );
 }
+
+#[test]
+fn refuses_strcmp_with_nonzero_entry_arm() {
+    // The rerouted prime-NUL case delivers index zero, so a nonzero
+    // entry arm would change the value: the idiom keeps the carried
+    // form.
+    let m = parse(
+        "global s1 i8\nglobal s2 i8\nfn strcmp(i16) (0=ptr, 1=ptr)\n  block 2:\n    %3 = load i8 @s1\n    %4 = icmp eq i8 %3 0\n    br i1 %4 .loopexit .preheader\n  block .preheader:\n    %5 = phi i8 %12 10 %3 2\n    %6 = phi i16 %11 10 0 2\n    %7 = gep @s2 +0 +1*%6\n    %8 = load i8 %7\n    %9 = icmp eq i8 %5 %8\n    br i1 %9 10 ..loopexit_crit_edge\n  block 10:\n    %11 = add i16 %6 1\n    %__gep3 = gep @s1 +1\n    %scevgep = gep %__gep3 +0 +1*%6\n    %12 = load i8 %scevgep\n    %13 = icmp eq i8 %12 0\n    br i1 %13 .loopexit .preheader\n  block ..loopexit_crit_edge:\n    %14 = zext i8 %5 to i16\n    br .loopexit\n  block .loopexit:\n    %15 = phi i16 7 2 %6 ..loopexit_crit_edge %11 10\n    %16 = phi i16 0 2 %14 ..loopexit_crit_edge 0 10\n    %17 = gep @s2 +0 +1*%15\n    %18 = load i8 %17\n    %19 = zext i8 %18 to i16\n    %20 = sub i16 %16 %19\n    ret i16 %20\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("scevgep"),
+        "nonzero entry arm keeps the carried form:\n{text}"
+    );
+}

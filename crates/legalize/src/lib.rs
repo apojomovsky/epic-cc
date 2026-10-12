@@ -1925,6 +1925,15 @@ fn find_strcmp_sites(f: &Func, const_globals: &HashSet<String>) -> Vec<StrcmpSit
                     continue;
                 }
             }
+            // The rerouted prime-NUL case delivers (0, 0) through the
+            // loop, so entry arms must already be zero; anything else
+            // changes the value and keeps the carried form.
+            if arm(idxphi, &el).is_some_and(|v| v != Val::Const(0)) {
+                continue;
+            }
+            if arm(valphi, &el).is_some_and(|v| v != Val::Const(0)) {
+                continue;
+            }
             let idx = idxphi.dst.clone();
             let val = valphi.dst.clone();
             if const_globals.contains(&g1) || const_globals.contains(&g2) {
