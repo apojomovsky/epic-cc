@@ -2276,8 +2276,10 @@ fn home_args(
 /// pass that drops those slots. Classic PIC14 pairs the same two passes
 /// (epic-cc#875), gated on every mapped RAM global: without an access
 /// bank the fold only deletes file-register accesses, so no placement
-/// can make one cost flash. Other cores, and PIC18 layouts that fall
-/// back to globals-first, take the bounding pass as the result.
+/// can make one cost flash. PIC14E pairs them the same way (epic-cc#902):
+/// it is globals-first like PIC14, so the exactness argument transfers.
+/// Other cores, and PIC18 layouts that fall back to globals-first, take
+/// the bounding pass as the result.
 pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     allocate_with_pool(device, m, edges_text, false)
 }
@@ -2299,7 +2301,7 @@ pub fn allocate_with_pool(
     // bank-used sum is the whole comparison.
     let select = |allow_dip: bool| -> AllocLayout {
         let (nofold, fit) = allocate_inner(device, m, edges_text, None, pool, allow_dip);
-        if device.core == Core::Pic14 {
+        if matches!(device.core, Core::Pic14 | Core::Pic14e) {
             // Globals-first is exact, not monotone: global placement reads
             // only the module's globals, never the frame widths the gated
             // pass shrinks, so the bounding map's globals are the final
@@ -2369,13 +2371,14 @@ fn allocate_inner(
     // slot materializes its two address bytes into the dst slot, so the
     // dst needs a RAM slot; a folded select is virtual and defines none.
     let resolved = resolve_pointers(m);
-    // Value folds (epic-cc#863, epic-cc#875): producers needing no slot,
-    // computed by the predicate both PIC18 and PIC14 backends share, so
-    // a dropped slot is never read. Other cores keep every slot: their
-    // backends still address staged copies. The gate names foldable
-    // globals (access-safe on PIC18, every mapped RAM global on PIC14);
-    // `None` folds nothing, for the bounding pass.
-    let fold_core = device.core == Core::Pic18 || device.core == Core::Pic14;
+    // Value folds (epic-cc#863, epic-cc#875, epic-cc#902): producers needing
+    // no slot, computed by the predicate the PIC18, PIC14, and PIC14E
+    // backends share, so a dropped slot is never read. Other cores keep
+    // every slot: their backends still address staged copies. The gate
+    // names foldable globals (access-safe on PIC18, every mapped RAM
+    // global on PIC14 and PIC14E); `None` folds nothing, for the bounding
+    // pass.
+    let fold_core = matches!(device.core, Core::Pic18 | Core::Pic14 | Core::Pic14e);
     let folds: HashMap<String, ValueFolds> = if fold_core {
         m.funcs
             .iter()
@@ -2384,8 +2387,8 @@ fn allocate_inner(
     } else {
         HashMap::new()
     };
-    // PIC14 drops only what its backend skips: folded loads plus
-    // load-forwarded stores. Forwarded `Bin` results keep their slot
+    // PIC14 and PIC14E drop only what their backends skip: folded loads
+    // plus load-forwarded stores. Forwarded `Bin` results keep their slot
     // there, so they stay out of this set even though the shared
     // predicate names them.
     let unplaced: HashMap<String, HashSet<String>> = m
@@ -2394,7 +2397,7 @@ fn allocate_inner(
         .map(|f| {
             let empty = ValueFolds::default();
             let folds = folds.get(&f.name).unwrap_or(&empty);
-            let dropped = if device.core == Core::Pic14 {
+            let dropped = if matches!(device.core, Core::Pic14 | Core::Pic14e) {
                 folds.unplaced_pic14(f)
             } else {
                 folds.unplaced()

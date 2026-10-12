@@ -16,6 +16,12 @@ flash_words = 16
 ram_bytes = 2
 
 [[entry]]
+name = "add-p16f1939"
+device = "16F1939"
+flash_words = 11
+ram_bytes = 3
+
+[[entry]]
 name = "bench-shift-18f4550"
 device = "18F4550"
 flash_words = 88
