@@ -578,12 +578,15 @@ fn main() {
             // The POSTINC copy loop trades cycles for flash, so the speed
             // profile drains staged runs as straight MOVFFs (epic-cc#883).
             // The divmod tail fold trades 2 words per helper the same way.
-            // The u16 inline multiply likewise spends flash per site for
-            // cycles, so it rides the same profile (epic-cc#892).
+            // The signed prescale skips leading dividend zeros the same way,
+            // signed helpers only (epic-cc#1090). The u16 inline multiply
+            // likewise spends flash per site for cycles, so it rides the
+            // same profile (epic-cc#892).
             let is_o2 = matches!(cli.opt_level, driver::cli::OptLevel::O2);
             let opts = isel_pic18::Options {
                 copy_loop: !is_o2,
                 divmod_fold: is_o2,
+                sdiv_prescale: is_o2,
                 inline_mul16: is_o2,
             };
             isel_pic18::select_with_opts(
