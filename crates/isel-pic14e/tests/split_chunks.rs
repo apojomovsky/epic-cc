@@ -3,6 +3,7 @@
 
 use device::PIC16F1937;
 use ir::parse;
+use iselcore::is_directive;
 use std::collections::{HashMap, HashSet};
 
 fn addrs(pairs: &[(&str, u16)]) -> HashMap<String, u16> {
@@ -13,14 +14,14 @@ fn label_addr(asm: &str, label: &str) -> usize {
     let mut org = 0usize;
     for raw in asm.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
             org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             break;
         }
         if let Some(l) = line.strip_suffix(':') {
