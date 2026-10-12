@@ -41,8 +41,9 @@
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    find_value_folds, flash_provenance, is_directive, log_pool_site, resolve_pointers, ssa_key,
-    Base, FlashProvenance, PtrResolution, Slot, LOG_POOL_CALLEE, LOG_POOL_VARIANT,
+    add_flash_walks, find_value_folds, flash_provenance, is_directive, log_pool_site,
+    resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot, LOG_POOL_CALLEE,
+    LOG_POOL_VARIANT,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -187,6 +188,10 @@ struct Gen<'m> {
     fast_divmod: bool,
     /// Eight-pass straight-line `__mul_u8` body (epic-cc#974, #1095), speed profile only.
     fast_mul_u8: bool,
+    /// Byte-granular variable shifts (epic-cc#1171): the u16/u32 shift
+    /// routines move whole bytes first when the masked count is >= 8,
+    /// then bit-loop the remainder. Speed profile only.
+    fast_shift: bool,
     cur_func: &'m str,
     /// Module-scoped fresh-label counter, shared across every function so the
     /// emitted `tmp{n}:` labels stay unique in the single `.asm` output.
@@ -1826,8 +1831,17 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Copy `val` (width `ty`) into the slot starting at `dst`.
+    /// Copy `val` (width `ty`) into the slot starting at `dst`. A staged
+    /// const's address is its staging buffer, not its flash label: route
+    /// it through the stage call like every other address writer, so a
+    /// walk slot holds a dereferenceable address (epic-cc#1141).
     fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u16) {
+        if let Val::Global(g) = val {
+            if self.staged.contains(g) {
+                self.emit_stage_const_to_slot(g, dst, 0);
+                return;
+            }
+        }
         for i in 0..ty.bytes() {
             // Zero bytes clear with one CLRF, not MOVLW 0 + MOVWF. The pair
             // leaves every flag alone (MOVLW/MOVWF touch none on PIC14)
@@ -5262,6 +5276,9 @@ impl<'m> Gen<'m> {
     /// layout-contract offset). ashr sets C from the sign bit before each
     /// rrf so the sign fills every vacated bit. All slots stay inside one
     /// GPR bank (any bank), the loops are skip-sensitive (epic-cc#6).
+    /// Under `fast_shift` (epic-cc#1171) the u16/u32 bodies move whole
+    /// bytes first when the masked count reaches 8, then bit-loop the
+    /// remainder (i8 counts never reach 8, so that body keeps the loop).
     fn emit_shift_body(&mut self, bytes: u16, op: BinOp, scr: u16) {
         let name = self.cur_func;
         let val = self.slot_addr(name, "val").direct();
@@ -5283,6 +5300,9 @@ impl<'m> Gen<'m> {
             // lives entirely in the low byte. Clear it once so a stale high
             // byte from an earlier call can't be misread as part of the count.
             self.emit(format!("    CLRF 0x{:02X}", scr + 1));
+        }
+        if self.fast_shift && bytes > 1 {
+            self.emit_shift_byte_prefix(bytes, op, val, scr);
         }
         let l_loop = self.fresh_label();
         let l_done = self.fresh_label();
@@ -5321,6 +5341,78 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_done}:"));
         self.store_retval(val, bytes as u8);
         self.emit("    RETURN".to_string());
+    }
+
+    /// Byte-granular prefix for the u16/u32 shift bodies (epic-cc#1171):
+    /// each set high count bit moves whole bytes, then clears its bit so
+    /// the bit loop below sees count % 8. Bit 3 selects one byte (u16 and
+    /// u32); bit 4 selects two more bytes first (u32 only). A clear bit
+    /// costs one GOTO; each set bit saves eight bit-loop trips.
+    fn emit_shift_byte_prefix(&mut self, bytes: u16, op: BinOp, val: u16, scr: u16) {
+        let l_bits = self.fresh_label();
+        if bytes == 4 {
+            let l_chk8 = self.fresh_label();
+            self.emit(format!("    BTFSS 0x{scr:02X}, 4")); // count >= 16?
+            self.emit(format!("    GOTO {l_chk8}"));
+            self.emit_shift_byte_move(bytes, 2, op, val);
+            self.emit(format!("    BCF 0x{scr:02X}, 4")); // remainder -= 16
+            self.emit(format!("{l_chk8}:"));
+        }
+        self.emit(format!("    BTFSS 0x{scr:02X}, 3")); // count >= 8?
+        self.emit(format!("    GOTO {l_bits}"));
+        self.emit_shift_byte_move(bytes, 1, op, val);
+        self.emit(format!("    BCF 0x{scr:02X}, 3")); // remainder -= 8
+        self.emit(format!("{l_bits}:"));
+    }
+
+    /// One whole-byte shift by `n` bytes over a `bytes`-byte LE value in
+    /// place. shl slides bytes up and clears the vacated low bytes; lshr
+    /// slides down and clears the high bytes; ashr slides down and fills
+    /// the high bytes with the original sign (still in the top byte: the
+    /// moves never write it before the fill reads it).
+    fn emit_shift_byte_move(&mut self, bytes: u16, n: u16, op: BinOp, val: u16) {
+        match op {
+            BinOp::Shl => {
+                for i in (0..bytes - n).rev() {
+                    self.emit(format!("    MOVF 0x{:02X}, W", val + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", val + i + n));
+                }
+                for i in 0..n {
+                    self.emit(format!("    CLRF 0x{:02X}", val + i));
+                }
+            }
+            BinOp::LShr => {
+                for i in n..bytes {
+                    self.emit(format!("    MOVF 0x{:02X}, W", val + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", val + i - n));
+                }
+                for i in bytes - n..bytes {
+                    self.emit(format!("    CLRF 0x{:02X}", val + i));
+                }
+            }
+            BinOp::AShr => {
+                for i in n..bytes {
+                    self.emit(format!("    MOVF 0x{:02X}, W", val + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", val + i - n));
+                }
+                let top = val + bytes - 1;
+                let l_neg = self.fresh_label();
+                let l_fill = self.fresh_label();
+                self.emit(format!("    BTFSC 0x{top:02X}, 7"));
+                self.emit(format!("    GOTO {l_neg}"));
+                for i in bytes - n..bytes {
+                    self.emit(format!("    CLRF 0x{:02X}", val + i));
+                }
+                self.emit(format!("    GOTO {l_fill}"));
+                self.emit(format!("{l_neg}:"));
+                self.emit("    MOVLW 0xFF".to_string());
+                for i in bytes - n..bytes {
+                    self.emit(format!("    MOVWF 0x{:02X}", val + i));
+                }
+                self.emit(format!("{l_fill}:"));
+            }
+            _ => unreachable!("isel: shift byte move takes a shift op"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7788,6 +7880,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         retval_lo: g.retval_lo,
         fast_divmod: g.fast_divmod,
         fast_mul_u8: g.fast_mul_u8,
+        fast_shift: g.fast_shift,
         cur_func: g.cur_func,
         bool_temps: HashSet::new(),
         tmp: &mut *g.tmp,
@@ -9469,10 +9562,22 @@ fn prev_instruction(out: &[String], k: usize) -> Option<&str> {
 ///   same slot-aliasing shape needs writer-first on a forward edge (the
 ///   source slot is not live) and reader-first on a back edge (it
 ///   holds the current iteration's value).
-/// A true cycle (%a <- %b, %b <- %a, a loop-carried swap) needs a temp
-/// register, so it panics rather than silently miscompile.
+/// A back-edge cycle (a loop-carried pointer swap) stages one arm through
+/// the first two retval bytes and replays it once its destination is free.
+/// Both bytes are dead at every block edge: call results copy out, `_delay`
+/// counters loop, and the pool prologue folds inside their own lowerings,
+/// while the ISR prologue saves the whole retval region. Anything else
+/// cyclic still panics instead of miscompiling.
 fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge: bool) {
-    let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
+    struct Pend {
+        da: u16,
+        src: Option<u16>,
+        ty: Ty,
+        val: Val,
+        from_temp: bool,
+    }
+    let temp_lo = g.retval_lo;
+    let mut pending: Vec<Pend> = copies
         .iter()
         .map(|(dst, ty, val)| {
             let da = g.slot_addr(g.cur_func, dst).direct();
@@ -9492,44 +9597,105 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
                 },
                 _ => None,
             };
-            (da, src, *ty, val.clone())
+            Pend {
+                da,
+                src,
+                ty: *ty,
+                val: val.clone(),
+                from_temp: false,
+            }
         })
         .collect();
     let n = pending.len();
     let mut emitted = vec![false; n];
     let mut emitted_count = 0usize;
+    let mut temp_live = false;
     while emitted_count < n {
         let mut progress = false;
         for i in 0..n {
             if emitted[i] {
                 continue;
             }
-            let (da, src, ty, val) = &pending[i];
             let blocked = if back_edge {
                 // Reader first: blocked while an un-emitted sibling READS
                 // this copy's destination (sibling source == my dst): that
                 // sibling reads a merge phi slot holding the current
                 // iteration's live value and must run before the overwrite.
-                (0..n).any(|j| !emitted[j] && j != i && pending[j].1 == Some(*da))
+                let da = pending[i].da;
+                (0..n).any(|j| !emitted[j] && j != i && pending[j].src == Some(da))
             } else {
                 // Writer first: blocked while an un-emitted sibling WRITES
                 // this copy's source (sibling dst == my src): on a forward
                 // edge the source slot is only defined by this edge's
                 // copies, so a reader runs after its definer.
-                match src {
-                    Some(s) => (0..n).any(|j| !emitted[j] && j != i && pending[j].0 == *s),
+                match pending[i].src {
+                    Some(s) => (0..n).any(|j| !emitted[j] && j != i && pending[j].da == s),
                     None => false,
                 }
             };
             if !blocked {
-                g.emit_move_val_to_slot(val, *ty, *da);
+                if pending[i].from_temp {
+                    for b in 0..pending[i].ty.bytes() {
+                        let t = temp_lo + u16::from(b);
+                        let d = pending[i].da + u16::from(b);
+                        g.emit(format!("    MOVF 0x{t:02X}, W"));
+                        g.emit(format!("    MOVWF 0x{d:02X}"));
+                    }
+                    temp_live = false;
+                } else {
+                    let (val, ty, da) = (pending[i].val.clone(), pending[i].ty, pending[i].da);
+                    g.emit_move_val_to_slot(&val, ty, da);
+                }
                 emitted[i] = true;
                 emitted_count += 1;
                 progress = true;
             }
         }
         if !progress {
-            panic!("isel: cyclic phi copies not supported");
+            if !back_edge {
+                panic!("isel: cyclic phi copies not supported");
+            }
+            if temp_live {
+                panic!("isel: disjoint cyclic phi copies not supported");
+            }
+            let pick = (0..n)
+                .find(|&i| !emitted[i] && pending[i].src.is_some())
+                .unwrap_or_else(|| panic!("isel: cyclic phi copies not supported"));
+            // A cycle over flash addresses cannot stage: the temp would
+            // preserve the address while INDF still misreads it. Walk marks
+            // are computed here, on demand: stalls only fire on cyclic
+            // edges, so the fixpoint never runs for acyclic code.
+            if let Val::Reg(r) = &pending[pick].val {
+                let key = ssa_key(g.cur_func, r);
+                let mut walks = FlashProvenance::default();
+                add_flash_walks(&mut walks, g.m, |n| {
+                    !n.starts_with("_ZTV")
+                        && !g.staged.contains(n)
+                        && !g.addrs.contains_key(n)
+                        && g.m.globals.iter().any(|gl| gl.name == n && gl.is_const)
+                });
+                if walks.flash.contains(&key) {
+                    panic!(
+                        "isel: pointer phi cycle over a flash address (flash walks read program memory, PIC18-only, epic-cc#1091, epic-cc#1141)"
+                    );
+                }
+                if walks.mixed.contains(&key) {
+                    panic!(
+                        "isel: pointer phi cycle over a maybe-flash address (a pointer joining flash and RAM, PIC18-only, epic-cc#1099, epic-cc#1141)"
+                    );
+                }
+            }
+            if pending[pick].ty.bytes() > 2 {
+                panic!("isel: phi copy cycle wider than temp not supported");
+            }
+            // Reader-first order kept every read of this slot pre-edge, so
+            // staging it now captures the current value; the arm replays
+            // from the temp once its destination is free.
+            let (val, ty) = (pending[pick].val.clone(), pending[pick].ty);
+            g.emit_move_val_to_slot(&val, ty, temp_lo);
+            pending[pick].src = Some(temp_lo);
+            pending[pick].from_temp = true;
+            temp_live = true;
         }
     }
 }
@@ -11284,6 +11450,10 @@ pub struct Options {
     /// Unrolled `__mul_u8` (epic-cc#974, #1095): eight straight-line passes,
     /// no loop and no per-bit branch. The speed profile turns it on.
     pub fast_mul_u8: bool,
+    /// Byte-granular variable shifts (epic-cc#1171): the u16/u32 shift
+    /// routines move whole bytes first when the masked count is >= 8,
+    /// then bit-loop the remainder. The speed profile turns it on.
+    pub fast_shift: bool,
 }
 
 impl Default for Options {
@@ -11291,6 +11461,7 @@ impl Default for Options {
         Self {
             fast_divmod: false,
             fast_mul_u8: false,
+            fast_shift: false,
         }
     }
 }
@@ -11319,10 +11490,11 @@ pub fn select_with_locs(
     select_with_opts(device, m, addrs, staged, pool, Options::default())
 }
 
-/// `select_with_locs` with codegen options. The driver sets `fast_divmod`
-/// and `fast_mul_u8` under O2, so the unsigned divide and multiply routines
-/// run their normalized loops instead of trading cycles for flash
-/// (epic-cc#895, epic-cc#974).
+/// `select_with_locs` with codegen options. The driver sets `fast_divmod`,
+/// `fast_mul_u8`, and `fast_shift` under O2, so the unsigned divide and
+/// multiply routines run their normalized loops and the u16/u32 shift
+/// routines move whole bytes first, instead of trading cycles for flash
+/// (epic-cc#895, epic-cc#974, epic-cc#1171).
 pub fn select_with_opts(
     device: &Device,
     m: &Module,
@@ -11529,6 +11701,7 @@ pub fn select_with_opts(
                 retval_lo,
                 fast_divmod: opts.fast_divmod,
                 fast_mul_u8: opts.fast_mul_u8,
+                fast_shift: opts.fast_shift,
                 cur_func: &f.name,
                 bool_temps: HashSet::new(),
                 tmp: &mut tmp,
@@ -11765,6 +11938,7 @@ pub fn select_with_opts(
                     retval_lo,
                     fast_divmod: opts.fast_divmod,
                     fast_mul_u8: opts.fast_mul_u8,
+                    fast_shift: opts.fast_shift,
                     cur_func: &f.name,
                     bool_temps: HashSet::new(),
                     tmp: &mut tmp2,
@@ -12118,6 +12292,7 @@ pub fn select_with_opts(
                                 retval_lo,
                                 fast_divmod: opts.fast_divmod,
                                 fast_mul_u8: opts.fast_mul_u8,
+                                fast_shift: opts.fast_shift,
                                 cur_func: &f.name,
                                 bool_temps: HashSet::new(),
                                 tmp: &mut tmp,

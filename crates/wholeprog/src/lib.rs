@@ -1,6 +1,8 @@
-//! Whole-program validation for the PIC8 pipeline: checks what `llvm-link`
-//! lets through on the merged module. Expects N translation units already
-//! merged into one `.ll` by `llvm-link` (docs/31 §7); this stage does not link.
+//! Whole-program validation and dead-global pruning for the PIC8 pipeline:
+//! checks what `llvm-link` lets through on the merged module, then drops
+//! `internal` globals nothing references so alloc never reserves RAM for
+//! them. Expects N translation units already merged into one `.ll` by
+//! `llvm-link` (docs/31 §7); this stage does not link.
 
 use ir::{collect_global_vals, GepBase, Inst, Module, SrcLoc, Val};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -20,6 +22,7 @@ pub fn merge(mut m: Module) -> Module {
     check_entry(&m);
     check_calls_resolved(&m);
     check_globals_resolved(&m);
+    drop_unreferenced_internals(&mut m);
     m
 }
 
@@ -103,11 +106,55 @@ fn check_globals_resolved(m: &Module) {
         .map(|g| g.name.as_str())
         .chain(m.funcs.iter().map(|f| f.name.as_str()))
         .collect();
-    let mut used: BTreeSet<String> = BTreeSet::new();
+    let mut used = code_referenced_globals(m);
     for g in &m.globals {
         for (_, target, _) in &g.refs {
             used.insert(target.clone());
         }
+    }
+    let missing: Vec<&String> = used
+        .iter()
+        .filter(|n| !defined.contains(n.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "wholeprog: undefined symbols: {}",
+        missing
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+/// Marks globals named literally in verbatim asm text: the exact spelling
+/// and the XC8 underscore alias (`_x` addresses C static `x`, asm crate's
+/// `insert_label`). Over-approximates by construction (any identifier
+/// token that could name a global keeps it); keeping is always safe.
+fn mark_text_refs(names: &HashSet<&str>, used: &mut BTreeSet<String>, text: &str) {
+    for tok in
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$'))
+    {
+        if names.contains(tok) {
+            used.insert(tok.to_string());
+        } else if let Some(bare) = tok.strip_prefix('_') {
+            if names.contains(bare) {
+                used.insert(bare.to_string());
+            }
+        }
+    }
+}
+
+/// Every global named by code: loads, stores, GEP bases, `Val::Global`
+/// operands, inline-asm templates, and module-level asm text. Debug
+/// metadata names nothing here (irparse drops it), so a global this
+/// misses is dead to codegen, not just unseen. Shared by the
+/// undefined-symbol check and the drop below.
+fn code_referenced_globals(m: &Module) -> BTreeSet<String> {
+    let names: HashSet<&str> = m.globals.iter().map(|g| g.name.as_str()).collect();
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    for entry in &m.module_asm {
+        mark_text_refs(&names, &mut used, entry);
     }
     for f in &m.funcs {
         for b in &f.blocks {
@@ -150,6 +197,12 @@ fn check_globals_resolved(m: &Module) {
                                 used.insert(n.to_string());
                             }
                         }
+                        // A template can name a global literally
+                        // (`asm("banksel _m_add_a")` carries no operand), so
+                        // identifier tokens count too: the exact spelling
+                        // and the XC8 underscore alias (`_x` addresses C
+                        // static `x`, asm crate's `insert_label`).
+                        mark_text_refs(&names, &mut used, &a.template);
                     }
                     Inst::VaArg(v) => {
                         if let Some(n) = v.ptr.strip_prefix('@') {
@@ -161,19 +214,41 @@ fn check_globals_resolved(m: &Module) {
             }
         }
     }
-    let missing: Vec<&String> = used
+    used
+}
+
+/// Drops `internal` globals with no code references, before alloc.
+///
+/// `opt` folds the dead test functions but keeps their `static` globals,
+/// which then hold RAM through the whole build. `internal` linkage proves
+/// no outside observer can name them, so reachability from code decides:
+/// roots are the code references plus every externally visible global,
+/// liveness follows initializer `refs` to a fixpoint, the rest go.
+/// Flash tables drop by the same rule: the fuse words leave the hex
+/// through the driver's own config emission, never through this global.
+fn drop_unreferenced_internals(m: &mut Module) {
+    let mut live: BTreeSet<String> = m
+        .globals
         .iter()
-        .filter(|n| !defined.contains(n.as_str()))
+        .filter(|g| !g.internal)
+        .map(|g| g.name.clone())
         .collect();
-    assert!(
-        missing.is_empty(),
-        "wholeprog: undefined symbols: {}",
-        missing
+    live.extend(code_referenced_globals(m));
+    let mut queue: Vec<String> = live.iter().cloned().collect();
+    while let Some(name) = queue.pop() {
+        let targets: Vec<String> = m
+            .globals
             .iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+            .find(|g| g.name == name)
+            .map(|g| g.refs.iter().map(|(_, t, _)| t.clone()).collect())
+            .unwrap_or_default();
+        for t in targets {
+            if live.insert(t.clone()) {
+                queue.push(t);
+            }
+        }
+    }
+    m.globals.retain(|g| !g.internal || live.contains(&g.name));
 }
 
 /// Formats one undefined-symbol entry. Appends call sites when the module
