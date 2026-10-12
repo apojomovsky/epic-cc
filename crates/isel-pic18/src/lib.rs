@@ -529,6 +529,12 @@ struct Gen<'m> {
     /// the same block with a clean span: the load arm skips the temp
     /// staging copy and the store arm reads `TABLAT` directly.
     tablat_fwd: HashSet<String>,
+    /// Sign-against-zero selects fused by the per-function pre-scan
+    /// (epic-cc#1149). Maps an `icmp slt/sge Reg, 0` dst consumed only
+    /// by the next instruction, a value `Select`, to the folded compare:
+    /// the `Select` arm tests the sign bit directly and the `Icmp` arm
+    /// skips the 0/1 byte nobody reads.
+    select_fused: HashMap<String, Icmp>,
     out: Vec<String>,
     /// One source location per emitted line, index-aligned with `out`.
     /// `None` marks a compiler-generated line (no source instruction).
@@ -2683,6 +2689,86 @@ impl<'m> Gen<'m> {
             (ir::BinOp::Add, Val::Const(k), Val::Reg(q)) => Some((q.clone(), *k)),
             _ => None,
         }
+    }
+
+    /// Sign-against-zero select pre-scan (epic-cc#1149): a value `Select`
+    /// whose cond is a single-use `icmp slt/sge Reg, 0` in the previous
+    /// slot, with a directly readable top byte outside SFR space. The
+    /// `Select` arm then tests the sign bit with the arms as its exits
+    /// (the b-arm falls through) instead of materializing a 0/1 byte
+    /// and re-testing it with `BZ`. Adjacency keeps the proof trivial:
+    /// nothing runs between the compare and its consumer, so the tested
+    /// byte is exactly what the materializing lowering would read. Runs
+    /// after every fold so `fold_reg` and the claim sets below are final.
+    /// Keyed by the compare dst, which the `Select` arm looks up from
+    /// its cond and the `Icmp` arm skips.
+    fn find_select_sign_zero(g: &Gen, f: &Func) -> HashMap<String, Icmp> {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        for b in &f.blocks {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                let Inst::Select(s) = inst else { continue };
+                if s.ptr {
+                    continue;
+                }
+                let Val::Reg(cond) = &s.cond else { continue };
+                if uses.get(cond).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                if g.bit_lanes.contains_key(&s.dst) || g.lane_consumed.contains(&s.dst) {
+                    continue;
+                }
+                if g.lane_consumed.contains(cond) {
+                    continue;
+                }
+                let Some(Inst::Icmp(c)) = ii.checked_sub(1).and_then(|p| b.insts.get(p)) else {
+                    continue;
+                };
+                if c.dst != *cond {
+                    continue;
+                }
+                let n = c.ty.bytes();
+                if !matches!(n, 1 | 2 | 4) {
+                    continue;
+                }
+                if !matches!(c.pred.as_str(), "slt" | "sge") {
+                    continue;
+                }
+                if !matches!(c.b, Val::Const(0)) {
+                    continue;
+                }
+                let a = g.fold_reg(&c.a);
+                if matches!(a, Val::Const(_)) {
+                    continue;
+                }
+                if let Val::Reg(ar) = &a {
+                    if g.store_fwd.contains_key(ar)
+                        || g.store_consumed.contains(ar)
+                        || g.lane_consumed.contains(ar)
+                        || g.bit_lanes.contains_key(ar)
+                    {
+                        continue;
+                    }
+                }
+                if !g.sign_zero_ok(&a, &c.pred, &c.b, n - 1) {
+                    continue;
+                }
+                let mut fused = c.clone();
+                fused.a = a;
+                out.insert(c.dst.clone(), fused);
+            }
+        }
+        out
     }
 
     /// Walk-loop pre-scan (epic-cc#896): single-block counted loops whose
@@ -9475,6 +9561,9 @@ impl<'m> Gen<'m> {
                 if self.lane_consumed.contains(&c.dst) {
                     return;
                 }
+                if self.select_fused.contains_key(&c.dst) {
+                    return;
+                }
                 let n = c.ty.bytes();
                 assert!(
                     n == 1 || n == 2 || n == 4,
@@ -9747,6 +9836,55 @@ impl<'m> Gen<'m> {
                     );
                     let dst = self.slot_addr(self.cur_func, &s.dst).direct();
                     let addr_value = seeded;
+                    // A W-threaded const select (epic-cc#825) leaves the
+                    // arm in W for the following store: `MOVLW` only.
+                    // Bytes resolve before any emission, so no closure
+                    // holds `self` across the branch lines below.
+                    let w_arms: Option<(u8, u8)> =
+                        if !addr_value && self.const_w_phis.contains(&s.dst) {
+                            let (Val::Const(ka), Val::Const(kb)) = (&s.a, &s.b) else {
+                                panic!("isel-pic18: W-only select arm without a constant")
+                            };
+                            Some(((*ka & 0xFF) as u8, (*kb & 0xFF) as u8))
+                        } else {
+                            None
+                        };
+                    // A fused sign-against-zero compare (epic-cc#1149): the
+                    // scan proved `cond` is a single-use `slt`/`sge`
+                    // against zero in the previous slot, so the sign bit
+                    // dispatches straight to the arms with the b-arm
+                    // falling through, saving the flag byte plus its `BZ`.
+                    let fused: Option<Icmp> = match &s.cond {
+                        Val::Reg(r) => self.select_fused.get(r).cloned(),
+                        _ => None,
+                    };
+                    if let Some(c) = fused {
+                        let l_true = self.fresh_label();
+                        let l_end = self.fresh_label();
+                        let n = c.ty.bytes();
+                        debug_assert!(matches!(n, 1 | 2 | 4));
+                        debug_assert!(matches!(c.pred.as_str(), "slt" | "sge"));
+                        debug_assert!(matches!(c.b, Val::Const(0)));
+                        assert!(
+                            !matches!(c.a, Val::Const(_)),
+                            "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
+                        );
+                        let hi = self.val_addr(&c.a).direct() + u16::from(n - 1);
+                        let (acc, af) = self.operand(hi);
+                        let bank = if acc == 0 { "A" } else { "B" };
+                        if c.pred == "slt" {
+                            self.emit(format!("    BTFSC 0x{af:03X},7,{bank}"));
+                        } else {
+                            self.emit(format!("    BTFSS 0x{af:03X},7,{bank}"));
+                        }
+                        self.emit(format!("    BRA {l_true}"));
+                        self.emit_select_arm(&s.b, s.ty, dst, addr_value, w_arms.map(|(_, bb)| bb));
+                        self.emit(format!("    BRA {l_end}"));
+                        self.emit_label(&l_true);
+                        self.emit_select_arm(&s.a, s.ty, dst, addr_value, w_arms.map(|(ba, _)| ba));
+                        self.emit_label(&l_end);
+                        return;
+                    }
                     let l_else = self.fresh_label();
                     let l_end = self.fresh_label();
                     // A reload of a just-computed byte only feeds this
@@ -9757,35 +9895,10 @@ impl<'m> Gen<'m> {
                         self.emit_load_w(&s.cond, 0, true);
                     }
                     self.emit(format!("    BZ {l_else}")); // cond byte == 0 -> else
-                                                           // A W-threaded const select (epic-cc#825) leaves the
-                                                           // arm in W for the following store: `MOVLW` only.
-                                                           // Bytes resolve before any emission, so no closure
-                                                           // holds `self` across the branch lines below.
-                    let w_arms: Option<(u8, u8)> =
-                        if !addr_value && self.const_w_phis.contains(&s.dst) {
-                            let (Val::Const(ka), Val::Const(kb)) = (&s.a, &s.b) else {
-                                panic!("isel-pic18: W-only select arm without a constant")
-                            };
-                            Some(((*ka & 0xFF) as u8, (*kb & 0xFF) as u8))
-                        } else {
-                            None
-                        };
-                    if addr_value {
-                        self.emit_move_addr_to_slot(&s.a, dst);
-                    } else if let Some((ba, _)) = w_arms {
-                        self.emit(format!("    MOVLW 0x{ba:02X}"));
-                    } else {
-                        self.emit_move_val_to_slot(&s.a, s.ty, dst);
-                    }
+                    self.emit_select_arm(&s.a, s.ty, dst, addr_value, w_arms.map(|(ba, _)| ba));
                     self.emit(format!("    BRA {l_end}"));
                     self.emit_label(&l_else);
-                    if addr_value {
-                        self.emit_move_addr_to_slot(&s.b, dst);
-                    } else if let Some((_, bb)) = w_arms {
-                        self.emit(format!("    MOVLW 0x{bb:02X}"));
-                    } else {
-                        self.emit_move_val_to_slot(&s.b, s.ty, dst);
-                    }
+                    self.emit_select_arm(&s.b, s.ty, dst, addr_value, w_arms.map(|(_, bb)| bb));
                     self.emit_label(&l_end);
                 }
             }
@@ -10290,6 +10403,20 @@ impl<'m> Gen<'m> {
         matches!(pred, "slt" | "sge")
             && matches!(b, Val::Const(0))
             && self.signed_chain_ok(a, b, hi)
+    }
+
+    /// One `Select` value arm: the address move for seeded pointer
+    /// selects, `MOVLW` for a W-threaded const arm, the value move
+    /// otherwise. Shared by the flag-tested and sign-fused diamonds so
+    /// both spell the arms identically.
+    fn emit_select_arm(&mut self, val: &Val, ty: Ty, dst: u16, addr_value: bool, w: Option<u8>) {
+        if addr_value {
+            self.emit_move_addr_to_slot(val, dst);
+        } else if let Some(b) = w {
+            self.emit(format!("    MOVLW 0x{b:02X}"));
+        } else {
+            self.emit_move_val_to_slot(val, ty, dst);
+        }
     }
 
     /// `slt`/`sge` against literal zero as one bit test on the top byte:
@@ -15371,6 +15498,7 @@ pub fn select_with_opts(
                 trunc_fwd: HashMap::new(),
                 zext_ret: HashSet::new(),
                 tablat_fwd: HashSet::new(),
+                select_fused: HashMap::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -15453,6 +15581,7 @@ pub fn select_with_opts(
             trunc_fwd: HashMap::new(),
             zext_ret: HashSet::new(),
             tablat_fwd: HashSet::new(),
+            select_fused: HashMap::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -15532,6 +15661,9 @@ pub fn select_with_opts(
         let nul_walks = Gen::find_nul_walks(&g, f);
         // Pointer walks (epic-cc#1151, strcmp): same position, same inputs.
         let ptr_walks = Gen::find_ptr_walks(&g, f);
+        // Sign-against-zero selects (epic-cc#1149): runs with the walks,
+        // after every fold and claim set the shape checks read.
+        g.select_fused = Gen::find_select_sign_zero(&g, f);
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
         // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
@@ -16345,6 +16477,7 @@ pub fn select_with_opts(
             trunc_fwd: HashMap::new(),
             zext_ret: HashSet::new(),
             tablat_fwd: HashSet::new(),
+            select_fused: HashMap::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -16734,6 +16867,7 @@ mod tests {
                 trunc_fwd: HashMap::new(),
                 zext_ret: HashSet::new(),
                 tablat_fwd: HashSet::new(),
+                select_fused: HashMap::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -16780,6 +16914,7 @@ mod tests {
                 rmw_fwd: HashMap::new(),
                 narrow_lo: HashSet::new(),
                 tablat_fwd: HashSet::new(),
+                select_fused: HashMap::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 trunc_fwd: HashMap::new(),
@@ -16922,6 +17057,7 @@ mod p3_gen_tests {
             rmw_fwd: HashMap::new(),
             narrow_lo: HashSet::new(),
             tablat_fwd: HashSet::new(),
+            select_fused: HashMap::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
