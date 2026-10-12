@@ -111,13 +111,9 @@ jobs:
 
       - name: Build ci image (cached)
         if: steps.noncode.outputs.non_code != 'true'
-        uses: docker/build-push-action@v6
-        with:
-          target: ci
-          load: true
-          tags: epic-cc-ci:latest
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
+        env:
+          CACHE_REF: ghcr.io/${{ github.repository }}-toolchain
+        run: bash scripts/warm-toolchain-cache.sh --target ci --load -t epic-cc-ci:latest
 
       # Exact-match content key only, no restore-keys prefix fallback.
       # A prefix-hit restores artifacts built from a different tree and
@@ -284,13 +280,9 @@ jobs:
 
       - name: Build ci image (cached)
         if: steps.noncode.outputs.non_code != 'true'
-        uses: docker/build-push-action@v6
-        with:
-          target: ci
-          load: true
-          tags: epic-cc-ci:latest
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
+        env:
+          CACHE_REF: ghcr.io/${{ github.repository }}-toolchain
+        run: bash scripts/warm-toolchain-cache.sh --target ci --load -t epic-cc-ci:latest
 
       - name: Cache cargo home
         if: steps.noncode.outputs.non_code != 'true'
@@ -354,13 +346,9 @@ jobs:
 
       - name: Build ci image (cached)
         if: steps.noncode.outputs.non_code != 'true'
-        uses: docker/build-push-action@v6
-        with:
-          target: ci
-          load: true
-          tags: epic-cc-ci:latest
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
+        env:
+          CACHE_REF: ghcr.io/${{ github.repository }}-toolchain
+        run: bash scripts/warm-toolchain-cache.sh --target ci --load -t epic-cc-ci:latest
 
       # Exact-match content key only, no restore-keys prefix fallback
       # (stale-rlib contamination, see #831 and the canonical job above).

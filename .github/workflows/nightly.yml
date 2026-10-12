@@ -40,13 +40,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build ci image (cached)
-        uses: docker/build-push-action@v6
-        with:
-          target: ci
-          load: true
-          tags: epic-cc-ci:latest
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
+        env:
+          CACHE_REF: ghcr.io/${{ github.repository }}-toolchain
+        run: bash scripts/warm-toolchain-cache.sh --target ci --load -t epic-cc-ci:latest
 
       # Exact-match content key only, no restore-keys prefix fallback
       # (stale-rlib contamination, see #831).
@@ -96,13 +92,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build ci image (cached)
-        uses: docker/build-push-action@v6
-        with:
-          target: ci
-          load: true
-          tags: epic-cc-ci:latest
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
+        env:
+          CACHE_REF: ghcr.io/${{ github.repository }}-toolchain
+        run: bash scripts/warm-toolchain-cache.sh --target ci --load -t epic-cc-ci:latest
 
       # Exact-match content key only, no restore-keys prefix fallback
       # (stale-rlib contamination, see #831).
@@ -155,13 +147,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build ci image (cached)
-        uses: docker/build-push-action@v6
-        with:
-          target: ci
-          load: true
-          tags: epic-cc-ci:latest
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
+        env:
+          CACHE_REF: ghcr.io/${{ github.repository }}-toolchain
+        run: bash scripts/warm-toolchain-cache.sh --target ci --load -t epic-cc-ci:latest
 
       - name: Run the SDCC regression suite and report pass rate
         run: |

@@ -1398,6 +1398,117 @@ pub fn flash_provenance(m: &Module) -> FlashProvenance {
     out
 }
 
+/// Marks flash-walk pointer regs: phi, select, and gep regs whose
+/// every base is a flash `const` global (`is_flash_const`), closed over reg
+/// arms. A loop walk over a flash string (`%p = phi ptr [@s+1, ..], [%n, ..]`
+/// with `%n = gep %p +1`) has no RAM base, so a load through it must read
+/// program memory via TBLRD (epic-cc#1091). Greatest fixpoint: a self-advancing
+/// cycle stays. A dropped reg that still reaches a flash arm is `mixed`
+/// (epic-cc#1099), so loads and stores through it panic. A gep over a walk phi
+/// has no slot; isel-pic18 reads it through the phi's slot.
+pub fn add_flash_walks(
+    prov: &mut FlashProvenance,
+    m: &Module,
+    is_flash_const: impl Fn(&str) -> bool,
+) {
+    enum Arm {
+        Ok,
+        Reg(String),
+        Bad,
+    }
+    let arm = |v: &ir::Val| match v {
+        ir::Val::Global(n) if is_flash_const(n) => Arm::Ok,
+        ir::Val::Reg(r) => Arm::Reg(r.clone()),
+        _ => Arm::Bad,
+    };
+    for f in &m.funcs {
+        let mut cands: Vec<(String, Vec<Arm>)> = Vec::new();
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Phi(p) if p.ptr => cands.push((
+                        p.dst.clone(),
+                        p.incoming.iter().map(|(v, _)| arm(v)).collect(),
+                    )),
+                    Inst::Select(s) if s.ptr => {
+                        cands.push((s.dst.clone(), vec![arm(&s.a), arm(&s.b)]));
+                    }
+                    Inst::Gep(g) => {
+                        let base = match &g.base {
+                            GepBase::Global(n) if is_flash_const(n) => Arm::Ok,
+                            GepBase::Global(_) => Arm::Bad,
+                            GepBase::Reg(r) => Arm::Reg(r.clone()),
+                        };
+                        cands.push((g.dst.clone(), vec![base]));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut live: HashSet<String> = cands.iter().map(|(d, _)| d.clone()).collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let dead: Vec<String> = cands
+                .iter()
+                .filter(|(d, arms)| {
+                    live.contains(d)
+                        && !arms.iter().all(|a| match a {
+                            Arm::Ok => true,
+                            Arm::Reg(r) => live.contains(r),
+                            Arm::Bad => false,
+                        })
+                })
+                .map(|(d, _)| d.clone())
+                .collect();
+            for d in dead {
+                live.remove(&d);
+                changed = true;
+            }
+        }
+        // A dead candidate that still reaches a flash arm, directly or through
+        // a live, mixed, or flash-tagged reg, holds a flash address on some path
+        // and RAM on another: no single address space (epic-cc#1099).
+        let mut maybe_flash: HashSet<String> = HashSet::new();
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for (d, arms) in &cands {
+                if live.contains(d) || maybe_flash.contains(d) {
+                    continue;
+                }
+                let touches = arms.iter().any(|a| match a {
+                    Arm::Ok => true,
+                    Arm::Reg(r) => {
+                        let key = ssa_key(&f.name, r);
+                        live.contains(r)
+                            || maybe_flash.contains(r)
+                            || prov.flash.contains(&key)
+                            || prov.mixed.contains(&key)
+                    }
+                    Arm::Bad => false,
+                });
+                if touches {
+                    maybe_flash.insert(d.clone());
+                    grew = true;
+                }
+            }
+        }
+        for d in maybe_flash {
+            let key = ssa_key(&f.name, &d);
+            // flash_provenance already tagged this vptr key flash; keep it.
+            if !prov.flash.contains(&key) {
+                prov.mixed.insert(key);
+            }
+        }
+        for d in live {
+            let key = ssa_key(&f.name, &d);
+            prov.mixed.remove(&key);
+            prov.flash.insert(key);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_directive;

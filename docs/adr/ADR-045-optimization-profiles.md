@@ -79,8 +79,9 @@ already type.
   cycle baselines profile-aware, whichever lands second.
 - Speed levers land behind `-O2` as `isel::Options` flags set only by the
   driver's O2 arm (`fast_divmod` #895, `fast_mul_u8` #974), so `-Os`
-  output stays byte-identical by construction. `fast_mul_u8` costs about
-  16 flash words per `__mul_u8` for 15% fewer cycles on the mul-u8 row.
+  output stays byte-identical by construction. `fast_mul_u8` unrolls
+  `__mul_u8` into eight straight-line passes: it trades flash for
+  cycles, and the measured per-row cost is in `cycle_baseline.toml`.
 
 ## Rejected alternatives
 

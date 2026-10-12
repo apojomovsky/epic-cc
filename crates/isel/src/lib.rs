@@ -180,7 +180,7 @@ struct Gen<'m> {
     /// unsigned divmod routines run a bit-length-derived iteration count
     /// instead of the full width, trading flash for cycles.
     fast_divmod: bool,
-    /// Four-pass `__mul_u8` body (epic-cc#974), speed profile only.
+    /// Eight-pass straight-line `__mul_u8` body (epic-cc#974, #1095), speed profile only.
     fast_mul_u8: bool,
     cur_func: &'m str,
     /// Module-scoped fresh-label counter, shared across every function so the
@@ -4504,25 +4504,21 @@ impl<'m> Gen<'m> {
                 self.assert_bank0(&[a, b, scr], name);
                 let r = scr;
                 if self.fast_mul_u8 {
-                    // Four passes per loop iteration with no per-bit branch.
-                    // W is a per-pass temporary reloaded from `a` each pass, so
-                    // a clear multiplier bit costs only the skipped ADDWF. The
-                    // zero test runs once per four bits. BCF before each RRF
-                    // keeps the ADDWF carry out of multiplier bit 7.
-                    let l_loop = self.fresh_label();
+                    // Eight straight-line passes, no loop and no BCF guard. An
+                    // ADDWF carry lands in multiplier bit 7 at the RRF of pass k
+                    // and reaches bit 0 no earlier than the RRF of pass k+7, after
+                    // the last BTFSC (pass 7) has read bit 0.
                     self.emit(format!("    CLRF 0x{r:02X}")); // r = 0
-                    self.emit(format!("{l_loop}:"));
-                    for _ in 0..4 {
+                    for pass in 0..8 {
                         self.emit(format!("    MOVF 0x{a:02X}, W")); // W = t = a << k
                         self.emit(format!("    BTFSC 0x{b:02X}, 0")); // skip add on clear bit
                         self.emit(format!("    ADDWF 0x{r:02X}, F")); // r += t, mod 256
-                        self.emit("    BCF STATUS, 0".to_string()); // carry from ADDWF must not enter bk bit 7
                         self.emit(format!("    RRF 0x{b:02X}, F")); // bk >>= 1
-                        self.emit(format!("    ADDWF 0x{a:02X}, F")); // t = t + t, mod 256
+                        if pass < 7 {
+                            // pass 7's t shift feeds no later pass
+                            self.emit(format!("    ADDWF 0x{a:02X}, F")); // t = t + t, mod 256
+                        }
                     }
-                    self.emit(format!("    MOVF 0x{b:02X}, F")); // Z = (bk == 0)
-                    self.emit("    BTFSS STATUS, 2".to_string());
-                    self.emit(format!("    GOTO {l_loop}"));
                 } else {
                     let l_loop = self.fresh_label();
                     let l_skip = self.fresh_label();
@@ -9580,8 +9576,8 @@ pub struct Options {
     /// run a bit-length-derived iteration count instead of the full width.
     /// The speed profile turns it on, trading flash for cycles.
     pub fast_divmod: bool,
-    /// Unrolled `__mul_u8` (epic-cc#974): four straight-line passes per
-    /// loop iteration, no per-bit branch. The speed profile turns it on.
+    /// Unrolled `__mul_u8` (epic-cc#974, #1095): eight straight-line passes,
+    /// no loop and no per-bit branch. The speed profile turns it on.
     pub fast_mul_u8: bool,
 }
 

@@ -894,6 +894,157 @@ fn phi_of_flash_and_runtime_is_mixed() {
     );
 }
 
+// epic-cc#1099: a flash literal joined with a RAM global (`p = buf` in a
+// loop) is neither a pure walk nor a pure RAM pointer. It must be mixed so
+// loads through it panic, not read INDF0 at a flash address.
+#[test]
+fn walk_phi_of_flash_literal_and_ram_global_is_mixed() {
+    let m = parse(
+        "global buf i8\n\
+         const str i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %p = phi ptr @str entry @buf entry\n\
+             %v = load i8 %p\n\
+             ret void\n",
+    );
+    let mut prov = iselcore::FlashProvenance::default();
+    iselcore::add_flash_walks(&mut prov, &m, |n| n == "str");
+    assert!(
+        prov.mixed.contains("main::p"),
+        "flash/RAM phi must be mixed, got {:?}",
+        prov.mixed
+    );
+    assert!(!prov.flash.contains("main::p"));
+}
+
+// A reg arm that is itself mixed carries the flash address one step further:
+// the outer phi must be mixed too, or its loads would skip the panic.
+#[test]
+fn walk_phi_through_mixed_reg_arm_is_mixed() {
+    let m = parse(
+        "global buf i8\n\
+         const str i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = phi ptr @str entry @buf entry\n\
+             %b = phi ptr %a entry @buf entry\n\
+             %v = load i8 %b\n\
+             ret void\n",
+    );
+    let mut prov = iselcore::FlashProvenance::default();
+    iselcore::add_flash_walks(&mut prov, &m, |n| n == "str");
+    assert!(prov.mixed.contains("main::a"), "got {:?}", prov.mixed);
+    assert!(prov.mixed.contains("main::b"), "got {:?}", prov.mixed);
+}
+
+#[test]
+fn select_of_flash_literal_and_ram_global_is_mixed() {
+    let m = parse(
+        "global buf i8\n\
+         const str i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %l = load i8 @buf\n\
+             %s = select i1 %l, ptr @str, ptr @buf\n\
+             %v = load i8 %s\n\
+             ret void\n",
+    );
+    let mut prov = iselcore::FlashProvenance::default();
+    iselcore::add_flash_walks(&mut prov, &m, |n| n == "str");
+    assert!(prov.mixed.contains("main::s"), "got {:?}", prov.mixed);
+    assert!(!prov.flash.contains("main::s"));
+}
+
+// epic-cc#1099: a flash literal joined with a null arm has no single address
+// space either. The select must be mixed so loads through it panic.
+#[test]
+fn select_of_flash_literal_and_null_is_mixed() {
+    let m = parse(
+        "global buf i8\n\
+         const str i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %l = load i8 @buf\n\
+             %n = inttoptr i16 0 to ptr\n\
+             %s = select i1 %l, ptr @str, ptr %n\n\
+             %v = load i8 %s\n\
+             ret void\n",
+    );
+    let mut prov = iselcore::FlashProvenance::default();
+    iselcore::add_flash_walks(&mut prov, &m, |n| n == "str");
+    assert!(prov.mixed.contains("main::s"), "got {:?}", prov.mixed);
+    assert!(!prov.flash.contains("main::s"));
+}
+
+// A pure loop walk over a flash string has no RAM arm, so the greatest
+// fixpoint keeps it flash and it must not be marked mixed.
+#[test]
+fn pure_flash_loop_walk_stays_flash_not_mixed() {
+    let m = parse(
+        "const str i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %p = phi ptr @str entry %n loop\n\
+             %n = gep %p +1\n\
+             %v = load i8 %p\n\
+             br loop\n",
+    );
+    let mut prov = iselcore::FlashProvenance::default();
+    iselcore::add_flash_walks(&mut prov, &m, |n| n == "str");
+    assert!(prov.flash.contains("main::p"), "got {:?}", prov.flash);
+    assert!(prov.flash.contains("main::n"), "got {:?}", prov.flash);
+    assert!(prov.mixed.is_empty(), "got {:?}", prov.mixed);
+}
+
+// A vptr phi that flash_provenance already tagged flash has only flash arms,
+// so it reaches a flash arm but must stay flash: the guard keeps it out of mixed.
+#[test]
+fn vptr_flash_phi_is_not_double_marked_mixed() {
+    let mut m = parse(
+        "global g_a i8\n\
+         const _ZTV4Base i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %9 = load ptr @g_a\n\
+             %10 = phi ptr %9 entry %9 entry\n\
+             %11 = load ptr %10\n\
+             ret void\n",
+    );
+    m.globals[0].refs = vec![
+        (0usize, "_ZTV4Base".to_string(), 4u16),
+        (1, "_ZTV4Base".to_string(), 4),
+    ];
+    let mut prov = iselcore::flash_provenance(&m);
+    assert!(
+        prov.flash.contains("main::10"),
+        "precondition: {:?}",
+        prov.flash
+    );
+    iselcore::add_flash_walks(&mut prov, &m, |n| n == "_ZTV4Base");
+    assert!(prov.flash.contains("main::10"));
+    assert!(!prov.mixed.contains("main::10"), "got {:?}", prov.mixed);
+}
+
+#[test]
+fn phi_of_two_ram_globals_is_not_a_walk() {
+    let m = parse(
+        "global buf i8\n\
+         global other i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %p = phi ptr @buf entry @other entry\n\
+             %v = load i8 %p\n\
+             ret void\n",
+    );
+    let mut prov = iselcore::FlashProvenance::default();
+    iselcore::add_flash_walks(&mut prov, &m, |_| false);
+    assert!(prov.flash.is_empty(), "got {:?}", prov.flash);
+    assert!(prov.mixed.is_empty(), "got {:?}", prov.mixed);
+}
+
 // A plain constant-GEP initializer (`&arr[2]` in C) folds to the same
 // nonzero-addend ref shape as a vptr, but names a RAM address: loads out
 // of it and dereferences through the result stay RAM (epic-cc#832 review).

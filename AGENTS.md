@@ -85,12 +85,13 @@ For every ticket:
    Only then run the takeoff ritual (`make pre-pr-check` → `epic-tasks takeoff`).
 4. Open the pull request with `Closes #N`, then
    `epic-tasks review <repo>#<n> --pr <url>`. The body must use real newlines:
-   copy-paste-safe ``gh pr create --body-file - <<'EOF'`` (or
-   ``cat <<'EOF' > /tmp/pr_body.md`` + ``gh pr create --body-file /tmp/pr_body.md``),
+   copy-paste-safe ``gh pr create --body-file - <<'EOF'`` (or write the body to a
+   unique file, as below),
    NEVER ``gh pr create --body "a\nb"``, the shell never expands ``\n`` so GitHub
    renders literal ``\n`` as text and the bullets collapse to one line (epic-cc#129):
    ```bash
-   cat <<'EOF' > /tmp/pr_body.md
+   issue=N; pr_body=$(mktemp "/tmp/pr-${issue}-XXXXXX.md")
+   cat <<'EOF' > "$pr_body"
    Closes #N
 
    Summary of the change.
@@ -98,9 +99,12 @@ For every ticket:
    - bullet one
    - bullet two
    EOF
-   gh pr create --title "fix(scope): summary" --body-file /tmp/pr_body.md
+   gh pr create --title "fix(scope): summary" --body-file "$pr_body"
    # - or inline: gh pr create --title "..." --body-file - <<'EOF'
    ```
+   NEVER a fixed path such as ``/tmp/pr_body.md``: ``/tmp`` is shared across
+   agents on a machine, and another agent overwrote it, so an epic-tasks PR #444
+   opened with ``Closes #379`` (epic-tasks#446).
    Heal an existing PR with ``gh pr edit --body-file - <<'EOF'`` or
    ``python3 -c 'from epic_tasks.gh import normalize_pr_body; print(normalize_pr_body(open("body.txt").read()))'``.
    The local ``check_pr_body`` gate (``epic_tasks/takeoff.py``) warns (advisory) and

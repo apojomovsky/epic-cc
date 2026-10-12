@@ -34,9 +34,9 @@ jobs:
 
       # No load/push/tags: this job only needs the registry cache
       # populated, not a local or published image. Every other job's own
-      # "Build ci image (cached)" (or `docker buildx build --target
-      # release`) step then hits CACHED against what this pushes.
+      # "Build ci image (cached)" or release build step then hits CACHED
+      # against what this pushes.
       - name: Build + push the toolchain cache (ci target)
         env:
           CACHE_REF: ghcr.io/${{ github.repository }}-toolchain
-        run: bash scripts/warm-toolchain-cache.sh
+        run: bash scripts/warm-toolchain-cache.sh --target ci

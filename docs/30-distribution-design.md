@@ -148,7 +148,7 @@ crate's `Cargo.toml` (`cargo run -p driver` keeps working). No pipeline-stage ch
 
 New `release.yml`, tag-triggered:
 
-- **Linux job:** `docker buildx build --target release` → bundle zip. The clang layer comes
+- **Linux job:** `scripts/warm-toolchain-cache.sh --target release --load` → bundle zip. The clang layer comes
   from the registry cache (see above).
 - **Windows job:** `windows-latest`, build the Rust binary natively; download the official
   LLVM 20.1.8 MSVC bundle, slice `clang.exe` + DLLs + `lib/clang/20/`, assemble the zip.

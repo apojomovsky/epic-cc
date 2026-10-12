@@ -26,6 +26,26 @@
   stores through either. The PIC14, PIC14E, and baseline backends panic on
   both: C++ virtual dispatch is PIC18-only, and a data-memory read of a
   flash address must never emit silently.
+* Amended (epic-cc#1099): the same `mixed` rule covers string literals. A
+  phi or select joining a flash literal with any non-walk arm (RAM global,
+  null, integer, or pointer param) lands in `mixed`, so a direct load through
+  it panics on PIC18 instead of reading INDF0 at a flash address. A
+  runtime-indexed load or store through a flash or `mixed` walk phi also
+  panics: the check runs on the phi slot, since a dynamic index has no
+  provenance key of its own.
+* Amended (epic-cc#1100): a constant-length `memcpy` from a `flash` walk reads
+  through TBLRD, seeding `TBLPTR` from the walk slot. This covers
+  `__builtin_memcpy` and a plain `memcpy` call, which is lowered to the same
+  copy because the libc body would read RAM. A `mixed` or runtime-indexed
+  source panics. A plain `memcpy` call with a runtime length from a flash walk
+  panics. Any memcpy whose destination is a const global, a flash-derived
+  pointer, a `mixed` phi, or a runtime-indexed walk panics, whatever its
+  source, as the Store arm does. A plain `memcpy` call with such a destination
+  or a flash source is lowered to the guarded copy. Open gap: a const-global
+  source to a plain call (`memcpy(buf, @table, n)`) still goes to libc. The
+  resolver folds a displacement to `u16`, so a walk stepped back (`p[-1]`)
+  sign-extends from bit 15; a positive offset of 0x8000 or more reads as
+  negative until the resolver carries a signed `i32`.
 * The dispatch sequence replays on hardware through the `tblrd-flash-ptr`
   superopt spec (candidate plus `LOW/HIGH` gensym support in the batch
   builder); per-fixture runs stay sim-only per docs/40 §5.
