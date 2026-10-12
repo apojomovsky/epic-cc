@@ -8081,11 +8081,17 @@ impl<'m> Gen<'m> {
                 let ty = arg
                     .ty
                     .expect("isel-pic18: scalar call arg must carry a type");
-                self.emit_move_val_to_slot(&arg.val, ty, pa);
+                // Shift routines read only the count's low byte (the body
+                // masks it to width-1), so copy one byte and skip the
+                // wide-param fill below: the high param bytes stay
+                // untouched, which the recipe never reads. (epic-cc#1150)
+                let narrowed = i == 1 && Self::shift_cnt_narrowed(func);
+                let copy_ty = if narrowed { Ty::I8 } else { ty };
+                self.emit_move_val_to_slot(&arg.val, copy_ty, pa);
                 // the float differential conversion ABI: __uitofp_f32/__sitofp_f32 take a 4-byte val slot
                 // but i8/i16 sources copy only their width; stale high bytes corrupt
                 // the leading-1 search (the conversion fill: isel/src/lib.rs:1618-1661). Fill them.
-                if (ty.bytes() as u16) < u16::from(callee.params[i].width) {
+                if !narrowed && (copy_ty.bytes() as u16) < u16::from(callee.params[i].width) {
                     assert_eq!(
                         callee.params[i].width, 4,
                         "isel-pic18: narrow scalar arg {} of @{} into non-4-byte param",
@@ -8129,6 +8135,29 @@ impl<'m> Gen<'m> {
                 }
             }
         }
+    }
+
+    /// Whether `func` is a variable-shift routine whose count arg (index 1)
+    /// copies one byte: the recipe masks the low byte and never reads the
+    /// param's high bytes, so the wide-param fill below must not run.
+    /// ISR suffixes strip the way `emit_routine` strips them.
+    fn shift_cnt_narrowed(func: &str) -> bool {
+        let base = func
+            .strip_suffix("_isr_high")
+            .or_else(|| func.strip_suffix("_isr"))
+            .unwrap_or(func);
+        matches!(
+            base,
+            "__shl_u8"
+                | "__shl_u16"
+                | "__shl_u32"
+                | "__lshr_u8"
+                | "__lshr_u16"
+                | "__lshr_u32"
+                | "__ashr_i8"
+                | "__ashr_i16"
+                | "__ashr_i32"
+        )
     }
 
     /// The narrow-multiply width of a runtime routine name, with the ISR
@@ -11699,6 +11728,8 @@ impl<'m> Gen<'m> {
             "    MOVF 0x{cf:03X},W,{}",
             if ca == 0 { "A" } else { "B" }
         ));
+        // ANDLW sets Z, and MOVWF preserves flags, so the zero test reads
+        // STATUS directly with no MOVF reload of the count. (epic-cc#1150)
         self.emit(format!("    ANDLW 0x{mask:02X}")); // count & (width-1)
         let (sa, sf) = self.operand(scr);
         self.emit(format!(
@@ -11707,11 +11738,6 @@ impl<'m> Gen<'m> {
         ));
         let l_loop = self.fresh_label();
         let l_done = self.fresh_label();
-        let (sa, sf) = self.operand(scr);
-        self.emit(format!(
-            "    MOVF 0x{sf:03X},F,{}",
-            if sa == 0 { "A" } else { "B" }
-        )); // Z = (cnt == 0)
         self.emit("    BTFSC 0xFD8,2,A".to_string()); // STATUS Z // skip the GOTO when cnt != 0
         self.emit(format!("    BRA {l_done}"));
         self.emit_label(&l_loop);
@@ -15963,11 +15989,6 @@ pub fn select_with_opts(
                         Vec::new();
                     if dense {
                         let l_tbl = g.fresh_label();
-                        // Alignment anchor for the assembler's page
-                        // fixup: if dispatch plus table would straddle a
-                        // 256-byte page, the assembler pads NOPs here to
-                        // push the block onto the next page.
-                        g.emit("    .pclalign".to_string());
                         // Bounds check, then `ADDWF PCL,F` into a table of
                         // absolute 2-word GOTO entries (4 bytes each, so the
                         // selector needs W = 4*idx). PCL reads as the address
@@ -16031,6 +16052,10 @@ pub fn select_with_opts(
                         g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
                         g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
                         g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
+                        // Page-fixup anchor sits past the prologue: only the
+                        // entry plus table must share a page, so a straddle
+                        // pads just those onto the next page (epic-cc#1065).
+                        g.emit("    .pclalign".to_string());
                         g.emit("    ADDWF 0xFF9,F,A".to_string()); // PCL: the jump
                         g.emit_label(&l_tbl);
                         let span = (base + n as i64) * 4;

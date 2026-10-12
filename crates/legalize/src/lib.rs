@@ -2190,8 +2190,10 @@ fn split_isr_routines(funcs: &mut [Func], used: &[String]) -> Vec<String> {
 /// and an already-fused `__udivmod_uW` / `__sdivmod_iW` (a second remainder
 /// below the first fuses onto the same call). The slot separates the signs,
 /// so an unsigned divide never fuses with a signed remainder and vice
-/// versa. Suffixed ISR spellings never match, so each context keeps its
-/// own remainder slot (see `fuse_divmod_pairs`).
+/// versa. Suffixed ISR spellings never match: an ISR pair fused onto the
+/// shared slot would let a preemption between the combined call and the
+/// slot load clobber main's remainder, so the ISR keeps two calls and the
+/// slot stays single context (see `fuse_divmod_pairs`).
 fn divmod_width(func: &str) -> Option<(Ty, &'static str, &'static str)> {
     match func {
         "__udiv_u8" | "__udivmod_u8" => Some((Ty::I8, "__udivmod_u8", "__udivmod_rem_u8")),
@@ -2301,6 +2303,8 @@ fn addr_taken(funcs: &[Func]) -> HashSet<String> {
 }
 /// Routine spellings for the `x - (x / y) * y` shape: the divide, the
 /// product's `__mul` routine, and the remainder that replaces the product.
+/// Suffixed ISR spellings never match, so an ISR idiom keeps its product
+/// call and subtract (see `recover_rem_idiom`).
 fn rem_idiom_routines(div: &str) -> Option<(Ty, &'static str, &'static str)> {
     match div {
         "__udiv_u8" => Some((Ty::I8, "__mul_u8", "__urem_u8")),
