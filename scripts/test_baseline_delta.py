@@ -2,7 +2,9 @@
 """Behavior tests for baseline_delta.judge: epic-tasks#306 as amended by epic-cc#1135."""
 
 import importlib.util
+import json
 import pathlib
+import tempfile
 import unittest
 
 SCRIPT = pathlib.Path(__file__).resolve().parent / "baseline_delta.py"
@@ -146,6 +148,32 @@ class JudgeTests(unittest.TestCase):
     def test_duplicate_ladder_row_is_an_error(self):
         with self.assertRaises(ValueError):
             run([size_row("add", 50), size_row("add", 40)], [size_row("add", 40)])
+
+
+class MeasuredBaseTests(unittest.TestCase):
+    def read(self, files):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for name, content in files.items():
+                if isinstance(content, bytes):
+                    (root / name).write_bytes(content)
+                else:
+                    (root / name).write_text(content)
+            return bd.read_measured_base(root, "size")
+
+    def test_missing_dir_and_file_read_as_no_base(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(bd.read_measured_base(None, "size"))
+            self.assertIsNone(bd.read_measured_base(pathlib.Path(tmp), "size"))
+
+    def test_valid_json_reads_entries(self):
+        rows = [size_row("add", 50)]
+        self.assertEqual(self.read({"size.json": json.dumps(rows)}), rows)
+
+    def test_empty_or_broken_json_reads_as_no_base(self):
+        self.assertIsNone(self.read({"size.json": "[]"}))
+        self.assertIsNone(self.read({"size.json": "{oops"}))
+        self.assertIsNone(self.read({"size.json": b"\xff\xfe"}))
 
 
 if __name__ == "__main__":

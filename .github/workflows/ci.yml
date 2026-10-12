@@ -285,9 +285,21 @@ jobs:
           fi
           git show "$BASE_SHA:scripts/add_device.py" > "$RUNNER_TEMP/add_device.py"
           printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
-          python3 "$RUNNER_TEMP/baseline_delta.py" --base-sha "$BASE_SHA" \
-            --artifacts scratch/baseline-artifacts --base-artifacts base/scratch/baseline-artifacts \
-            --pr-body "$RUNNER_TEMP/pr-body.md"
+          # Bootstrap for bases predating epic-cc#1135: their judge knows no
+          # --base-artifacts flag, so they run without it and judge against
+          # the committed TOML, as before. The base copy always rules; a PR
+          # never judges itself. This PR is the one such run: it moves no
+          # ladder row, so its hold names only other merges' stale TOML
+          # deltas and is safe to tap through (see the PR body).
+          if grep -q -- --base-artifacts "$RUNNER_TEMP/baseline_delta.py"; then
+            python3 "$RUNNER_TEMP/baseline_delta.py" --base-sha "$BASE_SHA" \
+              --artifacts scratch/baseline-artifacts --base-artifacts base/scratch/baseline-artifacts \
+              --pr-body "$RUNNER_TEMP/pr-body.md"
+          else
+            python3 "$RUNNER_TEMP/baseline_delta.py" --base-sha "$BASE_SHA" \
+              --artifacts scratch/baseline-artifacts \
+              --pr-body "$RUNNER_TEMP/pr-body.md"
+          fi
 
       - name: Publish delta summary
         if: always() && steps.noncode.outputs.non_code != 'true'

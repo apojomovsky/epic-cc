@@ -206,6 +206,7 @@ def read_committed_baseline(base_sha, path):
 def read_measured_base(base_artifacts, ladder):
     # The base ladder run writes the same JSON shape as the head run, so the
     # judge compares two measurements instead of a measurement and a TOML.
+    # Anything unreadable falls back to the committed TOML with disclosure.
     if base_artifacts is None:
         return None
     path = base_artifacts / ARTIFACT_FILES[ladder]
@@ -213,7 +214,7 @@ def read_measured_base(base_artifacts, ladder):
         return None
     try:
         entries = json.loads(path.read_text())
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         return None
     return entries or None
 
