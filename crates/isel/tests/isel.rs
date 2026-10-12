@@ -10482,3 +10482,277 @@ fn live_call_to_unreachable_placeholder_is_rejected() {
     );
     let _ = select(&PIC16F877A, &m, &addrs(&[]));
 }
+
+#[test]
+fn walk_bridge_loop_uses_down_counter() {
+    // epic-cc#897: a counted copy loop seeds the trip count and
+    // re-derives every FSR setup from it, closed by DECFSZ. No 16-bit
+    // increment, compare, or backedge copy of the index survives.
+    let m = parse(
+        "global src i8\nglobal dst i8\nfn main(void) ()\n  block entry:\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p1 = gep @src +0 +1*%i\n    %x = load i8 %p1\n    %p2 = gep @dst +0 +1*%i\n    store i8 %x %p2\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("src", 0x20u16),
+        ("dst", 0x30),
+        ("main::i", 0x25),
+        ("main::x", 0x27),
+        ("main::inc", 0x2A),
+        ("main::c", 0x2C),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        asm.contains("MOVLW 0x04\n    MOVWF 0x25"),
+        "trip seed replaces the zero init:\n{asm}"
+    );
+    assert!(asm.contains("SUBLW 0x24"), "src FSR from count:\n{asm}");
+    assert!(asm.contains("SUBLW 0x34"), "dst FSR from count:\n{asm}");
+    assert!(
+        asm.contains("MOVWF 0x27"),
+        "loaded byte spills home:\n{asm}"
+    );
+    assert!(asm.contains("DECFSZ 0x25, F"), "down-counter latch:\n{asm}");
+    assert!(!asm.contains("XORLW 0x04"), "16-bit latch gone:\n{asm}");
+}
+
+#[test]
+fn walk_bridge_loop_copies_in_sim() {
+    use pic14_sim::Pic14;
+    let m = parse(
+        "global src i8\nglobal dst i8\nfn main(void) ()\n  block entry:\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p1 = gep @src +0 +1*%i\n    %x = load i8 %p1\n    %p2 = gep @dst +0 +1*%i\n    store i8 %x %p2\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("src", 0x20u16),
+        ("dst", 0x30),
+        ("main::i", 0x25),
+        ("main::x", 0x27),
+        ("main::inc", 0x2A),
+        ("main::c", 0x2C),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    for (o, v) in [9u8, 7, 5, 3].iter().enumerate() {
+        p.ram_mut()[0x20 + o] = *v;
+    }
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    assert_eq!(
+        [p.ram()[0x30], p.ram()[0x31], p.ram()[0x32], p.ram()[0x33]],
+        [9, 7, 5, 3],
+        "walk copies every byte in order:\n{asm}"
+    );
+}
+
+#[test]
+fn walk_const_store_loop_writes_literal() {
+    // epic-cc#897: a counted constant fill stores its literal through
+    // the re-derived FSR, no index arithmetic at all.
+    let m = parse(
+        "global buf i8\nfn main(void) ()\n  block entry:\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p = gep @buf +0 +1*%i\n    store i8 7 %p\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 16\n    br i1 %c done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[("buf", 0x20u16), ("main::i", 0x25)]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(asm.contains("SUBLW 0x30"), "FSR from count:\n{asm}");
+    assert!(asm.contains("MOVLW 0x07"), "literal fill:\n{asm}");
+    assert!(asm.contains("MOVWF INDF"), "store through INDF:\n{asm}");
+    assert!(asm.contains("DECFSZ 0x25, F"), "down-counter latch:\n{asm}");
+}
+
+#[test]
+fn walk_index_value_store_rebuilds_from_count() {
+    // epic-cc#897: `buf[i] = base + i` rebuilds the value as
+    // `base + (K - count)` after the FSR setup, which must come first
+    // because it clobbers W.
+    let m = parse(
+        "global buf i8\nglobal base i8\nfn main(void) ()\n  block entry:\n    %b = load i8 @base\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p = gep @buf +0 +1*%i\n    %t = trunc i16 %i to i8\n    %v = add i8 %b %t\n    store i8 %v %p\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 16\n    br i1 %c done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("base", 0x21),
+        ("main::b", 0x26),
+        ("main::i", 0x25),
+        ("main::t", 0x27),
+        ("main::v", 0x28),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(asm.contains("SUBLW 0x30"), "FSR from count:\n{asm}");
+    assert!(asm.contains("SUBLW 0x10"), "index from count:\n{asm}");
+    assert!(
+        asm.contains("ADDWF 0x21, W") || asm.contains("ADDWF 0x26, W"),
+        "value adds the base:\n{asm}"
+    );
+    assert!(asm.contains("DECFSZ 0x25, F"), "down-counter latch:\n{asm}");
+}
+
+#[test]
+fn walk_down_counter_loop_with_carried_select() {
+    // epic-cc#899: a counter-free down loop (the crc k-loop shape)
+    // walks too: the count seeds the trip, carried values copy across.
+    let m = parse(
+        "global cv i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %c0 = load i16 @cv\n    br loop\n  block loop:\n    %k = phi i8 8 entry %dec loop\n    %c = phi i16 %c0 entry %nxt loop\n    %s = shl i16 %c 1\n    %x = xor i16 %s 4129\n    %t = icmp slt i16 %c 0\n    %nxt = select i1 %t i16 %x i16 %s\n    %dec = add i8 %k -1\n    %d = icmp eq i8 %dec 0\n    br i1 %d done loop\n  block done:\n    store i16 %nxt @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("cv", 0x20u16),
+        ("out", 0x22),
+        ("main::c0", 0x28),
+        ("main::k", 0x25),
+        ("main::c", 0x2A),
+        ("main::s", 0x2C),
+        ("main::x", 0x2E),
+        ("main::t", 0x30),
+        ("main::nxt", 0x31),
+        ("main::dec", 0x33),
+        ("main::d", 0x34),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        asm.contains("MOVLW 0x08\n    MOVWF 0x25"),
+        "trip seed:\n{asm}"
+    );
+    assert!(asm.contains("DECFSZ 0x25, F"), "down-counter latch:\n{asm}");
+    assert!(!asm.contains("ADDLW 0xFF"), "decrement gone:\n{asm}");
+}
+
+#[test]
+fn walk_carried_reduction_copies_across_latch() {
+    // epic-cc#897: a carried sum still copies at the latch while the
+    // counter rides home; the exit block reads the reduction, not the
+    // counter, so the walk stays sound.
+    let m = parse(
+        "global buf i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %s = phi i8 0 entry %acc loop\n    %p = gep @buf +0 +1*%i\n    %x = load i8 %p\n    %acc = add i8 %x %s\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done loop\n  block done:\n    store i8 %acc @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("out", 0x21),
+        ("main::i", 0x25),
+        ("main::s", 0x27),
+        ("main::x", 0x28),
+        ("main::acc", 0x29),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(asm.contains("SUBLW 0x24"), "FSR from count:\n{asm}");
+    assert!(asm.contains("DECFSZ 0x25, F"), "down-counter latch:\n{asm}");
+    assert!(!asm.contains("XORLW 0x04"), "16-bit latch gone:\n{asm}");
+}
+
+#[test]
+fn walk_refuses_post_increment_term() {
+    // The increment reads one ahead, so an access over it addresses the
+    // next cell: the loop keeps the old lowering.
+    let m = parse(
+        "global src i8\nglobal dst i8\nfn main(void) ()\n  block entry:\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p1 = gep @src +0 +1*%i\n    %x = load i8 %p1\n    %p2 = gep @dst +0 +1*%inc\n    store i8 %x %p2\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("src", 0x20u16),
+        ("dst", 0x30),
+        ("main::i", 0x25),
+        ("main::x", 0x27),
+        ("main::inc", 0x2A),
+        ("main::c", 0x2C),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("DECFSZ 0x25, F"),
+        "no walk on post-increment terms:\n{asm}"
+    );
+    assert!(asm.contains("XORLW 0x04"), "old latch survives:\n{asm}");
+}
+
+#[test]
+fn walk_refuses_trip_over_one_byte() {
+    // A 300-trip count does not fit the byte down-counter.
+    let m = parse(
+        "global src i8\nglobal dst i8\nfn main(void) ()\n  block entry:\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p1 = gep @src +0 +1*%i\n    %x = load i8 %p1\n    %p2 = gep @dst +0 +1*%i\n    store i8 %x %p2\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 300\n    br i1 %c done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("src", 0x20u16),
+        ("dst", 0x30),
+        ("main::i", 0x25),
+        ("main::x", 0x27),
+        ("main::inc", 0x2A),
+        ("main::c", 0x2C),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("DECFSZ 0x25, F"),
+        "no walk past 255 trips:\n{asm}"
+    );
+}
+
+#[test]
+fn walk_refuses_counter_read_after_loop() {
+    // The walk leaves zero in the counter slot while the source
+    // promises K there, so any exit use vetoes the walk.
+    let m = parse(
+        "global src i8\nglobal dst i8\nglobal out i16\nfn main(void) ()\n  block entry:\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p1 = gep @src +0 +1*%i\n    %x = load i8 %p1\n    %p2 = gep @dst +0 +1*%i\n    store i8 %x %p2\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done loop\n  block done:\n    store i16 %inc @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("src", 0x20u16),
+        ("dst", 0x30),
+        ("out", 0x22),
+        ("main::i", 0x25),
+        ("main::x", 0x27),
+        ("main::inc", 0x2A),
+        ("main::c", 0x2C),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("DECFSZ 0x25, F"),
+        "no walk when the exit reads the counter:\n{asm}"
+    );
+    assert!(asm.contains("XORLW 0x04"), "old latch survives:\n{asm}");
+}
+#[test]
+fn walk_refuses_shared_value_chain() {
+    // A value chain read anywhere but its store must keep the old
+    // lowering, which materializes it every iteration.
+    let m = parse(
+        "global buf i8\nglobal base i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %b = load i8 @base\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p = gep @buf +0 +1*%i\n    %t = trunc i16 %i to i8\n    %v = add i8 %b %t\n    store i8 %v %p\n    store i8 %v @out\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 16\n    br i1 %c done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("base", 0x21),
+        ("out", 0x22),
+        ("main::b", 0x26),
+        ("main::i", 0x25),
+        ("main::t", 0x27),
+        ("main::v", 0x28),
+        ("main::inc", 0x2A),
+        ("main::c", 0x2C),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("DECFSZ 0x25, F"),
+        "no walk on a shared value chain:\n{asm}"
+    );
+}
+
+#[test]
+fn walk_index_value_store_writes_in_sim() {
+    // The rebuild arithmetic runs for real: with base 0x10 over 4
+    // trips the buffer must hold 0x10..0x13 in order, proving the
+    // down-counter maps onto the ascending index.
+    use pic14_sim::Pic14;
+    let m = parse(
+        "global buf i8\nglobal base i8\nfn main(void) ()\n  block entry:\n    %b = load i8 @base\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p = gep @buf +0 +1*%i\n    %t = trunc i16 %i to i8\n    %v = add i8 %b %t\n    store i8 %v %p\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("base", 0x30),
+        ("main::b", 0x26),
+        ("main::i", 0x25),
+        ("main::t", 0x27),
+        ("main::v", 0x28),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    p.ram_mut()[0x30] = 0x10;
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    assert_eq!(
+        [p.ram()[0x20], p.ram()[0x21], p.ram()[0x22], p.ram()[0x23]],
+        [0x10, 0x11, 0x12, 0x13],
+        "rebuilt values ascend with the index:\n{asm}"
+    );
+}
