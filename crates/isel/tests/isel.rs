@@ -5342,7 +5342,7 @@ fn same_page_const_read_skips_restore() {
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
     // The set goes before the index computation (W = index is the reader's
-    // input — the set's MOVLW must not clobber it). A short entry takes
+    // input, so the set's MOVLW must not clobber it). A short entry takes
     // the base's full HIGH, not PAGE(entry).
     assert!(
         asm.contains("MOVLW HIGH(t)\n    MOVWF PCLATH"),

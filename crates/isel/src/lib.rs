@@ -10179,22 +10179,13 @@ pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec
     }
 }
 
-/// The const-table section's reader entries and the page PCLATH<4:3> holds
-/// after each CALL returns: a full reader writes `MOVLW HIGH(<base>);
-/// MOVWF PCLATH` before its computed jump, and a short entry's caller
-/// sets that same `HIGH(<base)>` ahead of the CALL, so PCLATH's page
-/// bits are the TABLE BASE's page (`<name>` for single/chunk-0 reads,
-/// `<name>_1` for chunk-1 reads): not `PAGE(__read_<name>)`, the page
-/// the caller set (the entry itself can sit in a different page than
-/// its base, e.g. a reader at 0x7FA with a 256-aligned base at 0x800).
-/// The caller's restore after the call is needed iff that page differs
-/// from its own, so this is the map `emit_pclath_restore` consults.
-/// The section's pass-A placement is used: it sits right after the
-/// last function, and pass B re-pins the section to this exact start
-/// with a leading `.org` whenever the pass-B elision would move a
-/// reader base across a page boundary (see the pass-B note in
-/// `select`), so no reader base can drift across a page boundary
-/// between the passes: the pages hold in the final text.
+/// Reader entries and the page PCLATH<4:3> holds after each CALL: a
+/// full reader writes HIGH(base) itself and a short entry's caller
+/// sets it, so both leave the TABLE BASE's page (not PAGE(entry): an
+/// entry can sit in another page than its base). Restores are needed
+/// iff that page differs from the caller's. Pass-A placement is used;
+/// pass B re-pins to this start on any base-page or short-decision
+/// drift, so the map holds in the final text.
 fn reader_pages(
     consts: &[&ir::Global],
     staged: &HashSet<String>,
