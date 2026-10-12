@@ -3344,10 +3344,7 @@ impl<'m> Gen<'m> {
                         }
                         let ptr = &operands[idx].ptr;
                         let addr = if let Some(g) = ptr.strip_prefix('@') {
-                            *self
-                                .addrs
-                                .get(g)
-                                .unwrap_or_else(|| panic!("isel-pic18: no address for @{g}"))
+                            self.global_addr(g)
                         } else if let Some(r) = ptr.strip_prefix('%') {
                             self.slot_addr(self.cur_func, r).direct()
                         } else {
@@ -3390,14 +3387,7 @@ impl<'m> Gen<'m> {
     /// RAM copy only to consts of 255 bytes or fewer, so a larger flash
     /// const with no address is a user error, not an internal invariant.
     fn missing_global_addr(&self, name: &str) -> ! {
-        match self.m.globals.iter().find(|g| g.name == name) {
-            Some(g) if g.is_const && g.size > 255 => panic!(
-                "epic-cc: error: flash const {name} is {} bytes, over the 255-byte RAM copy \
-                 limit; {} needs its address, and only consts of 255 bytes or fewer get one.",
-                g.size, self.cur_func
-            ),
-            _ => panic!("isel-pic18: no address for @{name}"),
-        }
+        missing_global_addr(self.m, self.cur_func, name)
     }
 
     /// Whether `name` is a local object in the current function: an
@@ -12253,10 +12243,25 @@ fn isr_save_needs(
     needs
 }
 
+/// Address lookup shared by the method and naked paths. Alloc gives a
+/// RAM copy only to consts of 255 bytes or fewer, so a larger flash
+/// const with no address is a user error, not an internal invariant.
+fn missing_global_addr(m: &Module, func: &str, name: &str) -> ! {
+    match m.globals.iter().find(|g| g.name == name) {
+        Some(g) if g.is_const && g.size > 255 => panic!(
+            "epic-cc: error: flash const {name} is {} bytes, over the 255-byte RAM copy \
+             limit; {func} needs its address, and only consts of 255 bytes or fewer get one.",
+            g.size
+        ),
+        _ => panic!("isel-pic18: no address for @{name}"),
+    }
+}
+
 /// Render one naked function's verbatim body. Shared by the pre-pass
 /// buffer (which the ISR narrowing scans) and pass B (which streams it):
 /// one source, so the scanned text and the emitted text cannot drift.
 fn render_naked_lines(
+    m: &Module,
     f: &Func,
     addrs: &HashMap<String, u16>,
     resolved: &PtrResolution,
@@ -12295,7 +12300,7 @@ fn render_naked_lines(
                                         let idx: usize = idx_str.parse().unwrap();
                                         if idx >= a.operands.len() { panic!("asm: placeholder ${idx} out of range for {} operands in template {:?}", a.operands.len(), a.template); }
                                         let ptr = &a.operands[idx].ptr;
-                                        let addr = if let Some(g) = ptr.strip_prefix('@') { *addrs.get(g).unwrap_or_else(|| panic!("isel-pic18: no address for @{g}")) } else if let Some(r) = ptr.strip_prefix('%') { *addrs.get(&ssa_key(&f.name, r)).unwrap_or_else(|| panic!("isel-pic18: no slot for {}::{}", f.name, r)) } else { panic!("asm: malformed operand ptr {ptr:?}") };
+                                        let addr = if let Some(g) = ptr.strip_prefix('@') { *addrs.get(g).unwrap_or_else(|| missing_global_addr(m, &f.name, g)) } else if let Some(r) = ptr.strip_prefix('%') { *addrs.get(&ssa_key(&f.name, r)).unwrap_or_else(|| panic!("isel-pic18: no slot for {}::{}", f.name, r)) } else { panic!("asm: malformed operand ptr {ptr:?}") };
                                         res.push_str(&format!("0x{addr:02X}"));
                                         continue;
                                     }
@@ -13537,7 +13542,7 @@ pub fn select_with_opts(
         if !f.naked {
             continue;
         }
-        naked_bodies.insert(f.name.as_str(), render_naked_lines(f, addrs, &resolved));
+        naked_bodies.insert(f.name.as_str(), render_naked_lines(m, f, addrs, &resolved));
     }
     // Narrow each ISR's buffered save/restore to the registers its
     // reachable bodies can write. Unrecognized reachable code keeps the
