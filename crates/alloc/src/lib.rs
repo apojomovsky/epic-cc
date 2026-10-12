@@ -2509,8 +2509,8 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
 
 /// `allocate` with the pooled flash string table (epic-cc#816): when
 /// `pool` is set on PIC14, a pooled const whose uses isel rewrites to
-/// pool addresses keeps no RAM copy. The driver sets this from
-/// `--const-pool`; every other caller keeps the status quo.
+/// pool addresses keeps no RAM copy. The driver passes its pooled
+/// default here (epic-cc#1211); every other caller keeps the status quo.
 pub fn allocate_with_pool(
     device: &Device,
     m: &Module,

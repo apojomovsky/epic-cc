@@ -509,9 +509,9 @@ fn cases() -> Vec<Case> {
         },
         Case {
             // epic-cc#878: the `epic-encoder` sim slice, the same file set
-            // `encoder_sim_const_pool_e2e` links (TU order included), built
-            // with `--const-pool` per POOL_ROWS: the plain `-O2` build
-            // overflows flash, so only the pooled build links all profiles.
+            // `encoder_sim_const_pool_e2e` links (TU order included). It
+            // links all profiles under the pooled default (epic-cc#1211);
+            // the `--no-const-pool` build overflows flash.
             name: "hal-pic16-encoder-sim-16f877a",
             device: "16F877A",
             includes: [
@@ -746,12 +746,6 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// Rows built with `--const-pool` (epic-cc#878): the encoder sim's string
-/// load only fits flash with pooled const tables. Name-matched so the
-/// `Case` struct stays flag-free; renaming a listed row breaks its build
-/// loudly (the plain `-O2` sim overflows flash), never silently.
-const POOL_ROWS: &[&str] = &["hal-pic16-encoder-sim-16f877a"];
-
 /// Run `epic-cc` for `c` under `profile` (`"Os"` is the default flags,
 /// anything else is passed as `-O<profile>`) and return its size-report
 /// stderr text. A failing profile build fails the test: every profile
@@ -774,9 +768,7 @@ fn measure(c: &Case, profile: &str) -> String {
     for d in &c.defines {
         cmd.arg("-D").arg(d);
     }
-    if POOL_ROWS.contains(&c.name) {
-        cmd.arg("--const-pool");
-    }
+
     cmd.arg("-o").arg(&hex_path);
     cmd.args(&c.inputs);
     let out = cmd.output().expect("run epic-cc");
