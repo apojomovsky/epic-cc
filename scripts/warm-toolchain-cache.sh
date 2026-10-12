@@ -28,10 +28,16 @@ while :; do
     "$@" . 2>&1 | tee "$log" || status=$?
   [ "$status" -eq 0 ] && exit 0
 
-  # A 5xx only counts on a line naming a registry, so a RUN step printing
-  # "Bad Gateway" from its own mirror fails at once instead of retrying for an hour.
-  if ! grep -qiE '429 Too Many Requests|toomanyrequests' "$log" \
-    && ! grep -iE 'docker\.io|registry-1|ghcr\.io' "$log" | grep -iE '502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout' >/dev/null; then
+  # A 429 only counts on the final log line, the ERROR BuildKit prints
+  # last, so an earlier tolerated 429 warning cannot retry an unrelated
+  # failure for an hour. A 5xx with a reason phrase only counts on a line
+  # naming a registry, and a bare 502/503/504 only at the end of the
+  # final line naming a registry after a status keyword, keeping byte
+  # counts and digests out of the match.
+  last="$(grep . "$log" | tail -n 1)"
+  if ! printf '%s\n' "$last" | grep -qiE '429 Too Many Requests|toomanyrequests' \
+    && ! grep -iE 'docker\.io|registry-1|ghcr\.io' "$log" | grep -iE '502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout' >/dev/null \
+    && ! printf '%s\n' "$last" | grep -iE 'docker\.io|registry-1|ghcr\.io' | grep -qiE 'status.*[^0-9]50[234][[:space:]]*$'; then
     echo "::error::toolchain cache build failed (not a transient registry error)" >&2
     exit "$status"
   fi
