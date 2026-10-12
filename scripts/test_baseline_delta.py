@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavior tests for baseline_delta.judge: the epic-tasks#306 rules."""
+"""Behavior tests for baseline_delta.judge: epic-tasks#306 as amended by epic-cc#1135."""
 
 import importlib.util
 import pathlib
@@ -87,13 +87,18 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(r["verdict"], "hold")
         self.assertFalse(r["net_win"])
 
-    def test_new_or_removed_row_holds(self):
-        self.assertEqual(
-            run([size_row("add", 50)], [size_row("add", 50), size_row("mul", 9)])[
-                "verdict"
-            ],
-            "hold",
-        )
+    def test_new_row_is_informational_and_passes(self):
+        r = run([size_row("add", 50)], [size_row("add", 50), size_row("mul", 9)])
+        self.assertEqual(r["verdict"], "pass")
+        self.assertEqual(r["new_rows"], ["size mul"])
+        self.assertIn("informational", bd.render_markdown(r))
+
+    def test_new_row_alone_passes_with_no_moved_rows(self):
+        r = run([], [size_row("mul", 9)])
+        self.assertEqual(r["verdict"], "pass")
+        self.assertEqual(r["totals"]["flash_words"], 0)
+
+    def test_removed_row_holds(self):
         self.assertEqual(
             run([size_row("add", 50), size_row("mul", 9)], [size_row("add", 50)])[
                 "verdict"
