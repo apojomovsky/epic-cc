@@ -148,7 +148,7 @@ static void task_stimulus(void *arg)
     g_frame_idx++;
 }
 
-/** @brief Log each injected frame's actual tick as 4 hex digits. */
+/** @brief Log each injected frame's actual tick as 4 hex digits, for visibility, not asserted against. */
 static void log_fire_ticks(void)
 {
     static const char hx[] = "0123456789ABCDEF";
@@ -339,6 +339,8 @@ int main(void)
     EPIC_IRQ_Restore(1);
 
     epic_taskmgr_run(); /* harness-bounded on the sim target */
+
+    log_fire_ticks();
 
     CHECK(g_frame_idx == FRAME_LEN, 0x00);      /* full script ran */
     CHECK(bridge_demo_response_count() == 5U, 0x01); /* 2 silent drops */

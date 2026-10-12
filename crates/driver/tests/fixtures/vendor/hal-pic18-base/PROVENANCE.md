@@ -1,7 +1,7 @@
 # Provenance
 
 Shared snapshot from `apojomovsky/epic-hal` at commit
-`51a048421ca28ebf539251957b895946ade680b8` (origin/master on 2026-10-01): every file below is byte-identical to that commit
+`ac43c99a81f12a3c97b1d86b5a5b31ccc57c890c` (origin/master on 2026-10-10): every file below is byte-identical to that commit
  (epic-cc#836). The PIC18 demo fixtures that use it
 (`hal-pic18-menu-demo`, `hal-pic18-control-demo`, `hal-pic18-pid`,
 `hal-pic18-bridge-demo` on `18F4550`, epic-cc toolchain file sets)
@@ -38,10 +38,3 @@ Vendored layout keeps the pre-reorg epic-cc names (`epic-*`,
 `pic18fxx5x-hal`); upstream renamed them in epic-hal#316
 (`lib/*`, `common/*`, `hal/pic18/18fxx5x/*`, `demos/*`). The drift
 script maps each file to its upstream path.
-
-Deliberate deltas from the pin (each with an upstream port issue, else
-the weekly drift gate stays red until re-vendor absorbs them):
-
-- `epic-bus/src/epic_bus.c`: the I2C/SPI default tables are `static
-  const` here (epic-cc#900, port: epic-hal#368); upstream still
-  populates mutable tables at init. Re-vendor drops this note.

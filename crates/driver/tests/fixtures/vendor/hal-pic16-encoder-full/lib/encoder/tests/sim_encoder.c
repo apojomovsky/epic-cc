@@ -68,6 +68,38 @@ static uint8_t wait_1ms_bounded(void)
     return 1u;
 }
 
+/* epic-cc folds a single-callsite helper into its caller; keep the
+ * attribute so main stays inside one page. */
+/**
+ * @brief Hammer the class-G position read under the live tick ISR, returning tear/stall/tick_ok packed in bits 0/1/2.
+ */
+static uint8_t __attribute__((noinline)) phase4_hammer(void)
+{
+    /* Position is never written here, so any non-zero read is a torn
+     * read; a wait that spins out its budget means the tick stopped
+     * (GIE left cleared). Packed so the caller keeps the same checks
+     * without the loop inline. */
+    epic_encoder_init(&g_ham, PIN_A, PIN_B, 0u, port_byte(0u));
+    uint32_t t_start = epic_tick_get();
+    int tear = 0;
+    int stall = 0;
+    for (uint32_t i = 0; epic_harness_running(i) && i < HAMMER_READS; i++)
+    {
+        epic_harness_tick();
+        if (epic_encoder_get_position(&g_ham) != 0)
+        {
+            tear = 1;
+        }
+        if ((i % HAMMER_WAIT_EVERY) == 0u && !wait_1ms_bounded())
+        {
+            stall = 1;
+        }
+    }
+    uint32_t t_end = epic_tick_get();
+    int tick_ok = (t_end > t_start) && !stall;
+    return (uint8_t)((uint8_t)tear | (uint8_t)(stall << 1) | (uint8_t)(tick_ok << 2));
+}
+
 /** @brief Run the scripted decode/glitch/class-G sequence and report PASS/FAIL. */
 int main(void)
 {
@@ -114,28 +146,10 @@ int main(void)
     uint16_t gg_after = epic_encoder_get_glitch_count(&g_gate);
     uint16_t eg_gate  = epic_encoder_get_error_count(&g_gate);
 
-    /* ---- Phase 4: class-G probe. Hammer the 32-bit position read
-     *      under the live tick ISR. Position is never written here, so
-     *      any non-zero read is a torn read; a wait that spins out its
-     *      budget means the tick stopped (GIE left cleared). */
-    epic_encoder_init(&g_ham, PIN_A, PIN_B, 0u, port_byte(0u));
-    uint32_t t_start = epic_tick_get();
-    int tear = 0;
-    int stall = 0;
-    for (uint32_t i = 0; epic_harness_running(i) && i < HAMMER_READS; i++)
-    {
-        epic_harness_tick();
-        if (epic_encoder_get_position(&g_ham) != 0)
-        {
-            tear = 1;
-        }
-        if ((i % HAMMER_WAIT_EVERY) == 0u && !wait_1ms_bounded())
-        {
-            stall = 1;
-        }
-    }
-    uint32_t t_end = epic_tick_get();
-    int tick_ok = (t_end > t_start) && !stall;
+    /* ---- Phase 4: class-G probe (hammer loop lives in phase4_hammer). */
+    uint8_t ham = phase4_hammer();
+    int tear = (int)(ham & 1u);
+    int tick_ok = (int)((ham >> 2) & 1u);
 
     /* ---- Report. ---- */
     int phase1_ok = (p_dec == 0) && (e_dec == 0) && (g_dec0 == 0);
