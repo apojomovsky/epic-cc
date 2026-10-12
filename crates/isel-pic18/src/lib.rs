@@ -2817,7 +2817,7 @@ impl<'m> Gen<'m> {
         }
         let count_slot = *g.addrs.get(&iselcore::ssa_key(&f.name, &cntreg))?;
         Self::walk_body(
-            g, f, b, uses, pre, exit, cntreg, increg, k as u16, count_slot,
+            g, f, b, uses, pre, exit, cntreg, increg, up, k as u16, count_slot,
         )
     }
 
@@ -2834,6 +2834,7 @@ impl<'m> Gen<'m> {
         exit: String,
         cntreg: String,
         increg: String,
+        up: bool,
         k: u16,
         count_slot: u16,
     ) -> Option<WalkLoop> {
@@ -2928,7 +2929,6 @@ impl<'m> Gen<'m> {
                         g,
                         f,
                         &cntreg,
-                        &increg,
                         &mut groups,
                         &mut term_sites,
                         &mut gep_users,
@@ -2976,7 +2976,6 @@ impl<'m> Gen<'m> {
                                 g,
                                 f,
                                 &cntreg,
-                                &increg,
                                 &mut groups,
                                 &mut term_sites,
                                 &mut gep_users,
@@ -3010,7 +3009,6 @@ impl<'m> Gen<'m> {
                         g,
                         f,
                         &cntreg,
-                        &increg,
                         &mut groups,
                         &mut term_sites,
                         &mut gep_users,
@@ -3031,7 +3029,24 @@ impl<'m> Gen<'m> {
         // A mid-body flush at the drain threshold becomes a seeded
         // `POSTINC` loop of its own and would move live walk pointers.
         // Pointer-free loops leave `FSR` dead, so only they may stage.
-        if !groups.is_empty() && stage_pairs >= COPY_LOOP_MIN_PAIRS {
+        // Carried backedge copies stage ahead of the latch the same way,
+        // so their bytes join the body's budget here.
+        let mut pairs = stage_pairs;
+        for inst in &b.insts {
+            if let Inst::Phi(p) = inst {
+                if p.dst != cntreg {
+                    pairs += usize::from(p.ty.bytes());
+                }
+            }
+        }
+        if !groups.is_empty() && pairs >= COPY_LOOP_MIN_PAIRS {
+            return None;
+        }
+        // A down-counting loop visits base+k down to base+1 while the
+        // walk visits base+k+0 up, so counter-valued constructs (walk
+        // addresses, rebuilt values) map wrong. Counter-free bodies do
+        // not observe the counter and stay sound.
+        if !up && (!groups.is_empty() || !consumed_vadds.is_empty()) {
             return None;
         }
         Self::walk_finish(
@@ -3116,7 +3131,6 @@ impl<'m> Gen<'m> {
         g: &Gen,
         f: &Func,
         cntreg: &str,
-        increg: &str,
         groups: &mut Vec<(u16, u16)>,
         term_sites: &mut HashMap<String, Vec<(String, usize)>>,
         gep_users: &mut HashMap<String, Vec<usize>>,
@@ -3135,7 +3149,9 @@ impl<'m> Gen<'m> {
             return None;
         }
         let t = &terms[0].1;
-        if t != cntreg && t != increg {
+        // The walk visits base+k+0..K-1, so only the pre-increment
+        // counter indexes it correctly; the increment reads one ahead.
+        if t != cntreg {
             return None;
         }
         term_sites.entry(t.clone()).or_default().push((header, ii));
@@ -3400,27 +3416,27 @@ impl<'m> Gen<'m> {
             paired.push(live[i].clone());
             i += 1;
         }
-        // One direction per pointer: a load and a store through the same
-        // `POSTINC` would address different cells.
-        let mut read = [false; 2];
-        let mut written = [false; 2];
+        // Exactly one access per pointer per iteration: every walk op
+        // advances its `POSTINC` once, so a second access through the
+        // same pointer would address the next cell, not the same one.
+        let mut hits = [0; 2];
         for op in &paired {
             match op {
                 WalkOp::Emit(_) => {}
-                WalkOp::Load { fsr, .. } => read[*fsr as usize] = true,
+                WalkOp::Load { fsr, .. } => hits[*fsr as usize] += 1,
                 WalkOp::Store { fsr, .. } | WalkOp::StoreVal { fsr, .. } => {
-                    written[*fsr as usize] = true;
+                    hits[*fsr as usize] += 1;
                 }
                 WalkOp::Bridge {
                     src_fsr, dst_fsr, ..
                 } => {
-                    read[*src_fsr as usize] = true;
-                    written[*dst_fsr as usize] = true;
+                    hits[*src_fsr as usize] += 1;
+                    hits[*dst_fsr as usize] += 1;
                 }
             }
         }
         for fsr in 0..groups.len() {
-            if read[fsr] && written[fsr] {
+            if hits[fsr] != 1 {
                 return None;
             }
         }

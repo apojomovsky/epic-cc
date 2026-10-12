@@ -9331,6 +9331,7 @@ fn phi_folded_i16_increment_reads_the_phi_home_through_a_materialized_compare() 
         assert_eq!(p.ram()[0x22], 1, "flag must ride the match (limit={limit})");
     }
 }
+
 #[test]
 fn walk_counted_copy_bridges_pointers_and_counts_down() {
     // A counted copy loop walks its pointers instead of re-deriving
@@ -9524,6 +9525,144 @@ fn walk_counter_only_loop_keeps_body_and_counts_down() {
     assert!(p.halted(), "program must halt");
     assert_eq!(p.ram()[0x20], 1, "carried select result");
     assert_eq!(p.ram()[0x42], 0, "counter must end at zero");
+}
+
+#[test]
+fn walk_refuses_post_increment_indexed_access() {
+    // `buf[i + 1]` indexes one ahead of the walk's `base+k+0..K-1`
+    // visit order, so the loop keeps its normal lowering and still
+    // copies the right cells (epic-cc#896).
+    let m = parse(
+        "global buf i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %n loop 0 entry\n\
+             %s = phi i8 %a loop 0 entry\n\
+             %r = add i16 %i, 1\n\
+             %g = gep @buf +0 +1*%r\n\
+             %v = load i8 %g\n\
+             %a = add i8 %s %v\n\
+             %n = add i16 %i, 1\n\
+             %c = icmp eq i16 %n, 11\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             store i8 %a @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("out", 0x040),
+        ("main::i", 0x050),
+        ("main::s", 0x052),
+        ("main::r", 0x054),
+        ("main::g", 0x056),
+        ("main::v", 0x058),
+        ("main::a", 0x05A),
+        ("main::n", 0x05C),
+        ("main::c", 0x05E),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(!lp.contains("DECFSZ"), "no walk latch:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for k in 0..12u8 {
+        p.ram_mut()[0x20 + usize::from(k)] = k;
+    }
+    p.run(4000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x40], 66, "sum of buf[1..11]");
+}
+
+#[test]
+fn walk_refuses_two_accesses_to_one_pointer() {
+    // Two stores through one pointer advance its `POSTINC` twice per
+    // iteration, so the loop keeps its normal lowering (epic-cc#896).
+    let m = parse(
+        "global buf i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i8 %r loop 0 entry\n\
+             %g = gep @buf +0 +1*%i\n\
+             store i8 7 %g\n\
+             store i8 9 %g\n\
+             %r = add i8 %i, 1\n\
+             %c = icmp eq i8 %r, 5\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("main::i", 0x040),
+        ("main::r", 0x042),
+        ("main::c", 0x044),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(!lp.contains("DECFSZ"), "no walk latch:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(4000);
+    assert!(p.halted(), "program must halt");
+    for k in 0..5u8 {
+        assert_eq!(p.ram()[0x20 + usize::from(k)], 9, "last store wins {k}");
+    }
+}
+
+#[test]
+fn walk_refuses_down_loop_with_indexed_access() {
+    // A down-counting loop visits base+k down while the walk visits
+    // base+k+0 up, so indexed down loops keep the normal lowering and
+    // still sum the right cells (epic-cc#896).
+    let m = parse(
+        "global buf i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i8 %r loop 8 entry\n\
+             %s = phi i8 %a loop 0 entry\n\
+             %g = gep @buf +0 +1*%i\n\
+             %v = load i8 %g\n\
+             %a = add i8 %s %v\n\
+             %r = add i8 %i, -1\n\
+             %c = icmp eq i8 %r, 0\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             store i8 %a @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("out", 0x040),
+        ("main::i", 0x050),
+        ("main::s", 0x052),
+        ("main::v", 0x054),
+        ("main::a", 0x056),
+        ("main::r", 0x058),
+        ("main::c", 0x05A),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(!lp.contains("DECFSZ"), "no walk latch:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for k in 0..9u8 {
+        p.ram_mut()[0x20 + usize::from(k)] = k;
+    }
+    p.run(4000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x40], 36, "sum of buf[8..1]");
 }
 
 #[test]
