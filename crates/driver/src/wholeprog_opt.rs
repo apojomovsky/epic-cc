@@ -540,6 +540,32 @@ fn const_div_loops(lines: &[&str], span: &FuncSpan) -> (Vec<String>, bool) {
             }
         }
     }
+    // Dominators: a back edge's header dominates its latch. Reachability
+    // alone also admits forward successors inside a shared outer cycle,
+    // which would invent loops that LLVM does not see.
+    let n_blocks = blocks.len();
+    let mut dom = vec![vec![true; n_blocks]; n_blocks];
+    if n_blocks > 0 {
+        dom[0] = vec![false; n_blocks];
+        dom[0][0] = true;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for n in 1..n_blocks {
+                let mut new = vec![true; n_blocks];
+                for p in &preds[n] {
+                    for i in 0..n_blocks {
+                        new[i] = new[i] && dom[*p][i];
+                    }
+                }
+                new[n] = true;
+                if new != dom[n] {
+                    dom[n] = new;
+                    changed = true;
+                }
+            }
+        }
+    }
     let mut loops: Vec<(Vec<String>, Vec<bool>)> = Vec::new();
     for (latch, b) in blocks.iter().enumerate() {
         if b.loop_ids.is_empty() {
@@ -549,23 +575,7 @@ fn const_div_loops(lines: &[&str], span: &FuncSpan) -> (Vec<String>, bool) {
             let Some(&header) = index.get(header_name.as_str()) else {
                 continue;
             };
-            // A back edge's header reaches the latch; an exit
-            // successor does not, and treating it as a header would
-            // pull every predecessor block into the loop.
-            let mut reaches = vec![false; blocks.len()];
-            let mut stack = vec![header];
-            while let Some(n) = stack.pop() {
-                if reaches[n] {
-                    continue;
-                }
-                reaches[n] = true;
-                for s in &blocks[n].succs {
-                    if let Some(&j) = index.get(s.as_str()) {
-                        stack.push(j);
-                    }
-                }
-            }
-            if !reaches[latch] {
+            if !dom[latch][header] {
                 continue;
             }
             let mut in_loop = vec![false; blocks.len()];
@@ -592,11 +602,24 @@ fn const_div_loops(lines: &[&str], span: &FuncSpan) -> (Vec<String>, bool) {
         .map(|(_, set)| set)
         .filter(|set| has_div(set))
         .collect();
+    // Innermost divide loops: no other divide loop strictly inside.
+    // The nest is their ancestors and descendants; a sibling loop
+    // inside a shared outer loop is neither and stays rolled.
+    let subset = |a: &Vec<bool>, b: &Vec<bool>| a.iter().zip(b.iter()).all(|(x, y)| !x || *y);
+    let innermost: Vec<&Vec<bool>> = div_sets
+        .iter()
+        .filter(|set| {
+            !div_sets
+                .iter()
+                .any(|other| subset(other, set) && !subset(set, other))
+        })
+        .copied()
+        .collect();
     let mut ids: Vec<String> = Vec::new();
     for (loop_ids, set) in &loops {
-        let in_nest = div_sets
+        let in_nest = innermost
             .iter()
-            .any(|div_set| set.iter().zip(div_set.iter()).any(|(a, b)| *a && *b));
+            .any(|div_set| subset(div_set, set) || subset(set, div_set));
         if in_nest {
             for id in loop_ids {
                 if !ids.contains(id) {
@@ -1026,6 +1049,25 @@ define internal void @driver() #0 {
             always_inline_candidates(ll, true),
             vec!["driver".to_string()],
             "the aggressive tier folds a small one-caller helper into main"
+        );
+    }
+
+    #[test]
+    fn strip_unroll_disable_keeps_sibling_nested_in_a_shared_outer_loop() {
+        let ll = "define i16 @main() #0 {\n  br label %ohead\nohead:\n  br label %shead\nshead:\n  %n = udiv i32 5000, %pq\n  br i1 %c, label %shead, label %rhead, !llvm.loop !4\nrhead:\n  %m = mul i32 %a, 3\n  br i1 %d, label %rhead, label %onext, !llvm.loop !7\nonext:\n  br i1 %e, label %ohead, label %exit, !llvm.loop !9\nexit:\n  ret i16 0\n}\n!4 = distinct !{!4, !6}\n!7 = distinct !{!7, !6}\n!9 = distinct !{!9, !6}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
+        let (out, targets) = strip_unroll_disable(ll);
+        assert_eq!(targets, vec!["main".to_string()]);
+        assert!(
+            out.contains("!4 = distinct !{!4}"),
+            "search loop unmarked: {out}"
+        );
+        assert!(
+            out.contains("!9 = distinct !{!9}"),
+            "outer loop unmarked: {out}"
+        );
+        assert!(
+            out.contains("!7 = distinct !{!7, !6}"),
+            "nested sibling keeps its mark: {out}"
         );
     }
 
