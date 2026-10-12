@@ -61,10 +61,12 @@ judges the move against master's baseline: a net win (no total grows, at
 least one shrinks) passes; flash growth up to 8 words or cycle growth up to
 1% on a single row passes when the PR body names it on a line of its own,
 `delta-ok: <row>`; RAM growth, a larger regression, a net loss, or a new or
-removed row holds for a human. Master's baseline files are refreshed on
-master, not in pull requests. Until the merge-time regeneration is decided
-(epic-cc#1087, needs-human), a maintainer refreshes them on master with
-`UPDATE_SIZE_BASELINE=1` / `UPDATE_CYCLE_BASELINE=1`, then reads the diff.
+removed row holds for a human. After a merge, the `baseline-regen` workflow
+re-measures the ladders on master and commits the refreshed TOMLs as
+`chore(baseline): regenerate`, so the next pull request is judged against
+current numbers. To preview what the bot will commit, run
+`bash scripts/baseline-regen.sh` in the dev container and read the diff;
+never commit the result from a pull request branch.
 
 ## Conventions, in brief
 
