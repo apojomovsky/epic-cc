@@ -2751,6 +2751,215 @@ fn keeps_product_with_another_reader() {
     assert!(!text.contains("__udivmod"), "nothing fused:\n{text}");
 }
 
+/// An ISR div/rem pair on identical operands keeps two calls: the ISR split
+/// renames both to `_isr` spellings, which never fuse (epic-cc#1081). Main's
+/// own pair still fuses onto the shared slot in the same module.
+#[test]
+fn isr_divmod_pair_keeps_two_calls() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal qi i16\nglobal mi i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %6 = urem i16 %1 %2\n\
+             store i16 %6 @m\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @qi\n\
+             %6 = urem i16 %1 %2\n\
+             store i16 %6 @mi\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    assert_eq!(call_targets(func("main", &m2)), ["__udivmod_u16"]);
+    assert_eq!(
+        call_targets(func("isr", &m2)),
+        ["__udiv_u16_isr", "__urem_u16_isr"]
+    );
+    let text = ir::serialize(&m2);
+    assert!(
+        !text.contains("__udivmod_u16_isr"),
+        "no combined ISR routine:\n{text}"
+    );
+    assert!(
+        !text.contains("__udivmod_rem_u16_isr"),
+        "no ISR remainder slot:\n{text}"
+    );
+}
+
+/// The rem idiom inside an ISR keeps its product call and subtract: the
+/// `_isr` divide and multiply spellings never recover (epic-cc#1081).
+/// Main's own idiom still recovers and fuses in the same module.
+#[test]
+fn isr_rem_idiom_keeps_product_call() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\nglobal qi i16\nglobal mi i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %5 = mul i16 %3 %2\n\
+             %6 = sub i16 %1 %5\n\
+             store i16 %6 @m\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @qi\n\
+             %5 = mul i16 %3 %2\n\
+             %6 = sub i16 %1 %5\n\
+             store i16 %6 @mi\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    assert_eq!(call_targets(func("main", &m2)), ["__udivmod_u16"]);
+    assert_eq!(
+        call_targets(func("isr", &m2)),
+        ["__udiv_u16_isr", "__mul_u16_isr"]
+    );
+    let text = ir::serialize(&m2);
+    assert!(
+        !text.contains("__urem_u16_isr"),
+        "no recovered ISR remainder:\n{text}"
+    );
+}
+
+/// A product the `ret` terminator also reads is not the rem idiom: the
+/// second reader keeps the multiply and the subtract (epic-cc#1082).
+#[test]
+fn keeps_product_read_by_ret() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(i16) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %5 = mul i16 %3 %2\n\
+             %6 = sub i16 %1 %5\n\
+             store i16 %6 @m\n\
+             ret i16 %5\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("@__mul_u16("), "shared product kept:\n{text}");
+    assert!(!text.contains("__udivmod"), "nothing fused:\n{text}");
+}
+
+/// A product read only by `ret`, with no subtract at all, is not the rem
+/// idiom either: the multiply survives (epic-cc#1082).
+#[test]
+fn declines_product_read_only_by_ret() {
+    let m = parse(
+        "global a i16\nglobal b i16\n\
+         fn main(i16) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             %5 = mul i16 %3 %2\n\
+             ret i16 %5\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("@__mul_u16("), "product kept:\n{text}");
+    assert!(
+        !text.contains("__urem_u16"),
+        "no recovered remainder:\n{text}"
+    );
+    assert!(!text.contains("__udivmod"), "nothing fused:\n{text}");
+}
+
+/// A product the `switch` scrutinee also reads is not the rem idiom: the
+/// second reader keeps the multiply and the subtract (epic-cc#1082).
+#[test]
+fn keeps_product_read_by_switch() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %5 = mul i16 %3 %2\n\
+             %6 = sub i16 %1 %5\n\
+             store i16 %6 @m\n\
+             switch i16 %5, default %def, cases 0 %c0\n\
+           block c0:\n\
+             store i16 %3 @q\n\
+             ret void\n\
+           block def:\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("@__mul_u16("), "shared product kept:\n{text}");
+    assert!(!text.contains("__udivmod"), "nothing fused:\n{text}");
+}
+
+/// A product a successor block's `phi` also reads is not the rem idiom:
+/// the second reader keeps the multiply and the subtract (epic-cc#1082).
+#[test]
+fn keeps_product_read_by_successor_phi() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\nglobal m i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             store i16 %3 @q\n\
+             %5 = mul i16 %3 %2\n\
+             %6 = sub i16 %1 %5\n\
+             store i16 %6 @m\n\
+             br next\n\
+           block next:\n\
+             %7 = phi i16 %5 entry\n\
+             store i16 %7 @q\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("@__mul_u16("), "shared product kept:\n{text}");
+    assert!(!text.contains("__udivmod"), "nothing fused:\n{text}");
+}
+
+/// A product read only by a successor `phi`, with no subtract at all, is
+/// not the rem idiom either: the multiply survives (epic-cc#1082).
+#[test]
+fn declines_product_read_only_by_successor_phi() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal q i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = load i16 @b\n\
+             %3 = udiv i16 %1 %2\n\
+             %5 = mul i16 %3 %2\n\
+             br next\n\
+           block next:\n\
+             %7 = phi i16 %5 entry\n\
+             store i16 %7 @q\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("@__mul_u16("), "product kept:\n{text}");
+    assert!(
+        !text.contains("__urem_u16"),
+        "no recovered remainder:\n{text}"
+    );
+    assert!(!text.contains("__udivmod"), "nothing fused:\n{text}");
+}
+
 /// Reloaded volatile globals never fuse: two reads of one volatile global
 /// may return different values (MMIO, or an ISR-shared flag changed
 /// between them), so the second pair is not provably the first.
