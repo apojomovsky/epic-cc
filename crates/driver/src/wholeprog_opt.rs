@@ -60,6 +60,13 @@
 //! PIC14 backend used to miscompile those, reading an `alloca`'s bytes
 //! where the walk needed its frame address, which is fixed (epic-cc#647),
 //! so both cores run it now.
+//! After the base list, a guarded second run tries to fold an
+//! all-constant search loop (the `compute_period` shape, epic-cc#1212):
+//! strip the `llvm.loop.unroll.disable` marks clang `-O1` stamps on
+//! every loop, unroll at a raised threshold, and clean up. The result
+//! is kept only when it has fewer instructions than the base result,
+//! so a runtime loop that unrolls into more code is never shipped.
+//! Skipped at `-O0`, whose contract leaves control flow untouched.
 use crate::cli::OptLevel;
 
 use std::path::Path;
@@ -404,6 +411,167 @@ fn mark_always_inline(ll_text: &str, candidates: &[String]) -> String {
     out
 }
 
+/// Cleanup after a forced unroll: `sccp`/`adce` collapse the unrolled
+/// constant chain that plain `dce` leaves behind.
+const FOLD_PASSES: &str =
+    "loop-unroll,instcombine,simplifycfg,sccp,adce,instcombine,simplifycfg,dce";
+/// Raised unroll threshold for the fold run. The default (a few hundred)
+/// stops just short of the 3x16x2 search body; this clears it while the
+/// keep-if-smaller guard in `run` bounds what can actually ship.
+const FOLD_UNROLL_THRESHOLD: &str = "1024";
+
+/// One divide or remainder with a constant operand (`udiv i32 5000, %pq`).
+fn is_const_div_line(t: &str) -> bool {
+    ["udiv", "sdiv", "urem", "srem"].iter().any(|op| {
+        let Some(pos) = t.find(&format!(" {op} ")) else {
+            return false;
+        };
+        let rest = &t[pos + op.len() + 2..];
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let _ty = parts.next();
+        let Some(operands) = parts.next() else {
+            return false;
+        };
+        operands.split(',').any(|o| {
+            let o = o.trim();
+            o.strip_prefix('-')
+                .unwrap_or(o)
+                .starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
+}
+
+/// Remove `llvm.loop.unroll.disable` from the loop metadata of
+/// functions containing a constant divide. clang `-O1` stamps the
+/// mark on every loop and the unroller honours it unconditionally,
+/// so no threshold alone can unroll `-O1` IR. Scoping to those
+/// functions keeps unrelated runtime loops out of the fold run.
+fn strip_unroll_disable(ll_text: &str) -> String {
+    let lines: Vec<&str> = ll_text.lines().collect();
+    let mut disable_ids: Vec<String> = Vec::new();
+    for line in &lines {
+        let t = line.trim();
+        if (t.contains("= !{!\"llvm.loop.unroll.disable\"}")
+            || t.contains("= distinct !{!\"llvm.loop.unroll.disable\"}"))
+            && t.starts_with('!')
+        {
+            if let Some(eq) = t.find(" =") {
+                disable_ids.push(t[1..eq].to_string());
+            }
+        }
+    }
+    if disable_ids.is_empty() {
+        return ll_text.to_string();
+    }
+    let mut loop_ids: Vec<String> = Vec::new();
+    for span in function_spans(&lines) {
+        let body = &lines[span.start..=span.end];
+        if !body.iter().any(|l| is_const_div_line(l.trim())) {
+            continue;
+        }
+        for line in body {
+            let mut rest = *line;
+            while let Some(pos) = rest.find("!llvm.loop !") {
+                let num = &rest[pos + "!llvm.loop !".len()..];
+                let id: String = num.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if id.is_empty() {
+                    break;
+                }
+                if !loop_ids.contains(&id) {
+                    loop_ids.push(id.clone());
+                }
+                rest = &num[id.len()..];
+            }
+        }
+    }
+    if loop_ids.is_empty() {
+        return ll_text.to_string();
+    }
+    let mut out = String::with_capacity(ll_text.len());
+    for line in &lines {
+        let t = line.trim_start();
+        let is_target = loop_ids.iter().any(|id| t.starts_with(&format!("!{id} =")));
+        if !is_target {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let mut owned = line.to_string();
+        for id in &disable_ids {
+            let tok = format!("!{id}");
+            owned = owned
+                .replace(&format!(", {tok},"), ",")
+                .replace(&format!(", {tok}}}"), "}")
+                .replace(&format!(", {tok})"), ")")
+                .replace(&format!("{{{tok}, "), "{");
+        }
+        out.push_str(&owned);
+        out.push('\n');
+    }
+    out
+}
+
+/// IR instruction count inside function bodies, debug records excluded.
+/// The proxy the fold guard compares: unrolled-and-folded must be
+/// strictly smaller than the loop it replaces.
+fn instruction_count(ll_text: &str) -> usize {
+    let mut in_fn = false;
+    let mut n = 0;
+    for line in ll_text.lines() {
+        let t = line.trim();
+        if t.starts_with("define ") {
+            in_fn = true;
+            continue;
+        }
+        if in_fn && t == "}" {
+            in_fn = false;
+            continue;
+        }
+        if !in_fn || t.starts_with("#dbg") || t.ends_with(':') {
+            continue;
+        }
+        if t.starts_with('%')
+            || t.starts_with("store ")
+            || t.starts_with("br ")
+            || t.starts_with("call ")
+            || t.starts_with("tail call ")
+            || t.starts_with("ret ")
+            || t.starts_with("switch ")
+            || t.starts_with("unreachable")
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The search shape worth a fold attempt: a loop plus a divide or
+/// remainder with a constant operand (`udiv i32 5000, %pq` and kin).
+fn has_const_div_loop(ll_text: &str) -> bool {
+    ll_text.contains("!llvm.loop") && ll_text.lines().any(|line| is_const_div_line(line.trim()))
+}
+
+/// One `opt` invocation: `input` to `out`, returning the output text.
+fn run_opt(
+    opt_bin: &Path,
+    input: &Path,
+    out: &Path,
+    passes: &str,
+    args: &[String],
+) -> Result<String, String> {
+    let mut cmd = Command::new(opt_bin);
+    cmd.arg("-S").arg(format!("-passes={passes}"));
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.arg(input).args(["-o", out.to_str().unwrap()]);
+    let res = cmd.output().map_err(|e| format!("run opt: {e}"))?;
+    if !res.status.success() {
+        return Err(String::from_utf8_lossy(&res.stderr).into_owned());
+    }
+    std::fs::read_to_string(out).map_err(|e| format!("read {}: {e}", out.display()))
+}
+
 /// Run the curated whole-program cleanup over `merged_path` (the
 /// `llvm-link` output), writing the result to `out_path`. Returns the
 /// optimized `.ll` text. The profile selects the pipeline, not clang's
@@ -459,17 +627,28 @@ pub fn run(
     };
     std::fs::write(merged_path, &marked)
         .map_err(|e| format!("write {}: {e}", merged_path.display()))?;
-    let mut cmd = Command::new(opt_bin);
-    cmd.arg("-S")
-        .arg(format!("--internalize-public-api-list={}", api.join(",")))
-        .arg(format!("-passes={passes}"))
-        .arg(merged_path)
-        .args(["-o", out_path.to_str().unwrap()]);
-    let out = cmd.output().map_err(|e| format!("run opt: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    let api_arg = format!("--internalize-public-api-list={}", api.join(","));
+    let base_text = run_opt(opt_bin, merged_path, out_path, &passes, &[api_arg])?;
+    if opt_level == OptLevel::O0 || !has_const_div_loop(&base_text) {
+        return Ok(base_text);
     }
-    std::fs::read_to_string(out_path).map_err(|e| format!("read {}: {e}", out_path.display()))
+    // Fold attempt (epic-cc#1212): unroll the now-constant search and
+    // keep it only if the folded module is strictly smaller.
+    let fold_in = out_path.with_extension("fold_in.ll");
+    let fold_out = out_path.with_extension("fold.ll");
+    let stripped = strip_unroll_disable(&base_text);
+    if std::fs::write(&fold_in, &stripped).is_err() {
+        return Ok(base_text);
+    }
+    let threshold = format!("--unroll-threshold={FOLD_UNROLL_THRESHOLD}");
+    let Ok(folded) = run_opt(opt_bin, &fold_in, &fold_out, FOLD_PASSES, &[threshold]) else {
+        return Ok(base_text);
+    };
+    if instruction_count(&folded) >= instruction_count(&base_text) {
+        return Ok(base_text);
+    }
+    std::fs::write(out_path, &folded).map_err(|e| format!("write {}: {e}", out_path.display()))?;
+    Ok(folded)
 }
 
 #[cfg(test)]
@@ -685,5 +864,43 @@ define internal void @driver() #0 {
             marked,
             "define internal void @helper(i16 %0) local_unnamed_addr #3 alwaysinline {\n}\n"
         );
+    }
+    #[test]
+    fn strip_unroll_disable_removes_mark_from_const_div_loops() {
+        let ll = "define i16 @main() #0 {\n  %n = udiv i32 5000, %pq\n  br i1 %c, label %a, label %b, !llvm.loop !4\n}\n!4 = distinct !{!4, !5, !6}\n!5 = !{!\"llvm.loop.mustprogress\"}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
+        let out = strip_unroll_disable(ll);
+        assert!(
+            out.contains("!4 = distinct !{!4, !5}"),
+            "mark removed from loop node: {out}"
+        );
+        assert!(out.contains("!llvm.loop !4"), "loop attachment kept: {out}");
+    }
+
+    #[test]
+    fn strip_unroll_disable_keeps_runtime_loop_marks() {
+        let ll = "define i16 @main() #0 {\n  br i1 %c, label %a, label %b, !llvm.loop !4\n}\n!4 = distinct !{!4, !5, !6}\n!5 = !{!\"llvm.loop.mustprogress\"}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
+        assert_eq!(strip_unroll_disable(ll), ll);
+    }
+
+    #[test]
+    fn strip_unroll_disable_without_node_is_identity() {
+        let ll = "define i16 @main() #0 {\n  ret i16 0\n}\n";
+        assert_eq!(strip_unroll_disable(ll), ll);
+    }
+
+    #[test]
+    fn has_const_div_loop_needs_loop_and_constant_operand() {
+        let search = "define i16 @main() #0 {\n1:\n  %n = udiv i32 5000, %pq\n  br label %1, !llvm.loop !4\n}\n";
+        assert!(has_const_div_loop(search));
+        let runtime = "define i16 @main() #0 {\n1:\n  %n = udiv i32 %a, %b\n  br label %1, !llvm.loop !4\n}\n";
+        assert!(!has_const_div_loop(runtime));
+        let no_loop = "define i16 @main() #0 {\n  %n = udiv i32 5000, %pq\n  ret i16 0\n}\n";
+        assert!(!has_const_div_loop(no_loop));
+    }
+
+    #[test]
+    fn instruction_count_skips_debug_and_metadata() {
+        let ll = "define i16 @main() #0 !dbg !9 {\n  %a = add i16 1, 2\n  #dbg_value(i16 %a, !1, !DIExpression(), !2)\n  store i16 %a, ptr @g\n  ret i16 %a\n}\n!9 = !{}\n";
+        assert_eq!(instruction_count(ll), 3);
     }
 }
