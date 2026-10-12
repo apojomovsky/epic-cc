@@ -101,9 +101,12 @@ fn staged_routine_words_fold_into_later_table_window() {
     // section model. main is padded so the fold fires only when the
     // routine counts: without it the base sits inside the window and no
     // pad emits, and the assembler would panic on the crossing base.
+    // (Short entries moved the section earlier than the 6-word layout
+    // this pad was tuned for (epic-cc#1080); four more pad units put
+    // the fold back on the boundary.)
     let ir_text = format!(
         "global in i8\nglobal out i8\nconst t i8\nconst a i8\nfn main(void) ()\n  block entry:\n           %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n{}    ret void\n",
-        pad_body(132)
+        pad_body(136)
     );
     let m = module_with_globals(
         &ir_text,
@@ -334,4 +337,191 @@ fn panics_on_staged_const_over_255_bytes() {
     let mut staged = HashSet::new();
     staged.insert("big".to_string());
     let _ = isel_pic14e::select_with_locs(&PIC16F1937, &m, &addrs, &staged);
+}
+
+#[test]
+fn same_page_const_read_goes_short() {
+    // epic-cc#1080: entry and base share page 0, so the caller sets the
+    // base's full HIGH ahead of the CALL and the entry jumps with no
+    // park and no PCLATH write of its own.
+    let m = module_with_globals(
+        "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+                internal: false,
+                refs: Vec::new(),
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+                internal: false,
+                refs: Vec::new(),
+            },
+            const_table_global("t", 37),
+        ],
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::i", 0x25),
+        ("main::v", 0x26),
+        ("main::a", 0x27),
+    ]);
+    let asm = isel_pic14e::select(&PIC16F1937, &m, &addrs);
+    assert!(
+        asm.contains("MOVLW HIGH(t)\n    MOVWF PCLATH"),
+        "caller sets the base HIGH before CALL __read_t:\n{asm}"
+    );
+    assert!(
+        asm.contains("__read_t:\n    ADDLW LOW(t)\n    MOVWF PCL"),
+        "short entry jumps with no park:\n{asm}"
+    );
+    assert!(
+        !asm.contains("PAGE(__read_t)"),
+        "no PAGE set for a short entry:\n{asm}"
+    );
+    isel_pic14e::verify_page_fit(&m, &asm);
+    assert_eq!(
+        sim_run_asm(&asm, &[(0x20, 5)], 0x21),
+        5,
+        "table[5] = 5 through the short entry:\n{asm}"
+    );
+}
+
+#[test]
+fn chunked_table_both_entries_go_short() {
+    // epic-cc#1080: both chunk entries share their bases' page, so each
+    // caller sets that chunk's full HIGH and each entry is two words.
+    let m = module_with_globals(
+        "global in i16\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n    %i = load i16 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I16,
+                is_const: false,
+                size: 2,
+                bytes: vec![0; 2],
+                addr: None,
+                internal: false,
+                refs: Vec::new(),
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+                internal: false,
+                refs: Vec::new(),
+            },
+            const_table_global("t", 300),
+        ],
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x22),
+        ("main::i", 0x24),
+        ("main::v", 0x26),
+    ]);
+    let asm = isel_pic14e::select(&PIC16F1937, &m, &addrs);
+    assert!(
+        asm.contains("__read_t:\n    ADDLW LOW(t)\n    MOVWF PCL"),
+        "chunk-0 reader jumps with no park:\n{asm}"
+    );
+    assert!(
+        asm.contains("__read_t_hi:\n    ADDLW LOW(t_1)\n    MOVWF PCL"),
+        "chunk-1 reader jumps with no park:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW HIGH(t_1)"),
+        "chunk-1 caller sets the chunk base HIGH:\n{asm}"
+    );
+    isel_pic14e::verify_page_fit(&m, &asm);
+    assert_eq!(
+        sim_run_asm(&asm, &[(0x20, 5), (0x21, 0)], 0x22),
+        5,
+        "table[5] = 5 through the short chunk-0 entry:\n{asm}"
+    );
+    assert_eq!(
+        sim_run_asm(&asm, &[(0x20, 4), (0x21, 1)], 0x22),
+        0x15,
+        "table[260] reads through the short chunk-1 entry:\n{asm}"
+    );
+}
+
+#[test]
+fn cross_page_table_keeps_full_entry() {
+    // epic-cc#1080: the entry sits at the page-0 tail while its base
+    // folds to page 1, so no caller set can cover the jump: the entry
+    // keeps the 6-word PCLATH-switch body and the caller sets
+    // PAGE(entry). main is padded so the section starts at 0x7F9;
+    // re-tune the pad when call sequences change length.
+    let ir_text = format!(
+        "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n{}    ret void\n",
+        pad_body(674)
+    );
+    let m = module_with_globals(
+        &ir_text,
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+                internal: false,
+                refs: Vec::new(),
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+                internal: false,
+                refs: Vec::new(),
+            },
+            const_table_global("t", 60),
+        ],
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::i", 0x25),
+        ("main::v", 0x26),
+        ("main::a", 0x27),
+    ]);
+    let asm = isel_pic14e::select(&PIC16F1937, &m, &addrs);
+    assert!(
+        asm.contains("MOVLW PAGE(__read_t)\n    MOVWF PCLATH"),
+        "caller sets PAGE(entry) for a full entry:\n{asm}"
+    );
+    assert!(
+        asm.contains("__read_t:\n    MOVWF 0x70\n    MOVLW HIGH(t)\n    MOVWF PCLATH"),
+        "full entry parks the index across its own PCLATH set:\n{asm}"
+    );
+    let base = label_addr(&asm, "t");
+    assert!(
+        base / 0x800 == 1,
+        "cross-page base must sit in page 1 (base 0x{base:03X}):\n{asm}"
+    );
+    isel_pic14e::verify_page_fit(&m, &asm);
+    assert_eq!(
+        sim_run_asm(&asm, &[(0x20, 3)], 0x21),
+        3,
+        "table[3] = 3 through the full entry:\n{asm}"
+    );
 }
