@@ -1,9 +1,10 @@
 // Pooled flash string table (epic-cc#815): several address-taken string
-// literals through one consumer, so alloc flags them address-taken and
-// the `--const-pool` build concatenates them into `__const_pool`.
-// `dup1`/`dup2` are distinct globals with identical bytes (C string
-// literals with identical text merge in clang, so named arrays carry
-// the dedup proof): the pool must carry those bytes once.
+// literals through one consumer, so alloc flags them address-taken.
+// Every member stages (the consumer reads through INDF), so no site
+// reads through the pool and the `--const-pool` build carries no table
+// (epic-cc#1088). `dup1`/`dup2` are distinct globals with identical
+// bytes (C string literals with identical text merge in clang, so named
+// arrays keep the dedup shape).
 #include <stdint.h>
 #include <string.h>
 
