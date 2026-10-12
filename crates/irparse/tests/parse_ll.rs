@@ -2564,3 +2564,87 @@ fn phi_two_constexpr_arms_hoist_in_order_without_moving_phis() {
         }
     }
 }
+
+// Whole-program `opt` folds a provably dead body to a lone `unreachable`
+// (epic-cc#1104): the body lowers to a self-branch placeholder and the
+// function is flagged so a live call fails at compile time, not at runtime.
+const UNREACHABLE_BODY: &str = r#"
+define void @endpoint() {
+entry:
+  unreachable
+}
+define void @main() {
+entry:
+  call void @endpoint()
+  ret void
+}
+"#;
+
+#[test]
+fn lone_unreachable_body_is_flagged_placeholder() {
+    let m = parse_ll(UNREACHABLE_BODY);
+    let endpoint = m.funcs.iter().find(|f| f.name == "endpoint").unwrap();
+    assert!(
+        endpoint.unreachable_body,
+        "lone unreachable must flag the body"
+    );
+    assert_eq!(endpoint.blocks.len(), 1);
+    match &endpoint.blocks[0].insts[..] {
+        [Inst::Br(b)] => assert_eq!(b.target, "entry"),
+        other => panic!("placeholder must be one self-branch, got {other:?}"),
+    }
+    let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+    assert!(
+        !main.unreachable_body,
+        "a caller with real code is not a placeholder"
+    );
+    let out = ir::serialize(&m);
+    assert!(
+        out.contains("fn endpoint(void) [unreachable] ()"),
+        "marker must survive the text boundary:\n{out}"
+    );
+    let m2 = ir::parse(&out);
+    assert!(
+        m2.funcs
+            .iter()
+            .find(|f| f.name == "endpoint")
+            .unwrap()
+            .unreachable_body,
+        "marker must round-trip through the text format"
+    );
+}
+
+#[test]
+fn placeholder_flag_covers_only_empty_bodies() {
+    let single = parse_ll(
+        "define void @e() { unreachable }\ndefine void @main() {\nentry:\n  ret void\n}\n",
+    );
+    assert!(
+        single
+            .funcs
+            .iter()
+            .find(|f| f.name == "e")
+            .unwrap()
+            .unreachable_body,
+        "single-line lone unreachable is the same placeholder"
+    );
+    let coded = parse_ll(
+        "define void @g() {\nentry:\n  ret void\n}\ndefine void @f() {\nentry:\n  call void @g()\n  unreachable\n}\ndefine void @main() {\nentry:\n  ret void\n}\n",
+    );
+    assert!(
+        !coded
+            .funcs
+            .iter()
+            .find(|f| f.name == "f")
+            .unwrap()
+            .unreachable_body,
+        "real code with a trailing unreachable is a noreturn tail, not a placeholder"
+    );
+    let naked = parse_ll("define void @n() naked {\nentry:\n  unreachable\n}\n");
+    let n = naked.funcs.iter().find(|f| f.name == "n").unwrap();
+    assert!(n.naked);
+    assert!(
+        !n.unreachable_body,
+        "naked keeps its pure-asm contract, never the placeholder"
+    );
+}

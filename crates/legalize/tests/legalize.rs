@@ -3392,3 +3392,27 @@ fn shares_lsr_mangled_decimal_loops_on_pic18_only_in_pairs() {
         "non-pic18 injects nothing:\n{plain}"
     );
 }
+
+#[test]
+fn unreachable_marker_survives_legalize() {
+    // epic-cc#1104: the placeholder flag rides the text boundary into
+    // legalize and must come out intact, or isel's gate goes blind.
+    let m = parse(
+        "fn endpoint(void) [unreachable] ()\n  block entry:\n    br entry\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let out = legalize(m);
+    assert!(
+        out.funcs
+            .iter()
+            .find(|f| f.name == "endpoint")
+            .unwrap()
+            .unreachable_body,
+        "flag must propagate through legalize"
+    );
+    let text = ir::serialize(&out);
+    assert!(
+        text.contains("fn endpoint(void) [unreachable] ()"),
+        "marker must survive the text boundary:\n{text}"
+    );
+}

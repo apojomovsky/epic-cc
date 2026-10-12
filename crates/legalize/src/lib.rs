@@ -167,6 +167,7 @@ fn legalize_inner(m: Module, pic18: bool) -> Module {
             isr: f.isr,
             irq_priority: f.irq_priority,
             naked: f.naked,
+            unreachable_body: f.unreachable_body,
             variadic: f.variadic,
         });
     }
@@ -428,6 +429,7 @@ fn share_decimal_loops(m: Module) -> (Module, bool) {
             isr: f.isr,
             irq_priority: f.irq_priority,
             naked: f.naked,
+            unreachable_body: f.unreachable_body,
             variadic: f.variadic,
         });
     }
@@ -496,6 +498,7 @@ fn share_bench_loops(m: Module) -> (Module, bool) {
             isr: f.isr,
             irq_priority: f.irq_priority,
             naked: f.naked,
+            unreachable_body: f.unreachable_body,
             variadic: f.variadic,
         });
     }
@@ -948,6 +951,7 @@ fn share_lsr_decimal_loops(m: Module) -> (Module, bool) {
             isr: f.isr,
             irq_priority: f.irq_priority,
             naked: f.naked,
+            unreachable_body: f.unreachable_body,
             variadic: f.variadic,
         });
     }
@@ -1610,6 +1614,7 @@ fn narrow_div_rem_tails(m: Module) -> Module {
             isr: f.isr,
             irq_priority: f.irq_priority,
             naked: f.naked,
+            unreachable_body: f.unreachable_body,
             variadic: f.variadic,
         });
     }
@@ -5446,6 +5451,7 @@ fn routine_func(name: &str) -> Func {
         isr: false, // runtime routines stay outside the interrupt context
         irq_priority: 0,
         naked: false,
+        unreachable_body: false,
         variadic: false,
     }
 }

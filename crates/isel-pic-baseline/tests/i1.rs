@@ -74,3 +74,15 @@ fn alloca_ptr_phi_materializes_the_frame_address_not_its_contents() {
         "the alloca's contents must not be read as its address:\n{asm}"
     );
 }
+
+#[test]
+#[should_panic(expected = "unreachable-body")]
+fn live_call_to_unreachable_placeholder_is_rejected() {
+    // epic-cc#1104: mirrors the isel gate, a live call to an LLVM-proved
+    // dead body fails at compile time, never hangs at runtime.
+    let m = parse(
+        "fn endpoint(void) [unreachable] ()\n  block entry:\n    br entry\n\
+         fn main(void) ()\n  block entry:\n    call void @endpoint()\n    ret void\n",
+    );
+    let _ = select(&PIC12F509, &m, &addrs(&[]));
+}

@@ -614,6 +614,12 @@ pub struct Func {
     /// `[irq2]` markers next to `[isr]`; absent means 0.
     pub irq_priority: u8,
     pub naked: bool,
+    /// True when the whole-program `opt` stage proved this body dead and
+    /// folded it to a lone `unreachable`, which `irparse` lowers to a
+    /// self-branch placeholder. A live call to one hangs at runtime, so
+    /// every isel backend rejects it at compile time. Serialized as an
+    /// `[unreachable]` marker next to `[naked]`.
+    pub unreachable_body: bool,
     /// True for a variadic function (`fn f(...)` in the .ll prototype): a
     /// callee that reads extra args through `va_arg`. Its calls may pass
     /// more args than the named params; those land in the callee's `__va`
@@ -787,6 +793,9 @@ pub fn serialize(m: &Module) -> String {
         }
         if f.naked {
             markers.push_str(" [naked]");
+        }
+        if f.unreachable_body {
+            markers.push_str(" [unreachable]");
         }
         let mut proto = params.join(", ");
         if f.variadic {
@@ -1220,11 +1229,12 @@ pub fn parse(text: &str) -> Module {
             let p_open = after
                 .find('(')
                 .expect("fn header must have a params group: fn <name>(<ret>) (<params>)");
-            // the optional `[isr]` and `[naked]` markers live between the ret group and
-            // the params group, in any order
+            // the optional `[isr]`, `[naked]` and `[unreachable]` markers
+            // live between the ret group and the params group, in any order
             let before_params = &after[..p_open];
             let isr = before_params.contains("[isr]");
             let naked = before_params.contains("[naked]");
+            let unreachable_body = before_params.contains("[unreachable]");
             let irq_priority = if before_params.contains("[irq1]") {
                 1
             } else if before_params.contains("[irq2]") {
@@ -1266,6 +1276,7 @@ pub fn parse(text: &str) -> Module {
                 isr,
                 irq_priority,
                 naked,
+                unreachable_body,
                 variadic,
             });
         } else if line == "}" || line == "{" {

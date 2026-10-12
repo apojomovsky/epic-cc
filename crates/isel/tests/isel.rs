@@ -10470,3 +10470,15 @@ fn three_chunk_table_followup_base_counts_all_chunks() {
         "t[5] = 5 takes the then arm with the restore skipped:\n{asm}"
     );
 }
+
+#[test]
+#[should_panic(expected = "unreachable-body")]
+fn live_call_to_unreachable_placeholder_is_rejected() {
+    // epic-cc#1104: the callee body is LLVM-proved dead, so the call must
+    // fail here rather than hang in the placeholder self-loop at runtime.
+    let m = parse(
+        "fn endpoint(void) [unreachable] ()\n  block entry:\n    br entry\n\
+         fn main(void) ()\n  block entry:\n    call void @endpoint()\n    ret void\n",
+    );
+    let _ = select(&PIC16F877A, &m, &addrs(&[]));
+}
