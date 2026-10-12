@@ -7531,9 +7531,9 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
 /// A counted byte loop lowered with a down-counter (epic-cc#897,
 /// epic-cc#899): a preheader seed plus a body re-deriving every FSR
 /// setup from the count, closed by `DECFSZ count; GOTO head`. Port of
-/// the isel-pic18 walk for one FSR with no POSTINC. The header holds
-/// the counter phi, the latch the increment and backedge; latch-out
-/// loops (cc#1169) span a layout-contiguous region of body blocks.
+/// the isel-pic18 walk (epic-cc#1148) for one FSR with no POSTINC. The
+/// header holds the counter phi, the latch the increment and backedge;
+/// latch-out loops (epic-cc#1169) span a layout-contiguous region.
 #[derive(Clone)]
 struct WalkLoop {
     preheader: String,
@@ -8258,8 +8258,9 @@ impl<'m> Gen<'m> {
                     Inst::Bin(q) => {
                         // A masked index link goes dead iff every use is a
                         // masked add (same classifier both arms, so they
-                        // agree); otherwise it stays plain ALU and its
-                        // adds fall back with it.
+                        // agree). Anything else refuses: a materialized
+                        // link would read the counter or trunc home, which
+                        // the walk never writes.
                         if anddefs.contains_key(&q.dst) {
                             let all_masked = uses.get(&q.dst).is_some_and(|u| {
                                 !u.is_empty()
@@ -8282,10 +8283,10 @@ impl<'m> Gen<'m> {
                                             })
                                     })
                             });
-                            if all_masked {
-                                continue;
+                            if !all_masked {
+                                return None;
                             }
-                            anddefs.remove(&q.dst);
+                            continue;
                         }
                         match Self::walk_value_add(
                             &q.op,

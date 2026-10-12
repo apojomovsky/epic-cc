@@ -3739,3 +3739,74 @@ fn refuses_strcmp_with_exit_tail_read() {
         "exit tail read keeps the carried form:\n{text}"
     );
 }
+
+#[test]
+fn refuses_strided_loop_with_wide_bound() {
+    // An i8 counter with a 400 bound wraps past the latch value while
+    // the rewrite would count 200 whole trips: the loop keeps its LSR
+    // form.
+    let m = parse(
+        "global buf i8\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %p = phi ptr %g 1 @buf 0\n    %i = phi i8 %inc 1 0 0\n    store i8 9 %p\n    %inc = add i8 %i 2\n    %g = gep %p +1\n    %c = icmp eq i8 %inc 400\n    br i1 %c done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("phi ptr"),
+        "wide bound keeps the LSR form:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strided_loop_with_wide_step() {
+    // The pointer advances by two per trip, so no unit GEP maps onto
+    // it: the loop keeps its LSR form.
+    let m = parse(
+        "global buf i8\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %p = phi ptr %g 1 @buf 0\n    %i = phi i16 %inc 1 0 0\n    store i8 9 %p\n    %inc = add i16 %i 1\n    %g = gep %p +2\n    %c = icmp eq i16 %inc 4\n    br i1 %c done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("phi ptr"),
+        "wide step keeps the LSR form:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strided_loop_with_wide_memop() {
+    // A two-byte load through the pointer has no unit byte form: the
+    // loop keeps its LSR form.
+    let m = parse(
+        "global buf i8\nglobal out i16\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %p = phi ptr %g 1 @buf 0\n    %i = phi i16 %inc 1 0 0\n    %x = load i16 %p\n    store i16 %x @out\n    %inc = add i16 %i 1\n    %g = gep %p +1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("phi ptr"),
+        "wide memop keeps the LSR form:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strided_loop_with_counter_alu_use() {
+    // The counter feeds a plain add outside the pattern, which the
+    // unit counter cannot serve: the loop keeps its LSR form.
+    let m = parse(
+        "global buf i8\nglobal out i16\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %p = phi ptr %g 1 @buf 0\n    %i = phi i16 %inc 1 0 0\n    store i8 9 %p\n    %q = add i16 %i 5\n    store i16 %q @out\n    %inc = add i16 %i 1\n    %g = gep %p +1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("phi ptr"),
+        "counter ALU use keeps the LSR form:\n{text}"
+    );
+}
+
+#[test]
+fn refuses_strided_loop_with_volatile_store() {
+    // MMIO stays on the carried form like every sibling matcher, even
+    // though the re-addressing preserves count and order.
+    let m = parse(
+        "global buf i8\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %p = phi ptr %g 1 @buf 0\n    %i = phi i16 %inc 1 0 0\n    store volatile i8 9 %p\n    %inc = add i16 %i 1\n    %g = gep %p +1\n    %c = icmp eq i16 %inc 4\n    br i1 %c done 1\n  block done:\n    ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("phi ptr"),
+        "volatile store keeps the LSR form:\n{text}"
+    );
+}

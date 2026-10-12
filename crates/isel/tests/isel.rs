@@ -11486,3 +11486,31 @@ fn nul_i8_counter_scans_without_carry() {
     );
     assert!(asm.contains("INCF FSR, F"), "pointer walks on:\n{asm}");
 }
+
+#[test]
+fn walk_refuses_partially_shared_chain() {
+    // epic-cc#1170: a masked link read outside any masked add (here a
+    // plain global store) keeps the old lowering: the link would read
+    // a home the walk never writes.
+    let m = parse(
+        "global buf i8\nglobal base i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %b = load i8 @base\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p = gep @buf +0 +1*%i\n    %t = trunc i16 %i to i8\n    %m = and i8 %t 7\n    %v = add i8 %b %m\n    store i8 %v %p\n    store i8 %m @out\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 16\n    br i1 %c done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("base", 0x21),
+        ("out", 0x22),
+        ("main::b", 0x27),
+        ("main::i", 0x25),
+        ("main::t", 0x28),
+        ("main::m", 0x29),
+        ("main::v", 0x2A),
+        ("main::inc", 0x2B),
+        ("main::c", 0x2D),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("DECFSZ 0x25, F"),
+        "no walk on a partially shared chain:\n{asm}"
+    );
+    assert!(asm.contains("XORLW 0x10"), "old latch survives:\n{asm}");
+}

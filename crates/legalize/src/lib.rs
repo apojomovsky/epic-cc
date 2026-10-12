@@ -1096,6 +1096,18 @@ fn find_strided_sites(f: &Func) -> Vec<StridedSite> {
         if cphi.ty != incb.ty {
             continue;
         }
+        // The latch compares at counter width, so the bound must fit
+        // it: a wider bound would fire on the wrapped value while the
+        // rewrite counts whole trips.
+        if cphi.ty == Ty::I8 && bound > 255 {
+            continue;
+        }
+        if cphi.ty == Ty::I16 && bound > 65535 {
+            continue;
+        }
+        if latch.ty != cphi.ty {
+            continue;
+        }
         if arm(&cphi, &hl) != Some(Val::Reg(increg.clone()))
             || arm(&cphi, &pl) != Some(Val::Const(0))
         {
@@ -1244,6 +1256,13 @@ fn find_strided_sites(f: &Func) -> Vec<StridedSite> {
                         break;
                     }
                     if ptr == pphi.dst {
+                        // A re-addressed volatile access keeps its
+                        // count and order, but MMIO stays on the
+                        // carried form like every sibling matcher.
+                        if l.volatile {
+                            ok = false;
+                            break;
+                        }
                         ptr_memops += 1;
                     }
                 }
@@ -1258,6 +1277,10 @@ fn find_strided_sites(f: &Func) -> Vec<StridedSite> {
                         break;
                     }
                     if ptr == pphi.dst {
+                        if s.volatile {
+                            ok = false;
+                            break;
+                        }
                         ptr_memops += 1;
                     }
                     if matches!(&s.val, Val::Reg(r)
