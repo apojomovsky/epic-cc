@@ -4777,11 +4777,10 @@ impl<'m> Gen<'m> {
             // multiplies the two's-complement patterns as unsigned into
             // the 32-bit `r`, pre-seeded with the sign correction (`r`
             // starts at `-ub << 16` when `a` is negative, minus `ua << 16`
-            // when `b` is). Seeding runs first because the loop shifts the
-            // `a` slot as the multiplicand's low half (plus two scratch
-            // bytes) and the `b` slot as the multiplier, destroying both
-            // patterns. The loop exits once the multiplier shifts out
-            // (the pid-step factors are small, so most passes never run).
+            // when `b` is). Seeding runs first: the loop shifts the `a`
+            // slot as the multiplicand's low half (plus two scratch bytes)
+            // and the `b` slot as the multiplier, destroying both patterns,
+            // and exits once the multiplier shifts out.
             "__mul_s16" => {
                 let a = self.slot_addr(name, "a").direct();
                 let b = self.slot_addr(name, "b").direct();
