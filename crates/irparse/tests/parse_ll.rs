@@ -2364,3 +2364,203 @@ define dso_local i16 @main() {
     assert_eq!(m.globals.len(), 1);
     assert_eq!(m.globals[0].name, "defined");
 }
+
+// epic-cc#1053: LSR turns a pointer walk into a header phi whose
+// preheader arm is a constant `getelementptr` (`&buf[15]`). The parser
+// materializes the constant as a Gep, which must live on the incoming
+// edge (in the predecessor, ahead of its terminator), not in the header
+// with the phi: the header does not dominate the predecessor, so an
+// in-header def is a use outside its dominating block for every
+// edge-keyed consumer downstream.
+const PHI_CONSTEXPR_GEP: &str = r#"
+@b = dso_local global [16 x i8] zeroinitializer, align 1
+
+define dso_local i16 @main() local_unnamed_addr #0 {
+  br label %1
+
+1:                                                ; preds = %1, %0
+  %4 = phi ptr [ getelementptr inbounds nuw (i8, ptr @b, i16 15), %0 ], [ %10, %1 ]
+  %10 = getelementptr inbounds i8, ptr %4, i16 -1
+  br label %1
+}
+"#;
+
+#[test]
+fn phi_constexpr_gep_arm_hoists_to_predecessor() {
+    let m = parse_ll(PHI_CONSTEXPR_GEP);
+    let main = &m.funcs[0];
+    assert_eq!(main.blocks.len(), 2);
+
+    // The constant lands in the predecessor ahead of its terminator.
+    let pre = &main.blocks[0];
+    assert_eq!(pre.label, "0");
+    assert_eq!(pre.insts.len(), 2);
+    let arm = match &pre.insts[0] {
+        Inst::Gep(g) => {
+            assert_eq!(g.base, GepBase::Global("b".to_string()));
+            assert_eq!(g.k, 15);
+            assert!(g.terms.is_empty());
+            g.dst.clone()
+        }
+        other => panic!("expected hoisted Gep, got {other:?}"),
+    };
+    assert!(matches!(&pre.insts[1], Inst::Br(_)));
+
+    // The header opens with the phi; the backedge arm is untouched.
+    let hd = &main.blocks[1];
+    match &hd.insts[0] {
+        Inst::Phi(p) => {
+            assert_eq!(p.dst, "4");
+            assert!(p.ptr);
+            assert_eq!(
+                p.incoming,
+                vec![
+                    (Val::Reg(arm), "0".to_string()),
+                    (Val::Reg("10".to_string()), "1".to_string()),
+                ]
+            );
+        }
+        other => panic!("expected Phi, got {other:?}"),
+    }
+}
+
+// The same edge rule covers clang's integer-address spelling:
+// `ptrtoint (ptr getelementptr ... to i16)` materializes a Gep plus a
+// Trunc, and both move to the predecessor together.
+const PHI_PTRTOINT_GEP: &str = r#"
+@b = dso_local global [16 x i8] zeroinitializer, align 1
+
+define dso_local i16 @main() local_unnamed_addr #0 {
+  br label %1
+
+1:                                                ; preds = %1, %0
+  %4 = phi i16 [ ptrtoint (ptr getelementptr inbounds nuw (i8, ptr @b, i16 15) to i16), %0 ], [ %5, %1 ]
+  %5 = add i16 %4, 1
+  br label %1
+}
+"#;
+
+#[test]
+fn phi_ptrtoint_constexpr_arm_hoists_gep_and_trunc() {
+    let m = parse_ll(PHI_PTRTOINT_GEP);
+    let main = &m.funcs[0];
+
+    let pre = &main.blocks[0];
+    assert_eq!(pre.insts.len(), 3);
+    let gep = match &pre.insts[0] {
+        Inst::Gep(g) => {
+            assert_eq!(g.base, GepBase::Global("b".to_string()));
+            assert_eq!(g.k, 15);
+            g.dst.clone()
+        }
+        other => panic!("expected hoisted Gep, got {other:?}"),
+    };
+    let trunc = match &pre.insts[1] {
+        Inst::Trunc(t) => {
+            assert_eq!(t.val, Val::Reg(gep));
+            t.dst.clone()
+        }
+        other => panic!("expected hoisted Trunc, got {other:?}"),
+    };
+    assert!(matches!(&pre.insts[2], Inst::Br(_)));
+
+    match &main.blocks[1].insts[0] {
+        Inst::Phi(p) => {
+            assert_eq!(p.dst, "4");
+            assert_eq!(
+                p.incoming,
+                vec![
+                    (Val::Reg(trunc), "0".to_string()),
+                    (Val::Reg("5".to_string()), "1".to_string()),
+                ]
+            );
+        }
+        other => panic!("expected Phi, got {other:?}"),
+    }
+}
+
+// A phi-arm GEP with register operands is not a constant: it has no
+// valid edge evaluation point, and clang never emits one. Loud panic,
+// not a silently misplaced address.
+#[test]
+#[should_panic(expected = "inlined getelementptr with register operands")]
+fn phi_arm_gep_with_register_operands_panics() {
+    parse_ll(
+        r#"
+define dso_local i16 @main(i16 %base) local_unnamed_addr #0 {
+  br label %2
+
+2:                                                ; preds = %0
+  br label %1
+
+1:                                                ; preds = %1, %2
+  %4 = phi ptr [ getelementptr inbounds (i8, ptr %base, i16 15), %2 ], [ %5, %1 ]
+  %5 = getelementptr inbounds i8, ptr %4, i16 -1
+  br label %1
+}
+"#,
+    );
+}
+
+// Two constant arms in one header hoist as a pair, in phi order, and no
+// phi moves: each move must scan the current layout, or the second move
+// lands on a phi instead of its GEP.
+const PHI_TWO_CONSTEXPR_ARMS: &str = r#"
+@b = dso_local global [16 x i8] zeroinitializer, align 1
+
+define dso_local i16 @main() local_unnamed_addr #0 {
+  br label %39
+
+39:                                               ; preds = %0
+  br label %41
+
+41:                                               ; preds = %54, %39
+  %19 = phi ptr [ getelementptr inbounds nuw (i8, ptr @b, i16 14), %39 ], [ %20, %54 ]
+  %13 = phi ptr [ getelementptr inbounds nuw (i8, ptr @b, i16 15), %39 ], [ %14, %54 ]
+  %20 = getelementptr inbounds i8, ptr %19, i16 -1
+  %14 = getelementptr inbounds i8, ptr %13, i16 -1
+  br label %54
+
+54:                                               ; preds = %41
+  br label %41
+}
+"#;
+
+#[test]
+fn phi_two_constexpr_arms_hoist_in_order_without_moving_phis() {
+    let m = parse_ll(PHI_TWO_CONSTEXPR_ARMS);
+    let main = &m.funcs[0];
+
+    let pre = main.blocks.iter().find(|b| b.label == "39").unwrap();
+    assert_eq!(pre.insts.len(), 3);
+    let mut arms = Vec::new();
+    for (i, k) in [14u16, 15].iter().enumerate() {
+        match &pre.insts[i] {
+            Inst::Gep(g) => {
+                assert_eq!(g.base, GepBase::Global("b".to_string()));
+                assert_eq!(g.k, *k);
+                arms.push(g.dst.clone());
+            }
+            other => panic!("expected hoisted Gep, got {other:?}"),
+        }
+    }
+    assert!(matches!(&pre.insts[2], Inst::Br(_)));
+
+    let hd = main.blocks.iter().find(|b| b.label == "41").unwrap();
+    assert_eq!(hd.insts.len(), 5);
+    for (i, (dst, back)) in [("19", "20"), ("13", "14")].iter().enumerate() {
+        match &hd.insts[i] {
+            Inst::Phi(p) => {
+                assert_eq!(&p.dst, dst);
+                assert_eq!(
+                    p.incoming,
+                    vec![
+                        (Val::Reg(arms[i].clone()), "39".to_string()),
+                        (Val::Reg(back.to_string()), "54".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected Phi, got {other:?}"),
+        }
+    }
+}
