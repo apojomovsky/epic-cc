@@ -6,6 +6,7 @@
 //! 14-bit word at `word*2`, `04` extended-linear-address header, `01` EOF).
 
 use device::Device;
+use iselcore::is_directive;
 
 /// Pass 1 shared by the PIC14 and PIC14E assemblers: resolves labels,
 /// `org`, `equ`, `.align` and `.table`, skips `list`/`radix`, and stops
@@ -21,17 +22,6 @@ fn insert_label(symbols: &mut std::collections::HashMap<String, usize>, name: &s
     if !name.starts_with('_') {
         symbols.entry(format!("_{name}")).or_insert(addr);
     }
-}
-
-/// A line is a bare directive `name` only when it is exactly `name` or
-/// `name` followed by whitespace (comment already stripped, line
-/// trimmed). A label such as `endpoint:` or `listener:` starts with a
-/// directive name but is not one.
-fn is_directive(line: &str, name: &str) -> bool {
-    line == name
-        || line
-            .strip_prefix(name)
-            .is_some_and(|rest| rest.starts_with([' ', '\t']))
 }
 
 fn assemble_first_pass(

@@ -24,6 +24,7 @@
 //! would leave a gap in gpasm's HEX and break the byte-for-byte compare).
 //! The compare itself proves the translation is word-exact.
 use asm::assemble_file_to_hex;
+use iselcore::is_directive;
 use pic14_sim::{parse_hex, Pic14};
 use std::process::Command;
 
@@ -39,8 +40,8 @@ fn to_gpasm_src(src: &str) -> String {
     for raw in src.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
         if line.is_empty()
-            || line.starts_with("list")
-            || line.starts_with("radix")
+            || is_directive(line, "list")
+            || is_directive(line, "radix")
             || line.contains(" equ ")
             || line.ends_with(':')
         {
@@ -52,7 +53,7 @@ fn to_gpasm_src(src: &str) -> String {
             out.push(raw.to_string());
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             out.push(raw.to_string());
             break;
         }

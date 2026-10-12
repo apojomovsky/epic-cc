@@ -7,6 +7,7 @@
 //! same epic-hal pin (see its PROVENANCE.md), compiled like
 //! `epic_build.py --module epic-encoder --variant sim` with `--const-pool`.
 
+use iselcore::is_directive;
 use std::process::Command;
 
 fn sim_case() -> (Vec<String>, Vec<String>, Vec<String>) {
@@ -120,7 +121,7 @@ fn encoder_sim_default_flags_layout_fits_pages() {
     let mut loads = [0usize; 5];
     for raw in asm.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
@@ -132,7 +133,7 @@ fn encoder_sim_default_flags_layout_fits_pages() {
             org = target;
             continue;
         }
-        if line.starts_with("end") {
+        if is_directive(line, "end") {
             break;
         }
         if line.ends_with(':') && !line.contains(' ') && !line.starts_with('.') {
