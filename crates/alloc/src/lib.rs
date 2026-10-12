@@ -898,25 +898,12 @@ fn frame_layout(
         }
     }
 
-    // Diamond-touch phi pin (epic-cc#1160): `%d = phi [%t from B], [%s from
-    // A]` with two distinct live regs. The pin above needs every arm to
-    // carry one reg; here each arm carries its own, so the dst interval
-    // touches every src slot at its pred-end copy and strict disjointness
-    // strands the dst in a slot of its own. Pinning the dst into one
-    // dead-after incoming's slot deletes that slot when the join is the
-    // frame's peak, as in the timer0-overflow ISR frame. Every arm passing
-    // the guards below stays eligible, in edge order; the coloring takes the
-    // first arm that is colored and clash-free, so a blocked early arm falls
-    // through to a later one instead of stranding the dst.
-    //
-    // Kept apart from `coalesce`: the width-sum gate at the coloring colors
-    // with and without these pins and keeps the pinned layout only on a
-    // strictly smaller sum. A bad arm skips the phi; with no eligible arm
-    // the phi keeps today's layout, never out of the function.
-    //
-    // Only leaf frames pin. A pin reshapes slot spans, and spanned slots
-    // move dipped callee bases through live_high, which the width-sum gate
-    // cannot see; with no call sites a leaf's pin is strictly local.
+    // Diamond-touch phi pin (epic-cc#1160): a phi joining two distinct live
+    // regs strands its dst in a slot of its own, since the dst interval
+    // touches every src slot at its pred-end copy. Eligible dead-after arms
+    // pin in edge order behind a width-sum gate (ties keep today) and only
+    // in leaf frames, whose pins cannot move another frame's base. At most
+    // one dst per merge.
     let leaf = !f
         .blocks
         .iter()
