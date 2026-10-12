@@ -435,6 +435,56 @@ fn block_order(f: &ir::Func) -> Vec<&ir::Block> {
     order
 }
 
+/// Whether sharing slot `si` with a value live over `[lo, hi]` collides:
+/// every other occupant must hold a disjoint interval. Overlap with the
+/// pin's own source is covered by the pin's dead-after guards, so only
+/// other occupants veto here.
+fn pin_clash(
+    slot_of: &HashMap<String, usize>,
+    interval_of: &HashMap<&str, ((usize, u16), (usize, u16))>,
+    si: usize,
+    src: &str,
+    lo: (usize, u16),
+    hi: (usize, u16),
+) -> bool {
+    slot_of.iter().any(|(o, &osi)| {
+        osi == si
+            && o.as_str() != src
+            && match interval_of.get(o.as_str()) {
+                Some(&(olo, ohi)) => !(hi < olo || ohi < lo),
+                None => true,
+            }
+    })
+}
+
+/// Whether a call couples its caller frame to a callee (mirrors the
+/// call-site map): `_delay` is inlined and numeric targets contribute no
+/// site, so neither moves another frame's base.
+fn is_site_call(c: &ir::Call) -> bool {
+    c.func != "_delay" && (!c.callees.is_empty() || !c.func.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+/// Lowest slot disjoint from `[lo, hi]`, pushing a fresh one when none is.
+/// Greedy first-fit (epic-cc#172): deterministic under the caller's value
+/// order, growing the reused slot to the widest occupant.
+fn first_fit(
+    slots: &mut Vec<((usize, u16), (usize, u16), u8)>,
+    lo: (usize, u16),
+    hi: (usize, u16),
+    w: u8,
+) -> usize {
+    for (i, (slo, shi, _)) in slots.iter().enumerate() {
+        if hi < *slo || *shi < lo {
+            slots[i].0 = slots[i].0.min(lo);
+            slots[i].1 = slots[i].1.max(hi);
+            slots[i].2 = slots[i].2.max(w);
+            return i;
+        }
+    }
+    slots.push((lo, hi, w));
+    slots.len() - 1
+}
+
 /// Compute a function's liveness-colored frame from its IR. Each value's
 /// live interval is `[min(def, uses, phi pred ends), max(...)]` in linear
 /// block order (entry first, then label order). Phi incoming values are
@@ -848,6 +898,139 @@ fn frame_layout(
         }
     }
 
+    // Diamond-touch phi pin (epic-cc#1160): `%d = phi [%t from B], [%s from
+    // A]` with two distinct live regs. The pin above needs every arm to
+    // carry one reg; here each arm carries its own, so the dst interval
+    // touches every src slot at its pred-end copy and strict disjointness
+    // strands the dst in a slot of its own. Pinning the dst into one
+    // dead-after incoming's slot deletes that slot when the join is the
+    // frame's peak, as in the timer0-overflow ISR frame. Every arm passing
+    // the guards below stays eligible, in edge order; the coloring takes the
+    // first arm that is colored and clash-free, so a blocked early arm falls
+    // through to a later one instead of stranding the dst.
+    //
+    // Kept apart from `coalesce`: the width-sum gate at the coloring colors
+    // with and without these pins and keeps the pinned layout only on a
+    // strictly smaller sum. A bad arm skips the phi; with no eligible arm
+    // the phi keeps today's layout, never out of the function.
+    //
+    // Only leaf frames pin. A pin reshapes slot spans, and spanned slots
+    // move dipped callee bases through live_high, which the width-sum gate
+    // cannot see; with no call sites a leaf's pin is strictly local.
+    let leaf = !f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|inst| matches!(inst, ir::Inst::Call(c) if is_site_call(c)));
+    let mut diamond: HashMap<String, Vec<String>> = HashMap::new();
+    for (mi, b) in order.iter().enumerate() {
+        for inst in &b.insts {
+            let ir::Inst::Phi(p) = inst else {
+                continue;
+            };
+            let Some(&(_, _, w_d, _, mem_d)) = defs.get(&p.dst) else {
+                continue;
+            };
+            if mem_d || p.ptr {
+                continue;
+            }
+            if retval_homed.contains(&p.dst) || unplaced.contains(&p.dst) {
+                continue;
+            }
+            // A merge on a CFG cycle repeats its copies each iteration, which
+            // linear order cannot see: another arm's copy can land between
+            // the src's def and a later arrival's skipped self-copy. A src
+            // defined by a non-phi in its single arm block stays sound: the
+            // def rewrites the slot on every run of the copy's own block, so
+            // each arrival reads fresh bytes either way. Checked per src
+            // below; loop-carried srcs already fail the live-out test.
+            let cyclic = on_cycle(mi);
+            // Distinct reg arms in edge order with their pred blocks; const
+            // and global arms copy immediates and need no case. A self-read
+            // or an unresolvable arm disqualifies the phi, as does a pred
+            // the linear order cannot place before the merge.
+            let mut arms: Vec<(String, u8, Vec<usize>)> = Vec::new();
+            let mut edges: Vec<usize> = Vec::new();
+            let mut bad = false;
+            for (v, pred) in &p.incoming {
+                let pi = idx[pred.as_str()];
+                edges.push(pi);
+                if pi >= mi {
+                    bad = true;
+                    break;
+                }
+                let ir::Val::Reg(r) = v else {
+                    continue;
+                };
+                if r == &p.dst {
+                    bad = true;
+                    break;
+                }
+                let Some(&(_, _, w_s, _, mem_s)) = defs.get(r) else {
+                    bad = true;
+                    break;
+                };
+                if mem_s {
+                    bad = true;
+                    break;
+                }
+                match arms.iter_mut().find(|arm| arm.0 == *r) {
+                    Some(arm) => arm.2.push(pi),
+                    None => arms.push((r.clone(), w_s, vec![pi])),
+                }
+            }
+            if bad || arms.len() < 2 {
+                continue;
+            }
+            // Every dead-after arm stays eligible: widths must match and the
+            // src must be dead past its own copies and out of every pred, so
+            // no later copy or read observes the dst bytes. On a cycle the
+            // src must also materialize in its single arm block, a real
+            // instruction rather than a phi or a param whose bytes predate
+            // the loop.
+            let mut eligible: Vec<String> = Vec::new();
+            for (s, w_s, ps) in &arms {
+                if *w_s != w_d || retval_homed.contains(s) || unplaced.contains(s) {
+                    continue;
+                }
+                if cyclic {
+                    if ps.len() != 1 {
+                        continue;
+                    }
+                    let Some(&(d, pd, _, _, _)) = defs.get(s) else {
+                        continue;
+                    };
+                    if d != ps[0] || f.params.iter().any(|p| &p.name == s) {
+                        continue;
+                    }
+                    let def_here = order[d].insts.get(pd as usize);
+                    if !matches!(def_here, Some(inst) if !matches!(inst, ir::Inst::Phi(_))) {
+                        continue;
+                    }
+                }
+                let mut latest: Option<(usize, u16)> = None;
+                for &pi in ps {
+                    let c = (pi, block_len[pi]);
+                    latest = Some(latest.map_or(c, |e| e.max(c)));
+                }
+                if edges.iter().any(|&pi| live_out[pi].contains(s)) {
+                    continue;
+                }
+                if let Some(us) = uses.get(s.as_str()) {
+                    if let Some(last) = latest {
+                        if us.iter().any(|&u| u > last) {
+                            continue;
+                        }
+                    }
+                }
+                eligible.push(s.clone());
+            }
+            if !eligible.is_empty() && leaf {
+                diamond.insert(p.dst.clone(), eligible);
+            }
+        }
+    }
+
     // Straight-line range copies (epic-cc#739): freeze and the casts copy
     // lane 0 byte-for-byte through staged copy lanes, so a dead-after
     // source lets the destination share its slot base and isel skips the
@@ -1062,55 +1245,104 @@ fn frame_layout(
     // Greedy first-fit coloring: reuse the lowest slot whose interval is
     // disjoint from the new value's; the slot's width grows to the widest
     // occupant.
-    let mut slots: Vec<((usize, u16), (usize, u16), u8)> = Vec::new();
-    let mut slot_of: HashMap<String, usize> = HashMap::new();
     let interval_of: HashMap<&str, ((usize, u16), (usize, u16))> = vals
         .iter()
         .map(|(v, lo, hi, _, _)| (v.as_str(), (*lo, *hi)))
         .collect();
-    for (v, lo, hi, w, _) in &vals {
-        if let Some(s) = coalesce.get((*v).as_str()) {
-            if let Some(&si) = slot_of.get(s.as_str()) {
-                // A second pair pinning the same slot falls back unless the
-                // destination is disjoint from every other occupant; the
-                // source overlap is covered by the dead-after guards above.
-                let clash = slot_of.iter().any(|(o, &osi)| {
-                    osi == si
-                        && o != s
-                        && match interval_of.get(o.as_str()) {
-                            Some(&(olo, ohi)) => !(hi < &olo || &ohi < lo),
-                            None => true,
-                        }
-                });
-                if !clash {
-                    slots[si].0 = slots[si].0.min(*lo);
-                    slots[si].1 = slots[si].1.max(*hi);
-                    slots[si].2 = slots[si].2.max(*w);
-                    slot_of.insert((*v).clone(), si);
-                    continue;
+    // Diamond pins color behind a per-frame width-sum gate: the pinned
+    // layout wins only on a strictly smaller slot-width sum, ties keep the
+    // unpinned one, so a frame the pin cannot shrink lays out exactly as
+    // before and no overlay base moves on a tie.
+    let color = |pins: &HashMap<String, String>, extra: &HashMap<String, Vec<String>>| {
+        let mut slots: Vec<((usize, u16), (usize, u16), u8)> = Vec::new();
+        let mut slot_of: HashMap<String, usize> = HashMap::new();
+        // A diamond dst sorts before a late-defined target (its interval
+        // opens at the earliest pred end), so arms with no slot yet wait
+        // for a second sweep. Base pins keep the single sweep bit for bit.
+        let mut deferred: Vec<(String, Vec<String>, (usize, u16), (usize, u16), u8)> = Vec::new();
+        for (v, lo, hi, w, _) in &vals {
+            let mut stuck = false;
+            if let Some(s) = pins.get(v.as_str()) {
+                if let Some(&si) = slot_of.get(s.as_str()) {
+                    // A second pair pinning the same slot falls back unless
+                    // the destination is disjoint from every other occupant;
+                    // the source overlap is covered by the dead-after guards.
+                    if !pin_clash(&slot_of, &interval_of, si, s, *lo, *hi) {
+                        slots[si].0 = slots[si].0.min(*lo);
+                        slots[si].1 = slots[si].1.max(*hi);
+                        slots[si].2 = slots[si].2.max(*w);
+                        slot_of.insert((*v).clone(), si);
+                        stuck = true;
+                    }
                 }
             }
-        }
-        let mut placed = None;
-        for (i, (slo, shi, _)) in slots.iter().enumerate() {
-            if hi < slo || shi < lo {
-                placed = Some(i);
-                break;
+            // Diamond arms in edge order: the first colored and clash-free
+            // arm takes the dst, so a blocked early arm falls through to a
+            // later one instead of stranding the dst.
+            if !stuck {
+                if let Some(list) = extra.get(v.as_str()) {
+                    let mut waited = false;
+                    for s in list {
+                        if let Some(&si) = slot_of.get(s.as_str()) {
+                            if !pin_clash(&slot_of, &interval_of, si, s, *lo, *hi) {
+                                slots[si].0 = slots[si].0.min(*lo);
+                                slots[si].1 = slots[si].1.max(*hi);
+                                slots[si].2 = slots[si].2.max(*w);
+                                slot_of.insert((*v).clone(), si);
+                                stuck = true;
+                                break;
+                            }
+                        } else {
+                            waited = true;
+                        }
+                    }
+                    if !stuck && waited {
+                        deferred.push(((*v).clone(), list.clone(), *lo, *hi, *w));
+                        stuck = true;
+                    }
+                }
             }
-        }
-        match placed {
-            Some(i) => {
-                slots[i].0 = slots[i].0.min(*lo);
-                slots[i].1 = slots[i].1.max(*hi);
-                slots[i].2 = slots[i].2.max(*w);
+            if !stuck {
+                let i = first_fit(&mut slots, *lo, *hi, *w);
                 slot_of.insert((*v).clone(), i);
             }
-            None => {
-                slots.push((*lo, *hi, *w));
-                slot_of.insert((*v).clone(), slots.len() - 1);
+        }
+        for (v, list, lo, hi, w) in deferred {
+            let mut stuck = false;
+            for s in &list {
+                if let Some(&si) = slot_of.get(s.as_str()) {
+                    if !pin_clash(&slot_of, &interval_of, si, s, lo, hi) {
+                        slots[si].0 = slots[si].0.min(lo);
+                        slots[si].1 = slots[si].1.max(hi);
+                        slots[si].2 = slots[si].2.max(w);
+                        slot_of.insert(v.clone(), si);
+                        stuck = true;
+                        break;
+                    }
+                }
+            }
+            if !stuck {
+                let i = first_fit(&mut slots, lo, hi, w);
+                slot_of.insert(v, i);
             }
         }
-    }
+        (slots, slot_of)
+    };
+    let width_sum = |slots: &[((usize, u16), (usize, u16), u8)]| {
+        slots.iter().map(|&(_, _, w)| u16::from(w)).sum::<u16>()
+    };
+    let no_diamond: HashMap<String, Vec<String>> = HashMap::new();
+    let (slots, slot_of) = if diamond.is_empty() {
+        color(&coalesce, &no_diamond)
+    } else {
+        let (base_slots, base_of) = color(&coalesce, &no_diamond);
+        let (pin_slots, pin_of) = color(&coalesce, &diamond);
+        if width_sum(&pin_slots) < width_sum(&base_slots) {
+            (pin_slots, pin_of)
+        } else {
+            (base_slots, base_of)
+        }
+    };
     let widths: Vec<u8> = slots.iter().map(|&(_, _, w)| w).collect();
     // Per-slot access heat: the operand reads plus the defining write of
     // every value the slot holds. A memory object (alloca, byval/sret param,
