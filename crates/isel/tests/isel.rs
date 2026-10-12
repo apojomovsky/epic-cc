@@ -10774,6 +10774,10 @@ fn walk_down_copy_writes_high_to_low_in_sim() {
         ("main::d", 0x2B),
     ]);
     let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("DECFSZ 0x25, F"),
+        "down loop with memops keeps the old lowering:\n{asm}"
+    );
     let words = asm::assemble(&asm);
     let mut p = Pic14::new(words);
     for o in 0..9 {
