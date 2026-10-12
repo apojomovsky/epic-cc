@@ -99,6 +99,10 @@ it after emission. The scan crosses only neutral lines: any `CALL`, `GOTO`, retu
 or computed `PCL` jump keeps the pair, as does a skip-targeted pair (removing it would move the
 skip's target) and user inline asm, which is never rewritten.
 
+Const-table readers that share their table's page go short: the caller sets the table's full
+`HIGH` ahead of the `CALL`, and the two-word entry (`ADDLW LOW; MOVWF PCL`) jumps with no
+`PCLATH` write of its own. Entries in another page keep the parking entry (ADR-051).
+
 ### 6. A single indirect pointer
 
 Indirect addressing goes through exactly one register pair: `FSR` (8-bit offset) with `IRP`
