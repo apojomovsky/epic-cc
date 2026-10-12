@@ -181,6 +181,10 @@ size-first pipeline above, `-O2` trades flash for speed (no factoring,
 single-use helpers folded even into `main`), `-O0` keeps the IR closest
 to source for debugging, `-O1` sits between. ([ADR-045](docs/adr/ADR-045-optimization-profiles.md))
 
+On PIC14, address-taken const bytes (string literals and friends) pool
+into one flash table by default instead of staging a RAM copy per const;
+`--no-const-pool` restores the per-const staging.
+
 Three decisions shape everything:
 
 - **clang out-of-process, not an LLVM backend.** We parse clang's `.ll` text
