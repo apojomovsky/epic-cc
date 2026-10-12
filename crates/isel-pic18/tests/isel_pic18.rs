@@ -456,6 +456,68 @@ fn const_shl_i8_by_4_is_a_swapf_mask_and_matches_across_the_byte() {
 }
 
 #[test]
+fn variable_shl_u32_copies_one_count_byte_and_masks_in_body() {
+    // epic-cc#1150: the recipe masks the count's low byte, so the call
+    // copies one count byte (not four MOVFFs) and the body tests Z straight
+    // off the ANDLW with no MOVF reload. Sim-exact over counts 0, 1, 8,
+    // 19, 31, with garbage in the count's high bytes to prove only the
+    // low byte matters.
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal out i32\n\
+         fn __shl_u32(i32) (val=i32, cnt=i32)\n  block entry:\n    %__scr = alloca 2\n    ret i32 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i32 @a\n    %2 = load i32 @b\n\
+         %3 = call i32 @__shl_u32(i32 %1, i32 %2)\n    store i32 %3 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x24),
+        ("out", 0x28),
+        ("main::1", 0x30),
+        ("main::2", 0x34),
+        ("main::3", 0x38),
+        ("__shl_u32::val", 0x40),
+        ("__shl_u32::cnt", 0x44),
+        ("__shl_u32::__scr", 0x48),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVFF 0x034, 0x044").count(),
+        1,
+        "one count byte copied:\n{asm}"
+    );
+    for hi in [0x045, 0x046, 0x047] {
+        assert!(
+            !asm.contains(&format!("0x{hi:03X}")),
+            "count high byte {hi:#05X} must stay unwritten:\n{asm}"
+        );
+    }
+    assert!(
+        !asm.contains("MOVF 0x048,F,A"),
+        "no MOVF reload of the masked count:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (v, c) in [
+        (0x12345678u32, 0u8),
+        (0x12345678, 1),
+        (0x12345678, 8),
+        (0x12345678, 19),
+        (0xFFFFFFFF, 31),
+        (0xABCDEF01, 4),
+    ] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20..0x24].copy_from_slice(&v.to_le_bytes());
+        p.ram_mut()[0x24] = c;
+        p.ram_mut()[0x25..0x28].copy_from_slice(&[0xDE, 0xAD, 0xBE]);
+        p.run(500);
+        let got = u32::from_le_bytes(p.ram()[0x28..0x2C].try_into().unwrap());
+        let want = v.wrapping_shl(u32::from(c & 31));
+        assert_eq!(got, want, "v={v:#010X} << {c}");
+        assert!(p.halted(), "program must run to completion (cnt={c})");
+    }
+}
+
+#[test]
 fn const_lshr_i16_by_12_shifts_only_the_surviving_lane() {
     // k = 12 -> m = 1 byte move plus r = 4 residual over the single
     // surviving lane at dst[0] (right shifts keep dst[0..n-m)). Distinct
