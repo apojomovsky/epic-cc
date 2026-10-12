@@ -101,7 +101,8 @@ usage: epic-cc [options] <input.c|input.cpp>...
   --const-pool         PIC14: also emit address-taken const bytes as one
                        pooled flash table alongside the per-const tables,
                        rewrite their addresses to it, and drop their RAM
-                       copies (epic-cc#815, epic-cc#816)
+                       copies (epic-cc#815, epic-cc#816); the table emits
+                       only when some site reads through it (epic-cc#1088)
   --report <file>      write the build report as JSON into <file>: flash and
                        RAM use, the clock, and every config field's value
   --f-cpu <hz>         board clock in Hz, the last-resort D-4 source: it must

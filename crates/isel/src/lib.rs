@@ -163,6 +163,11 @@ struct Gen<'m> {
     /// materializes as chunk label plus offset; everything else keeps
     /// today's paths. Empty unless asked, so unflagged output matches.
     pool: &'m ConstPool,
+    /// The pool table ships this build (epic-cc#1088): some site reads
+    /// through it, so the table, its reader, and the log variant emit.
+    /// Without a routed site they would sit unreferenced; the section
+    /// and the variant stay out instead. Constant for the module.
+    pool_active: bool,
     /// Every pointer reg in the module, keyed `{func}::{reg}`, resolved to
     /// its folded `(base, k, terms)`: GEP chains fully collapsed (base
     /// `Reg` replaced by the base's own entry), plus the seeded pointer
@@ -7503,6 +7508,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         tmp: &mut *g.tmp,
         page_of: g.page_of,
         pool_log: true,
+        pool_active: g.pool_active,
         pool_slots: slots,
         split: g.split,
         global_addrs: g.global_addrs,
@@ -7898,7 +7904,9 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
     g.emit("".to_string());
     // Pool log variant (epic-cc#817): alternate entry over the same
     // frame, emitted once per pass right after the RAM loop above.
-    if f.name == LOG_POOL_CALLEE && !g.pool_log && !g.pool.chunks.is_empty() {
+    // Without a routed reader the pool table stays out (epic-cc#1088),
+    // so the variant that reads it stays out too.
+    if f.name == LOG_POOL_CALLEE && !g.pool_log && g.pool_active {
         emit_log_pool_variant(g, f);
     }
     // Dead PCLATH sets: a set pair that a later write overwrites before any read.
@@ -9607,6 +9615,39 @@ pub fn build_pool(m: &Module, candidates: &HashSet<String>) -> ConstPool {
     ConstPool { chunks, loc }
 }
 
+/// Whether any emitted site reads through the pool (epic-cc#1088): a
+/// fully gated member (its own table is dropped below, so every live
+/// use reads its chunk) or a call routed to the pool log variant under
+/// the same arguments `emit_call` routes on. False means the table and
+/// reader would sit unreferenced, so the section skips them.
+fn pool_has_routed_site(
+    m: &Module,
+    resolved: &PtrResolution,
+    pool: &ConstPool,
+    staged: &HashSet<String>,
+    addrs: &HashMap<String, u16>,
+) -> bool {
+    if pool.chunks.is_empty() {
+        return false;
+    }
+    if m.globals.iter().any(|g| {
+        pool.contains(&g.name) && !staged.contains(&g.name) && !addrs.contains_key(&g.name)
+    }) {
+        return true;
+    }
+    let pooled = |n: &str| pool.contains(n);
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts.iter().any(|inst| match inst {
+                ir::Inst::Call(c) => {
+                    log_pool_site(m, resolved, &pooled, &f.name, &c.func, &c.args, &c.callees)
+                }
+                _ => false,
+            })
+        })
+    })
+}
+
 /// Select instructions for the whole module, producing PIC14 assembly text.
 ///
 /// `addrs` is the complete address map from `alloc`: globals by name, locals
@@ -9840,6 +9881,10 @@ pub fn select_with_opts(
     // Flash-pointer provenance for the C++ dispatch panic below: computed
     // once beside the pointer resolution (epic-cc#832).
     let prov = flash_provenance(m);
+    // The pool table ships only with a routed reader (epic-cc#1088):
+    // a gated member or a routed log call, decided once here so every
+    // pass and the section below agree.
+    let pool_active = pool_has_routed_site(m, &resolved, pool, staged, addrs);
     // Value folds for every function (epic-cc#875): loads whose byte never
     // stages, over the same mapped-global set `alloc` places by, so a
     // skipped load reads an address both stages agree on. Pass-independent
@@ -9907,6 +9952,7 @@ pub fn select_with_opts(
                 tmp: &mut tmp,
                 page_of: None,
                 pool_log: false,
+                pool_active,
                 pool_slots: HashSet::new(),
                 split: &no_split,
                 global_addrs: &global_addrs,
@@ -10140,6 +10186,7 @@ pub fn select_with_opts(
                     tmp: &mut tmp2,
                     page_of: None,
                     pool_log: false,
+                    pool_active,
                     pool_slots: HashSet::new(),
                     split: &split_set,
                     global_addrs: &global_addrs,
@@ -10324,8 +10371,13 @@ pub fn select_with_opts(
             .collect();
         // Pooled chunks table exactly like per-const tables from here on:
         // reader pages, chunking, the collision guard, and both emission
-        // passes all reuse the per-const path (epic-cc#815).
-        let pool_globals = pool.globals();
+        // passes all reuse the per-const path (epic-cc#815). With no
+        // routed site the chunks would sit unreferenced (epic-cc#1088).
+        let pool_globals = if pool_active {
+            pool.globals()
+        } else {
+            Vec::new()
+        };
         consts.extend(pool_globals.iter());
         consts.sort_by_key(|g| g.name.clone());
         // Repair re-lays the section at the measured code end when the pin
@@ -10381,8 +10433,8 @@ pub fn select_with_opts(
         }
         // Pool log variant (epic-cc#817): emitted inside the callee's own
         // extent, so it shares the callee's page and routed same-page calls
-        // elide the restore. Absent without the pool, like the variant.
-        if !pool.chunks.is_empty() {
+        // elide the restore. Absent when the pool table stays out, like the variant.
+        if pool_active {
             if let Some(&p) = pages.get(LOG_POOL_CALLEE) {
                 pages.insert(LOG_POOL_VARIANT.to_string(), p);
             }
@@ -10470,6 +10522,7 @@ pub fn select_with_opts(
                                 tmp: &mut tmp,
                                 page_of: Some(&pages),
                                 pool_log: false,
+                                pool_active,
                                 pool_slots: HashSet::new(),
                                 split: &split_set,
                                 global_addrs: &global_addrs,
