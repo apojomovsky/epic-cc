@@ -11340,3 +11340,83 @@ fn cross_page_reader_keeps_parking_entry() {
         "table[1] = 1 through the full entry:\n{asm}"
     );
 }
+
+/// Signed widening multiply (epic-cc#1174): `__mul_s16` takes two i16
+/// patterns and returns the signed 32-bit product. The loop multiplies
+/// the patterns unsigned; the pre-seed corrects each negative operand.
+/// Literals pin the pid-step factors, the sign matrix, and the
+/// INT16_MIN corners; the stride sweep checks the rest against host
+/// `i32` arithmetic (an independent oracle, like the u8 exhaustive test).
+#[test]
+fn mul_s16_wide_simulates_signed_products() {
+    let ir = "global ina i16\n\
+         global inb i16\n\
+         global out i32\n\
+         fn __mul_s16(i32) (a=i16, b=i16)\n\
+           block entry:\n\
+             %__scr = alloca 6\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = load i16 @ina\n\
+             %y = load i16 @inb\n\
+             %r = call i32 @__mul_s16(i16 %x, i16 %y)\n\
+             store i32 %r @out\n\
+             ret void\n";
+    let map = [
+        ("ina".to_string(), 0x20),
+        ("inb".to_string(), 0x22),
+        ("out".to_string(), 0x24),
+        ("main::x".to_string(), 0x28),
+        ("main::y".to_string(), 0x2A),
+        ("main::r".to_string(), 0x2C),
+        ("__mul_s16::a".to_string(), 0x40),
+        ("__mul_s16::b".to_string(), 0x42),
+        ("__mul_s16::__scr".to_string(), 0x44),
+    ];
+    let run = |a: i16, b: i16| -> [u8; 4] {
+        let seed = [
+            (0x20, a as u16 as u8),
+            (0x21, (a as u16 >> 8) as u8),
+            (0x22, b as u16 as u8),
+            (0x23, (b as u16 >> 8) as u8),
+        ];
+        let got = sim_run_bytes(ir, &map, &seed, 0x24, 4);
+        [got[0], got[1], got[2], got[3]]
+    };
+    let check = |a: i16, b: i16| {
+        let want = (a as i32).wrapping_mul(b as i32).to_le_bytes();
+        assert_eq!(run(a, b), want, "__mul_s16({a}, {b}) must be {want:?}");
+    };
+    // The pid-step factors and the sign matrix around them.
+    for &(a, b) in &[
+        (256, 40),
+        (64, 40),
+        (0, 40),
+        (40, 0),
+        (1, 1),
+        (1, -1),
+        (-1, 1),
+        (-1, -1),
+        (0, 0),
+        (-32768, 1),
+        (1, -32768),
+        (-32768, -1),
+        (-1, -32768),
+        (-32768, -32768),
+        (32767, 32767),
+        (32767, -32768),
+        (-32768, 32767),
+        (32767, -1),
+        (0x5555, 0x2AAA),
+        (-0x5556, 0x2AAA),
+    ] {
+        check(a, b);
+    }
+    // Deterministic stride across all four quadrants plus the extremes.
+    for i in 0..64u16 {
+        let a = (i.wrapping_mul(1009).wrapping_add(7)) as i16;
+        let b = (i.wrapping_mul(631).wrapping_add(0x8000)) as i16;
+        check(a, b);
+        check(b, a);
+    }
+}
