@@ -367,6 +367,11 @@ fn sink_ptr_select_funcs(m: Module) -> Module {
 /// at least two sites module-wide: one lone loop stays expanded, since a
 /// call plus the helper body cost more than the inline loop.
 ///
+/// Loop `loop-reduce` leaves this shape alone for non-constant values
+/// (the menu demo's serial loop arrives exactly so, epic-cc#1054);
+/// constant values can fold it to a pointer walk no demo emits, which
+/// the matcher does not cover.
+///
 /// Fires only when the shape is exact and loop-local: a self-edge plus one
 /// preheader, the value phi fed from that preheader, the count phi from
 /// zero, every intermediate single-use inside the header, the buffer a

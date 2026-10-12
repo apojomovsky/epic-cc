@@ -2503,6 +2503,35 @@ fn shares_decimal_digit_loops_on_pic18_only() {
     }
 }
 
+/// epic-cc#1054: the menu demo's serial loop arrives post-LSR in exactly
+/// the shared shape (indexed `zext` store, `ult`-10 back-edge, the `n == 0`
+/// dead check on the exit), but it is the only u32 site module-wide, so
+/// the pair gate keeps it expanded. Two copies of the same shape share.
+#[test]
+fn lone_menu_serial_loop_stays_expanded_on_pic18() {
+    use legalize::legalize_pic18;
+    let site = |name: &str| {
+        format!(
+            "fn {name}(void) (0=i16)\n  block 1:\n    %2 = zext i16 %0 to i32\n    br 3\n  block 3:\n    %4 = phi i32 %6 3 %2 1\n    %5 = phi i8 %12 3 0 1\n    %6 = udiv i32 %4 10\n    %.neg = mul i32 %6 246\n    %7 = add i32 %.neg %4\n    %8 = trunc i32 %7 to i8\n    %9 = or i8 %8 48\n    %10 = zext i8 %5 to i16\n    %11 = gep @s_fmt_buf +0 +1*%10\n    store i8 %9 %11\n    %12 = add i8 %5 1\n    %13 = icmp ult i32 %4 10\n    br i1 %13 14 3\n  block 14:\n    %15 = icmp eq i8 %12 0\n    br i1 %15 99 16\n  block 16:\n    ret void\n  block 99:\n    ret void\n"
+        )
+    };
+    let header = "global s_fmt_buf i8\n";
+    let lone = format!("{header}{}", site("put_u16"));
+    let out = ir::serialize(&legalize_pic18(parse(&lone)));
+    assert!(
+        out.contains("__udiv_u32") && !out.contains("__udec_u32"),
+        "a lone serial loop stays expanded:\n{out}"
+    );
+    let pair = format!("{header}{}{}", site("put_u16"), site("put_u32"));
+    let text = ir::serialize(&legalize_pic18(parse(&pair)));
+    assert_eq!(
+        text.matches("call i8 @__udec_u32(i32 %2, @s_fmt_buf)")
+            .count(),
+        2,
+        "the same shape shares once paired:\n{text}"
+    );
+}
+
 /// epic-cc#722: the bench-u16-dec counted loop (i16 counter phi, udiv-10 /
 /// mul-246 / truncating add, indexed byte store, count bump, `eq`-on-count
 /// exit after 5 digits) becomes one void `__udec_u16_5` call on the PIC18
