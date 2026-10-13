@@ -12245,8 +12245,8 @@ fn page_tight_module(main_pad: usize, work_pad: usize) -> (ir::Module, HashMap<S
 
 #[test]
 fn page_tight_perturbations_never_oscillate() {
-    for main_pad in [660usize, 670, 680, 690, 700] {
-        for work_pad in [80usize, 120, 160, 200] {
+    for main_pad in [300usize, 420, 660, 670, 680, 690, 700] {
+        for work_pad in [40usize, 80, 120, 160, 200] {
             let (m, map) = page_tight_module(main_pad, work_pad);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 select(&PIC16F877A, &m, &map)
@@ -12262,6 +12262,118 @@ fn page_tight_perturbations_never_oscillate() {
                     assert!(
                         !msg.contains("oscillat"),
                         "main_pad={main_pad} work_pad={work_pad} oscillated: {msg}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// Two single-block functions: main fills most of page 0 and work takes
+// another page. `extra` load/store pairs in main shift its size by 2
+// words each, so the sweep steps main's page-0 end through every
+// residue the 3-word pad increments skip.
+fn page_tail_module(
+    main_pad: usize,
+    work_pad: usize,
+    extra: usize,
+) -> (ir::Module, HashMap<String, u16>) {
+    fn pads(n: usize, v: &str) -> String {
+        let mut s = String::new();
+        for _ in 0..n {
+            s.push_str(&format!("    %{v} = add i8 %{v}, 1\n"));
+        }
+        s
+    }
+    let mut text = String::from(
+        "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @in\n    %d = add i8 %a, 0\n",
+    );
+    text.push_str(&pads(main_pad, "d"));
+    for _ in 0..extra {
+        text.push_str("    %q = load i8 @in\n    store i8 %q @out\n");
+    }
+    text.push_str("    %t = call i8 @work(i8 %d)\n    store i8 %t @out\n    ret void\n");
+    text.push_str("fn work(i8) (x)\n  block entry:\n    %e = add i8 %x, 0\n");
+    text.push_str(&pads(work_pad, "e"));
+    text.push_str("    %r = add i8 %e, 1\n    ret i8 %r\n");
+    let m = parse(&text);
+    let map = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::a", 0x25),
+        ("main::d", 0x26),
+        ("main::t", 0x27),
+        ("work::x", 0x30),
+        ("work::e", 0x31),
+        ("work::r", 0x32),
+        ("main::q", 0x33),
+    ]);
+    (m, map)
+}
+
+// Free words at the end of each used page, in page order.
+fn page_remainders(asm: &str) -> Vec<usize> {
+    let mut org = 0usize;
+    let mut ends = [0usize; 8];
+    for raw in asm.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
+            continue;
+        }
+        if let Some(r) = line.strip_prefix("org ") {
+            org = usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).unwrap();
+            continue;
+        }
+        if line == "end" {
+            break;
+        }
+        if line.ends_with(':') || line.contains(" equ ") || line.starts_with(".table ") {
+            continue;
+        }
+        if let Some(n) = line.strip_prefix(".align ") {
+            let n: usize = n.trim().parse().unwrap();
+            org = (org + n - 1) & !(n - 1);
+            continue;
+        }
+        ends[org / 0x800] = ends[org / 0x800].max(org + 1);
+        org += 1;
+    }
+    ends.iter()
+        .enumerate()
+        .filter(|(_, e)| **e > 0)
+        .map(|(p, e)| (p + 1) * 0x800 - e)
+        .collect()
+}
+
+#[test]
+fn page_tail_sweep_never_ends_inside_placement_slack() {
+    for main_pad in 674usize..=678 {
+        for extra in 0usize..=2 {
+            let (m, map) = page_tail_module(main_pad, 100, extra);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                select(&PIC16F877A, &m, &map)
+            }));
+            match outcome {
+                Ok(asm) => {
+                    verify_page_fit(&m, &asm);
+                    let rems = page_remainders(&asm);
+                    if rems.len() > 1 {
+                        assert!(
+                            rems[0] >= 2,
+                            "main_pad={main_pad} extra={extra} ends page 0 with {} free words, inside the placement slack",
+                            rems[0]
+                        );
+                    }
+                }
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    assert!(
+                        !msg.contains("oscillat"),
+                        "main_pad={main_pad} extra={extra} oscillated: {msg}"
                     );
                 }
             }
