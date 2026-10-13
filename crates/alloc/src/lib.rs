@@ -629,10 +629,13 @@ fn first_fit(
 /// immediately reusable. Greedy first-fit coloring reuses the lowest slot
 /// whose interval is disjoint; the slot's width grows to the widest
 /// occupant.
+/// `precise` bounds memory objects by their use ranges (epic-cc#853); off
+/// keeps every object full-function, the pre-lever layout bit for bit.
 fn frame_layout(
     f: &ir::Func,
     resolved: &PtrResolution,
     retention: &Retention,
+    precise: bool,
     va_size: u16,
     unplaced: &HashSet<String>,
     retval_homed: &HashSet<String>,
@@ -867,7 +870,8 @@ fn frame_layout(
     }
     // Full-function holdouts: byval/sret params plus escaped allocas, and
     // the va region when its address leaves the function. Every other
-    // memory object colors from its bounded range.
+    // memory object colors from its bounded range. With the lever off
+    // every object holds out, the pre-lever layout bit for bit.
     let mut fixed: HashSet<String> = HashSet::new();
     for p in &f.params {
         if p.byval.is_some() || p.sret {
@@ -877,6 +881,9 @@ fn frame_layout(
     fixed.extend(escaped.into_iter());
     if va_pinned {
         fixed.insert("__va".to_string());
+    }
+    if !precise {
+        fixed.extend(defs.iter().filter(|(_, d)| d.4).map(|(k, _)| k.clone()));
     }
 
     // Loop-aware liveness: a value used in a loop body is live across the
@@ -2766,6 +2773,17 @@ fn home_args(
     sel
 }
 
+/// Whether precise intervals can shrink a frame: some alloca or va region
+/// exists. Modules without either skip the lever-off comparison outright.
+fn lever_can_fire(m: &Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.variadic
+            || f.blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|i| matches!(i, ir::Inst::Alloca(_))))
+    })
+}
+
 /// Whole-program overlay address allocation (entry point used by the
 /// driver, the `alloc` binary, and tests). On PIC18 with fitting frames
 /// it pairs two passes (epic-cc#863): a bounding pass with every slot
@@ -2798,8 +2816,18 @@ pub fn allocate_with_pool(
     // the same bank reaches past the ISR end. Other cores keep the RAM
     // rule alone: the region tie flipped a large PIC16 program's layout
     // for flash with no RAM saved. Full ties keep the earlier candidate.
-    let select = |dip: Dip| -> AllocLayout {
-        let (nofold, fit) = allocate_inner(device, m, edges_text, None, pool, dip);
+    let ram = |l: &AllocLayout| l.bank_used.iter().sum::<u16>();
+    let region = |l: &AllocLayout| {
+        if device.core == Core::Pic18 {
+            l.isr_bytes
+        } else {
+            0
+        }
+    };
+    let score = |l: &AllocLayout| (ram(l), region(l));
+    let select_impl = |dip: Dip, precise: bool| -> (AllocLayout, HashMap<String, u16>) {
+        let (nofold, fit, nofold_base) =
+            allocate_inner(device, m, edges_text, None, pool, dip, precise);
         if matches!(device.core, Core::Pic14 | Core::Pic14e) {
             // Globals-first is exact, not monotone: global placement reads
             // only the module's globals, never the frame widths the gated
@@ -2811,13 +2839,15 @@ pub fn allocate_with_pool(
                 .filter(|g| !g.is_const && nofold.globals.contains_key(&g.name))
                 .map(|g| g.name.clone())
                 .collect();
-            return allocate_inner(device, m, edges_text, Some(&safe), pool, dip).0;
+            let (layout, _, base) =
+                allocate_inner(device, m, edges_text, Some(&safe), pool, dip, precise);
+            return (layout, base);
         }
         if device.core != Core::Pic18 || !fit {
-            return nofold;
+            return (nofold, nofold_base);
         }
         let Some((_, hi)) = device.access_bank else {
-            return nofold;
+            return (nofold, nofold_base);
         };
         // Same bank test `isel-pic18` applies to the final map, so its
         // folds agree with these drops on every placed slot.
@@ -2827,15 +2857,29 @@ pub fn allocate_with_pool(
             .filter(|g| !g.is_const && nofold.globals.get(&g.name).is_some_and(|a| *a <= hi))
             .map(|g| g.name.clone())
             .collect();
-        allocate_inner(device, m, edges_text, Some(&safe), pool, dip).0
+        let (layout, _, base) =
+            allocate_inner(device, m, edges_text, Some(&safe), pool, dip, precise);
+        (layout, base)
     };
-    let ram = |l: &AllocLayout| l.bank_used.iter().sum::<u16>();
-    let region = |l: &AllocLayout| {
-        if device.core == Core::Pic18 {
-            l.isr_bytes
-        } else {
-            0
+    // Precise intervals shrink frames, and every shrink re-tiles the
+    // downstream bases the outliner merges on (epic-cc#1145). The lever
+    // stays only where it pays: a strict RAM win keeps the precise map,
+    // a RAM-neutral shrink keeps it only when no base moved, and anything
+    // else keeps the lever-off map, so a layout churn that buys no RAM
+    // can never break outline merges.
+    let select = |dip: Dip| -> AllocLayout {
+        let (plain, plain_base) = select_impl(dip, true);
+        if !lever_can_fire(m) {
+            return plain;
         }
+        let (off, off_base) = select_impl(dip, false);
+        if score(&off) < score(&plain) {
+            return off;
+        }
+        if score(&off) == score(&plain) && off_base != plain_base {
+            return off;
+        }
+        plain
     };
     let mut best = select(Dip::Off);
     // Without an ISR the ISR-scoped layout is the plain one bit for bit;
@@ -2876,7 +2920,10 @@ enum Dip {
 /// do not, the globals-first fallback owns the layout instead. `pool`
 /// gates pooled-const RAM copies on PIC14 (epic-cc#816). `dip` scopes
 /// the per-site live-high dip; `Dip::Off` follows the caller-end rule
-/// everywhere, the pre-dip layout bit for bit.
+/// everywhere, the pre-dip layout bit for bit. `precise` bounds memory
+/// objects by their use ranges (epic-cc#853); off keeps the pre-lever
+/// layout bit for bit. Returns the layout, the fit flag, and the frame
+/// bases (the tie-break in `allocate_with_pool` compares them).
 fn allocate_inner(
     device: &Device,
     m: &Module,
@@ -2884,7 +2931,8 @@ fn allocate_inner(
     gate: Option<&HashSet<String>>,
     pool: bool,
     dip: Dip,
-) -> (AllocLayout, bool) {
+    precise: bool,
+) -> (AllocLayout, bool, HashMap<String, u16>) {
     // The va region size frame_layout reserves: the widest call site, with
     // a one-byte floor so a variadic function whose call sites pass no
     // extra args still has a base address for its va_start (epic-cc#391).
@@ -3070,6 +3118,7 @@ fn allocate_inner(
             f,
             &resolved,
             &retention,
+            precise,
             floored_va_size(f, &va_sizes),
             unplaced_in(&f.name),
             &retval_in(&f.name),
@@ -4529,6 +4578,7 @@ fn allocate_inner(
             f,
             &resolved,
             &retention,
+            precise,
             floored_va_size(f, &va_sizes),
             unplaced_in(&f.name),
             &retval_in(&f.name),
@@ -4700,6 +4750,7 @@ fn allocate_inner(
             isr_hi_save,
         },
         frames_fit,
+        base,
     )
 }
 
