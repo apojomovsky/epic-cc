@@ -6832,6 +6832,21 @@ fn sub32_const_ff_byte_folds_without_park() {
         vec![0x01, 0x00, 0xFF, 0x00],
         "borrow through the 0xFF fold"
     );
+    // 0x0000FF00 - 0x0000FFFF = 0xFFFFFF01: byte 1's 0xFF fold takes a
+    // borrow in (a_0 = 0x00 under the 0xFF) and must pass it to byte 2.
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 %a, 65535\n    store i32 %r @out\n    ret void\n";
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0x00), (0x21, 0xFF), (0x22, 0x00), (0x23, 0x00)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0x01, 0xFF, 0xFF, 0xFF],
+        "borrow-in through the 0xFF fold"
+    );
 }
 
 #[test]
@@ -6892,12 +6907,15 @@ fn icmp_const_ff_byte_simulates() {
         asm.contains("    MOVF 0x32, W\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01"),
         "0xFF compare byte folds in W:\n{asm}"
     );
-    // 16711680 = 0x00FF0000.
+    // 16711680 = 0x00FF0000. 0x0100FF00 puts a 0x00 low byte under the
+    // 0xFF byte, so the fold takes the borrow-in path and must still
+    // pass the borrow out to byte 3.
     for (x, want) in [
         (0x00FE_FFFFu32, 1u8),
         (0x00FF_0000, 0),
         (0x00FF_0001, 0),
         (0x0100_0000, 0),
+        (0x0100_FF00, 0),
         (0x0000_0000, 1),
     ] {
         let seed: Vec<(u16, u8)> = (0..4)

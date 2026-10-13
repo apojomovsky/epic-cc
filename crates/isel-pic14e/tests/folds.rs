@@ -101,6 +101,20 @@ fn sub32_and_sub_const_lhs_folds_simulate() {
         vec![0x01, 0x00, 0xFF, 0x00],
         "sub32 borrow through 0xFF"
     );
+    // 0x0000FF00 - 0x0000FFFF = 0xFFFFFF01: byte 1's 0xFF fold takes a
+    // borrow in (a_0 = 0x00 under the 0xFF) and must pass it to byte 2.
+    let got = sim_run_bytes(
+        ir,
+        &map,
+        &[(0x20, 0x00), (0x21, 0xFF), (0x22, 0x00), (0x23, 0x00)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0x01, 0xFF, 0xFF, 0xFF],
+        "sub32 borrow-in through 0xFF"
+    );
     // 0x0000FF00 - 0x0000FF01 = 0xFFFFFFFF.
     let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 65280, %a\n    store i32 %r @out\n    ret void\n";
     let got = sim_run_bytes(
@@ -146,6 +160,7 @@ fn icmp_const_ff_byte_simulates() {
         (0x00FE_FFFFu32, 1u8),
         (0x00FF_0000, 0),
         (0x0100_0000, 0),
+        (0x0100_FF00, 0),
         (0x0000_0000, 1),
     ] {
         let seed: Vec<(u16, u8)> = (0..4)
