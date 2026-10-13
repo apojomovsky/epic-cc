@@ -1,8 +1,8 @@
-//! Pooled flash string table (epic-cc#815): with `--const-pool` the
+//! Pooled flash string table (epic-cc#815, default per epic-cc#1211):
 //! address-taken const bytes emit as one `__const_pool` table only when
 //! a routed site reads through it (epic-cc#1088). The pool_strings
-//! fixture stages every member, so its flagged build carries no table;
-//! without the flag the output is unchanged.
+//! fixture stages every member, so its pooled build carries no table;
+//! `--no-const-pool` restores the per-const staging output.
 
 use std::process::Command;
 
@@ -36,17 +36,17 @@ fn asm_for(tag: &str, extra: &[&str]) -> String {
 fn pool_without_routed_site_emits_no_table() {
     // epic-cc#1088: every pool_strings member stages (its consumer
     // reads through INDF), so no site reads through the pool. The
-    // flagged listing carries no table, reader, or reference, and
-    // matches the unflagged listing exactly.
+    // pooled listing carries no table, reader, or reference, and
+    // matches the opt-out listing exactly.
     let flagged = asm_for("no-table-flagged", &["--const-pool"]);
     assert!(
         !flagged.lines().any(|l| l.contains("__const_pool")),
         "no pool table, reader, or reference expected:\n{flagged}"
     );
-    let plain = asm_for("no-table-plain", &[]);
+    let plain = asm_for("no-table-plain", &["--no-const-pool"]);
     assert_eq!(
         flagged, plain,
-        "flagged output must equal plain output with no routed site"
+        "pooled output must equal opt-out output with no routed site"
     );
 }
 
@@ -66,12 +66,12 @@ fn drop_table_aligns(lines: Vec<&str>) -> Vec<&str> {
 }
 
 #[test]
-fn pool_is_additive_unflagged_output_unchanged() {
+fn pool_is_additive_over_opt_out_output() {
     // Strip every pool trace (chunk spans, reader entries, name
-    // references) from the flagged listing: the remainder must equal
-    // the unflagged listing byte for byte, modulo table window padding.
+    // references) from the pooled listing: the remainder must equal
+    // the opt-out listing byte for byte, modulo table window padding.
     let flagged = asm_for("additive-flagged", &["--const-pool"]);
-    let plain = asm_for("additive-plain", &[]);
+    let plain = asm_for("additive-plain", &["--no-const-pool"]);
     let mut stripped: Vec<&str> = Vec::new();
     let mut lines = flagged.lines().peekable();
     let mut in_pool_data = false;

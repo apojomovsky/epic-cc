@@ -58,7 +58,11 @@ fn run(tag: &str, extra: &[&str]) -> [u8; 3] {
 fn pooled_member_reads_match_unpooled_build() {
     // 30 + 60 from memcpy(&tbl[2]); 'l' = txt[1 + 2]; strlen("hello-world").
     let expected = [90, 108, 11];
-    assert_eq!(run("base", &[]), expected, "unpooled build");
+    assert_eq!(
+        run("base", &["--no-const-pool"]),
+        expected,
+        "unpooled build"
+    );
     assert_eq!(
         run("pool", &["--const-pool"]),
         expected,
