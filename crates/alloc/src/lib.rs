@@ -2519,11 +2519,11 @@ pub fn allocate_with_pool(
 ) -> AllocLayout {
     // The fold-gate selection below, run without the per-site dip, with
     // the dip inside the ISR contexts only, and with it everywhere:
-    // candidates rank by RAM, then by the disjoint ISR region, a span the
-    // bank-used sum can mask when another frame in the same bank reaches
-    // past the ISR end. A dip that shrinks neither only churns addresses
-    // (outliner sharing, select placement), and full ties keep the
-    // earlier candidate. Fixed bytes are identical either way.
+    // candidates rank by RAM, then, on PIC18 only, by the disjoint ISR
+    // region, a span the bank-used sum can mask when another frame in
+    // the same bank reaches past the ISR end. Other cores keep the RAM
+    // rule alone: the region tie flipped a large PIC16 program's layout
+    // for flash with no RAM saved. Full ties keep the earlier candidate.
     let select = |dip: Dip| -> AllocLayout {
         let (nofold, fit) = allocate_inner(device, m, edges_text, None, pool, dip);
         if matches!(device.core, Core::Pic14 | Core::Pic14e) {
@@ -2556,16 +2556,24 @@ pub fn allocate_with_pool(
         allocate_inner(device, m, edges_text, Some(&safe), pool, dip).0
     };
     let ram = |l: &AllocLayout| l.bank_used.iter().sum::<u16>();
+    let region = |l: &AllocLayout| {
+        if device.core == Core::Pic18 {
+            l.isr_bytes
+        } else {
+            0
+        }
+    };
     let mut best = select(Dip::Off);
-    // Without an ISR the ISR-scoped layout is the plain one bit for bit.
-    let scopes: &[Dip] = if m.funcs.iter().any(|f| f.isr) {
+    // Without an ISR the ISR-scoped layout is the plain one bit for bit;
+    // off PIC18 it is not run at all (see the ranking rule above).
+    let scopes: &[Dip] = if device.core == Core::Pic18 && m.funcs.iter().any(|f| f.isr) {
         &[Dip::Isr, Dip::All]
     } else {
         &[Dip::All]
     };
     for &scope in scopes {
         let cand = select(scope);
-        if (ram(&cand), cand.isr_bytes) < (ram(&best), best.isr_bytes) {
+        if (ram(&cand), region(&cand)) < (ram(&best), region(&best)) {
             best = cand;
         }
     }
