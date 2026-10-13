@@ -62,8 +62,12 @@ against the base measurement: a net win (no total grows, at least one
 shrinks) passes; flash growth up to 8 words or cycle growth up to 1% on a
 single row passes when the PR body names it on a line of its own,
 `delta-ok: <row>`; RAM growth, a larger regression, a net loss, or a
-removed row holds for a human. A new row has nothing to regress against,
-so it is reported and never holds. The committed TOMLs are a local record
+removed row holds for a human. `-O2` is the speed profile, so a cycle-ladder
+`-O2` binary whose cycles shrink at least 1% may also grow flash up to 64
+words per row (named the same way, and not counted against the flash total):
+the speed levers of ADR-045 trade flash for cycles by design. The same
+growth on an `-Os` row, a size-ladder row, or without the cycle win holds.
+A new row has nothing to regress against, so it is reported and never holds. The committed TOMLs are a local record
 for non-CI runs, refreshed by an occasional manual regen pull request: from
 a clean master worktree run `bash scripts/baseline-regen.sh` in the dev
 container and open the diff as a PR; never commit the result from a pull

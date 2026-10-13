@@ -84,6 +84,13 @@ already type.
   `fast_shift` moves whole bytes first in the u16/u32 shift routines:
   both trade flash for cycles, and the measured per-row cost is in
   `cycle_baseline.toml`.
+- The baseline judge (`scripts/baseline_delta.py`) treats that trade as
+  intended (#1096): on a cycle-ladder `-O2` binary whose cycles shrink at
+  least 1%, flash may grow up to 64 words per row past the general 8-word
+  cap, the row must still be named `delta-ok: <row>`, and the growth stays
+  out of the flash total so the cycle win decides the net. `-Os` and
+  size-ladder rows keep the 8-word cap, RAM never grows, and a speed trade
+  over 64 words is a design decision for a human.
 
 ## Rejected alternatives
 
