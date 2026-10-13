@@ -46,10 +46,15 @@ if [ -n "$force_refs" ]; then
     fi
 fi
 
-# --- local CI (only reached when the push is not refused) ------------
-
+# The suite is a gate, not a report: a red `make ci-local` refuses the
+# push (epic-cc#1238). No bypass exists for parked branches with known
+# red tests: AGENTS.md forbids skipping this hook, so a red suite means
+# fixing the tests first, not pushing around them.
 echo "pre-push: make ci-local (docker epic-cc-ci bash scripts/ci-test.sh) — see #99"
-make ci-local
+if ! make ci-local; then
+    echo "pre-push: local CI failed; refusing the push" >&2
+    exit 1
+fi
 
 # ---- prose lint gate (fires even when the ritual was never run) ----
 
