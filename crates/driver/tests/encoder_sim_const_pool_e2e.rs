@@ -112,8 +112,12 @@ fn encoder_sim_constant_irq_calls_have_no_out_of_line_bodies() {
 /// that exact failure without assembling.
 fn asm_text() -> String {
     let (includes, inputs, defines) = sim_case();
+    // Two tests call this concurrently in one process: a shared path let
+    // one test delete the file the other was about to read.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let asm_path =
-        std::env::temp_dir().join(format!("encoder_sim_plain_{}.asm", std::process::id()));
+        std::env::temp_dir().join(format!("encoder_sim_plain_{}_{n}.asm", std::process::id()));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_epic-cc"));
     cmd.args(["--target", "16F877A", "--emit", "asm"]);
     for dir in &includes {
