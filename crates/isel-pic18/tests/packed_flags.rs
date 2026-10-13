@@ -163,3 +163,68 @@ fn materialized_packed_load_masks_to_01() {
         assert_eq!(p.ram()[0x21], expect, "byte {byte:#04x} read wrong");
     }
 }
+
+#[test]
+fn single_use_zext_fold_reads_the_slot_not_the_byte() {
+    // A single-use load into a zext matches the load-zext fold, but a
+    // packed source must still materialize: the zext reads the masked
+    // slot, never the shared byte.
+    let m = parse(
+        "global fa i1 internal\nglobal fb i1 internal\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i1 @fb\n    %2 = zext i1 %1 to i8\n\
+           store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("fa", 0x20),
+        ("fb", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x22),
+        ("main::2", 0x23),
+    ]);
+    let asm = select_packed(&m, &addrs, &[("fa", 0), ("fb", 1)]);
+    let words = asm::assemble_pic18(&asm);
+    for (byte, expect) in [(0x00u8, 0u8), (0x01, 0), (0x02, 1), (0x03, 1)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20] = byte;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x21], expect, "byte {byte:#04x} read wrong");
+    }
+}
+
+#[test]
+fn cross_bank_materialized_load_stays_skip_safe() {
+    // Slot and shared byte in different banks: a bank select must never
+    // land between the bit test and its skipped instruction, or the set
+    // hits the wrong bank and corrupts RAM.
+    let m = parse(
+        "global fa i1 internal\nglobal fb i1 internal\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i1 @fb\n    %2 = zext i1 %1 to i8\n\
+           store i8 %2 @out\n    br i1 %1 t f\n\
+         block t:\n    ret void\n\
+         block f:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("fa", 0x120),
+        ("fb", 0x120),
+        ("out", 0x121),
+        ("main::1", 0x220),
+        ("main::2", 0x221),
+    ]);
+    let asm = select_packed(&m, &addrs, &[("fa", 0), ("fb", 1)]);
+    let words = asm::assemble_pic18(&asm);
+    for (byte, expect) in [(0x00u8, 0u8), (0x01, 0), (0x02, 1), (0x03, 1)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x120] = byte;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x121], expect, "byte {byte:#04x} read wrong");
+        assert_eq!(
+            p.ram()[0x120],
+            byte,
+            "shared byte must survive, byte {byte:#04x}"
+        );
+    }
+}

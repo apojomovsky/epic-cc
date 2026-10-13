@@ -60,6 +60,12 @@ fn find_packed_bytes(device: &Device, m: &Module) -> Vec<PackedByte> {
                 && !g.is_const
                 && g.addr.is_none()
                 && g.refs.is_empty()
+                // Another global's initializer naming this flag
+                // materializes its address at startup, and every indirect
+                // access through that pointer reads the whole shared byte.
+                && !m.globals.iter().any(|o| {
+                    o.refs.iter().any(|(_, t, _)| t == &g.name)
+                })
                 && g.bytes.len() <= 1
                 && g.bytes.iter().all(|&b| b <= 1)
                 && uses_packable(m, &g.name)
@@ -2755,6 +2761,10 @@ fn allocate_inner(
         .iter()
         .flat_map(|p| p.members.iter().map(|(n, _)| n.clone()))
         .collect();
+    let packed_bits: HashMap<String, u8> = packed_bytes
+        .iter()
+        .flat_map(|p| p.members.iter().map(|(n, b)| (n.clone(), *b)))
+        .collect();
     let gate_filtered: Option<HashSet<String>> = gate.map(|s| {
         s.iter()
             .filter(|n| !packed_names.contains(*n))
@@ -2773,7 +2783,7 @@ fn allocate_inner(
     // global on PIC14 and PIC14E); `None` folds nothing, for the bounding
     // pass.
     let fold_core = matches!(device.core, Core::Pic18 | Core::Pic14 | Core::Pic14e);
-    let folds: HashMap<String, ValueFolds> = if fold_core {
+    let mut folds: HashMap<String, ValueFolds> = if fold_core {
         m.funcs
             .iter()
             .map(|f| {
@@ -2786,6 +2796,16 @@ fn allocate_inner(
     } else {
         HashMap::new()
     };
+    // Packed loads keep their slot for the bit materialization, so a
+    // forward naming one as producer must go even though the shared
+    // predicate recorded it.
+    if fold_core {
+        for f in &m.funcs {
+            if let Some(fd) = folds.get_mut(&f.name) {
+                iselcore::drop_packed_forwards(fd, f, &packed_bits);
+            }
+        }
+    }
     // PIC14 and PIC14E drop only what their backends skip: folded loads
     // plus load-forwarded stores. Forwarded `Bin` results keep their slot
     // there, so they stay out of this set even though the shared
@@ -4084,10 +4104,9 @@ fn allocate_inner(
         });
         floating.extend(stage_holder.iter());
     }
-    // One placed byte per packed group. The holder never reaches the
-    // address map: members map onto its byte below, so the report and
-    // the high-water accounting see each shared byte once per member
-    // address, never as a synthetic name.
+    // One placed byte per packed group. Members map onto the holder's
+    // byte below and the holder leaves the address map again, so users
+    // see only real globals at shared addresses.
     let mut pbit_holder: Vec<ir::Global> = Vec::new();
     for pb in &packed_bytes {
         pbit_holder.push(ir::Global {
@@ -4251,19 +4270,22 @@ fn allocate_inner(
     } else {
         device.gpr_start()
     };
-    // Packed members share their group's byte; the bit map rides the
-    // layout for the packed-aware lowerings.
-    let mut packed_bits: HashMap<String, u8> = HashMap::new();
+    // Packed members share their group's byte; the bit map built above
+    // rides the layout for the packed-aware lowerings.
     for pb in &packed_bytes {
         let byte = *floating_map
             .get(&pb.holder)
             .expect("alloc: packed holder unplaced");
-        for (name, bit) in &pb.members {
+        for (name, _) in &pb.members {
             globals.insert(name.clone(), byte);
-            packed_bits.insert(name.clone(), *bit);
         }
     }
     globals.extend(floating_map);
+    // Holders reserve placement only: their names must not reach the map
+    // users and tests parse.
+    for pb in &packed_bytes {
+        globals.remove(&pb.holder);
+    }
     // Value-fold placement check (epic-cc#863, epic-cc#875): every
     // dropped slot's globals must be addressable in the final map, or
     // the backend declines the fold and reads a slot that is not there.

@@ -1065,6 +1065,29 @@ pub fn find_value_folds(
     out
 }
 
+/// Drop `forwarded` entries whose producer is a load from a packed flag
+/// global (epic-cc#1162). The packed load still needs its slot: the
+/// backend materializes the bit there for its consumers, so a forwarded
+/// (slotless) producer would leave the store reading nothing. The fold
+/// shapes that read whole bytes exclude packed sources through the fold
+/// gate; this covers the forward shape, which never consults it. Empty
+/// `packed` is a no-op.
+pub fn drop_packed_forwards(
+    folds: &mut ValueFolds,
+    f: &ir::Func,
+    packed: &std::collections::HashMap<String, u8>,
+) {
+    if packed.is_empty() {
+        return;
+    }
+    folds.forwarded.retain(|r, _| {
+        !f.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            matches!(i, ir::Inst::Load(l) if &l.dst == r
+                && l.ptr.strip_prefix('@').is_some_and(|g| packed.contains_key(g)))
+        })
+    });
+}
+
 /// Whether a const global joins the pooled flash string table
 /// (epic-cc#815): unmapped, non-empty, and fitting one RETLW chunk.
 /// `build_pool` and alloc's copy gating both call this, so membership

@@ -2050,7 +2050,7 @@ impl<'m> Gen<'m> {
                 let Some(known) = g.m.globals.iter().find(|x| x.name == src) else {
                     continue;
                 };
-                if known.is_const {
+                if known.is_const || g.packed_bits.contains_key(src) {
                     continue;
                 }
                 if g.resolved.contains_key(&ssa_key(&f.name, r)) {
@@ -8531,12 +8531,14 @@ impl<'m> Gen<'m> {
         ci: usize,
         c: &ir::Call,
     ) -> Option<(Vec<(String, String)>, Option<(String, u16)>)> {
-        // Access bank only: MOVF/MULWF here take the `A` bit.
+        // Access bank only: MOVF/MULWF here take the `A` bit. Packed
+        // members never fold: the inline sequence reads whole bytes.
         let access = |glob: &str| {
             g.addrs
                 .get(glob)
                 .copied()
                 .filter(|a| *a <= g.access_bank_hi)
+                .filter(|_| !g.packed_bits.contains_key(glob))
         };
         let mut ops: Vec<(String, String, usize)> = Vec::new();
         for arg in &c.args {
@@ -8717,8 +8719,11 @@ impl<'m> Gen<'m> {
             Inst::Load(l) => {
                 // A packed flag materializes its bit as a 0/1 byte. The
                 // fused branch skips these loads at the block loop, so a
-                // load reaching here has another consumer. The slot starts
-                // clear and bit ops preserve W, so the result is exact.
+                // load reaching here has another consumer. The sequence is
+                // skip-safe by construction: the skipped `MOVLW` takes no
+                // bank select, so no `MOVLB` can land between the bit test
+                // and its target even when slot and byte sit in different
+                // banks. W ends holding the bit, so the W cache drops.
                 if let Some(name) = l.ptr.strip_prefix('@') {
                     if let Some((addr, bit)) = self.packed_bit(name) {
                         assert!(
@@ -8726,9 +8731,11 @@ impl<'m> Gen<'m> {
                             "isel-pic18: packed load of @{name} must stay a plain i1 load"
                         );
                         let dst = self.slot_addr(self.cur_func, &l.dst).direct();
-                        self.emit_banked("CLRF", dst, "");
+                        self.emit("    MOVLW 0x00".to_string());
                         self.emit_banked("BTFSC", addr, &format!(", {bit}"));
-                        self.emit_banked("BSF", dst, ", 0");
+                        self.emit("    MOVLW 0x01".to_string());
+                        self.emit_banked("MOVWF", dst, "");
+                        self.w_holds = None;
                         return;
                     }
                 }
@@ -15775,6 +15782,10 @@ pub fn select_with_opts(
                 .map(|x| x.name.clone())
                 .collect();
         g.w_folds = iselcore::find_value_folds(f, g.m, g.resolved, Some(&access_safe));
+        // Packed loads keep their slot for the bit materialization, so a
+        // forward naming one as producer must go: the shared predicate
+        // never consults the fold gate for forwards.
+        iselcore::drop_packed_forwards(&mut g.w_folds, f, g.packed_bits);
         Gen::fold_inline_mul_sites(&mut g, f);
         // In-place literal-add folds for this function (epic-cc#767): same-home
         // `Bin`s and loop increments feeding their own phi backedge. Runs

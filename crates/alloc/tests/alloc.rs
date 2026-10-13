@@ -4243,3 +4243,84 @@ fn packed_flags_stay_bytes_off_pic18() {
     assert!(out.packed_bits.is_empty());
     assert_ne!(out.globals["fa"], out.globals["fb"]);
 }
+
+#[test]
+fn packed_gate_rejects_pointer_initializer_ref() {
+    // A pointer global initialized with a flag's address materializes
+    // that address at startup, and every indirect access through it
+    // reads the whole shared byte. The flag keeps its byte.
+    let mut m = parse(
+        "global fa i1 internal\n\
+         global fb i1 internal\n\
+         global p i8 internal\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i1 1 @fa\n\
+             store i1 0 @fb\n\
+             ret void\n",
+    );
+    m.globals
+        .iter_mut()
+        .find(|g| g.name == "p")
+        .expect("p")
+        .refs
+        .push((0, "fa".to_string(), 0));
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert!(
+        !out.packed_bits.contains_key("fa"),
+        "address-taken flag must not pack"
+    );
+}
+
+#[test]
+fn packed_load_feeding_a_store_keeps_its_slot() {
+    // A single-use packed load into a direct-global store matches the
+    // value-fold forward shape, but the packed load still needs its
+    // slot: the backend materializes the bit there. Dropping it would
+    // leave the store reading nothing.
+    let m = parse(
+        "global fa i1 internal\n\
+         global fb i1 internal\n\
+         global dst i1\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i1 @fa\n\
+             store i1 %1 @dst\n\
+             store i1 1 @fb\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert_eq!(out.packed_bits.get("fa"), Some(&0));
+    assert_eq!(out.packed_bits.get("fb"), Some(&1));
+    assert!(
+        out.locals.contains_key("main::1"),
+        "forwarded packed load keeps its slot: {:?}",
+        out.locals
+    );
+}
+
+#[test]
+fn packed_holders_stay_out_of_the_address_map() {
+    // The synthetic group bytes reserve placement only: no `__pbit`
+    // name may reach the map text users and tests parse.
+    let m = parse(
+        "global fa i1 internal\n\
+         global fb i1 internal\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i1 1 @fa\n\
+             store i1 0 @fb\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert!(
+        !out.globals.keys().any(|k| k.starts_with("__pbit")),
+        "holders must not leak: {:?}",
+        out.globals
+    );
+    let text = map_text(&out);
+    assert!(
+        !text.contains("__pbit"),
+        "map text must not leak holders:\n{text}"
+    );
+}
