@@ -81,6 +81,30 @@ fn encoder_sim_links_under_const_pool() {
     assert!(!words.is_empty(), "the sim build must produce flash words");
 }
 
+#[test]
+fn encoder_sim_constant_irq_calls_have_no_out_of_line_bodies() {
+    // epic-cc#1214: every EPIC_IRQ_Enable/DisableSrc/ClearFlag call site
+    // in this firmware passes a constant irq, so the whole-program fold
+    // inlines each body at its sites and the table lookup collapses.
+    // No runtime-indexed reader of irq_table survives in this firmware
+    // (EPIC_IRQ_GetFlag has no live caller), so the table drops too.
+    let asm = asm_text();
+    for body in [
+        "EPIC_IRQ_Enable:",
+        "EPIC_IRQ_DisableSrc:",
+        "EPIC_IRQ_ClearFlag:",
+    ] {
+        assert!(
+            !asm.lines().any(|l| l.trim() == body),
+            "{body} survived as an out-of-line body, constant irq calls were not folded"
+        );
+    }
+    assert!(
+        !asm.contains("irq_table"),
+        "no folded call site may still chase the irq_table"
+    );
+}
+
 /// Emit the sim slice under default flags (pooled, epic-cc#1211) and walk
 /// the text with the assembler's pass-1 counting (`.org` jumps, `.align`
 /// pads, labels and directives emit none). epic-cc#923 failed here with a
