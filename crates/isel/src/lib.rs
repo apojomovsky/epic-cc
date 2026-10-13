@@ -2136,22 +2136,41 @@ impl<'m> Gen<'m> {
                 }
                 let aa = self.val_addr(a).direct();
                 let use_scratch = signed; // signed file-LHS: SUBWF's file operand must be a ^ 0x80
+                                          // Signed i8 against a const: x - kb and x + (0 - kb)
+                                          // carry identically (both exactly when x >= kb) with
+                                          // matching Z, so the complemented byte folds into an
+                                          // ADDLW and the park drops. kb == 0 keeps the park:
+                                          // ADDLW 0 never carries while x - 0 always does.
+                let add_fold = match b {
+                    Val::Const(k) if signed => {
+                        let kb = ((k & 0xFF) as u8) ^ 0x80;
+                        (kb != 0).then(|| 0u8.wrapping_sub(kb))
+                    }
+                    _ => None,
+                };
                 if use_scratch {
-                    // Pre-store the complemented sign byte; MOVLW/XORWF/MOVWF
-                    // do not touch C, and the low-byte SUBWF below sets it.
+                    // Complemented sign byte: parked for the SUBWF below,
+                    // or left in W for the ADDLW fold. Neither op touches
+                    // C; the closing ADDLW/SUBWF sets it.
                     self.emit("    MOVLW 0x80".to_string());
                     self.emit(format!("    XORWF 0x{:02X}, W", aa + high as u16));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                }
-                self.emit_load_cmp_byte(b, 0, signed, high);
-                self.emit(format!(
-                    "    SUBWF 0x{:02X}, W",
-                    if use_scratch && n == 1 {
-                        self.scratch
-                    } else {
-                        aa
+                    if add_fold.is_none() {
+                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
                     }
-                ));
+                }
+                if let Some(c) = add_fold {
+                    self.emit(format!("    ADDLW 0x{c:02X}"));
+                } else {
+                    self.emit_load_cmp_byte(b, 0, signed, high);
+                    self.emit(format!(
+                        "    SUBWF 0x{:02X}, W",
+                        if use_scratch && n == 1 {
+                            self.scratch
+                        } else {
+                            aa
+                        }
+                    ));
+                }
                 for i in 1..n {
                     self.emit_load_cmp_byte(b, i, signed, high);
                     self.emit("    BTFSS STATUS, 0 ; C".to_string());
