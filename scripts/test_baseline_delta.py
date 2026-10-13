@@ -115,6 +115,84 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(r["verdict"], "pass")
         self.assertEqual([row["key"] for row in r["rows"]], ["add@O2"])
 
+    def test_o2_speed_trade_allows_flash_past_cap_when_named(self):
+        base = [cycle_row("k", 1000, flash=100, profile="O2")]
+        head = [cycle_row("k", 900, flash=116, profile="O2")]
+        r = run(base_cycle=base, head_cycle=head)
+        self.assertEqual(r["verdict"], "hold")
+        r = run(base_cycle=base, head_cycle=head, body="delta-ok: k@O2")
+        self.assertEqual(r["verdict"], "pass")
+        self.assertEqual(r["speed_trades"], ["k@O2"])
+        self.assertEqual(r["totals"]["flash_words"], 0)
+        self.assertIn("speed trade", bd.render_markdown(r))
+
+    def test_o2_speed_trade_needs_one_percent_cycle_win(self):
+        base = [cycle_row("k", 1000, flash=100, profile="O2")]
+        weak = [cycle_row("k", 991, flash=116, profile="O2")]
+        same = [cycle_row("k", 1000, flash=116, profile="O2")]
+        for head in (weak, same):
+            r = run(base_cycle=base, head_cycle=head, body="delta-ok: k@O2")
+            self.assertEqual(r["verdict"], "hold")
+        edge = [cycle_row("k", 990, flash=116, profile="O2")]
+        r = run(base_cycle=base, head_cycle=edge, body="delta-ok: k@O2")
+        self.assertEqual(r["verdict"], "pass")
+
+    def test_o2_speed_trade_is_bounded(self):
+        base = [cycle_row("k", 1000, flash=100, profile="O2")]
+        at = [cycle_row("k", 500, flash=164, profile="O2")]
+        over = [cycle_row("k", 500, flash=165, profile="O2")]
+        body = "delta-ok: k@O2"
+        self.assertEqual(
+            run(base_cycle=base, head_cycle=at, body=body)["verdict"], "pass"
+        )
+        self.assertEqual(
+            run(base_cycle=base, head_cycle=over, body=body)["verdict"], "hold"
+        )
+
+    def test_o2_speed_trade_never_covers_os_size_or_ram(self):
+        body = "delta-ok: k\ndelta-ok: k@O2"
+        os_rows = ([cycle_row("k", 1000)], [cycle_row("k", 500, flash=116)])
+        self.assertEqual(
+            run(base_cycle=os_rows[0], head_cycle=os_rows[1], body=body)["verdict"],
+            "hold",
+        )
+        size = ([size_row("k", 100, profile="O2")], [size_row("k", 116, profile="O2")])
+        self.assertEqual(run(*size, body=body)["verdict"], "hold")
+        base = [cycle_row("k", 1000, ram=10, profile="O2")]
+        head = [cycle_row("k", 500, flash=116, ram=11, profile="O2")]
+        self.assertEqual(
+            run(base_cycle=base, head_cycle=head, body=body)["verdict"], "hold"
+        )
+
+    def test_o2_speed_trade_does_not_excuse_other_regressions(self):
+        base = [
+            cycle_row("k", 1000, flash=100, profile="O2"),
+            cycle_row("j", 500, flash=100),
+        ]
+        head = [
+            cycle_row("k", 900, flash=116, profile="O2"),
+            cycle_row("j", 500, flash=105),
+        ]
+        body = "delta-ok: k@O2\ndelta-ok: j"
+        r = run(base_cycle=base, head_cycle=head, body=body)
+        self.assertEqual(r["verdict"], "hold")
+        self.assertIn("regressions without a net win", " ".join(r["reasons"]))
+
+    def test_o2_speed_trade_covers_both_isr_rows_of_one_binary(self):
+        base = [
+            cycle_row("speed-isr-a-latency@O2", 80, flash=100, profile=None),
+            cycle_row("speed-isr-a-roundtrip@O2", 200, flash=100, profile=None),
+        ]
+        for r in base:
+            r["name"] = r["name"].removesuffix("@O2")
+            r["profile"] = "O2"
+        head = [dict(r) for r in base]
+        head[0].update(cycles=80, flash_words=120)
+        head[1].update(cycles=150, flash_words=120)
+        body = "delta-ok: speed-isr-a-latency@O2\ndelta-ok: speed-isr-a-roundtrip@O2"
+        r = run(base_cycle=base, head_cycle=head, body=body)
+        self.assertEqual(r["verdict"], "pass")
+
     def test_marker_must_be_a_whole_line_for_the_exact_key(self):
         self.assertFalse(bd.names_row("the address table grows", "add"))
         self.assertFalse(bd.names_row("add grows by 2", "add"))
