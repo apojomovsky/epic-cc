@@ -48,8 +48,79 @@ fn var_table_reports_each_piece_where_it_landed() {
             && t.contains("local main::arr 0x2F int[4] ; bytes 2+2\n"),
         "{t}"
     );
-    // Adjacent pieces still read as the one object they used to be.
+    // Adjacent but short of the 8-byte type: bytes 4..8 have no
+    // storage, so no single record may claim the whole array.
     let t = var_table_text(dev, &layout(0x2B, 0x2D), &vars);
+    assert!(
+        t.contains("local main::arr 0x2B int[4] ; bytes 0+2\n")
+            && t.contains("local main::arr 0x2D int[4] ; bytes 2+2\n"),
+        "{t}"
+    );
+    // Pieces tiling a 4-byte pair end to end collapse to one record.
+    let vars = irparse::parse_debug_vars(FULL_PAIR);
+    let t = var_table_text(dev, &layout(0x2B, 0x2D), &vars);
+    assert!(t.contains("local main::pair 0x2B int[2]\n"), "{t}");
+    assert!(!t.contains("bytes"), "{t}");
+}
+
+/// `volatile int pair[2]` fully covered by two adjacent 2-byte pieces.
+const FULL_PAIR: &str = r#"
+define dso_local i16 @main() local_unnamed_addr #1 !dbg !30 {
+  %1 = alloca i16, align 2, !DIAssignID !39
+    #dbg_assign(i1 undef, !34, !DIExpression(DW_OP_LLVM_fragment, 0, 16), !39, ptr %1, !DIExpression(), !40)
+  %2 = alloca i16, align 2, !DIAssignID !41
+    #dbg_assign(i1 undef, !34, !DIExpression(DW_OP_LLVM_fragment, 16, 16), !41, ptr %2, !DIExpression(), !40)
+  ret i16 0
+}
+!30 = distinct !DISubprogram(name: "main", scope: !3, file: !3, line: 15, type: !31, scopeLine: 15, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !2)
+!34 = !DILocalVariable(name: "pair", scope: !30, file: !3, line: 16, type: !35)
+!35 = !DICompositeType(tag: DW_TAG_array_type, baseType: !6, size: 32, elements: !37)
+!37 = !{!38}
+!38 = !DISubrange(count: 2)
+!6 = !DIBasicType(name: "int", size: 16, encoding: DW_ATE_signed)
+"#;
+
+#[test]
+fn var_table_never_claims_gap_bytes() {
+    let vars = irparse::parse_debug_vars(SPLIT_ARR);
+    let dev = device::resolve("p16f877a").expect("p16f877a");
+    // Only the second piece maps: the first record must not appear,
+    // and no record may cover bytes 0..2 at 0x2B.
+    let mut l = AllocLayout::default();
+    l.locals.insert("main::2".to_string(), 0x2F);
+    let t = var_table_text(dev, &l, &vars);
+    assert!(
+        t.contains("local main::arr 0x2F int[4] ; bytes 2+2\n") && !t.contains("0x2B"),
+        "{t}"
+    );
+}
+
+/// A whole `#dbg_declare` on `%9` plus fragments on folded slots: with
+/// no piece mapped, the whole address stands in, as master reported.
+const WHOLE_AND_FRAGMENTS: &str = r#"
+define dso_local i16 @main() local_unnamed_addr #1 !dbg !30 {
+    #dbg_declare(ptr %9, !34, !DIExpression(), !40)
+  %1 = alloca i16, align 2, !DIAssignID !39
+    #dbg_assign(i1 undef, !34, !DIExpression(DW_OP_LLVM_fragment, 0, 16), !39, ptr %1, !DIExpression(), !40)
+  %2 = alloca i16, align 2, !DIAssignID !41
+    #dbg_assign(i1 undef, !34, !DIExpression(DW_OP_LLVM_fragment, 16, 16), !41, ptr %2, !DIExpression(), !40)
+  ret i16 0
+}
+!30 = distinct !DISubprogram(name: "main", scope: !3, file: !3, line: 15, type: !31, scopeLine: 15, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !2)
+!34 = !DILocalVariable(name: "arr", scope: !30, file: !3, line: 16, type: !35)
+!35 = !DICompositeType(tag: DW_TAG_array_type, baseType: !6, size: 64, elements: !37)
+!37 = !{!38}
+!38 = !DISubrange(count: 4)
+!6 = !DIBasicType(name: "int", size: 16, encoding: DW_ATE_signed)
+"#;
+
+#[test]
+fn unmapped_pieces_fall_back_to_the_whole_record() {
+    let vars = irparse::parse_debug_vars(WHOLE_AND_FRAGMENTS);
+    let dev = device::resolve("p16f877a").expect("p16f877a");
+    let mut l = AllocLayout::default();
+    l.locals.insert("main::9".to_string(), 0x2B);
+    let t = var_table_text(dev, &l, &vars);
     assert!(t.contains("local main::arr 0x2B int[4]\n"), "{t}");
     assert!(!t.contains("bytes"), "{t}");
 }

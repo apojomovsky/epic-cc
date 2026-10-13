@@ -39,10 +39,12 @@ pub struct Piece {
 }
 
 /// Join a local's recorded storage against the allocation. A variable
-/// with fragment records is described by its pieces alone: the allocator
+/// with fragment records is described by its pieces: the allocator
 /// colors each piece's alloca separately, so the first piece's address
 /// is not the variable's base. A piece the allocator has no slot for
-/// (folded away) leaves a hole; `None` when nothing is mapped.
+/// (folded away) leaves a hole. When every piece folded away but the
+/// whole record still maps, that address stands in, as origin/master
+/// reported; `None` only when nothing maps.
 pub fn local_loc(layout: &AllocLayout, v: &DiVar) -> Option<VarLoc> {
     let func = v.func.as_ref()?;
     let addr_of = |ssa: &String| layout.locals.get(&format!("{func}::{ssa}")).copied();
@@ -60,7 +62,10 @@ pub fn local_loc(layout: &AllocLayout, v: &DiVar) -> Option<VarLoc> {
             })
         })
         .collect();
-    (!pieces.is_empty()).then_some(VarLoc::Pieces(pieces))
+    if !pieces.is_empty() {
+        return Some(VarLoc::Pieces(pieces));
+    }
+    addr_of(v.ssa.as_ref()?).map(VarLoc::Whole)
 }
 
 /// One mapped variable of the phase-2 join: a plain C name, its RAM

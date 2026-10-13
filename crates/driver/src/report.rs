@@ -125,14 +125,19 @@ pub fn var_table_text(device: &Device, layout: &AllocLayout, vars: &DebugVars) -
                 ));
             }
             Some(VarLoc::Pieces(pieces)) => {
-                // Pieces laid out back to back from offset 0 read as one
-                // object at the first address; anything else is one record
-                // per piece, since no single base reaches every byte.
+                // Pieces collapse to one whole-style record only when they
+                // tile the variable end to end from offset 0 at matching
+                // addresses. A gap or a short tail would otherwise be
+                // claimed as the variable's bytes at unrelated RAM.
                 let base = pieces[0].addr;
-                let contiguous = pieces
-                    .iter()
-                    .all(|p| u32::from(p.addr) == u32::from(base) + p.offset);
-                if contiguous && pieces[0].offset == 0 {
+                let mut end = 0u32;
+                let aligned = pieces.iter().all(|p| {
+                    let ok = p.offset == end && u32::from(p.addr) == u32::from(base) + p.offset;
+                    end = p.offset + p.size;
+                    ok
+                });
+                let full = vars.type_size(v.ty).is_some_and(|size| end == size);
+                if aligned && full {
                     out.push_str(&format!(
                         "local {func}::{name} 0x{base:02X} {ty}\n",
                         name = v.name
