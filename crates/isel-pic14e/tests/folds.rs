@@ -55,21 +55,26 @@ fn add32_const_folds_carry_without_park() {
 }
 
 #[test]
-fn add32_const_ff_byte_keeps_parking_fold() {
-    // epic-cc#1078: a 0xFF const byte plus carry wraps to zero, where
-    // only INCFSZ's skip keeps the true carry-out. The park stays.
+fn add32_const_ff_byte_folds_without_park() {
+    // epic-cc#1192: a 0xFF const byte plus carry is a_i - 1 + carry, so
+    // subtracting the 1 only when carry is clear keeps the true
+    // carry-out (a skipped SUBWF keeps C = 1) with no scratch park.
     let m = parse(
         "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = add i32 %a, 16711681\n    store i32 %r @out\n    ret void\n",
     );
-    // 16711681 = 0x00FF0001: byte 2 is the wrapping fold.
+    // 16711681 = 0x00FF0001: byte 2 is the 0xFF fold.
     let asm = select(
         &PIC16F1937,
         &m,
         &addrs(&[("x", 0x20), ("out", 0x24), ("main::r", 0x38)]),
     );
     assert!(
-        asm.contains("    MOVF 0x22, W\n    MOVWF 0x3A\n    MOVLW 0xFF\n    MOVWF 0x70\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x3A, F"),
-        "0xFF byte keeps the parking fold:\n{asm}"
+        asm.contains("    MOVF 0x22, W\n    MOVWF 0x3A\n    MOVLW 0x01\n    BTFSS STATUS, 0 ; C\n    SUBWF 0x3A, F"),
+        "0xFF byte folds without a park:\n{asm}"
+    );
+    assert!(
+        !asm.contains("INCFSZ 0x70, W"),
+        "no const park remains in this add:\n{asm}"
     );
     assert!(
         asm.contains("    MOVF 0x21, W\n    MOVWF 0x39\n    MOVLW 0x00\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01\n    ADDWF 0x39, F"),
@@ -78,8 +83,81 @@ fn add32_const_ff_byte_keeps_parking_fold() {
 }
 
 #[test]
+fn sub32_and_sub_const_lhs_folds_simulate() {
+    // epic-cc#1189/#1192: const borrow folds (including 0xFF bytes and
+    // the const-LHS complement fold) keep the borrow across bytes.
+    let map = [("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
+    // 0x01000000 - 0x0000FFFF = 0x00FF0001.
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 %a, 65535\n    store i32 %r @out\n    ret void\n";
+    let got = sim_run_bytes(
+        ir,
+        &map,
+        &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x00), (0x23, 0x01)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0x01, 0x00, 0xFF, 0x00],
+        "sub32 borrow through 0xFF"
+    );
+    // 0x0000FF00 - 0x0000FF01 = 0xFFFFFFFF.
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 65280, %a\n    store i32 %r @out\n    ret void\n";
+    let got = sim_run_bytes(
+        ir,
+        &map,
+        &[(0x20, 0x01), (0x21, 0xFF), (0x22, 0x00), (0x23, 0x00)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0xFF, 0xFF, 0xFF, 0xFF],
+        "const-LHS borrow through 0xFF"
+    );
+    // 0x12345678 - 0x00000001 = 0x12345677 (no-borrow complement bytes).
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 305419896, %a\n    store i32 %r @out\n    ret void\n";
+    let got = sim_run_bytes(
+        ir,
+        &map,
+        &[(0x20, 0x01), (0x21, 0x00), (0x22, 0x00), (0x23, 0x00)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0x77, 0x56, 0x34, 0x12],
+        "const-LHS no-borrow bytes"
+    );
+}
+
+#[test]
+fn icmp_const_ff_byte_simulates() {
+    // epic-cc#1192: the compare folds a 0xFF const byte in W as
+    // a_i + 1 - borrow, keeping the borrow-out for the higher bytes.
+    let ir = "global x i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %c = icmp ult i32 %a, 16711680\n    store i8 %c @out\n    ret void\n";
+    let map = [
+        ("x", 0x20),
+        ("out", 0x24),
+        ("main::a", 0x28),
+        ("main::c", 0x30),
+    ];
+    for (x, want) in [
+        (0x00FE_FFFFu32, 1u8),
+        (0x00FF_0000, 0),
+        (0x0100_0000, 0),
+        (0x0000_0000, 1),
+    ] {
+        let seed: Vec<(u16, u8)> = (0..4)
+            .map(|i| (0x20 + i as u16, (x >> (i * 8)) as u8))
+            .collect();
+        let got = sim_run_bytes(ir, &map, &seed, 0x24, 1);
+        assert_eq!(got[0], want, "ult 0x00FF0000 with a = 0x{x:08X}");
+    }
+}
+#[test]
 fn add32_const_folds_simulate_carry_boundaries() {
-    // epic-cc#1078: the ADDLW folds and the kept 0xFF park must carry
+    // epic-cc#1078/#1192: the ADDLW folds and the 0xFF fold must carry
     // exactly across 0x00 and 0xFF const bytes with carry in and out.
     let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = add i32 %a, 65535\n    store i32 %r @out\n    ret void\n";
     let map = [("x", 0x20), ("out", 0x24), ("main::r", 0x38)];

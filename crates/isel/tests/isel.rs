@@ -1801,12 +1801,9 @@ fn sub_const_lhs_emits_sublw_chain() {
     // sub is NOT commutative: d = k - a cannot reuse the reg-const lowering
     // (which computes a - k) and must never read a const as a file register.
     // The const-LHS path lowers byte 0 as `MOVF a,W; SUBLW k; MOVWF d`
-    // (SUBLW computes k - W), then each higher byte preloads k_i into the
-    // destination and folds the borrow with the wrap-correct INCFSZ idiom
-    // (issue #1): a_i is stashed in the scratch, `INCFSZ scratch, W` skips
-    // the in-place `SUBWF d_i, F` when a_i + borrow wraps to 0x100, leaving
-    // d_i = k_i — the correct mod-256 result — with C = borrow-in, the
-    // true borrow-out.
+    // (SUBLW computes k - W), then each higher byte complements a_i in
+    // the destination and adds k_i + 1 - borrow (epic-cc#1189): the sum
+    // is k_i - a_i - borrow mod 256 with the true borrow-out.
     //
     // i8: d = 5 - a. `%a` folds and the sub reads `@x` directly (epic-cc#875).
     let m = parse(
@@ -1834,21 +1831,13 @@ fn sub_const_lhs_emits_sublw_chain() {
     assert!(asm16.contains("MOVF 0x20, W"), "load a_lo:\n{asm16}");
     assert!(asm16.contains("SUBLW 0x34"), "k_lo - a_lo:\n{asm16}");
     assert!(asm16.contains("MOVWF 0x29"), "store d_lo:\n{asm16}");
-    assert!(asm16.contains("MOVF 0x21, W"), "load a_hi:\n{asm16}");
     assert!(
-        asm16.contains("MOVWF 0x70"),
-        "a_hi stashed in the scratch:\n{asm16}"
-    );
-    assert!(asm16.contains("MOVLW 0x12"), "preload k_hi:\n{asm16}");
-    assert!(asm16.contains("MOVWF 0x2A"), "preload d_hi:\n{asm16}");
-    assert!(asm16.contains("BTFSS STATUS, 0"), "borrow test:\n{asm16}");
-    assert!(
-        asm16.contains("INCFSZ 0x70, W"),
-        "wrap-correct borrow fold:\n{asm16}"
+        asm16.contains("    MOVF 0x21, W\n    MOVWF 0x2A\n    COMF 0x2A, F\n    MOVLW 0x12\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01\n    ADDWF 0x2A, F"),
+        "hi byte complement fold without a park:\n{asm16}"
     );
     assert!(
-        asm16.contains("SUBWF 0x2A, F"),
-        "k_hi - a_hi in place:\n{asm16}"
+        !asm16.contains("INCFSZ"),
+        "no scratch fold remains in this sub:\n{asm16}"
     );
     assert!(!asm16.contains("SUBWF 0x20") && !asm16.contains("SUBWF 0x21"), "const-LHS sub must never subtract from the source a (a - k is the wrong direction):\n{asm16}");
 
@@ -1859,42 +1848,23 @@ fn sub_const_lhs_emits_sublw_chain() {
     );
     let addrs32 = addrs(&[("x", 0x20), ("out", 0x24), ("main::r", 0x34)]);
     let asm32 = select(&PIC16F877A, &m, &addrs32);
-    // %a=@x=0x20..0x23, %r=0x34..0x37, scratch=0x70; 0x12345678 -> bytes
-    // 0x78, 0x56, 0x34, 0x12. Each higher byte: a_i -> scratch, k_i
-    // preloaded into d_i, then the wrap-correct INCFSZ fold + in-place
-    // SUBWF d_i, F.
+    // %a=@x=0x20..0x23, %r=0x34..0x37; 0x12345678 -> bytes 0x78, 0x56,
+    // 0x34, 0x12. Each higher byte complements a_i in d_i and adds
+    // k_i + 1 - borrow in place.
     assert!(asm32.contains("MOVF 0x20, W"), "load a_b0:\n{asm32}");
     assert!(asm32.contains("SUBLW 0x78"), "k_b0 - a_b0:\n{asm32}");
     assert!(asm32.contains("MOVWF 0x34"), "store d_b0:\n{asm32}");
-    assert!(asm32.contains("MOVF 0x21, W"), "load a_b1:\n{asm32}");
     assert!(
-        asm32.contains("MOVWF 0x70"),
-        "a_b1 stashed in the scratch:\n{asm32}"
-    );
-    assert!(asm32.contains("MOVLW 0x56"), "preload k_b1:\n{asm32}");
-    assert!(asm32.contains("MOVWF 0x35"), "preload d_b1:\n{asm32}");
-    assert!(asm32.contains("BTFSS STATUS, 0"), "borrow test:\n{asm32}");
-    assert!(
-        asm32.contains("INCFSZ 0x70, W"),
-        "wrap-correct borrow fold:\n{asm32}"
+        asm32.contains("    MOVF 0x21, W\n    MOVWF 0x35\n    COMF 0x35, F\n    MOVLW 0x56\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01\n    ADDWF 0x35, F"),
+        "b1 complement fold:\n{asm32}"
     );
     assert!(
-        asm32.contains("SUBWF 0x35, F"),
-        "k_b1 - a_b1 in place:\n{asm32}"
+        asm32.contains("    MOVF 0x23, W\n    MOVWF 0x37\n    COMF 0x37, F\n    MOVLW 0x12\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01\n    ADDWF 0x37, F"),
+        "b3 complement fold:\n{asm32}"
     );
-    assert!(asm32.contains("MOVF 0x22, W"), "load a_b2:\n{asm32}");
-    assert!(asm32.contains("MOVLW 0x34"), "preload k_b2:\n{asm32}");
-    assert!(asm32.contains("MOVWF 0x36"), "preload d_b2:\n{asm32}");
     assert!(
-        asm32.contains("SUBWF 0x36, F"),
-        "k_b2 - a_b2 in place:\n{asm32}"
-    );
-    assert!(asm32.contains("MOVF 0x23, W"), "load a_b3:\n{asm32}");
-    assert!(asm32.contains("MOVLW 0x12"), "preload k_b3:\n{asm32}");
-    assert!(asm32.contains("MOVWF 0x37"), "preload d_b3:\n{asm32}");
-    assert!(
-        asm32.contains("SUBWF 0x37, F"),
-        "k_b3 - a_b3 in place:\n{asm32}"
+        !asm32.contains("INCFSZ") && !asm32.contains("MOVWF 0x70"),
+        "no scratch park remains in this sub:\n{asm32}"
     );
     assert!(
         !asm32.contains("SUBWF 0x20")
@@ -2964,11 +2934,9 @@ fn icmp_uge_i16_wrap_case_simulates() {
 
 #[test]
 fn sub_const_lhs_wrap_simulates() {
-    // The const-LHS sub chain (d = k - a) shares the naive ADDLW 1 fold
-    // with the cmp chains; at 4 bytes the corrupted intermediate borrow
-    // propagates into wrong values. 0 - 0x0000FF01 = 0xFFFF00FF: byte 1's
-    // fold wraps at a_1 = 0xFF + borrow-in, and a naive chain then
-    // mis-subtracts bytes 2-3 (giving 0xFF000000).
+    // The const-LHS sub chain (d = k - a) must keep the intermediate
+    // borrow exact: 0 - 0x0000FF01 = 0xFFFF00FF, where byte 1 folds
+    // a_1 = 0xFF with a borrow in and bytes 2-3 must still borrow.
     let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 0, %a\n    store i32 %r @out\n    ret void\n";
     let map = [
         ("x", 0x20u16),
@@ -6692,18 +6660,23 @@ fn add32_reg_const_emits_four_byte_carry_chain() {
 }
 
 #[test]
-fn add32_const_ff_byte_keeps_parking_fold() {
-    // epic-cc#1078: a 0xFF const byte plus carry wraps to zero, where
-    // only INCFSZ's skip keeps the true carry-out. The park stays.
+fn add32_const_ff_byte_folds_without_park() {
+    // epic-cc#1192: a 0xFF const byte plus carry is a_i - 1 + carry, so
+    // subtracting the 1 only when carry is clear keeps the true
+    // carry-out (a skipped SUBWF keeps C = 1) with no scratch park.
     let m = parse(
         "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = add i32 %a, 16711681\n    store i32 %r @out\n    ret void\n",
     );
-    // 16711681 = 0x00FF0001: byte 2 is the wrapping fold.
+    // 16711681 = 0x00FF0001: byte 2 is the 0xFF fold.
     let map = vec![("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
     let asm = select(&PIC16F877A, &m, &addrs(&map));
     assert!(
-        asm.contains("    MOVF 0x22, W\n    MOVWF 0x3A\n    MOVLW 0xFF\n    MOVWF 0x70\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x3A, F"),
-        "0xFF byte keeps the parking fold:\n{asm}"
+        asm.contains("    MOVF 0x22, W\n    MOVWF 0x3A\n    MOVLW 0x01\n    BTFSS STATUS, 0 ; C\n    SUBWF 0x3A, F"),
+        "0xFF byte folds without a park:\n{asm}"
+    );
+    assert!(
+        !asm.contains("INCFSZ 0x70, W"),
+        "no const park remains in this add:\n{asm}"
     );
     assert!(
         asm.contains("    MOVF 0x21, W\n    MOVWF 0x39\n    MOVLW 0x00\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01\n    ADDWF 0x39, F"),
@@ -6713,7 +6686,7 @@ fn add32_const_ff_byte_keeps_parking_fold() {
 
 #[test]
 fn add32_const_folds_simulate_carry_boundaries() {
-    // epic-cc#1078: the ADDLW folds and the kept 0xFF park must carry
+    // epic-cc#1078/#1192: the ADDLW folds and the 0xFF fold must carry
     // exactly across 0x00 and 0xFF const bytes with carry in and out.
     let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = add i32 %a, 65535\n    store i32 %r @out\n    ret void\n";
     let map = vec![("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
@@ -6816,9 +6789,123 @@ fn sub32_reg_const_emits_four_byte_borrow_chain() {
         "byte 0 const sub:\n{asm}"
     );
     assert!(
-        asm.contains("    MOVF 0x21, W\n    MOVWF 0x39\n    MOVLW 0x02\n    MOVWF 0x70\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x70, W\n    SUBWF 0x39, F"),
-        "byte 1 const borrow chain:\n{asm}"
+        asm.contains("    MOVF 0x21, W\n    MOVWF 0x39\n    MOVLW 0x02\n    BTFSS STATUS, 0 ; C\n    ADDLW 0x01\n    SUBWF 0x39, F"),
+        "byte 1 const borrow folds without a park:\n{asm}"
     );
+    assert!(
+        !asm.contains("INCFSZ 0x70, W"),
+        "no const park remains in this sub:\n{asm}"
+    );
+}
+
+#[test]
+fn sub32_const_ff_byte_folds_without_park() {
+    // epic-cc#1192: a_i - 0xFF - borrow is a_i + 1 - borrow, so adding
+    // the 1 only when there is no borrow keeps the true borrow-out.
+    let m = parse(
+        "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 %a, 16711681\n    store i32 %r @out\n    ret void\n",
+    );
+    // 16711681 = 0x00FF0001: byte 2 is the 0xFF fold.
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert!(
+        asm.contains("    MOVF 0x22, W\n    MOVWF 0x3A\n    MOVLW 0x01\n    BTFSC STATUS, 0 ; C\n    ADDWF 0x3A, F"),
+        "0xFF byte folds without a park:\n{asm}"
+    );
+    assert!(
+        !asm.contains("INCFSZ 0x70, W"),
+        "no const park remains in this sub:\n{asm}"
+    );
+    // 0x01000000 - 0x0000FFFF = 0x00FF0001: the 0xFF byte at byte 1
+    // takes a borrow in and passes a borrow out to byte 2.
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 %a, 65535\n    store i32 %r @out\n    ret void\n";
+    let map = [("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x00), (0x23, 0x01)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0x01, 0x00, 0xFF, 0x00],
+        "borrow through the 0xFF fold"
+    );
+}
+
+#[test]
+fn sub_const_lhs_ff_byte_simulates() {
+    // epic-cc#1189/#1192: a 0xFF minuend byte subtracts the borrow
+    // from the complement of a_i instead of adding a wrapped literal.
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 65280, %a\n    store i32 %r @out\n    ret void\n";
+    let map = [("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
+    let m = parse(ir);
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert!(
+        asm.contains("COMF 0x39, F\n    MOVLW 0x01\n    BTFSS STATUS, 0 ; C\n    SUBWF 0x39, F"),
+        "0xFF byte uses the complement fold:\n{asm}"
+    );
+    // 0x0000FF00 - 0x0000FF01 = 0xFFFFFFFF: byte 1 is 0xFF against
+    // a_i = 0xFF with a borrow in, and byte 2 borrows again.
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0x01), (0x21, 0xFF), (0x22, 0x00), (0x23, 0x00)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0xFF, 0xFF, 0xFF, 0xFF],
+        "borrow through the 0xFF byte"
+    );
+    // 0x0000FF00 - 0x00000100 = 0x0000FE00: the 0xFF byte takes no borrow.
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0x00), (0x21, 0x01), (0x22, 0x00), (0x23, 0x00)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0x00, 0xFE, 0x00, 0x00],
+        "no borrow into the 0xFF byte"
+    );
+}
+
+#[test]
+fn icmp_const_ff_byte_simulates() {
+    // epic-cc#1192: the compare folds a 0xFF const byte in W as
+    // a_i + 1 - borrow, keeping the borrow-out for the higher bytes.
+    let ir = "global x i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %c = icmp ult i32 %a, 16711680\n    store i8 %c @out\n    ret void\n";
+    let map = [
+        ("x", 0x20),
+        ("out", 0x24),
+        ("main::a", 0x30),
+        ("main::c", 0x38),
+    ];
+    let m = parse(ir);
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert!(
+        asm.contains("    MOVF 0x32, W\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01"),
+        "0xFF compare byte folds in W:\n{asm}"
+    );
+    // 16711680 = 0x00FF0000.
+    for (x, want) in [
+        (0x00FE_FFFFu32, 1u8),
+        (0x00FF_0000, 0),
+        (0x00FF_0001, 0),
+        (0x0100_0000, 0),
+        (0x0000_0000, 1),
+    ] {
+        let seed: Vec<(u16, u8)> = (0..4)
+            .map(|i| (0x20 + i as u16, (x >> (i * 8)) as u8))
+            .collect();
+        let got = sim_run_bytes(ir, &str_map(&map), &seed, 0x24, 1);
+        assert_eq!(got[0], want, "ult 0x00FF0000 with a = 0x{x:08X}");
+    }
 }
 
 #[test]
@@ -7298,13 +7385,11 @@ fn sub32_simulates_with_borrow_chain() {
 }
 
 #[test]
-fn sub_const_lhs_no_borrow_fold_reloads_the_subtrahend() {
-    // const-LHS `d = k - a`: each higher byte preloads k_i into dst and
-    // folds the borrow with INCFSZ's skip. On the no-borrow path the skip
-    // means SUBWF must find the subtrahend in W, reloaded from scratch
-    // after the MOVLW/MOVWF pair (the pair leaves W holding k_i); without
-    // it SUBWF computes k_i - k_i = 0, zeroing every no-borrow byte (fuzz
-    // corpus seed 128). Bytes 1-3 below all fold no-borrow.
+fn sub_const_lhs_complement_fold_simulates_no_borrow_bytes() {
+    // const-LHS `d = k - a`: each higher byte complements a_i in the
+    // destination and adds k_i + 1 - borrow. On the no-borrow path the
+    // added literal is k_i + 1, so bytes 1-3 must not zero (fuzz corpus
+    // seed 128). Bytes 1-3 below all fold no-borrow.
     let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 305419896, %a\n    store i32 %r @out\n    ret void\n";
     let map = [
         ("x", 0x20),
