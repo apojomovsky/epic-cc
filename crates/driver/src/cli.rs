@@ -69,9 +69,8 @@ pub struct Cli {
     /// PIC18 code factoring (docs/44); `--no-outline` turns it off.
     pub outline: bool,
     /// PIC14 pooled flash string table (epic-cc#815, addresses and
-    /// gating per epic-cc#816); `--const-pool` turns it on. Off by
-    /// default: the pool is additive, so unflagged output stays
-    /// bit-identical.
+    /// gating per epic-cc#816, default per epic-cc#1211): on by
+    /// default, `--no-const-pool` restores per-const staging.
     pub const_pool: bool,
 }
 
@@ -98,11 +97,12 @@ usage: epic-cc [options] <input.c|input.cpp>...
   --no-outline         PIC18: keep repeated code inline instead of sharing it
                        (smaller flash by default; opt out for timing-critical
                        code or stepping through inline copies)
-  --const-pool         PIC14: also emit address-taken const bytes as one
-                       pooled flash table alongside the per-const tables,
-                       rewrite their addresses to it, and drop their RAM
-                       copies (epic-cc#815, epic-cc#816); the table emits
-                       only when some site reads through it (epic-cc#1088)
+  --const-pool         PIC14: emit address-taken const bytes as one pooled
+                       flash table, rewrite their addresses to it, and drop
+                       their RAM copies (epic-cc#815, epic-cc#816); on by
+                       default, the table emits only when some site reads
+                       through it (epic-cc#1088)
+  --no-const-pool      PIC14: restore per-const RAM staging, no pool table
   --report <file>      write the build report as JSON into <file>: flash and
                        RAM use, the clock, and every config field's value
   --f-cpu <hz>         board clock in Hz, the last-resort D-4 source: it must
@@ -141,7 +141,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut f_cpu: Option<u64> = None;
     let mut outline = true;
     let mut opt_level = OptLevel::default();
-    let mut const_pool = false;
+    let mut const_pool = true;
     let mut i = 0;
     while i < argv.len() {
         let a = argv[i].as_str();
@@ -239,6 +239,8 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
             outline = false;
         } else if a == "--const-pool" {
             const_pool = true;
+        } else if a == "--no-const-pool" {
+            const_pool = false;
         } else if a == "--sidecar" {
             i += 1;
             sidecar = Some(

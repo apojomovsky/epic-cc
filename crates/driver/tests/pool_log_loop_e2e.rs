@@ -134,6 +134,6 @@ fn pool_log_loop_links_without_copies_and_matches_ram_output() {
 
 #[test]
 fn pool_log_loop_ram_backed_baseline_matches() {
-    let (hex, map, _) = build("unflagged", &[]);
+    let (hex, map, _) = build("optout", &["--no-const-pool"]);
     assert_eq!(transcript(&hex, &map), expected());
 }

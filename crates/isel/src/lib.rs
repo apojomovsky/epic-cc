@@ -12976,10 +12976,10 @@ pub struct PoolChunk {
 }
 
 /// Pooled flash string table: address-taken const bytes under one base,
-/// emitted alongside the per-const tables. Empty unless the driver was
-/// asked (`--const-pool`), so unflagged output is bit-identical. `loc`
-/// maps every member (duplicates alias the first occurrence) to its
-/// chunk label plus byte offset, for the epic-cc#816 rewrite.
+/// emitted alongside the per-const tables. Empty when the driver opts
+/// out (`--no-const-pool`, epic-cc#1211). `loc` maps every member
+/// (duplicates alias the first occurrence) to its chunk label plus
+/// byte offset, for the epic-cc#816 rewrite.
 pub struct ConstPool {
     pub chunks: Vec<PoolChunk>,
     loc: HashMap<String, (String, u16)>,

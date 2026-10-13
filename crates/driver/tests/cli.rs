@@ -14,6 +14,16 @@ fn parses_a_minimal_invocation() {
 }
 
 #[test]
+fn const_pool_defaults_on_with_opt_out() {
+    let c = parse_args(&args(&["a.c", "--device", "p16f877a"])).unwrap();
+    assert!(c.const_pool);
+    let c = parse_args(&args(&["a.c", "--device", "p16f877a", "--no-const-pool"])).unwrap();
+    assert!(!c.const_pool);
+    let c = parse_args(&args(&["a.c", "--device", "p16f877a", "--const-pool"])).unwrap();
+    assert!(c.const_pool);
+}
+
+#[test]
 fn parses_an_f_cpu_board_clock() {
     let c = parse_args(&args(&[
         "a.c", "--device", "p16f877a", "--f-cpu", "4000000",
