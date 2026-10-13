@@ -2995,9 +2995,11 @@ fn allocate_inner(
                     .max()
                     .unwrap_or(region_start);
                 // Re-derive each priority's context from its disjoint base in topo
-                // order (callers precede callees, and every caller of a context
-                // function is itself in that context after the legalize
-                // duplication).
+                // order. Every context function has at least one context caller
+                // (its predecessor on a path from a root, itself already
+                // re-derived), so `old` never falls back to a main frame end;
+                // a main caller can also reach a copy through a shared callback
+                // dispatch, and `old`'s max covers that case too.
                 let assign_region =
                     |base: &mut HashMap<String, u16>, roots: &[&&String], region_base: u16| {
                         let ctx: HashSet<String> = roots
