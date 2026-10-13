@@ -24,18 +24,20 @@ fn map_addr(map: &str, name: &str) -> usize {
 
 #[test]
 fn arity_filtered_indirect_call_dispatches_both_sites() {
-    let hex_path = "tests/fixtures/indirect_call_arity.hex";
-    let map_path = "tests/fixtures/indirect_call_arity.map";
+    // Outputs live in a per-test temp dir, never in tests/fixtures:
+    // fixed shared paths turn a killed run's leftovers or a second
+    // process into cross-test interference (epic-cc#1227).
+    let dir = std::env::temp_dir().join(format!("indirect_call_arity_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let hex_path = dir.join("indirect_call_arity.hex");
+    let map_path = dir.join("indirect_call_arity.map");
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args([
-            "tests/fixtures/indirect_call_arity.c",
-            "-o",
-            hex_path,
-            "--map",
-            map_path,
-            "--device",
-            "p16f877a",
-        ])
+        .arg("tests/fixtures/indirect_call_arity.c")
+        .arg("-o")
+        .arg(&hex_path)
+        .arg("--map")
+        .arg(&map_path)
+        .args(["--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(
@@ -43,9 +45,9 @@ fn arity_filtered_indirect_call_dispatches_both_sites() {
         "driver: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let hex = std::fs::read_to_string(hex_path).unwrap();
-    let map = std::fs::read_to_string(map_path).expect("read map");
-    let _ = std::fs::remove_file(map_path);
+    let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let map = std::fs::read_to_string(&map_path).expect("read map");
+    let _ = std::fs::remove_dir_all(&dir);
     let out_addr = map_addr(&map, "out1");
     let out2_addr = map_addr(&map, "out2");
     let cb1_addr = map_addr(&map, "g_cb1");
@@ -76,5 +78,5 @@ fn arity_filtered_indirect_call_dispatches_both_sites() {
     assert!(p.halted(), "machine must halt after the ISR returns");
     assert_eq!(p.ram()[out_addr], 0x55, "1-arg site dispatched on_b");
     assert_eq!(p.ram()[out2_addr], 1, "0-arg site dispatched on_a");
-    let _ = std::fs::remove_file(hex_path);
+    let _ = std::fs::remove_dir_all(&dir);
 }

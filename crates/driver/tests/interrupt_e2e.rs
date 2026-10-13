@@ -54,19 +54,21 @@ fn map_addr(map: &str, name: &str) -> usize {
 
 #[test]
 fn interrupt_runs_correctly_with_mid_run_fire() {
-    let hex_path = "tests/fixtures/interrupt.hex";
-    let map_path = "tests/fixtures/interrupt.map";
+    // Outputs live in a per-test temp dir, never in tests/fixtures:
+    // fixed shared paths turn a killed run's leftovers or a second
+    // process into cross-test interference (epic-cc#1227).
+    let dir = std::env::temp_dir().join(format!("interrupt_e2e_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let hex_path = dir.join("interrupt.hex");
+    let map_path = dir.join("interrupt.map");
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args([
-            "tests/fixtures/interrupt.c",
-            "-o",
-            hex_path,
-            "--map",
-            map_path,
-            "--device",
-            "p16f877a",
-        ])
+        .arg("tests/fixtures/interrupt.c")
+        .arg("-o")
+        .arg(&hex_path)
+        .arg("--map")
+        .arg(&map_path)
+        .args(["--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(
@@ -75,9 +77,9 @@ fn interrupt_runs_correctly_with_mid_run_fire() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let hex = std::fs::read_to_string(hex_path).unwrap();
-    let map = std::fs::read_to_string(map_path).expect("read map");
-    let _ = std::fs::remove_file(map_path);
+    let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let map = std::fs::read_to_string(&map_path).expect("read map");
+    let _ = std::fs::remove_dir_all(&dir);
     let in_addr = map_addr(&map, "in");
     let out_addr = map_addr(&map, "out");
     let prog = pic14_sim::parse_hex(&hex);

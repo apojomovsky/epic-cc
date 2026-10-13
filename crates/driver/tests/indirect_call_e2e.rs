@@ -33,23 +33,29 @@ fn expected(sel: u8) -> u8 {
 }
 
 fn run_one(device_name: &str, device: &device::Device, sel: u8) {
-    let hex_path = format!("tests/fixtures/indirect_call_{device_name}.hex");
-    let map_path = format!("tests/fixtures/indirect_call_{device_name}.map");
+    // Outputs live in a per-case temp dir, never in tests/fixtures:
+    // fixed shared paths turn a killed run's leftovers or a second
+    // process into cross-test interference (epic-cc#1227).
+    let dir = std::env::temp_dir().join(format!(
+        "indirect_call_{device_name}_{sel}_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let hex_path = dir.join(format!("indirect_call_{device_name}.hex"));
+    let map_path = dir.join(format!("indirect_call_{device_name}.map"));
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args([
-            "tests/fixtures/indirect_call.c",
-            "-o",
-            &hex_path,
-            "--map",
-            &map_path,
-            "--device",
-            device_name,
-            // `sel`'s input rides in as a real initializer (`volatile
-            // unsigned char sel = SEL`): __start clears zero-initialized
-            // globals before main (epic-cc#561), which would erase a
-            // sim-side seed.
-            "-D",
-        ])
+        .arg("tests/fixtures/indirect_call.c")
+        .arg("-o")
+        .arg(&hex_path)
+        .arg("--map")
+        .arg(&map_path)
+        .arg("--device")
+        .arg(device_name)
+        // `sel`'s input rides in as a real initializer (`volatile
+        // unsigned char sel = SEL`): __start clears zero-initialized
+        // globals before main (epic-cc#561), which would erase a
+        // sim-side seed.
+        .arg("-D")
         .arg(format!("SEL={sel}"))
         .output()
         .expect("run driver");
@@ -60,7 +66,7 @@ fn run_one(device_name: &str, device: &device::Device, sel: u8) {
     );
     let hex = std::fs::read_to_string(&hex_path).unwrap();
     let map = std::fs::read_to_string(&map_path).expect("read map");
-    let _ = std::fs::remove_file(&map_path);
+    let _ = std::fs::remove_dir_all(&dir);
     let sel_addr = map_addr(&map, "sel");
     let out_addr = map_addr(&map, "out");
 
