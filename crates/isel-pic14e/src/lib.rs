@@ -21,8 +21,8 @@
 //!
 //! A constant offset accesses the plain file register. Dynamic terms
 //! set FSR to `base + k` plus scaled registers. One scale-1 term keeps
-//! the fast single-register offset shape. General sums accumulate in
-//! the fixed scratch byte. An indirect base reads its target from the
+//! the fast single-register offset shape. General sums accumulate in W
+//! as an `ADDWF %r,W` chain. An indirect base reads its target from the
 //! slot contents.
 //!
 //! Pointers into const flash load via `CALL __read_<name>` from a RETLW
@@ -895,7 +895,7 @@ impl<'m> Gen<'m> {
     /// Sets FSR0 to `base + k + offset + scaled terms` for a spanned object.
     /// Loads the physical or linear base (docs/33 §D-2) into FSR0L and H,
     /// then adds the offset with carry. One scale-1 term keeps the fast
-    /// register shape. General sums accumulate in scratch first. The offset
+    /// register shape. General sums accumulate in W first. The offset
     /// stays in one byte, so one carry suffices.
     fn emit_fsr_to(
         &mut self,
@@ -934,7 +934,6 @@ impl<'m> Gen<'m> {
             }
             _ => {
                 self.emit_accum_terms(terms);
-                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 if kk != 0 {
                     self.emit(format!("    ADDLW 0x{kk:02X}"));
                 }
@@ -979,7 +978,6 @@ impl<'m> Gen<'m> {
             }
             _ => {
                 self.emit_accum_terms(terms);
-                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 if kk != 0 {
                     self.emit(format!("    ADDLW 0x{kk:02X}"));
                 }
@@ -991,24 +989,34 @@ impl<'m> Gen<'m> {
         self.emit("    INCF FSR0H, F".to_string());
     }
 
-    /// Accumulates scaled terms into scratch. Reloads W per repetition:
-    /// ADDWF consumes W, so reuse without reload folds the wrong sum and
-    /// mis-addresses.
+    /// `W = Σ scale×%reg` (mod 256): the first repetition loads
+    /// `MOVF %r,W`, every later one is `ADDWF %r,W`, so the sum never
+    /// leaves W and the scratch byte stays untouched. `ADDWF f,W` is
+    /// W = f + W, which is the accumulate: no reload of W is needed, the
+    /// register is the operand. An empty sum is `MOVLW 0`.
+    ///
+    /// Flags: each `ADDWF` rewrites C, DC and Z from its two operands, and
+    /// the sum commutes, so after two or more adds the flags equal the old
+    /// `scratch` chain's last `ADDWF`. A one-add sum ends on a `MOVF`
+    /// (Z only), and every caller follows the chain with an `ADDLW` or an
+    /// `ADDWF` that rewrites all three before any reader.
     fn emit_accum_terms(&mut self, terms: &[(u16, String)]) {
-        self.emit("    MOVLW 0x00".to_string());
-        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+        let mut first = true;
         for (scale, r) in terms {
             let a = self.val_addr(&Val::Reg(r.clone())).direct();
             for _ in 0..*scale {
-                self.emit(format!("    MOVF 0x{a:02X}, W"));
-                self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch));
-                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                let op = if first { "MOVF" } else { "ADDWF" };
+                self.emit(format!("    {op} 0x{a:02X}, W"));
+                first = false;
             }
+        }
+        if first {
+            self.emit("    MOVLW 0x00".to_string());
         }
     }
 
     /// Computes the const-table byte index into W. One scale-1 term keeps
-    /// the fast register shape. General sums accumulate in scratch.
+    /// the fast register shape. General sums accumulate in W.
     fn emit_ptr_index_w(&mut self, k: u16, terms: &[(u16, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
@@ -1026,7 +1034,6 @@ impl<'m> Gen<'m> {
             }
             _ => {
                 self.emit_accum_terms(terms);
-                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 self.emit(format!("    ADDLW 0x{kk:02X}"));
             }
         }
