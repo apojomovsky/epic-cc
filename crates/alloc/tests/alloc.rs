@@ -4414,6 +4414,217 @@ fn phi_reseeded_alloca_keeps_full_interval() {
     assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
 }
 
+/// A callee that stores its pointer param keeps reading the bytes after the
+/// call returns: the alloca must keep its full-function interval, or a
+/// value defined after the call reuses the slot a later load through the
+/// stored pointer reads.
+#[test]
+fn storing_callee_keeps_alloca_full_interval() {
+    let m = parse(
+        "global tab i8\n\
+         global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             call void @keep(%g)\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             ret void\n\
+         fn keep(void) (p=ptr)\n\
+           block entry:\n\
+             store ptr %p @tab\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge f keep\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// A callee that returns its pointer param hands the address back to the
+/// caller, which dereferences it after later values were defined.
+#[test]
+fn returning_callee_keeps_alloca_full_interval() {
+    let m = parse(
+        "global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             %r = call ptr @id(%g)\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             store i8 5 %r\n\
+             ret void\n\
+         fn id(ptr) (p=ptr)\n\
+           block entry:\n\
+             ret ptr %p\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge f id\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// Retention is transitive: a callee that only forwards the pointer to a
+/// retaining callee retains it too, and so does one that stores a pointer
+/// derived from it.
+#[test]
+fn forwarding_and_derived_pointers_propagate_retention() {
+    let m = parse(
+        "global tab i8\n\
+         global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 4\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             call void @fwd(%g)\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             %buf2 = alloca 4\n\
+             %h = gep %buf2 +0\n\
+             store i8 1 %h\n\
+             call void @fwd_derived(%h)\n\
+             %y = add i8 5, 6\n\
+             store i8 %y @out\n\
+             ret void\n\
+         fn fwd(void) (p=ptr)\n\
+           block entry:\n\
+             call void @keep(%p)\n\
+             ret void\n\
+         fn fwd_derived(void) (p=ptr)\n\
+           block entry:\n\
+             %q = gep %p +2\n\
+             call void @keep(%q)\n\
+             ret void\n\
+         fn keep(void) (p=ptr)\n\
+           block entry:\n\
+             store ptr %p @tab\n\
+             ret void\n",
+    );
+    let out = allocate(
+        &PIC16F877A,
+        &m,
+        "edge f fwd\nedge f fwd_derived\nedge fwd keep\nedge fwd_derived keep\n",
+    );
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+    assert_ne!(out.locals["f::buf2"], out.locals["f::y"]);
+}
+
+/// An indirect call has no visible callee, and a variadic tail lands in the
+/// callee's `va_arg` reads: both retain when any candidate or read does.
+#[test]
+fn indirect_and_variadic_calls_keep_alloca_full_interval() {
+    let m = parse(
+        "global tab i8\n\
+         global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             %fp = add i16 1, 2\n\
+             call void %fp(%g) callees keep\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             %buf2 = alloca 2\n\
+             %h = gep %buf2 +0\n\
+             store i8 1 %h\n\
+             call void @vkeep(i8 1, %h)\n\
+             %y = add i8 5, 6\n\
+             store i8 %y @out\n\
+             ret void\n\
+         fn keep(void) (p=ptr)\n\
+           block entry:\n\
+             store ptr %p @tab\n\
+             ret void\n\
+         fn vkeep(void) (n, ...)\n\
+           block entry:\n\
+             %ap = alloca 1\n\
+             va_start ap\n\
+             %q = va_arg ptr ap ptr\n\
+             store ptr %q @tab\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge f keep\nedge f vkeep\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+    assert_ne!(out.locals["f::buf2"], out.locals["f::y"]);
+}
+
+/// A naked callee is opaque asm: the walk cannot see what it does with a
+/// param, so an alloca handed to it keeps its full-function interval.
+#[test]
+fn naked_callee_keeps_alloca_full_interval() {
+    let m = parse(
+        "global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             call void @opaque(%g)\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             ret void\n\
+         fn opaque(void) [naked] (p=ptr)\n\
+           block entry:\n\
+             asm \"nop\"\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge f opaque\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// Retention is decided per callee: an alloca passed to a callee that only
+/// dereferences its param, directly or through a callee that does the
+/// same, frees its slot after the call, while one passed to a storing
+/// callee in the same caller keeps it.
+#[test]
+fn retention_is_decided_per_callee() {
+    let m = parse(
+        "global tab i8\n\
+         global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             call void @peek(%g)\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             %buf2 = alloca 2\n\
+             %h = gep %buf2 +0\n\
+             store i8 1 %h\n\
+             call void @keep(%h)\n\
+             %y = add i8 5, 6\n\
+             store i8 %y @out\n\
+             ret void\n\
+         fn peek(void) (p=ptr)\n\
+           block entry:\n\
+             %q = gep %p +1\n\
+             %v = load i8 %q\n\
+             store i8 %v %p\n\
+             call void @leaf(%q)\n\
+             ret void\n\
+         fn leaf(void) (r=ptr)\n\
+           block entry:\n\
+             %w = load i8 %r\n\
+             store i8 %w @out\n\
+             ret void\n\
+         fn keep(void) (p=ptr)\n\
+           block entry:\n\
+             store ptr %p @tab\n\
+             ret void\n",
+    );
+    let out = allocate(
+        &PIC16F877A,
+        &m,
+        "edge f peek\nedge f keep\nedge peek leaf\n",
+    );
+    assert_eq!(out.locals["f::buf"], out.locals["f::z"]);
+    assert_ne!(out.locals["f::buf2"], out.locals["f::y"]);
+}
+
 /// The va region ends at its last va_arg: a value defined after shares the
 /// region's slot (epic-cc#853).
 #[test]
