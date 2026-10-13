@@ -46,8 +46,8 @@
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    find_value_folds, flash_provenance, is_directive, resolve_pointers, ssa_key, Base,
-    FlashProvenance, PtrResolution, Slot,
+    find_value_folds, flash_provenance, flash_walk_refusal, is_directive, resolve_pointers,
+    ssa_key, Base, FlashProvenance, PtrResolution, Slot,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -141,6 +141,10 @@ struct Gen<'m> {
     /// store through a flash-derived reg is C++ virtual dispatch over a
     /// flash vtable, PIC18-only, so this backend panics on it (epic-cc#832).
     prov: FlashProvenance,
+    /// Flash-walk marks for the PIC14 family (`iselcore::pic14_flash_walks`):
+    /// a slot-held address over a const with no RAM copy is a flash label,
+    /// so a deref through it panics instead of reading RAM (epic-cc#1197).
+    walks: FlashProvenance,
     scratch: u16,
     retval_lo: u16,
     cur_func: &'m str,
@@ -477,6 +481,26 @@ impl<'m> Gen<'m> {
         self.m.funcs.iter().any(|f| f.name == name)
     }
 
+    /// Whether `v` is a flash address no RAM copy backs: a flash const's
+    /// label (vtables, functions, and staged consts aside) or a pointer reg
+    /// the walk marks flag. A RAM store of one is read back as RAM later
+    /// (epic-cc#1197).
+    fn is_flash_address(&self, v: &Val) -> bool {
+        match v {
+            Val::Global(g) => {
+                !g.starts_with("_ZTV")
+                    && !self.is_function(g)
+                    && !self.staged.contains(g)
+                    && self.global_is_const(g)
+            }
+            Val::Reg(r) => {
+                let key = ssa_key(self.cur_func, r);
+                self.walks.flash.contains(&key) || self.walks.mixed.contains(&key)
+            }
+            Val::Const(_) => false,
+        }
+    }
+
     /// The byte size of a global: a const table's size selects the reader
     /// shape (≤ 255 single entry; ≥ 256 two chunked entries, chunk 1 empty
     /// for exactly 256 bytes).
@@ -639,6 +663,13 @@ impl<'m> Gen<'m> {
                         let sa = self.slot_addr(self.cur_func, sname).direct();
                         // Reads a plain pointer param like an sret slot: the
                         // slot holds an address, while a byval slot is data.
+                        if *indirect {
+                            if let Some(why) =
+                                flash_walk_refusal(&self.walks, self.cur_func, sname, "1197")
+                            {
+                                panic!("isel: {why}");
+                            }
+                        }
                         if *indirect || self.param_holds_addr(sname) {
                             self.emit_fsr_indirect(sa, k, &terms, byte_off);
                             Addr::Indirect
@@ -2855,6 +2886,12 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Store(s) => {
+                if self.is_flash_address(&s.val) {
+                    panic!(
+                        "isel: store of a ROM address into RAM is not supported: {:?} (PIC18-only, epic-cc#1101, epic-cc#1197)",
+                        s.val
+                    );
+                }
                 let ty = if s.ty == Ty::I1 { Ty::I8 } else { s.ty };
                 if let Some(g) = s.ptr.strip_prefix('@') {
                     let dst = self.global_addr(g);
@@ -7272,6 +7309,7 @@ pub fn const_memcpy_parks_hold(device: &Device, m: &Module, addrs: &HashMap<Stri
             staged: &staged,
             resolved: &resolved,
             prov: prov.clone(),
+            walks: FlashProvenance::default(),
             scratch: 0,
             retval_lo: 0,
             cur_func: &f.name,
@@ -7441,6 +7479,9 @@ pub fn select_with_locs(
     // Flash-pointer provenance for the C++ dispatch panic below: computed
     // once beside the pointer resolution (epic-cc#832).
     let prov = flash_provenance(m);
+    // Walk marks for the flash-walk deref refusal (epic-cc#1197): computed
+    // once beside the vptr provenance.
+    let walks = iselcore::pic14_flash_walks(m, addrs, staged);
     // Value folds for every function (epic-cc#902): loads whose byte never
     // stages, over the same mapped-global set `alloc` places by, so a
     // skipped load reads an address both stages agree on. Pass-independent
@@ -7493,6 +7534,7 @@ pub fn select_with_locs(
                 staged: &staged,
                 resolved: &resolved,
                 prov: prov.clone(),
+                walks: walks.clone(),
                 scratch,
                 retval_lo,
                 cur_func: &f.name,
@@ -7792,6 +7834,7 @@ pub fn select_with_locs(
                         staged: &staged,
                         resolved: &resolved,
                         prov: prov.clone(),
+                        walks: walks.clone(),
                         scratch,
                         retval_lo,
                         cur_func: &f.name,
