@@ -2821,6 +2821,16 @@ fn allocate_inner(
             } else {
                 folds.unplaced()
             };
+            let mut dropped = dropped;
+            // isel-pic18's fused compares write no 0/1 byte and read their
+            // operand loads in place, and its W-threaded const producers
+            // leave the byte in W for the store (epic-cc#862). Both are
+            // gate-independent, so the bounding pass drops the same regs
+            // and the gated pass still only shrinks the overlay.
+            if device.core == Core::Pic18 {
+                dropped.extend(iselcore::fused_compare_regs(f, m, &resolved, &packed_bits));
+                dropped.extend(iselcore::const_w_phi_regs(f, m, &resolved, &packed_bits));
+            }
             (f.name.clone(), dropped)
         })
         .collect();
