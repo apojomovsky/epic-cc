@@ -412,6 +412,16 @@ fn narrow_candidates(m: &Module) -> Vec<String> {
             }
         }
     }
+    // An initializer reference takes the address too (`static u16 *p =
+    // &g` records g in p's refs): a stored pointer can write wide
+    // through it after narrowing, so the target stays wide.
+    for g in &m.globals {
+        for (_, t, _) in &g.refs {
+            if let Some(u) = uses.get_mut(t) {
+                u.excluded = true;
+            }
+        }
+    }
     // A direct call through a global's address (never produced by the
     // clang shapes irparse accepts, but free to check).
     for f in &m.funcs {
@@ -1125,6 +1135,32 @@ mod tests {
         );
         let m = narrow_proven_range(m);
         assert_eq!(narrowed_ty(&m, "g"), ir::Ty::I16);
+    }
+
+    /// An initializer reference takes the address the same way a stored
+    /// one does (`static u16 *p = &g`): the target stays wide while an
+    /// unreferenced sibling still narrows.
+    #[test]
+    fn initializer_ref_stays_wide() {
+        let mut m = zeroed(
+            "global g i16\n\
+             global p i16\n\
+             global q i16\n\
+             fn main(i16) ()\n\
+             block 0:\n\
+             store i16 1 @g\n\
+             store i16 2 @q\n\
+             ret i16 0\n",
+        );
+        m.globals
+            .iter_mut()
+            .find(|g| g.name == "p")
+            .expect("p parses")
+            .refs
+            .push((0, "g".to_string(), 0));
+        let m = narrow_proven_range(m);
+        assert_eq!(narrowed_ty(&m, "g"), ir::Ty::I16);
+        assert_eq!(narrowed_ty(&m, "q"), ir::Ty::I8);
     }
 
     /// A wide `urem` divisor proves nothing: the global stays wide.
