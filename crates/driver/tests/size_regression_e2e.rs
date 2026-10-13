@@ -51,7 +51,10 @@
 //! step summary as build-only). Baseline entries carry `profile`; rows
 //! without one are `-Os`. `STRICT_SIZE_BASELINE` applies to each gated
 //! profile independently. `SIZE_BASELINE_ONLY` matches `name` for `-Os`
-//! rows and `name@O2` for `-O2` rows.
+//! rows and `name@O2` for `-O2` rows. `SIZE_LADDER_ARGS` forwards extra
+//! flags to every `epic-cc` invocation (e.g. `--no-outline` for the
+//! outline on/off split that prices a layout-churning lever's flash tax,
+//! epic-cc#1145); measure-only, never with the gate.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -746,6 +749,27 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// Splits `SIZE_LADDER_ARGS` on whitespace; empty input gives no flags.
+fn split_ladder_args(extra: &str) -> Vec<String> {
+    extra.split_whitespace().map(str::to_string).collect()
+}
+
+/// Extra `epic-cc` flags from `SIZE_LADDER_ARGS`.
+/// Measure-only: panics under the gate so a flagged run can never be
+/// compared against the committed baseline.
+fn ladder_args() -> Vec<String> {
+    match std::env::var("SIZE_LADDER_ARGS") {
+        Err(_) => Vec::new(),
+        Ok(extra)
+            if std::env::var("BASELINE_ARTIFACT_DIR").is_ok()
+                || std::env::var("SIZE_REPORT_JSON").is_ok() =>
+        {
+            split_ladder_args(&extra)
+        }
+        Ok(_) => panic!("SIZE_LADDER_ARGS is measure-only; set BASELINE_ARTIFACT_DIR"),
+    }
+}
+
 /// Run `epic-cc` for `c` under `profile` (`"Os"` is the default flags,
 /// anything else is passed as `-O<profile>`) and return its size-report
 /// stderr text. A failing profile build fails the test: every profile
@@ -759,6 +783,7 @@ fn measure(c: &Case, profile: &str) -> String {
     ));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_epic-cc"));
     cmd.args(["--target", c.device]);
+    cmd.args(ladder_args());
     if profile != "Os" {
         cmd.arg(format!("-{profile}"));
     }
@@ -1332,4 +1357,14 @@ fn case_names_are_unique() {
     for c in cases() {
         assert!(seen.insert(c.name), "duplicate size case name {}", c.name);
     }
+}
+
+#[test]
+fn ladder_args_split_on_whitespace() {
+    assert!(split_ladder_args("").is_empty());
+    assert_eq!(split_ladder_args("--no-outline"), ["--no-outline"]);
+    assert_eq!(
+        split_ladder_args("--no-outline  -O2"),
+        ["--no-outline", "-O2"]
+    );
 }

@@ -4778,3 +4778,43 @@ fn const_phi_into_store_takes_no_pic18_slot() {
         out.locals
     );
 }
+/// A RAM-neutral shrink that re-tiles bases keeps the lever-off map
+/// (epic-cc#1145): `f` could share its two allocas, but `big` sets the
+/// top in both maps, so sharing buys no RAM while moving `g`. The tie
+/// goes to the old layout: no sharing, no moved base, no broken merges.
+#[test]
+fn ram_neutral_shrink_keeps_lever_off_map() {
+    let m = parse(
+        "global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %a = alloca 4\n\
+             %g1 = gep %a +0\n\
+             store i8 1 %g1\n\
+             call void @g()\n\
+             %b = alloca 4\n\
+             %g2 = gep %b +0\n\
+             store i8 2 %g2\n\
+             ret void\n\
+         fn g(void) ()\n\
+           block entry:\n\
+             %x = add i8 1, 2\n\
+             store i8 %x @out\n\
+             ret void\n\
+         fn big(void) ()\n\
+           block entry:\n\
+             %w = alloca 16\n\
+             %gw = gep %w +0\n\
+             store i8 3 %gw\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge f g\n");
+    assert_ne!(
+        out.locals["f::a"], out.locals["f::b"],
+        "RAM-neutral sharing stays off"
+    );
+    assert_eq!(
+        out.locals["g::x"], 0x29,
+        "g stays at its lever-off base instead of the shrunk 0x25"
+    );
+}
