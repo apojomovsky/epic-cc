@@ -539,6 +539,12 @@ struct Gen<'m> {
     /// the `Select` arm tests the sign bit directly and the `Icmp` arm
     /// skips the 0/1 byte nobody reads.
     select_fused: HashMap<String, Icmp>,
+    /// Counted-latch increments narrowed by the per-function pre-scan
+    /// (epic-cc#1149). A loop counting 0, S, .. K in a 16-bit home never
+    /// sets the high byte, so the `Bin` arm emits lane 0 only (adds) and
+    /// the eq arm drops its high-lane check (cmps).
+    latch_narrow_adds: HashSet<String>,
+    latch_narrow_cmps: HashSet<String>,
     out: Vec<String>,
     /// One source location per emitted line, index-aligned with `out`.
     /// `None` marks a compiler-generated line (no source instruction).
@@ -2829,6 +2835,99 @@ impl<'m> Gen<'m> {
             }
         }
         out
+    }
+    /// Counted-latch narrowing (epic-cc#1149): `add i16 %phi, S` with
+    /// 1 <= S <= 254 in the latch block, feeding a phi backedge from
+    /// that block over a zero entry, closed by `icmp eq i16 %add, K`
+    /// (1 <= K <= 255, K % S == 0) terminating the block with false
+    /// back to the phi and true out. The count visits 0, S, .. K, so
+    /// both high bytes stay zero: lane 0 is the whole update and the
+    /// eq arm drops its high-lane check. `phi_fold` carries the region
+    /// proof; the scan only adds the counting shape and its exit guard.
+    fn find_latch_narrow(g: &Gen, f: &Func) -> (HashSet<String>, HashSet<String>) {
+        let mut bins: HashMap<&str, (&ir::Bin, &str)> = HashMap::new();
+        let mut phis: HashMap<&str, (&ir::Phi, &str)> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                match inst {
+                    Inst::Bin(q) => {
+                        bins.insert(q.dst.as_str(), (q, b.label.as_str()));
+                    }
+                    Inst::Phi(p) => {
+                        phis.insert(p.dst.as_str(), (p, b.label.as_str()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut adds = HashSet::new();
+        let mut cmps = HashSet::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let Inst::Icmp(c) = inst else { continue };
+                if c.pred != "eq" || c.ty.bytes() != 2 {
+                    continue;
+                }
+                let Val::Reg(ar) = &c.a else { continue };
+                let Val::Const(k) = &c.b else { continue };
+                if *k < 1 || *k > 255 {
+                    continue;
+                }
+                let Some((q, qblock)) = bins.get(ar.as_str()) else {
+                    continue;
+                };
+                if *qblock != b.label.as_str() || q.op != ir::BinOp::Add || q.ty.bytes() != 2 {
+                    continue;
+                }
+                let Some((qreg, s)) = Self::const_bin_reg(&q.op, &q.a, &q.b) else {
+                    continue;
+                };
+                if s < 1 || s > 254 || k % s != 0 {
+                    continue;
+                }
+                if g.phi_fold.get(&q.dst) != Some(&qreg) {
+                    continue;
+                }
+                let Some((p, pblock)) = phis.get(qreg.as_str()) else {
+                    continue;
+                };
+                if p.ty.bytes() != 2 || p.incoming.len() != 2 {
+                    continue;
+                }
+                let mut zero_entry = false;
+                let mut backedge = false;
+                for (v, from) in &p.incoming {
+                    match v {
+                        Val::Const(0) => zero_entry = true,
+                        Val::Reg(rr) if rr == &q.dst && from == &b.label => backedge = true,
+                        _ => {}
+                    }
+                }
+                if !zero_entry || !backedge {
+                    continue;
+                }
+                // The counting bound needs the compare to guard the loop:
+                // this block must terminate in a `BrCond` on the result
+                // with false back to the phi and true out. Otherwise the
+                // count can run past 255 with a nonzero high byte while
+                // the lanes stay narrowed.
+                let Some(Inst::BrCond(bc)) = b.insts.last() else {
+                    continue;
+                };
+                if bc.cond != Val::Reg(c.dst.clone()) {
+                    continue;
+                }
+                if bc.f.as_str() != *pblock
+                    || bc.t.as_str() == *pblock
+                    || bc.t.as_str() == b.label.as_str()
+                {
+                    continue;
+                }
+                adds.insert(q.dst.clone());
+                cmps.insert(c.dst.clone());
+            }
+        }
+        (adds, cmps)
     }
 
     /// Walk-loop pre-scan (epic-cc#896): single-block counted loops whose
@@ -9178,6 +9277,13 @@ impl<'m> Gen<'m> {
                         if let Some(preg) = self.phi_fold.get(&b.dst).cloned() {
                             if preg == qreg {
                                 let home = self.slot_addr(self.cur_func, &preg).direct();
+                                // A counted latch (epic-cc#1149) never sets
+                                // the high byte, so lane 0 is the update.
+                                let n = if self.latch_narrow_adds.contains(&b.dst) {
+                                    1
+                                } else {
+                                    n
+                                };
                                 self.emit_const_bin_inplace(&b.op, n, k, home);
                                 return;
                             }
@@ -10713,6 +10819,13 @@ impl<'m> Gen<'m> {
         bytes: u8,
         fuse: Option<(String, String)>,
     ) {
+        // A counted latch (epic-cc#1149) never sets the high byte, so
+        // lane 0 decides: the high-lane check always matches 0 == 0.
+        let bytes = if self.latch_narrow_cmps.contains(dst) {
+            1
+        } else {
+            bytes
+        };
         let (l_true, l_false, l_done);
         match fuse {
             Some((t, f)) => {
@@ -15669,6 +15782,8 @@ pub fn select_with_opts(
                 zext_ret: HashSet::new(),
                 tablat_fwd: HashSet::new(),
                 select_fused: HashMap::new(),
+                latch_narrow_adds: HashSet::new(),
+                latch_narrow_cmps: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -15753,6 +15868,8 @@ pub fn select_with_opts(
             zext_ret: HashSet::new(),
             tablat_fwd: HashSet::new(),
             select_fused: HashMap::new(),
+            latch_narrow_adds: HashSet::new(),
+            latch_narrow_cmps: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -15842,6 +15959,11 @@ pub fn select_with_opts(
         // Sign-against-zero selects (epic-cc#1149): runs with the walks,
         // after every fold and claim set the shape checks read.
         g.select_fused = Gen::find_select_sign_zero(&g, f);
+        // Counted-latch narrowing (epic-cc#1149): runs with the walks,
+        // after the inplace folds its region proof rides on.
+        let (latch_adds, latch_cmps) = Gen::find_latch_narrow(&g, f);
+        g.latch_narrow_adds = latch_adds;
+        g.latch_narrow_cmps = latch_cmps;
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
         // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
@@ -16672,6 +16794,8 @@ pub fn select_with_opts(
             zext_ret: HashSet::new(),
             tablat_fwd: HashSet::new(),
             select_fused: HashMap::new(),
+            latch_narrow_adds: HashSet::new(),
+            latch_narrow_cmps: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -17101,6 +17225,8 @@ mod tests {
                 zext_ret: HashSet::new(),
                 tablat_fwd: HashSet::new(),
                 select_fused: HashMap::new(),
+                latch_narrow_adds: HashSet::new(),
+                latch_narrow_cmps: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -17149,6 +17275,8 @@ mod tests {
                 narrow_lo: HashSet::new(),
                 tablat_fwd: HashSet::new(),
                 select_fused: HashMap::new(),
+                latch_narrow_adds: HashSet::new(),
+                latch_narrow_cmps: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 trunc_fwd: HashMap::new(),
@@ -17293,6 +17421,8 @@ mod p3_gen_tests {
             narrow_lo: HashSet::new(),
             tablat_fwd: HashSet::new(),
             select_fused: HashMap::new(),
+            latch_narrow_adds: HashSet::new(),
+            latch_narrow_cmps: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),

@@ -10822,6 +10822,114 @@ fn phi_folded_i16_increment_with_split_header_and_latch_folds() {
 }
 
 #[test]
+fn latch_narrow_step_one_drops_high_increment_and_check() {
+    // The crc outer-latch shape: `add i16 %i, 1` over a zero entry,
+    // closed by `icmp eq i16 %r, 32`. The count visits 0..32, so the
+    // high byte stays zero: one `INCF` plus a low-only `SUBWF`/`BNZ`
+    // close the loop (epic-cc#1149).
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n    br header\n  block header:\n    %i = phi i16 %r latch 0 entry\n    br latch\n  block latch:\n    %r = add i16 %i, 1\n    %c = icmp eq i16 %r, 32\n    br i1 %c, exit, header\n  block exit:\n    ret void\n",
+    );
+    let addrs = addrs(&[("main::i", 0x30), ("main::r", 0x34), ("main::c", 0x36)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Llatch");
+    assert!(lp.contains("INCF 0x030,F,A"), "latch:\n{lp}");
+    assert!(lp.contains("MOVLW 0x20"), "latch:\n{lp}");
+    assert!(lp.contains("SUBWF 0x030,W,A"), "latch:\n{lp}");
+    assert!(!lp.contains("0x031"), "high byte must go untouched:\n{lp}");
+    assert!(!lp.contains("0x034"), "dead temp must go unread:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(2000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x30], 32, "counter lo");
+    assert_eq!(p.ram()[0x31], 0, "counter hi stays zero");
+}
+
+#[test]
+fn latch_narrow_step_seven_drops_carry_and_high_check() {
+    // The crc fill-latch shape: step 7 to 224, a multiple of the step
+    // under 256. The `ADDWFC` carry and the high `MOVF`/`BNZ` go, the
+    // low `ADDWF` and `SUBWF` stay (epic-cc#1149).
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n    br header\n  block header:\n    %i = phi i16 %r latch 0 entry\n    br latch\n  block latch:\n    %r = add i16 %i, 7\n    %c = icmp eq i16 %r, 224\n    br i1 %c, exit, header\n  block exit:\n    ret void\n",
+    );
+    let addrs = addrs(&[("main::i", 0x30), ("main::r", 0x34), ("main::c", 0x36)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Llatch");
+    assert!(lp.contains("MOVLW 0x07"), "latch:\n{lp}");
+    assert!(lp.contains("ADDWF 0x030,F,A"), "latch:\n{lp}");
+    assert!(lp.contains("MOVLW 0xE0"), "latch:\n{lp}");
+    assert!(!lp.contains("ADDWFC"), "no carry into high:\n{lp}");
+    assert!(!lp.contains("0x031"), "high byte must go untouched:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(3000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x30], 224, "counter lo");
+    assert_eq!(p.ram()[0x31], 0, "counter hi stays zero");
+}
+
+#[test]
+fn latch_narrow_keeps_high_lanes_past_255() {
+    // An exit at 300 reaches past the low byte, so the high lanes stay:
+    // the fold only fires while the whole count fits (epic-cc#1149).
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n    br header\n  block header:\n    %i = phi i16 %r latch 0 entry\n    br latch\n  block latch:\n    %r = add i16 %i, 1\n    %c = icmp eq i16 %r, 300\n    br i1 %c, exit, header\n  block exit:\n    ret void\n",
+    );
+    let addrs = addrs(&[("main::i", 0x30), ("main::r", 0x34), ("main::c", 0x36)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Llatch");
+    assert!(lp.contains("INCF 0x031,F,A"), "high increment stays:\n{lp}");
+    assert!(lp.contains("SUBWF 0x031,W,A"), "high check stays:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(8000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x30], 44, "counter lo (300 & 0xFF)");
+    assert_eq!(p.ram()[0x31], 1, "counter hi (300 >> 8)");
+}
+
+#[test]
+fn latch_narrow_keeps_high_lanes_without_a_divisible_exit() {
+    // Step 7 never lands on 225, so the count would leave the low byte
+    // and the fold must decline. The loop cannot exit, so this test
+    // pins the shape only (epic-cc#1149).
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n    br header\n  block header:\n    %i = phi i16 %r latch 0 entry\n    br latch\n  block latch:\n    %r = add i16 %i, 7\n    %c = icmp eq i16 %r, 225\n    br i1 %c, exit, header\n  block exit:\n    ret void\n",
+    );
+    let addrs = addrs(&[("main::i", 0x30), ("main::r", 0x34), ("main::c", 0x36)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Llatch");
+    assert!(lp.contains("ADDWFC"), "carry into high stays:\n{lp}");
+    assert!(lp.contains("MOVF 0x031,W,A"), "high check stays:\n{lp}");
+}
+
+#[test]
+fn latch_narrow_keeps_high_lanes_without_a_zero_entry() {
+    // Starting at 5, the induction base is gone: the high byte may be
+    // set on entry, so the fold must decline and still count exactly
+    // (epic-cc#1149).
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n    br header\n  block header:\n    %i = phi i16 %r latch 5 entry\n    br latch\n  block latch:\n    %r = add i16 %i, 1\n    %c = icmp eq i16 %r, 32\n    br i1 %c, exit, header\n  block exit:\n    ret void\n",
+    );
+    let addrs = addrs(&[("main::i", 0x30), ("main::r", 0x34), ("main::c", 0x36)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Llatch");
+    assert!(lp.contains("INCF 0x031,F,A"), "high increment stays:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(2000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x30], 32, "counter lo");
+    assert_eq!(p.ram()[0x31], 0, "counter hi");
+}
+
+#[test]
 fn phi_folded_i16_increment_with_separate_continuation_folds() {
     // The backedge may leave from a latch continuation past the
     // increment's own block, as in the menu demo's flag-latched copy
@@ -10855,13 +10963,81 @@ fn phi_folded_i16_increment_with_separate_continuation_folds() {
 }
 
 #[test]
+fn latch_narrow_declines_when_the_compare_does_not_guard() {
+    // The eq shape alone proves nothing: here the loop exits on a wider
+    // bound while the eq only feeds a later branch, so the count can
+    // pass 255 and the high lanes must stay (epic-cc#1149).
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n    br header\n  block header:\n    %i = phi i16 %r latch 0 entry\n    br latch\n  block latch:\n    %r = add i16 %i, 1\n    %c = icmp eq i16 %r, 5\n    %d = icmp ult i16 %r, 100\n    br i1 %d, header, exit\n  block exit:\n    br i1 %c, done1, done2\n  block done1:\n    ret void\n  block done2:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("main::i", 0x30),
+        ("main::r", 0x34),
+        ("main::c", 0x36),
+        ("main::d", 0x37),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Llatch");
+    assert!(lp.contains("INCF 0x031,F,A"), "high increment stays:\n{lp}");
+    assert!(lp.contains("MOVF 0x031,W,A"), "high check stays:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x30], 100, "counter lo");
+    assert_eq!(p.ram()[0x31], 0, "counter hi");
+}
+
+#[test]
+fn latch_narrow_materializes_a_guarded_multi_use_compare() {
+    // A guarding compare with a second use cannot fuse, so it
+    // materializes: the materialized check still drops its high lane
+    // while the loop closes on the byte (epic-cc#1149).
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n    br header\n  block header:\n    %i = phi i16 %r latch 0 entry\n    br latch\n  block latch:\n    %r = add i16 %i, 1\n    %c = icmp eq i16 %r, 32\n    br i1 %c, exit, header\n  block exit:\n    br i1 %c, done1, done2\n  block done1:\n    ret void\n  block done2:\n    ret void\n",
+    );
+    let addrs = addrs(&[("main::i", 0x30), ("main::r", 0x34), ("main::c", 0x36)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Llatch");
+    assert!(lp.contains("INCF 0x030,F,A"), "latch:\n{lp}");
+    assert!(!lp.contains("0x031"), "high byte must go untouched:\n{lp}");
+    assert!(!lp.contains("0x034"), "dead temp must go unread:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(2000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x30], 32, "counter lo");
+    assert_eq!(p.ram()[0x31], 0, "counter hi stays zero");
+}
+
+#[test]
+fn latch_narrow_declines_when_true_reenters_the_latch() {
+    // Exiting into the latch itself reruns the count past the exit
+    // value, so the guard proves no bound and the high lanes must
+    // stay. The loop hangs at the exit value, so this pins shape
+    // only (epic-cc#1149).
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n    br header\n  block header:\n    %i = phi i16 %r latch 0 entry\n    br latch\n  block latch:\n    %r = add i16 %i, 1\n    %c = icmp eq i16 %r, 32\n    br i1 %c, latch, header\n  block exit:\n    ret void\n",
+    );
+    let addrs = addrs(&[("main::i", 0x30), ("main::r", 0x34), ("main::c", 0x36)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Llatch");
+    assert!(lp.contains("INCF 0x031,F,A"), "high increment stays:\n{lp}");
+    assert!(lp.contains("MOVF 0x031,W,A"), "high check stays:\n{lp}");
+}
+
+#[test]
 fn phi_folded_i16_increment_with_carried_pointer_folds() {
     // Real counted loops carry their buffer pointer alongside the
     // index, so the header holds pointer phis with no RAM home. The
     // fold only cares about the index lanes: pointer edges carry
-    // address state, never a home copy (epic-cc#937).
+    // address state, never a home copy (epic-cc#937). The exit sits
+    // past 255 so the counted-latch narrowing (epic-cc#1149) declines
+    // and this keeps pinning the full-width fold.
     let m = parse(
-        "global buf i8\nglobal flag i8\nfn main(void) ()\n  block entry:\n    %b = gep @buf +0\n    br header\n  block header:\n    %p = phi ptr %q latch %b entry\n    %i = phi i16 %r latch 0 entry\n    br latch\n  block latch:\n    %v = load i8 %p\n    store i8 %v @flag\n    %r = add i16 %i, 1\n    %c = icmp eq i16 %r, 5\n    %q = gep %p +1\n    br i1 %c, exit, header\n  block exit:\n    ret void\n",
+        "global buf i8\nglobal flag i8\nfn main(void) ()\n  block entry:\n    %b = gep @buf +0\n    br header\n  block header:\n    %p = phi ptr %q latch %b entry\n    %i = phi i16 %r latch 0 entry\n    br latch\n  block latch:\n    %v = load i8 %p\n    store i8 %v @flag\n    %r = add i16 %i, 1\n    %c = icmp eq i16 %r, 300\n    %q = gep %p +1\n    br i1 %c, exit, header\n  block exit:\n    ret void\n",
     );
     let addrs = addrs(&[
         ("buf", 0x020),
