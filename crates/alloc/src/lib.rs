@@ -414,12 +414,16 @@ struct FrameLayout {
 }
 
 /// Blocks of `f` in liveness and placement order: the entry (the function's
-/// first block) is index 0, the rest follow in label order.
+/// first block) is index 0, the rest follow in textual order.
 ///
 /// Pinning the entry is load-bearing: opt can leave an unnamed numeric entry
 /// next to a block an inline named (`merged.exit`, epic-cc#446), and ranking
 /// a name below a number would sort it off index 0, where `frame_layout`
 /// reads params and entry live-ins from (epic-cc#448).
+///
+/// Textual order keeps loop latches next to their headers, so linear
+/// intervals stay tight: sorting numeric labels last rips each latch past
+/// later diamonds and strands every exit phi across them (epic-cc#1156).
 fn block_order(f: &ir::Func) -> Vec<&ir::Block> {
     let (entry, rest) = f
         .blocks
@@ -428,10 +432,6 @@ fn block_order(f: &ir::Func) -> Vec<&ir::Block> {
     let mut order: Vec<&ir::Block> = Vec::with_capacity(f.blocks.len());
     order.push(entry);
     order.extend(rest);
-    order[1..].sort_by_key(|b| match b.label.parse::<u64>() {
-        Ok(v) => (1u8, v),
-        Err(_) => (0u8, 0),
-    });
     order
 }
 
@@ -487,7 +487,7 @@ fn first_fit(
 
 /// Compute a function's liveness-colored frame from its IR. Each value's
 /// live interval is `[min(def, uses, phi pred ends), max(...)]` in linear
-/// block order (entry first, then label order). Phi incoming values are
+/// block order (entry first, then textual order). Phi incoming values are
 /// used at the END of their predecessor (isel emits the incoming copies
 /// there), and a phi destination is live from the earliest predecessor end
 /// (its first copy) through its last use. A loop-carried value (use before
