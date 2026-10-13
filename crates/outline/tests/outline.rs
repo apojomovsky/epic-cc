@@ -512,3 +512,133 @@ fn spot_replaced_by_a_tail_merge_still_hosts_local_bodies() {
         "local body must follow the tail-merge jump that replaced f's RETURN, got {before:?}:\n{out}"
     );
 }
+
+/// Flash words in a factored listing: two-word forms count double, layout
+/// directives do not count.
+fn words(out: &str) -> i64 {
+    let mut n = 0i64;
+    for l in out.lines() {
+        if !l.starts_with(' ') && !l.starts_with('\t') {
+            continue;
+        }
+        let m = l
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if m.is_empty() || ["ORG", "END", "LIST", "RADIX", "DB", "DW", "DATA"].contains(&m.as_str())
+        {
+            continue;
+        }
+        n += if ["MOVFF", "LFSR", "GOTO", "CALL", "MOVSF", "MOVSS"].contains(&m.as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    n
+}
+
+/// A six-instruction run shared whole by three functions.
+const CANARY_RUN: [&str; 6] = [
+    "MOVF 0x020,W,A",
+    "ADDWF 0x021,W,A",
+    "MOVWF 0x022,A",
+    "CLRF 0x023,A",
+    "INCF 0x024,F,A",
+    "DECF 0x025,F,A",
+];
+
+#[test]
+fn one_byte_shift_with_local_shape_change_stays_within_cap() {
+    // A narrowing-style perturbation: every address at or above 0x021
+    // slides down one byte, and one site's word store becomes a byte
+    // clear. The two untouched sites must keep sharing one body, and
+    // the factored size must not move more than the #306 row cap.
+    let slid: Vec<String> = CANARY_RUN
+        .iter()
+        .map(|l| {
+            // Single pass: sequential replaces would cascade (0x022
+            // becomes 0x021, then matches the 0x021 rule).
+            let mut t = String::new();
+            let mut rest = *l;
+            while let Some(p) = rest.find("0x") {
+                t.push_str(&rest[..p]);
+                let hex: String = rest[p + 2..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .collect();
+                let v = u32::from_str_radix(&hex, 16).unwrap();
+                if v >= 0x021 {
+                    let w = v - 1;
+                    t.push_str(&format!("0x{w:03X}"));
+                } else {
+                    t.push_str(&rest[p..p + 2 + hex.len()]);
+                }
+                rest = &rest[p + 2 + hex.len()..];
+            }
+            t.push_str(rest);
+            t
+        })
+        .collect();
+    let slid_run: Vec<&str> = slid.iter().map(String::as_str).collect();
+    let mut shaped = slid.clone();
+    shaped[2] = "CLRF 0x021,A".to_string();
+    let shaped_run: Vec<&str> = shaped.iter().map(String::as_str).collect();
+    let mk = |name: &str, run: &[&str], sep: &str| {
+        let mut b = vec![sep];
+        b.extend(run.iter().copied());
+        b.push(sep);
+        func(name, &b)
+    };
+    let base = program(
+        &[
+            mk("f", &CANARY_RUN, "NOP"),
+            mk("g", &CANARY_RUN, "INCF 0x030,F,A"),
+            mk("h", &CANARY_RUN, "DECF 0x031,F,A"),
+        ],
+        &["f", "g", "h"],
+    );
+    let shifted = program(
+        &[
+            mk("f", &slid_run, "NOP"),
+            mk("g", &slid_run, "INCF 0x030,F,A"),
+            mk("h", &shaped_run, "DECF 0x031,F,A"),
+        ],
+        &["f", "g", "h"],
+    );
+    let out_base = factor(&base, &Options::default());
+    let out_shifted = factor(&shifted, &Options::default());
+    // The shared body holds the whole run, not a subrun fragment: a
+    // re-partitioning selector would split or drop it.
+    fn body_lines<'a>(out: &'a str, marker: &str) -> Vec<&'a str> {
+        let lines: Vec<&str> = out.lines().collect();
+        for (i, l) in lines.iter().enumerate() {
+            if (l.starts_with(' ') || l.starts_with('\t'))
+                || !l.trim_end_matches(':').starts_with("__pa")
+            {
+                continue;
+            }
+            let body: Vec<&str> = lines[i + 1..i + 7].iter().map(|x| x.trim()).collect();
+            if body.contains(&marker) {
+                return body;
+            }
+        }
+        panic!("no body holds {marker}:\n{out}");
+    }
+    assert_eq!(
+        body_lines(&out_base, "MOVWF 0x022,A"),
+        CANARY_RUN.to_vec(),
+        "base shares the whole run:\n{out_base}"
+    );
+    assert_eq!(
+        body_lines(&out_shifted, "MOVWF 0x021,A"),
+        slid_run,
+        "untouched sites keep sharing the whole slid run:\n{out_shifted}"
+    );
+    let delta = words(&out_shifted) - words(&out_base);
+    assert!(
+        delta.abs() <= 8,
+        "one-byte shift moved factoring by {delta} words:\n{out_shifted}"
+    );
+}

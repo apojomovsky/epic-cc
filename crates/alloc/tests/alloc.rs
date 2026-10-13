@@ -4134,6 +4134,42 @@ fn pic14e_multi_use_load_keeps_its_slot() {
     );
 }
 
+/// epic-cc#1156: liveness runs in textual block order, so a numeric loop
+/// latch stays next to its header and the exit phi's interval ends at the
+/// merge. Sorting numeric labels last rips the latch past later diamonds,
+/// and the phi's pred-end interval then strands it across the whole frame.
+/// Post-merge code packs below the dead exit phi; a stranded phi pushes it
+/// above instead.
+#[test]
+fn loop_exit_phi_slot_reused_after_merge() {
+    let m = parse(
+        "const sink i8\n\
+         fn f(i8) (n=i8)\n\
+           block entry:\n\
+             br label %.preheader\n\
+           block .preheader:\n\
+             %iv = phi i8 %n entry %next 9\n\
+             %c = icmp eq i8 %iv, 0\n\
+             br i1 %c, label %.loopexit, label %9\n\
+           block 9:\n\
+             %next = add i8 %iv, 1\n\
+             %d = icmp eq i8 %next, %n\n\
+             br i1 %d, label %.loopexit, label %.preheader\n\
+           block .loopexit:\n\
+             %e = phi i8 %iv .preheader %next 9\n\
+             store i8 %e, ptr @sink\n\
+             %later = add i8 1, 2\n\
+             store i8 %later, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert!(
+        out.locals["f::later"] < out.locals["f::e"],
+        "exit phi strands across later code: {:?}",
+        out.locals
+    );
+}
+
 #[test]
 fn packable_flags_share_one_byte_on_pic18() {
     // Three internal i1 flags with only plain loads and const stores
