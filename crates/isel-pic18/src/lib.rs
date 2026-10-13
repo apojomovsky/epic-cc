@@ -2394,10 +2394,17 @@ impl<'m> Gen<'m> {
                             }
                         }
                         Inst::Load(l) => {
-                            Self::scan_ptr_terms(g, &key, &l.ptr, &mut marked, &mut changed);
+                            Self::scan_ptr_terms(g, &key, &l.ptr, None, &mut marked, &mut changed);
                         }
                         Inst::Store(s) => {
-                            Self::scan_ptr_terms(g, &key, &s.ptr, &mut marked, &mut changed);
+                            Self::scan_ptr_terms(
+                                g,
+                                &key,
+                                &s.ptr,
+                                Some(&s.val),
+                                &mut marked,
+                                &mut changed,
+                            );
                             if let Val::Reg(r) = &s.val {
                                 if marked.remove(r) {
                                     changed = true;
@@ -2448,27 +2455,52 @@ impl<'m> Gen<'m> {
     /// term reads lane 0 only on a `PLUSW` shape and whole on every
     /// other address computation (which adds the full 16-bit index
     /// into `FSR0`). The pointer reg itself is the virtual `Gep`'s
-    /// def, never a narrowable dst, so it needs no edge.
+    /// def, never a narrowable dst, so it needs no edge. A store takes
+    /// the `PLUSW` path only for a register value with a slot: constants
+    /// and address-valued regs keep the `INDF0` lowering (epic-cc#665),
+    /// whose full-width `FSR0` adjust reads lane 1, so their terms read
+    /// whole too (banked_ptr.c proved it: a `CLRF`-free high lane held
+    /// an `sret` byte).
     fn scan_ptr_terms(
         g: &Gen,
         key: &dyn Fn(&str) -> String,
         ptr: &str,
+        store_val: Option<&Val>,
         marked: &mut HashSet<String>,
         changed: &mut bool,
     ) {
+        let unmark_terms = |terms: &[String], marked: &mut HashSet<String>, changed: &mut bool| {
+            for t in terms {
+                if marked.remove(t) {
+                    *changed = true;
+                }
+            }
+        };
         let Some(r) = ptr.strip_prefix('%') else {
             return;
         };
-        let Some((_, _, terms)) = g.resolved.get(&key(r)) else {
-            return;
-        };
-        if g.plusw_shape(&Val::Reg(r.to_string())).is_some() {
+        let terms: Vec<String> = g
+            .resolved
+            .get(&key(r))
+            .map(|(_, _, ts)| ts.iter().map(|(_, t)| t.clone()).collect())
+            .unwrap_or_default();
+        let mut unmark = || unmark_terms(&terms, marked, changed);
+        if g.plusw_shape(&Val::Reg(r.to_string())).is_none() {
+            unmark();
             return;
         }
-        for (_, t) in terms {
-            if marked.remove(t) {
-                *changed = true;
+        // Loads ride `PLUSW0` on the shape alone; stores additionally
+        // need a slotted register value, mirroring the store arm.
+        let slotted = match store_val {
+            None => true,
+            Some(Val::Reg(x)) => {
+                let x = g.rmw_fwd.get(x).unwrap_or(x);
+                g.addrs.get(&key(x)).is_some()
             }
+            _ => false,
+        };
+        if !slotted {
+            unmark();
         }
     }
     /// Whether an RMW-candidate store pointer resolves to an indirect
