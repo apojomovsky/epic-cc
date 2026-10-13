@@ -381,17 +381,17 @@ ram_bytes = 55
 [[entry]]
 name = "speed-strlen-strcmp-16f877a"
 device = "16F877A"
-cycles = 2652
-flash_words = 273
-ram_bytes = 57
+cycles = 1194
+flash_words = 201
+ram_bytes = 56
 
 [[entry]]
 name = "speed-strlen-strcmp-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 2652
-flash_words = 273
-ram_bytes = 57
+cycles = 1194
+flash_words = 201
+ram_bytes = 56
 
 [[entry]]
 name = "speed-crc16-18f4550"
@@ -411,17 +411,17 @@ ram_bytes = 52
 [[entry]]
 name = "speed-crc16-16f877a"
 device = "16F877A"
-cycles = 14842
-flash_words = 196
-ram_bytes = 54
+cycles = 9454
+flash_words = 132
+ram_bytes = 55
 
 [[entry]]
 name = "speed-crc16-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 14842
-flash_words = 196
-ram_bytes = 54
+cycles = 9454
+flash_words = 132
+ram_bytes = 55
 
 [[entry]]
 name = "speed-switch16-18f4550"
@@ -591,9 +591,9 @@ ram_bytes = 131
 [[entry]]
 name = "scen-control-pass-18f4550"
 device = "18F4550"
-cycles = 774
-flash_words = 3931
-ram_bytes = 636
+cycles = 778
+flash_words = 3561
+ram_bytes = 533
 
 [[entry]]
 name = "scen-control-pass-18f4550"

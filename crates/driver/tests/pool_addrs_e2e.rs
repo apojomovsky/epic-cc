@@ -92,16 +92,16 @@ fn pool_addrs_gates_copies_and_omits_unread_table() {
 }
 
 #[test]
-fn pool_addrs_unflagged_stages_and_copies() {
-    let (_, map) = build("unflagged", &[]);
+fn pool_addrs_opt_out_stages_and_copies() {
+    let (_, map) = build("optout", &["--no-const-pool"]);
     let gs = globals(&map);
     let ss = staged(&map);
     assert!(
         gs.contains(&"mixed"),
-        "mixed-use const copies without the flag: {gs:?}"
+        "mixed-use const copies under the opt-out: {gs:?}"
     );
     assert!(
         ss.iter().filter(|s| s.starts_with(".str")).count() == 2 && gs.contains(&"__const_stage"),
-        "string literals stage without the flag: {map}"
+        "string literals stage under the opt-out: {map}"
     );
 }

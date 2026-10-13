@@ -102,10 +102,29 @@ fn legalize_inner(m: Module, pic18: bool, core: device::Core) -> Module {
     } else {
         (m, false)
     };
+    // Post-LSR strided pointer loops become unit-stride counted loops
+    // (epic-cc#1169), which the PIC14 down-counter walk serves. The
+    // PIC18 path keeps the LSR form for its own POSTINC walk.
+    let m = if pic18 { m } else { destrengthen_lsr_loops(m) };
+    // The `strcmp` idiom rotates into the two-block NUL-walk shape
+    // (epic-cc#1170) on the same path: the PIC18 backend keeps the
+    // carried form for its own walk.
+    let m = if pic18 { m } else { rotate_strcmp_loops(m) };
     let m = narrow_div_rem_tails(m);
+    // Widening products narrow on classic PIC14 only: the other cores keep
+    // `__mul_u32` and have no `__mul_s16` recipe. Runs before the lowering
+    // loop so the loop never sees the wide multiply it would route to u32.
+    let (m, wide_mul) = if core == device::Core::Pic14 {
+        narrow_widening_mul(m)
+    } else {
+        (m, false)
+    };
     let mut m = narrow_zext_snapshots(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
+    if wide_mul {
+        used.push("__mul_s16".to_string());
+    }
     if udec {
         used.push("__udec_u32".to_string());
     }
@@ -978,6 +997,1166 @@ fn share_lsr_decimal_loops(m: Module) -> (Module, bool) {
         true,
     )
 }
+/// One post-LSR strided pointer loop (epic-cc#1169): a pointer phi
+/// stepping by one alongside an integer counter stepping by `s`, with
+/// the latch comparing the stepped increment against `s * K`. The
+/// down-counter walk serves unit-stride counted loops only, so the
+/// rewrite carries the shape there: a unit counter plus a byte value
+/// recurrence for the truncated steps.
+struct StridedSite {
+    h: usize,
+    pre: usize,
+    base: GepBase,
+    counter_ty: Ty,
+    step: i64,
+    k: i64,
+    ptr_phi: String,
+    counter: String,
+    increg: String,
+    latch: String,
+    step_gep: String,
+    truncs: Vec<String>,
+}
+
+/// Matches post-LSR strided pointer loops in one function: a
+/// single-block self-loop whose pointer phi walks by one while an
+/// integer counter walks by `s`. Every counter read must sit on the
+/// pattern (truncs remap to the value recurrence, the increment and
+/// latch rebuild); every pointer-phi read must be a byte memop or the
+/// step GEP. Anything else keeps the loop, which is always correct.
+fn find_strided_sites(f: &Func) -> Vec<StridedSite> {
+    let preds = block_preds(f);
+    let uses = block_uses(f);
+    let only_in =
+        |r: &str, h: usize| -> bool { uses.get(r).is_some_and(|v| v.iter().all(|&i| i == h)) };
+    let mut sites = Vec::new();
+    for h in 0..f.blocks.len() {
+        if h == 0 {
+            continue;
+        }
+        if preds[h].len() != 2 || !preds[h].contains(&h) {
+            continue;
+        }
+        let pre = *preds[h].iter().find(|&&p| p != h).unwrap();
+        let hl = f.blocks[h].label.clone();
+        let pl = f.blocks[pre].label.clone();
+        let hinsts = &f.blocks[h].insts;
+        if !matches!(&f.blocks[pre].insts.last(), Some(Inst::Br(br)) if br.target == hl) {
+            continue;
+        }
+        let Some(Inst::BrCond(hbr)) = hinsts.last() else {
+            continue;
+        };
+        if hbr.t == hbr.f {
+            continue;
+        }
+        if hbr.t != hl && hbr.f != hl {
+            continue;
+        }
+        let Val::Reg(cond) = &hbr.cond else {
+            continue;
+        };
+        if hinsts.len() < 2 {
+            continue;
+        }
+        let latch = match &hinsts[hinsts.len() - 2] {
+            Inst::Icmp(c) if c.dst == *cond && c.pred == "eq" => c.clone(),
+            _ => continue,
+        };
+        if !only_in(&latch.dst, h) {
+            continue;
+        }
+        let (increg, bound) = match (&latch.a, &latch.b) {
+            (Val::Reg(r), Val::Const(c)) | (Val::Const(c), Val::Reg(r)) => (r.clone(), *c),
+            _ => continue,
+        };
+        let incb = match hinsts.iter().find_map(|i| match i {
+            Inst::Bin(q) if q.dst == increg => Some(q.clone()),
+            _ => None,
+        }) {
+            Some(q) => q,
+            None => continue,
+        };
+        let (counter, step) = match (&incb.op, &incb.a, &incb.b) {
+            (BinOp::Add, Val::Reg(q), Val::Const(s)) | (BinOp::Add, Val::Const(s), Val::Reg(q)) => {
+                (q.clone(), *s)
+            }
+            _ => continue,
+        };
+        if !(1..=255).contains(&step) {
+            continue;
+        }
+        if !(incb.ty == Ty::I8 || incb.ty == Ty::I16) {
+            continue;
+        }
+        if bound % step != 0 {
+            continue;
+        }
+        let k = bound / step;
+        if !(1..=255).contains(&k) {
+            continue;
+        }
+        let arm = |ph: &Phi, l: &str| -> Option<Val> {
+            ph.incoming
+                .iter()
+                .find(|(_, lab)| lab == l)
+                .map(|(v, _)| v.clone())
+        };
+        let cphi = match hinsts.iter().find_map(|i| match i {
+            Inst::Phi(p) if p.dst == counter => Some(p.clone()),
+            _ => None,
+        }) {
+            Some(p) => p,
+            None => continue,
+        };
+        if cphi.ptr || !(cphi.ty == Ty::I8 || cphi.ty == Ty::I16) {
+            continue;
+        }
+        if cphi.ty != incb.ty {
+            continue;
+        }
+        // The latch compares at counter width, so the bound must fit
+        // it: a wider bound would fire on the wrapped value while the
+        // rewrite counts whole trips.
+        if cphi.ty == Ty::I8 && bound > 255 {
+            continue;
+        }
+        if cphi.ty == Ty::I16 && bound > 65535 {
+            continue;
+        }
+        if latch.ty != cphi.ty {
+            continue;
+        }
+        if arm(&cphi, &hl) != Some(Val::Reg(increg.clone()))
+            || arm(&cphi, &pl) != Some(Val::Const(0))
+        {
+            continue;
+        }
+        // The counter feeds truncs (remapped), its increment, and its
+        // phi arms only. A direct value use outside a width step stays
+        // unproven and keeps the loop.
+        let mut truncs = Vec::new();
+        let mut ok = true;
+        for inst in hinsts {
+            match inst {
+                Inst::Trunc(t) if matches!(&t.val, Val::Reg(r) if r == &counter) => {
+                    if t.to != Ty::I8 || t.from != cphi.ty {
+                        ok = false;
+                        break;
+                    }
+                    truncs.push(t.dst.clone());
+                }
+                Inst::Zext(z) if matches!(&z.val, Val::Reg(r) if r == &counter) => {
+                    if step != 1 {
+                        ok = false;
+                        break;
+                    }
+                }
+                Inst::Sext(s) if matches!(&s.val, Val::Reg(r) if r == &counter) => {
+                    if step != 1 {
+                        ok = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            for r in inst_reads(inst) {
+                if r != counter {
+                    continue;
+                }
+                match inst {
+                    Inst::Trunc(_) => {}                             // remapped to the recurrence
+                    Inst::Bin(q) if q.dst == increg => {}            // the step
+                    Inst::Phi(p) if p.dst == counter => {}           // the counter
+                    Inst::Zext(_) | Inst::Sext(_) if step == 1 => {} // retargeted
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        if !only_in(&counter, h) || !only_in(&increg, h) {
+            continue;
+        }
+        // The pointer phi arms from the base and steps by one through a
+        // lone GEP; every other read is a byte memop over it.
+        let pphi = match hinsts.iter().find_map(|i| match i {
+            Inst::Phi(p) if p.ptr => Some(p.clone()),
+            _ => None,
+        }) {
+            Some(p) => p,
+            None => continue,
+        };
+        if hinsts
+            .iter()
+            .any(|i| matches!(i, Inst::Phi(p) if p.ptr && p.dst != pphi.dst))
+        {
+            continue;
+        }
+        let base = match arm(&pphi, &pl) {
+            Some(Val::Global(g)) => GepBase::Global(g),
+            Some(Val::Reg(r)) if f.params.iter().any(|p| p.name == r && p.ptr) => GepBase::Reg(r),
+            _ => continue,
+        };
+        let step_gep = match hinsts.iter().find_map(|i| match i {
+            Inst::Gep(gp)
+                if matches!(&gp.base, GepBase::Reg(r) if r == &pphi.dst)
+                    && gp.k == 1
+                    && gp.terms.is_empty() =>
+            {
+                Some(gp.dst.clone())
+            }
+            _ => None,
+        }) {
+            Some(g) => g,
+            None => continue,
+        };
+        if arm(&pphi, &hl) != Some(Val::Reg(step_gep.clone())) {
+            continue;
+        }
+        if !only_in(&pphi.dst, h) || !only_in(&step_gep, h) {
+            continue;
+        }
+        for t in &truncs {
+            if !only_in(t, h) {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        // At least one memop walks the pointer: a pure-dead pointer
+        // walk is dead-code territory, not a stride to straighten.
+        let mut ptr_memops = 0;
+        for inst in hinsts {
+            match inst {
+                Inst::Phi(p) => {
+                    // The counter and pointer phis are rebuilt; a carried
+                    // phi may remap a trunc arm, but nothing else names
+                    // the pattern regs.
+                    if p.dst != counter && p.dst != pphi.dst {
+                        for (v, _) in &p.incoming {
+                            if matches!(v, Val::Reg(r)
+                                if r == &counter
+                                    || r == &increg
+                                    || r == &pphi.dst
+                                    || r == &step_gep
+                                    || r == &latch.dst)
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                Inst::Gep(_)
+                | Inst::Bin(_)
+                | Inst::Trunc(_)
+                | Inst::Zext(_)
+                | Inst::Sext(_)
+                | Inst::Icmp(_)
+                | Inst::Select(_)
+                | Inst::Freeze(_)
+                | Inst::Br(_)
+                | Inst::BrCond(_) => {}
+                Inst::Load(l) => {
+                    if l.ptr_ty || l.ty != Ty::I8 {
+                        ok = false;
+                        break;
+                    }
+                    let ptr = l.ptr.strip_prefix('%').unwrap_or(&l.ptr);
+                    if ptr != pphi.dst && !l.ptr.starts_with('@') {
+                        ok = false;
+                        break;
+                    }
+                    if ptr == pphi.dst {
+                        // A re-addressed volatile access keeps its
+                        // count and order, but MMIO stays on the
+                        // carried form like every sibling matcher.
+                        if l.volatile {
+                            ok = false;
+                            break;
+                        }
+                        ptr_memops += 1;
+                    }
+                }
+                Inst::Store(s) => {
+                    if s.ty != Ty::I8 {
+                        ok = false;
+                        break;
+                    }
+                    let ptr = s.ptr.strip_prefix('%').unwrap_or(&s.ptr);
+                    if ptr != pphi.dst && !s.ptr.starts_with('@') {
+                        ok = false;
+                        break;
+                    }
+                    if ptr == pphi.dst {
+                        if s.volatile {
+                            ok = false;
+                            break;
+                        }
+                        ptr_memops += 1;
+                    }
+                    if matches!(&s.val, Val::Reg(r)
+                        if r == &counter || r == &increg || r == &pphi.dst || r == &step_gep)
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                break;
+            }
+            // Every remaining pattern-reg read must sit on the pattern:
+            // trunc regs remap at value positions only, the increment
+            // feeds the latch and the counter phi, the step GEP feeds
+            // the pointer phi, and the latch feeds the branch.
+            for r in inst_reads(inst) {
+                if truncs.iter().any(|t| t == &r) {
+                    let ptr_pos = match inst {
+                        Inst::Load(l) => l.ptr.strip_prefix('%').unwrap_or(&l.ptr) == r,
+                        Inst::Store(s) => s.ptr.strip_prefix('%').unwrap_or(&s.ptr) == r,
+                        _ => false,
+                    };
+                    if ptr_pos
+                        || matches!(
+                            inst,
+                            Inst::Ret(..)
+                                | Inst::Call(_)
+                                | Inst::BrCond(_)
+                                | Inst::Switch(_)
+                                | Inst::Gep(_)
+                        )
+                    {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
+                if r == increg
+                    && !matches!(inst, Inst::Phi(p) if p.dst == counter)
+                    && !matches!(inst, Inst::Icmp(c) if c.dst == latch.dst)
+                {
+                    ok = false;
+                    break;
+                }
+                if r == pphi.dst
+                    && !matches!(inst, Inst::Phi(_) | Inst::Load(_) | Inst::Store(_))
+                    && !matches!(inst, Inst::Gep(gp) if gp.dst == step_gep)
+                {
+                    ok = false;
+                    break;
+                }
+                if r == step_gep && !matches!(inst, Inst::Phi(_)) {
+                    ok = false;
+                    break;
+                }
+                if r == latch.dst && !matches!(inst, Inst::BrCond(_)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                break;
+            }
+        }
+        if !ok || ptr_memops == 0 {
+            continue;
+        }
+        sites.push(StridedSite {
+            h,
+            pre,
+            base,
+            counter_ty: cphi.ty.clone(),
+            step,
+            k,
+            ptr_phi: pphi.dst.clone(),
+            counter: counter.clone(),
+            increg: increg.clone(),
+            latch: latch.dst.clone(),
+            step_gep: step_gep.clone(),
+            truncs,
+        });
+    }
+    sites
+}
+/// Rewrites every post-LSR strided pointer loop into a unit-stride
+/// counted loop: a unit counter plus a byte value recurrence for the
+/// truncated steps, one GEP per old pointer memop. The value recurrence
+/// is exact mod 256 and the addresses walk the same bytes in order, so
+/// the rewrite preserves semantics even where the down-counter walk
+/// later refuses the span.
+fn destrengthen_lsr_loops(m: Module) -> Module {
+    let mut names = FreshNames::from_module(&m);
+    let mut funcs = Vec::with_capacity(m.funcs.len());
+    for f in m.funcs {
+        let sites = find_strided_sites(&f);
+        if sites.is_empty() {
+            funcs.push(f);
+            continue;
+        }
+        let Func {
+            name,
+            ret,
+            params,
+            blocks,
+            isr,
+            irq_priority,
+            naked,
+            unreachable_body,
+            variadic,
+        } = f;
+        let labels: Vec<String> = blocks.iter().map(|b| b.label.clone()).collect();
+        let by_site: HashMap<usize, &StridedSite> = sites.iter().map(|s| (s.h, s)).collect();
+        let mut out = Vec::with_capacity(blocks.len());
+        for (bi, b) in blocks.into_iter().enumerate() {
+            match by_site.get(&bi) {
+                None => out.push(b),
+                Some(site) => out.push(rewrite_strided_block(b, &labels, site, &mut names)),
+            }
+        }
+        funcs.push(Func {
+            name,
+            ret,
+            params,
+            blocks: out,
+            isr,
+            irq_priority,
+            naked,
+            unreachable_body,
+            variadic,
+        });
+    }
+    Module {
+        globals: m.globals,
+        funcs,
+        module_asm: m.module_asm,
+    }
+}
+
+/// Rewrites one strided header: the pointer and stepped-counter phis
+/// become a unit counter (plus the value recurrence when truncs feed
+/// values), the step GEP drops, each pointer memop gains its own unit
+/// GEP, and the increment plus latch count units. New regs come from
+/// the module fresh set, so no site collides with user names.
+fn rewrite_strided_block(
+    b: Block,
+    labels: &[String],
+    site: &StridedSite,
+    names: &mut FreshNames,
+) -> Block {
+    let jreg = names.fresh();
+    let jnext = names.fresh();
+    let need_v = !site.truncs.is_empty() && site.step != 1;
+    let vreg = if need_v { Some(names.fresh()) } else { None };
+    let vnext = if need_v { Some(names.fresh()) } else { None };
+    // A trunc value rebuilds from the recurrence when stepped, or
+    // re-truncates the unit counter when the stride is one.
+    let remap = |v: &Val| -> Val {
+        match v {
+            Val::Reg(r) if site.truncs.iter().any(|t| t == r) => match &vreg {
+                Some(vr) => Val::Reg(vr.clone()),
+                None => Val::Reg(jreg.clone()),
+            },
+            _ => v.clone(),
+        }
+    };
+    // New GEP dst per pointer memop, allocated up front so emission
+    // order never depends on the scan.
+    let mut gep_dsts: HashMap<usize, String> = HashMap::new();
+    for (ii, inst) in b.insts.iter().enumerate() {
+        let is_ptr_memop = match inst {
+            Inst::Load(l) => l.ptr.strip_prefix('%').unwrap_or(&l.ptr) == site.ptr_phi,
+            Inst::Store(s) => s.ptr.strip_prefix('%').unwrap_or(&s.ptr) == site.ptr_phi,
+            _ => false,
+        };
+        if is_ptr_memop {
+            gep_dsts.insert(ii, names.fresh());
+        }
+    }
+    let mut insts: Vec<Inst> = Vec::with_capacity(b.insts.len() + 4);
+    let mut phis_done = false;
+    for (ii, inst) in b.insts.iter().enumerate() {
+        match inst {
+            Inst::Phi(p) if p.dst == site.counter || p.dst == site.ptr_phi => {
+                if !phis_done {
+                    phis_done = true;
+                    insts.push(Inst::Phi(Phi {
+                        dst: jreg.clone(),
+                        ty: site.counter_ty.clone(),
+                        incoming: vec![
+                            (Val::Const(0), labels[site.pre].clone()),
+                            (Val::Reg(jnext.clone()), labels[site.h].clone()),
+                        ],
+                        ptr: false,
+                        loc: None,
+                    }));
+                    if let (Some(vr), Some(vn)) = (vreg.clone(), vnext.clone()) {
+                        insts.push(Inst::Phi(Phi {
+                            dst: vr,
+                            ty: Ty::I8,
+                            incoming: vec![
+                                (Val::Const(0), labels[site.pre].clone()),
+                                (Val::Reg(vn), labels[site.h].clone()),
+                            ],
+                            ptr: false,
+                            loc: None,
+                        }));
+                    }
+                }
+            }
+            Inst::Phi(p) => {
+                let mut np = p.clone();
+                for (v, _) in np.incoming.iter_mut() {
+                    *v = remap(v);
+                }
+                insts.push(Inst::Phi(np));
+            }
+            Inst::Gep(gp) if gp.dst == site.step_gep => {}
+            Inst::Trunc(t) if matches!(&t.val, Val::Reg(r) if r == &site.counter) => {
+                if site.step == 1 {
+                    let mut nt = t.clone();
+                    nt.val = Val::Reg(jreg.clone());
+                    insts.push(Inst::Trunc(nt));
+                }
+            }
+            Inst::Bin(q) if q.dst == site.increg => {
+                insts.push(Inst::Bin(Bin {
+                    dst: jnext.clone(),
+                    op: BinOp::Add,
+                    ty: site.counter_ty.clone(),
+                    a: Val::Reg(jreg.clone()),
+                    b: Val::Const(1),
+                    loc: q.loc.clone(),
+                }));
+                if let (Some(vr), Some(vn)) = (vreg.clone(), vnext.clone()) {
+                    insts.push(Inst::Bin(Bin {
+                        dst: vn,
+                        op: BinOp::Add,
+                        ty: Ty::I8,
+                        a: Val::Reg(vr),
+                        b: Val::Const(site.step),
+                        loc: q.loc.clone(),
+                    }));
+                }
+            }
+            Inst::Bin(q) => {
+                let mut nq = q.clone();
+                nq.a = remap(&nq.a);
+                nq.b = remap(&nq.b);
+                insts.push(Inst::Bin(nq));
+            }
+            Inst::Icmp(c) if c.dst == site.latch => {
+                insts.push(Inst::Icmp(Icmp {
+                    dst: c.dst.clone(),
+                    pred: c.pred.clone(),
+                    ty: site.counter_ty.clone(),
+                    a: Val::Reg(jnext.clone()),
+                    b: Val::Const(site.k),
+                    loc: c.loc.clone(),
+                }));
+            }
+            Inst::Icmp(c) => {
+                let mut nc = c.clone();
+                nc.a = remap(&nc.a);
+                nc.b = remap(&nc.b);
+                insts.push(Inst::Icmp(nc));
+            }
+            Inst::Load(l) if gep_dsts.contains_key(&ii) => {
+                let dst = gep_dsts[&ii].clone();
+                insts.push(Inst::Gep(Gep {
+                    dst: dst.clone(),
+                    base: site.base.clone(),
+                    k: 0,
+                    terms: vec![(1, jreg.clone())],
+                    loc: l.loc.clone(),
+                }));
+                let mut nl = l.clone();
+                nl.ptr = format!("%{dst}");
+                insts.push(Inst::Load(nl));
+            }
+            Inst::Store(s) if gep_dsts.contains_key(&ii) => {
+                let dst = gep_dsts[&ii].clone();
+                insts.push(Inst::Gep(Gep {
+                    dst: dst.clone(),
+                    base: site.base.clone(),
+                    k: 0,
+                    terms: vec![(1, jreg.clone())],
+                    loc: s.loc.clone(),
+                }));
+                let mut ns = s.clone();
+                ns.ptr = format!("%{dst}");
+                ns.val = remap(&ns.val);
+                insts.push(Inst::Store(ns));
+            }
+            Inst::Zext(z) => {
+                let mut nz = z.clone();
+                if matches!(&nz.val, Val::Reg(r) if r == &site.counter) {
+                    nz.val = Val::Reg(jreg.clone());
+                } else {
+                    nz.val = remap(&nz.val);
+                }
+                insts.push(Inst::Zext(nz));
+            }
+            Inst::Sext(sx) => {
+                let mut ns = sx.clone();
+                if matches!(&ns.val, Val::Reg(r) if r == &site.counter) {
+                    ns.val = Val::Reg(jreg.clone());
+                } else {
+                    ns.val = remap(&ns.val);
+                }
+                insts.push(Inst::Sext(ns));
+            }
+            Inst::Select(s) => {
+                let mut ns = s.clone();
+                ns.cond = remap(&ns.cond);
+                ns.a = remap(&ns.a);
+                ns.b = remap(&ns.b);
+                insts.push(Inst::Select(ns));
+            }
+            Inst::Freeze(fz) => {
+                let mut nf = fz.clone();
+                nf.val = remap(&nf.val);
+                insts.push(Inst::Freeze(nf));
+            }
+            other => insts.push(other.clone()),
+        }
+    }
+    Block {
+        label: b.label,
+        insts,
+    }
+}
+/// One `strcmp`-idiom loop (epic-cc#1170): a primed entry, a header
+/// comparing the carried byte against the next string, and a latch
+/// pre-loading the following byte with its NUL test. The rotation moves
+/// both loads into the header and the NUL test into a latch block, which
+/// is the two-block NUL-walk shape: the bottom pre-load and the prime
+/// dissolve, and every iteration tests the current bytes.
+struct StrcmpSite {
+    e: usize,
+    h: usize,
+    l: usize,
+    x: usize,
+    /// Carried byte phi dst, reused as the header load dst.
+    b: String,
+    /// Counter phi dst.
+    j: String,
+    /// Increment dst.
+    inc: String,
+    /// NUL test dst.
+    nul: String,
+    /// Exit index/value phi dsts.
+    idx: String,
+    val: String,
+    /// s1 global name, base of the rotated header load.
+    g1: String,
+}
+
+/// Matches the `strcmp` idiom in one function: entry prime (`load @G1`,
+/// NUL test, exit-or-header), header (carried byte phi, unit counter
+/// phi, `s2` load, equal-compare into latch-or-crit), latch (counter
+/// increment, `s1+1` advance GEP plus counter GEP, next-byte load, NUL
+/// test into exit-or-header), crit (`zext` into the exit), and an exit
+/// combining the index and the value. Const strings refuse: FSR cannot
+/// read flash, so the walk would refuse and the rotation would be
+/// pointless churn.
+fn find_strcmp_sites(f: &Func, const_globals: &HashSet<String>) -> Vec<StrcmpSite> {
+    let preds = block_preds(f);
+    let uses = block_uses(f);
+    let only_in = |r: &str, blocks: &[usize]| -> bool {
+        uses.get(r)
+            .is_some_and(|v| v.iter().all(|i| blocks.contains(i)))
+    };
+    let arm = |ph: &Phi, l: &str| -> Option<Val> {
+        ph.incoming
+            .iter()
+            .find(|(_, lab)| lab == l)
+            .map(|(v, _)| v.clone())
+    };
+    let mut sites = Vec::new();
+    for l in 1..f.blocks.len() {
+        let lbr = match f.blocks[l].insts.last() {
+            Some(Inst::BrCond(br)) => br.clone(),
+            _ => continue,
+        };
+        if lbr.t == lbr.f {
+            continue;
+        }
+        // Either arm may head back; the other exits.
+        for (h, x) in [(&lbr.t, &lbr.f), (&lbr.f, &lbr.t)] {
+            let h = match f.blocks.iter().position(|b| &b.label == h) {
+                Some(h) => h,
+                None => continue,
+            };
+            if h == l {
+                continue;
+            }
+            let x = match f.blocks.iter().position(|b| &b.label == x) {
+                Some(x) => x,
+                None => continue,
+            };
+            if x == l || x == h {
+                continue;
+            }
+            let hbr = match f.blocks[h].insts.last() {
+                Some(Inst::BrCond(br)) => br.clone(),
+                _ => continue,
+            };
+            if hbr.t == hbr.f {
+                continue;
+            }
+            let hlabels: Vec<&str> = vec![&hbr.t, &hbr.f];
+            if !hlabels.contains(&f.blocks[l].label.as_str()) {
+                continue;
+            }
+            let c = if hbr.t == f.blocks[l].label {
+                hbr.f.clone()
+            } else {
+                hbr.t.clone()
+            };
+            let c = match f.blocks.iter().position(|b| b.label == c) {
+                Some(c) => c,
+                None => continue,
+            };
+            if c == l || c == h {
+                continue;
+            }
+            if preds[h].len() != 2 || !preds[h].contains(&l) {
+                continue;
+            }
+            let e = match preds[h].iter().find(|&&p| p != l) {
+                Some(&e) => e,
+                None => continue,
+            };
+            if e == h || e == l || e == c || e == x {
+                continue;
+            }
+            if preds[l] != vec![h] {
+                continue;
+            }
+            if preds[c] != vec![h] {
+                continue;
+            }
+            let hl = f.blocks[h].label.clone();
+            let ll = f.blocks[l].label.clone();
+            let el = f.blocks[e].label.clone();
+            let cl = f.blocks[c].label.clone();
+            let xl = f.blocks[x].label.clone();
+            // Entry prime: one load, one NUL test, out or in.
+            if f.blocks[e].insts.len() != 3 {
+                continue;
+            }
+            let (a0, t0) = match (&f.blocks[e].insts[0], &f.blocks[e].insts[1]) {
+                (Inst::Load(ld), Inst::Icmp(ic))
+                    if !ld.ptr_ty && ld.ty == Ty::I8 && !ld.volatile && ic.pred == "eq" =>
+                {
+                    (ld.clone(), ic.clone())
+                }
+                _ => continue,
+            };
+            let g1 = match a0.ptr.strip_prefix('@') {
+                Some(g) => g.to_string(),
+                None => continue,
+            };
+            let prime_ok = match (&t0.a, &t0.b) {
+                (Val::Reg(r), Val::Const(0)) | (Val::Const(0), Val::Reg(r)) => r == &a0.dst,
+                _ => continue,
+            };
+            if !prime_ok {
+                continue;
+            }
+            match &f.blocks[e].insts[2] {
+                Inst::BrCond(bc) if (bc.t == xl && bc.f == hl) || (bc.t == hl && bc.f == xl) => {}
+                _ => continue,
+            }
+            // Header: carried byte phi, counter phi, s2 load, compare.
+            let hinsts = &f.blocks[h].insts;
+            if hinsts.len() != 6 {
+                continue;
+            }
+            let (bphi, jphi) = match (&hinsts[0], &hinsts[1]) {
+                (Inst::Phi(a), Inst::Phi(b)) => (a.clone(), b.clone()),
+                _ => continue,
+            };
+            let (bphi, jphi) = if bphi.ty == Ty::I8 && jphi.ty == Ty::I16 && !bphi.ptr && !jphi.ptr
+            {
+                (bphi, jphi)
+            } else if bphi.ty == Ty::I16 && jphi.ty == Ty::I8 && !bphi.ptr && !jphi.ptr {
+                (jphi, bphi)
+            } else {
+                continue;
+            };
+            let b = bphi.dst.clone();
+            let j = jphi.dst.clone();
+            let nb = match arm(&bphi, &ll) {
+                Some(Val::Reg(r)) => r,
+                _ => continue,
+            };
+            if arm(&bphi, &el) != Some(Val::Reg(a0.dst.clone())) {
+                continue;
+            }
+            let inc = match arm(&jphi, &ll) {
+                Some(Val::Reg(r)) => r,
+                _ => continue,
+            };
+            if arm(&jphi, &el) != Some(Val::Const(0)) {
+                continue;
+            }
+            let (g2gep, b2load, cmp) = match (&hinsts[2], &hinsts[3], &hinsts[4]) {
+                (Inst::Gep(gp), Inst::Load(ld), Inst::Icmp(ic))
+                    if !ld.ptr_ty && ld.ty == Ty::I8 && !ld.volatile && ic.pred == "eq" =>
+                {
+                    (gp.clone(), ld.clone(), ic.clone())
+                }
+                _ => continue,
+            };
+            let g2 = match &g2gep.base {
+                GepBase::Global(g) => g.clone(),
+                _ => continue,
+            };
+            if g2gep.terms.len() != 1 || g2gep.terms[0].0 != 1 || g2gep.terms[0].1 != j {
+                continue;
+            }
+            if b2load.ptr != format!("%{}", g2gep.dst) {
+                continue;
+            }
+            let cmp_ok = match (&cmp.a, &cmp.b) {
+                (Val::Reg(a), Val::Reg(bb)) if a == &b && bb == &b2load.dst => true,
+                (Val::Reg(a), Val::Reg(bb)) if a == &b2load.dst && bb == &b => true,
+                _ => false,
+            };
+            if !cmp_ok {
+                continue;
+            }
+            // Latch: increment, s1 advance, next load, NUL test.
+            let linsts = &f.blocks[l].insts;
+            if linsts.len() != 6 {
+                continue;
+            }
+            let (linc, gbase, gs, nbload, t1) =
+                match (&linsts[0], &linsts[1], &linsts[2], &linsts[3], &linsts[4]) {
+                    (
+                        Inst::Bin(q),
+                        Inst::Gep(gb),
+                        Inst::Gep(gs),
+                        Inst::Load(ld),
+                        Inst::Icmp(ic),
+                    ) if q.op == BinOp::Add
+                        && q.ty == Ty::I16
+                        && !ld.ptr_ty
+                        && ld.ty == Ty::I8
+                        && !ld.volatile
+                        && ic.pred == "eq" =>
+                    {
+                        (q.clone(), gb.clone(), gs.clone(), ld.clone(), ic.clone())
+                    }
+                    _ => continue,
+                };
+            let inc_ok = match (&linc.a, &linc.b) {
+                (Val::Reg(q), Val::Const(1)) | (Val::Const(1), Val::Reg(q)) => q == &j,
+                _ => false,
+            };
+            if linc.dst != inc || !inc_ok {
+                continue;
+            }
+            let gb_ok = match &gbase.base {
+                GepBase::Global(g) if g == &g1 => gbase.k == 1 && gbase.terms.is_empty(),
+                _ => false,
+            };
+            if !gb_ok {
+                continue;
+            }
+            if gs.k != 0 || gs.terms.len() != 1 || gs.terms[0].0 != 1 || gs.terms[0].1 != j {
+                continue;
+            }
+            if !matches!(&gs.base, GepBase::Reg(r) if r == &gbase.dst) {
+                continue;
+            }
+            if nbload.dst != nb || nbload.ptr != format!("%{}", gs.dst) {
+                continue;
+            }
+            let t1_ok = match (&t1.a, &t1.b) {
+                (Val::Reg(r), Val::Const(0)) | (Val::Const(0), Val::Reg(r)) => r == &nb,
+                _ => false,
+            };
+            if !t1_ok {
+                continue;
+            }
+            // Crit: zext of the carried byte into the exit.
+            if f.blocks[c].insts.len() != 2 {
+                continue;
+            }
+            let z = match (&f.blocks[c].insts[0], &f.blocks[c].insts[1]) {
+                (Inst::Zext(z), Inst::Br(br)) if br.target == xl => {
+                    if z.from != Ty::I8 || z.to != Ty::I16 {
+                        continue;
+                    }
+                    if z.val != Val::Reg(b.clone()) {
+                        continue;
+                    }
+                    z.dst.clone()
+                }
+                _ => continue,
+            };
+            // Exit: index and value phis over the loop edges.
+            let xinsts = &f.blocks[x].insts;
+            let mut xphis: Vec<Phi> = Vec::new();
+            for inst in xinsts {
+                if let Inst::Phi(p) = inst {
+                    xphis.push(p.clone());
+                } else {
+                    break;
+                }
+            }
+            if xphis.len() != 2 {
+                continue;
+            }
+            let (idxphi, valphi) = (&xphis[0], &xphis[1]);
+            if idxphi.ty != Ty::I16 || valphi.ty != Ty::I16 || idxphi.ptr || valphi.ptr {
+                continue;
+            }
+            if arm(idxphi, &cl) != Some(Val::Reg(j.clone())) {
+                continue;
+            }
+            if arm(idxphi, &ll) != Some(Val::Reg(inc.clone())) {
+                continue;
+            }
+            if arm(valphi, &cl) != Some(Val::Reg(z.clone())) {
+                continue;
+            }
+            if arm(valphi, &ll) != Some(Val::Const(0)) {
+                continue;
+            }
+            for phi in &[idxphi, valphi] {
+                if phi.incoming.len() != 2 && !(phi.incoming.len() == 3 && arm(phi, &el).is_some())
+                {
+                    continue;
+                }
+            }
+            // The rerouted prime-NUL case delivers (0, 0) through the
+            // loop, so entry arms must already be zero; anything else
+            // changes the value and keeps the carried form.
+            if arm(idxphi, &el).is_some_and(|v| v != Val::Const(0)) {
+                continue;
+            }
+            if arm(valphi, &el).is_some_and(|v| v != Val::Const(0)) {
+                continue;
+            }
+            let idx = idxphi.dst.clone();
+            let val = valphi.dst.clone();
+            if const_globals.contains(&g1) || const_globals.contains(&g2) {
+                continue;
+            }
+            // Doomed regs (prime, pre-load chain, compares) must read
+            // only where the rewrite rebuilds; the exit tail must not
+            // name them, and the carried byte must not escape to it.
+            let doomed = [
+                a0.dst.clone(),
+                t0.dst.clone(),
+                nb.clone(),
+                inc.clone(),
+                gbase.dst.clone(),
+                gs.dst.clone(),
+                b2load.dst.clone(),
+                cmp.dst.clone(),
+                t1.dst.clone(),
+            ];
+            let mut ok = true;
+            for inst in xinsts.iter().skip(xphis.len()) {
+                for r in inst_reads(inst) {
+                    if doomed.iter().any(|d| d == &r) || r == b {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            for (r, allowed) in [
+                (a0.dst.clone(), vec![e, h]),
+                (t0.dst.clone(), vec![e]),
+                (nb.clone(), vec![l, h]),
+                (inc.clone(), vec![l, h, x]),
+                (gbase.dst.clone(), vec![l]),
+                (gs.dst.clone(), vec![l]),
+                (b2load.dst.clone(), vec![h]),
+                (cmp.dst.clone(), vec![h]),
+                (t1.dst.clone(), vec![l]),
+            ] {
+                if !only_in(&r, &allowed) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            if !only_in(&b, &[h, c]) {
+                continue;
+            }
+            if !only_in(&j, &[h, l, x]) {
+                continue;
+            }
+            if h == 0 || l == 0 || c == 0 {
+                continue;
+            }
+            sites.push(StrcmpSite {
+                e,
+                h,
+                l,
+                x,
+                b,
+                j,
+                inc,
+                nul: t1.dst.clone(),
+                idx,
+                val,
+                g1,
+            });
+            break;
+        }
+    }
+    sites
+}
+/// Rewrites every `strcmp`-idiom loop into the two-block NUL-walk shape
+/// (epic-cc#1170): the entry prime becomes a plain branch, the header
+/// loads both current bytes (the carried phi dst becomes the `s1` load),
+/// and the latch tests the current byte for NUL beside the increment.
+/// The per-iteration values match the idiom exactly: the prime and the
+/// pre-load dissolve because iteration `j` tests `s1[j]` itself, and the
+/// exit arms trade the ahead-index for the homed counter, which agrees
+/// on every exit path.
+fn rotate_strcmp_loops(m: Module) -> Module {
+    let const_globals: HashSet<String> = m
+        .globals
+        .iter()
+        .filter(|g| g.is_const)
+        .map(|g| g.name.clone())
+        .collect();
+    let mut names = FreshNames::from_module(&m);
+    let mut funcs = Vec::with_capacity(m.funcs.len());
+    for f in m.funcs {
+        let sites = find_strcmp_sites(&f, &const_globals);
+        if sites.is_empty() {
+            funcs.push(f);
+            continue;
+        }
+        funcs.push(rewrite_strcmp_func(f, &sites, &mut names));
+    }
+    Module {
+        globals: m.globals,
+        funcs,
+        module_asm: m.module_asm,
+    }
+}
+
+/// Rewrites one function's strcmp sites in place by block index: the
+/// entry prime becomes a plain branch, the header gains the `s1` GEP
+/// and load (reusing the carried phi's name), the latch trades its
+/// pre-load chain for a current-byte NUL test, and the exit phis drop
+/// the dead prime arm while the latch arm names the homed counter.
+fn rewrite_strcmp_func(mut f: Func, sites: &[StrcmpSite], names: &mut FreshNames) -> Func {
+    for site in sites {
+        let hl = f.blocks[site.h].label.clone();
+        let el = f.blocks[site.e].label.clone();
+        let ll = f.blocks[site.l].label.clone();
+        // Entry: prime dissolves into a plain branch.
+        let eloc = f.blocks[site.e].insts.last().and_then(|i| match i {
+            Inst::BrCond(bc) => bc.loc.clone(),
+            _ => None,
+        });
+        f.blocks[site.e].insts = vec![Inst::Br(Br {
+            target: hl,
+            loc: eloc,
+        })];
+        // Header: drop the carried phi, load both current bytes. The
+        // kept s2 chain, compare, and branch already read the counter
+        // and the (now loaded) carried byte, so they stay verbatim.
+        let s1gep = names.fresh();
+        let mut rebuilt: Vec<Inst> = Vec::with_capacity(8);
+        let mut phi_done = false;
+        for inst in f.blocks[site.h].insts.iter() {
+            match inst {
+                Inst::Phi(p) if p.dst == site.b => {}
+                Inst::Phi(_) if !phi_done => {
+                    phi_done = true;
+                    rebuilt.push(inst.clone());
+                    rebuilt.push(Inst::Gep(Gep {
+                        dst: s1gep.clone(),
+                        base: GepBase::Global(site.g1.clone()),
+                        k: 0,
+                        terms: vec![(1, site.j.clone())],
+                        loc: None,
+                    }));
+                    rebuilt.push(Inst::Load(Load {
+                        dst: site.b.clone(),
+                        ty: Ty::I8,
+                        ptr: format!("%{s1gep}"),
+                        ptr_ty: false,
+                        volatile: false,
+                        loc: None,
+                    }));
+                }
+                _ => rebuilt.push(inst.clone()),
+            }
+        }
+        f.blocks[site.h].insts = rebuilt;
+        // Latch: the pre-load chain becomes a current-byte NUL test.
+        let mut linsts: Vec<Inst> = Vec::new();
+        for inst in f.blocks[site.l].insts.iter() {
+            match inst {
+                Inst::Bin(q) if q.dst == site.inc => linsts.push(inst.clone()),
+                Inst::Icmp(c) if c.dst == site.nul => {
+                    linsts.push(Inst::Icmp(Icmp {
+                        dst: c.dst.clone(),
+                        pred: c.pred.clone(),
+                        ty: Ty::I8,
+                        a: Val::Reg(site.b.clone()),
+                        b: Val::Const(0),
+                        loc: c.loc.clone(),
+                    }));
+                }
+                Inst::BrCond(_) => linsts.push(inst.clone()),
+                Inst::Gep(_) | Inst::Load(_) => {}
+                other => linsts.push(other.clone()),
+            }
+        }
+        f.blocks[site.l].insts = linsts;
+        // Exit phis: drop the dead prime arm, name the homed counter.
+        for inst in f.blocks[site.x].insts.iter_mut() {
+            if let Inst::Phi(p) = inst {
+                if p.dst == site.idx {
+                    p.incoming.retain(|(_, lab)| lab != &el);
+                    for (v, lab) in p.incoming.iter_mut() {
+                        if lab == &ll {
+                            *v = Val::Reg(site.j.clone());
+                        }
+                    }
+                } else if p.dst == site.val {
+                    p.incoming.retain(|(_, lab)| lab != &el);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    f
+}
 /// One decimal-loop header matched for sharing: the call arguments plus
 /// the exit edge and source locations the rewritten block keeps.
 struct DecimalSite {
@@ -1637,6 +2816,128 @@ fn narrow_div_rem_tails(m: Module) -> Module {
         funcs,
         module_asm: m.module_asm,
     }
+}
+
+/// Narrow a widening product to a signed 16x16 -> 32 call (epic-cc#1174).
+/// clang widens both Q8.8 factors (`sext i16 -> i32`) before `mul i32`,
+/// which pays two sign-extension diamonds plus a 32-iteration `__mul_u32`.
+/// The product of two i16 values always fits i32, so `__mul_s16` (two i16
+/// params, i32 result) computes it with a 16-iteration loop and a sign
+/// correction. Sexts with surviving uses stay; the sweep drops only defs
+/// the rewrite orphaned.
+fn narrow_widening_mul(m: Module) -> (Module, bool) {
+    let mut funcs = Vec::with_capacity(m.funcs.len());
+    let mut fired = false;
+    for f in m.funcs {
+        let mut sexts: HashMap<String, String> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Sext(x) = inst {
+                    if x.from == Ty::I16 && x.to == Ty::I32 {
+                        if let Val::Reg(src) = &x.val {
+                            sexts.insert(x.dst.clone(), src.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if sexts.is_empty() {
+            funcs.push(f);
+            continue;
+        }
+        let mut narrowed = false;
+        let mut blocks = Vec::with_capacity(f.blocks.len());
+        for b in f.blocks {
+            let mut insts = Vec::with_capacity(b.insts.len());
+            for inst in b.insts {
+                if let Inst::Bin(bin) = &inst {
+                    if bin.op == BinOp::Mul && bin.ty == Ty::I32 {
+                        if let (Val::Reg(a), Val::Reg(b)) = (&bin.a, &bin.b) {
+                            if let (Some(sa), Some(sb)) = (sexts.get(a), sexts.get(b)) {
+                                let mkarg = |s: &String| CallArg {
+                                    ty: Some(Ty::I16),
+                                    val: Val::Reg(s.clone()),
+                                    byval: None,
+                                    sret: false,
+                                };
+                                insts.push(Inst::Call(Call {
+                                    dst: Some(bin.dst.clone()),
+                                    ty: Some(Ty::I32),
+                                    func: "__mul_s16".to_string(),
+                                    args: vec![mkarg(sa), mkarg(sb)],
+                                    callees: Vec::new(),
+                                    loc: None,
+                                }));
+                                narrowed = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                insts.push(inst);
+            }
+            blocks.push(Block {
+                label: b.label,
+                insts,
+            });
+        }
+        if !narrowed {
+            funcs.push(Func {
+                name: f.name,
+                ret: f.ret,
+                params: f.params,
+                blocks,
+                isr: f.isr,
+                irq_priority: f.irq_priority,
+                naked: f.naked,
+                unreachable_body: f.unreachable_body,
+                variadic: f.variadic,
+            });
+            continue;
+        }
+        fired = true;
+        let mut live: HashSet<String> = HashSet::new();
+        for b in &blocks {
+            for inst in &b.insts {
+                live.extend(inst_reads(inst));
+            }
+        }
+        let mut swept = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            let mut insts = Vec::with_capacity(b.insts.len());
+            for inst in b.insts {
+                if let Inst::Sext(x) = &inst {
+                    if x.from == Ty::I16 && x.to == Ty::I32 && !live.contains(&x.dst) {
+                        continue;
+                    }
+                }
+                insts.push(inst);
+            }
+            swept.push(Block {
+                label: b.label,
+                insts,
+            });
+        }
+        funcs.push(Func {
+            name: f.name,
+            ret: f.ret,
+            params: f.params,
+            blocks: swept,
+            isr: f.isr,
+            irq_priority: f.irq_priority,
+            naked: f.naked,
+            unreachable_body: f.unreachable_body,
+            variadic: f.variadic,
+        });
+    }
+    (
+        Module {
+            globals: m.globals,
+            funcs,
+            module_asm: m.module_asm,
+        },
+        fired,
+    )
 }
 
 /// Narrow a zero-extended snapshot to its source width when every use
@@ -5592,6 +6893,10 @@ fn routine_func(name: &str, core: device::Core) -> Func {
     let (ret, params, scr) = match name {
         "__mul_u8" => (Ty::I8, vec![param("a", 1), param("b", 1)], 1),
         "__mul_u16" => (Ty::I16, vec![param("a", 2), param("b", 2)], 2),
+        // Signed widening product (epic-cc#1174): two i16 params, i32
+        // result. `r`@0-3 (32-bit running product), `t_hi`@4-5 (the
+        // multiplicand's high half: its low half shifts in the `a` slot).
+        "__mul_s16" => (Ty::I32, vec![param("a", 2), param("b", 2)], 6),
         "__mul_u32" => (
             Ty::I32,
             vec![param("a", 4), param("b", 4)],

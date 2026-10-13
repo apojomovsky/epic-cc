@@ -1801,12 +1801,9 @@ fn sub_const_lhs_emits_sublw_chain() {
     // sub is NOT commutative: d = k - a cannot reuse the reg-const lowering
     // (which computes a - k) and must never read a const as a file register.
     // The const-LHS path lowers byte 0 as `MOVF a,W; SUBLW k; MOVWF d`
-    // (SUBLW computes k - W), then each higher byte preloads k_i into the
-    // destination and folds the borrow with the wrap-correct INCFSZ idiom
-    // (issue #1): a_i is stashed in the scratch, `INCFSZ scratch, W` skips
-    // the in-place `SUBWF d_i, F` when a_i + borrow wraps to 0x100, leaving
-    // d_i = k_i — the correct mod-256 result — with C = borrow-in, the
-    // true borrow-out.
+    // (SUBLW computes k - W), then each higher byte complements a_i in
+    // the destination and adds k_i + 1 - borrow (epic-cc#1189): the sum
+    // is k_i - a_i - borrow mod 256 with the true borrow-out.
     //
     // i8: d = 5 - a. `%a` folds and the sub reads `@x` directly (epic-cc#875).
     let m = parse(
@@ -1834,21 +1831,13 @@ fn sub_const_lhs_emits_sublw_chain() {
     assert!(asm16.contains("MOVF 0x20, W"), "load a_lo:\n{asm16}");
     assert!(asm16.contains("SUBLW 0x34"), "k_lo - a_lo:\n{asm16}");
     assert!(asm16.contains("MOVWF 0x29"), "store d_lo:\n{asm16}");
-    assert!(asm16.contains("MOVF 0x21, W"), "load a_hi:\n{asm16}");
     assert!(
-        asm16.contains("MOVWF 0x70"),
-        "a_hi stashed in the scratch:\n{asm16}"
-    );
-    assert!(asm16.contains("MOVLW 0x12"), "preload k_hi:\n{asm16}");
-    assert!(asm16.contains("MOVWF 0x2A"), "preload d_hi:\n{asm16}");
-    assert!(asm16.contains("BTFSS STATUS, 0"), "borrow test:\n{asm16}");
-    assert!(
-        asm16.contains("INCFSZ 0x70, W"),
-        "wrap-correct borrow fold:\n{asm16}"
+        asm16.contains("    MOVF 0x21, W\n    MOVWF 0x2A\n    COMF 0x2A, F\n    MOVLW 0x12\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01\n    ADDWF 0x2A, F"),
+        "hi byte complement fold without a park:\n{asm16}"
     );
     assert!(
-        asm16.contains("SUBWF 0x2A, F"),
-        "k_hi - a_hi in place:\n{asm16}"
+        !asm16.contains("INCFSZ"),
+        "no scratch fold remains in this sub:\n{asm16}"
     );
     assert!(!asm16.contains("SUBWF 0x20") && !asm16.contains("SUBWF 0x21"), "const-LHS sub must never subtract from the source a (a - k is the wrong direction):\n{asm16}");
 
@@ -1859,42 +1848,23 @@ fn sub_const_lhs_emits_sublw_chain() {
     );
     let addrs32 = addrs(&[("x", 0x20), ("out", 0x24), ("main::r", 0x34)]);
     let asm32 = select(&PIC16F877A, &m, &addrs32);
-    // %a=@x=0x20..0x23, %r=0x34..0x37, scratch=0x70; 0x12345678 -> bytes
-    // 0x78, 0x56, 0x34, 0x12. Each higher byte: a_i -> scratch, k_i
-    // preloaded into d_i, then the wrap-correct INCFSZ fold + in-place
-    // SUBWF d_i, F.
+    // %a=@x=0x20..0x23, %r=0x34..0x37; 0x12345678 -> bytes 0x78, 0x56,
+    // 0x34, 0x12. Each higher byte complements a_i in d_i and adds
+    // k_i + 1 - borrow in place.
     assert!(asm32.contains("MOVF 0x20, W"), "load a_b0:\n{asm32}");
     assert!(asm32.contains("SUBLW 0x78"), "k_b0 - a_b0:\n{asm32}");
     assert!(asm32.contains("MOVWF 0x34"), "store d_b0:\n{asm32}");
-    assert!(asm32.contains("MOVF 0x21, W"), "load a_b1:\n{asm32}");
     assert!(
-        asm32.contains("MOVWF 0x70"),
-        "a_b1 stashed in the scratch:\n{asm32}"
-    );
-    assert!(asm32.contains("MOVLW 0x56"), "preload k_b1:\n{asm32}");
-    assert!(asm32.contains("MOVWF 0x35"), "preload d_b1:\n{asm32}");
-    assert!(asm32.contains("BTFSS STATUS, 0"), "borrow test:\n{asm32}");
-    assert!(
-        asm32.contains("INCFSZ 0x70, W"),
-        "wrap-correct borrow fold:\n{asm32}"
+        asm32.contains("    MOVF 0x21, W\n    MOVWF 0x35\n    COMF 0x35, F\n    MOVLW 0x56\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01\n    ADDWF 0x35, F"),
+        "b1 complement fold:\n{asm32}"
     );
     assert!(
-        asm32.contains("SUBWF 0x35, F"),
-        "k_b1 - a_b1 in place:\n{asm32}"
+        asm32.contains("    MOVF 0x23, W\n    MOVWF 0x37\n    COMF 0x37, F\n    MOVLW 0x12\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01\n    ADDWF 0x37, F"),
+        "b3 complement fold:\n{asm32}"
     );
-    assert!(asm32.contains("MOVF 0x22, W"), "load a_b2:\n{asm32}");
-    assert!(asm32.contains("MOVLW 0x34"), "preload k_b2:\n{asm32}");
-    assert!(asm32.contains("MOVWF 0x36"), "preload d_b2:\n{asm32}");
     assert!(
-        asm32.contains("SUBWF 0x36, F"),
-        "k_b2 - a_b2 in place:\n{asm32}"
-    );
-    assert!(asm32.contains("MOVF 0x23, W"), "load a_b3:\n{asm32}");
-    assert!(asm32.contains("MOVLW 0x12"), "preload k_b3:\n{asm32}");
-    assert!(asm32.contains("MOVWF 0x37"), "preload d_b3:\n{asm32}");
-    assert!(
-        asm32.contains("SUBWF 0x37, F"),
-        "k_b3 - a_b3 in place:\n{asm32}"
+        !asm32.contains("INCFSZ") && !asm32.contains("MOVWF 0x70"),
+        "no scratch park remains in this sub:\n{asm32}"
     );
     assert!(
         !asm32.contains("SUBWF 0x20")
@@ -2964,11 +2934,9 @@ fn icmp_uge_i16_wrap_case_simulates() {
 
 #[test]
 fn sub_const_lhs_wrap_simulates() {
-    // The const-LHS sub chain (d = k - a) shares the naive ADDLW 1 fold
-    // with the cmp chains; at 4 bytes the corrupted intermediate borrow
-    // propagates into wrong values. 0 - 0x0000FF01 = 0xFFFF00FF: byte 1's
-    // fold wraps at a_1 = 0xFF + borrow-in, and a naive chain then
-    // mis-subtracts bytes 2-3 (giving 0xFF000000).
+    // The const-LHS sub chain (d = k - a) must keep the intermediate
+    // borrow exact: 0 - 0x0000FF01 = 0xFFFF00FF, where byte 1 folds
+    // a_1 = 0xFF with a borrow in and bytes 2-3 must still borrow.
     let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 0, %a\n    store i32 %r @out\n    ret void\n";
     let map = [
         ("x", 0x20u16),
@@ -3516,6 +3484,7 @@ fn sim_run_bytes_o2(
     let opts = Options {
         fast_divmod: true,
         fast_mul_u8: true,
+        fast_shift: true,
     };
     let (asm, _, _, _) = select_with_opts(
         &PIC16F877A,
@@ -3977,6 +3946,7 @@ fn mul_u8_unrolled_body_matches_wrapping_mul() {
     let opts = Options {
         fast_divmod: true,
         fast_mul_u8: true,
+        fast_shift: true,
     };
     let (asm, _, _, _) = select_with_opts(
         &PIC16F877A,
@@ -4665,6 +4635,261 @@ fn variable_count_shifts_mask_wide_counts() {
             &[wlo, whi],
             "{name} with count 0x{nhi:02X}{nlo:02X} (masked) must be 0x{whi:02X}{wlo:02X}"
         );
+    }
+}
+
+/// `sim_run_bytes` with only the byte-granular shift prefix on: isolates
+/// the epic-cc#1171 path from the other O2 bodies.
+fn sim_run_bytes_shift(
+    ir_text: &str,
+    map: &[(String, u16)],
+    seed: &[(u16, u8)],
+    out: u16,
+    n: usize,
+) -> Vec<u8> {
+    use pic14_sim::Pic14;
+    let m = parse(ir_text);
+    let opts = Options {
+        fast_divmod: false,
+        fast_mul_u8: false,
+        fast_shift: true,
+    };
+    let (asm, _, _, _) = select_with_opts(
+        &PIC16F877A,
+        &m,
+        &addrs(&map_refs(map)),
+        &HashSet::new(),
+        &ConstPool::empty(),
+        opts,
+    );
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    for (a, v) in seed {
+        p.ram_mut()[*a as usize] = *v;
+    }
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    (0..n).map(|i| p.ram()[out as usize + i]).collect()
+}
+
+/// The fast-shift prefix emits where it should and nowhere else: the O2
+/// bodies carry the count-bit dispatch and the byte moves, the default
+/// bodies keep the pure bit loop (the -Os flash pin).
+#[test]
+fn fast_shift_prefix_emits_only_under_o2() {
+    let fast = Options {
+        fast_divmod: false,
+        fast_mul_u8: false,
+        fast_shift: true,
+    };
+    let emit = |ir: &str, map: &[(String, u16)], opts: Options| {
+        let (asm, _, _, _) = select_with_opts(
+            &PIC16F877A,
+            &parse(ir),
+            &addrs(&map_refs(map)),
+            &HashSet::new(),
+            &ConstPool::empty(),
+            opts,
+        );
+        asm
+    };
+    let (ir16, map16) = routine_module("__shl_u16");
+    let slow16 = emit(&ir16, &map16, Options::default());
+    assert!(
+        !slow16.contains("BTFSS 0x44, 3"),
+        "default __shl_u16 keeps the bit loop:\n{slow16}"
+    );
+    let fast16 = emit(&ir16, &map16, fast);
+    for p in [
+        "BTFSS 0x44, 3",
+        "MOVF 0x40, W",
+        "MOVWF 0x41",
+        "CLRF 0x40",
+        "BCF 0x44, 3",
+    ] {
+        assert!(
+            fast16.contains(p),
+            "fast __shl_u16 must contain `{p}`:\n{fast16}"
+        );
+    }
+    let (ir32, map32) = routine_module32("__shl_u32");
+    let slow32 = emit(&ir32, &map32, Options::default());
+    assert!(
+        !slow32.contains("BTFSS 0x48, 4"),
+        "default __shl_u32 keeps the bit loop:\n{slow32}"
+    );
+    let fast32 = emit(&ir32, &map32, fast);
+    for p in [
+        "BTFSS 0x48, 4",
+        "BCF 0x48, 4",
+        "BTFSS 0x48, 3",
+        "BCF 0x48, 3",
+    ] {
+        assert!(
+            fast32.contains(p),
+            "fast __shl_u32 must contain `{p}`:\n{fast32}"
+        );
+    }
+    // i8 counts never reach 8: no prefix even under O2.
+    let (ir8, map8) = routine_module("__shl_u8");
+    let fast8 = emit(&ir8, &map8, fast);
+    assert!(
+        !fast8.contains("BTFSS 0x32, 3"),
+        "fast __shl_u8 must not grow a byte prefix:\n{fast8}"
+    );
+}
+
+/// The fast u16 bodies return exact results on byte-path counts (8..15),
+/// small counts, zero, and masked poison-range counts.
+#[test]
+fn fast_shift_u16_simulates_byte_path_counts() {
+    // (routine, val bytes lo..hi, cnt bytes lo..hi, expected result bytes)
+    let cases: &[(&str, &[u8], &[u8], &[u8])] = &[
+        ("__shl_u16", &[0x05, 0x00], &[0x08, 0x00], &[0x00, 0x05]),
+        ("__shl_u16", &[0xFF, 0x00], &[0x09, 0x00], &[0x00, 0xFE]),
+        ("__shl_u16", &[0x01, 0x00], &[0x0F, 0x00], &[0x00, 0x80]),
+        ("__shl_u16", &[0x05, 0x00], &[0x03, 0x00], &[0x28, 0x00]),
+        ("__shl_u16", &[0x05, 0x00], &[0x00, 0x00], &[0x05, 0x00]),
+        ("__shl_u16", &[0x05, 0x00], &[0x10, 0x00], &[0x05, 0x00]),
+        ("__lshr_u16", &[0x34, 0x12], &[0x08, 0x00], &[0x12, 0x00]),
+        ("__lshr_u16", &[0x34, 0x12], &[0x0C, 0x00], &[0x01, 0x00]),
+        ("__lshr_u16", &[0xCD, 0xAB], &[0x0F, 0x00], &[0x01, 0x00]),
+        ("__lshr_u16", &[0x00, 0x80], &[0x04, 0x00], &[0x00, 0x08]),
+        ("__ashr_i16", &[0x05, 0x80], &[0x08, 0x00], &[0x80, 0xFF]),
+        ("__ashr_i16", &[0x00, 0x7F], &[0x09, 0x00], &[0x3F, 0x00]),
+        ("__ashr_i16", &[0x00, 0x80], &[0x0F, 0x00], &[0xFF, 0xFF]),
+        ("__ashr_i16", &[0x00, 0x40], &[0x0F, 0x00], &[0x00, 0x00]),
+        ("__ashr_i16", &[0x05, 0x80], &[0x02, 0x00], &[0x01, 0xE0]),
+    ];
+    for &(name, x, n, want) in cases {
+        let (ir, map) = routine_module(name);
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((0x20 + i as u16, *b));
+        }
+        for (i, b) in n.iter().enumerate() {
+            seed.push((0x22 + i as u16, *b));
+        }
+        let got = sim_run_bytes_shift(&ir, &map, &seed, 0x24, want.len());
+        assert_eq!(&got[..], want, "{name}({x:?}, {n:?}) must be {want:?}");
+    }
+}
+
+/// The fast u32 bodies return exact results on two-byte (16..23),
+/// three-byte (24..31), one-byte (8..15), and small counts.
+#[test]
+fn fast_shift_u32_simulates_byte_path_counts() {
+    // (routine, val bytes lo..hi, cnt bytes lo..hi, expected result bytes)
+    let cases: &[(&str, &[u8], &[u8], &[u8])] = &[
+        ("__shl_u32", &[1, 0, 0, 0], &[19, 0, 0, 0], &[0, 0, 8, 0]),
+        ("__shl_u32", &[1, 0, 0, 0], &[31, 0, 0, 0], &[0, 0, 0, 0x80]),
+        (
+            "__shl_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[16, 0, 0, 0],
+            &[0, 0, 0x78, 0x56],
+        ),
+        (
+            "__shl_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[24, 0, 0, 0],
+            &[0, 0, 0, 0x78],
+        ),
+        ("__shl_u32", &[1, 0, 0, 0], &[3, 0, 0, 0], &[8, 0, 0, 0]),
+        ("__shl_u32", &[1, 0, 0, 0], &[33, 0, 0, 0], &[2, 0, 0, 0]),
+        // One-byte counts (8..15): bit 4 clear, bit 3 set.
+        (
+            "__shl_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[8, 0, 0, 0],
+            &[0, 0x78, 0x56, 0x34],
+        ),
+        ("__shl_u32", &[1, 0, 0, 0], &[15, 0, 0, 0], &[0, 0x80, 0, 0]),
+        (
+            "__lshr_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[19, 0, 0, 0],
+            &[0x46, 0x02, 0, 0],
+        ),
+        (
+            "__lshr_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[24, 0, 0, 0],
+            &[0x12, 0, 0, 0],
+        ),
+        (
+            "__lshr_u32",
+            &[0, 0, 0, 0x80],
+            &[31, 0, 0, 0],
+            &[1, 0, 0, 0],
+        ),
+        (
+            "__lshr_u32",
+            &[0, 0, 0, 0x80],
+            &[16, 0, 0, 0],
+            &[0, 0x80, 0, 0],
+        ),
+        ("__lshr_u32", &[0, 0, 0, 0x80], &[4, 0, 0, 0], &[0, 0, 0, 8]),
+        (
+            "__lshr_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[8, 0, 0, 0],
+            &[0x56, 0x34, 0x12, 0],
+        ),
+        (
+            "__ashr_i32",
+            &[0, 0, 0, 0x80],
+            &[19, 0, 0, 0],
+            &[0, 0xF0, 0xFF, 0xFF],
+        ),
+        (
+            "__ashr_i32",
+            &[1, 0, 0, 0x80],
+            &[24, 0, 0, 0],
+            &[0x80, 0xFF, 0xFF, 0xFF],
+        ),
+        (
+            "__ashr_i32",
+            &[0, 0, 0, 0x80],
+            &[31, 0, 0, 0],
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+        ),
+        (
+            "__ashr_i32",
+            &[0xFF, 0xFF, 0xFF, 0x7F],
+            &[31, 0, 0, 0],
+            &[0, 0, 0, 0],
+        ),
+        (
+            "__ashr_i32",
+            &[0, 0, 0, 0x80],
+            &[4, 0, 0, 0],
+            &[0, 0, 0, 0xF8],
+        ),
+        (
+            "__ashr_i32",
+            &[1, 0, 0, 0x80],
+            &[8, 0, 0, 0],
+            &[0, 0, 0x80, 0xFF],
+        ),
+        (
+            "__ashr_i32",
+            &[0, 0, 0, 0x7F],
+            &[8, 0, 0, 0],
+            &[0, 0, 0x7F, 0],
+        ),
+    ];
+    for &(name, x, y, want) in cases {
+        let (ir, map) = routine_module32(name);
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((0x20 + i as u16, *b));
+        }
+        for (i, b) in y.iter().enumerate() {
+            seed.push((0x24 + i as u16, *b));
+        }
+        let got = sim_run_bytes_shift(&ir, &map, &seed, 0x28, want.len());
+        assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) must be {want:?}");
     }
 }
 
@@ -6435,18 +6660,23 @@ fn add32_reg_const_emits_four_byte_carry_chain() {
 }
 
 #[test]
-fn add32_const_ff_byte_keeps_parking_fold() {
-    // epic-cc#1078: a 0xFF const byte plus carry wraps to zero, where
-    // only INCFSZ's skip keeps the true carry-out. The park stays.
+fn add32_const_ff_byte_folds_without_park() {
+    // epic-cc#1192: a 0xFF const byte plus carry is a_i - 1 + carry, so
+    // subtracting the 1 only when carry is clear keeps the true
+    // carry-out (a skipped SUBWF keeps C = 1) with no scratch park.
     let m = parse(
         "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = add i32 %a, 16711681\n    store i32 %r @out\n    ret void\n",
     );
-    // 16711681 = 0x00FF0001: byte 2 is the wrapping fold.
+    // 16711681 = 0x00FF0001: byte 2 is the 0xFF fold.
     let map = vec![("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
     let asm = select(&PIC16F877A, &m, &addrs(&map));
     assert!(
-        asm.contains("    MOVF 0x22, W\n    MOVWF 0x3A\n    MOVLW 0xFF\n    MOVWF 0x70\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x3A, F"),
-        "0xFF byte keeps the parking fold:\n{asm}"
+        asm.contains("    MOVF 0x22, W\n    MOVWF 0x3A\n    MOVLW 0x01\n    BTFSS STATUS, 0 ; C\n    SUBWF 0x3A, F"),
+        "0xFF byte folds without a park:\n{asm}"
+    );
+    assert!(
+        !asm.contains("INCFSZ 0x70, W"),
+        "no const park remains in this add:\n{asm}"
     );
     assert!(
         asm.contains("    MOVF 0x21, W\n    MOVWF 0x39\n    MOVLW 0x00\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01\n    ADDWF 0x39, F"),
@@ -6456,7 +6686,7 @@ fn add32_const_ff_byte_keeps_parking_fold() {
 
 #[test]
 fn add32_const_folds_simulate_carry_boundaries() {
-    // epic-cc#1078: the ADDLW folds and the kept 0xFF park must carry
+    // epic-cc#1078/#1192: the ADDLW folds and the 0xFF fold must carry
     // exactly across 0x00 and 0xFF const bytes with carry in and out.
     let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = add i32 %a, 65535\n    store i32 %r @out\n    ret void\n";
     let map = vec![("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
@@ -6559,9 +6789,141 @@ fn sub32_reg_const_emits_four_byte_borrow_chain() {
         "byte 0 const sub:\n{asm}"
     );
     assert!(
-        asm.contains("    MOVF 0x21, W\n    MOVWF 0x39\n    MOVLW 0x02\n    MOVWF 0x70\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x70, W\n    SUBWF 0x39, F"),
-        "byte 1 const borrow chain:\n{asm}"
+        asm.contains("    MOVF 0x21, W\n    MOVWF 0x39\n    MOVLW 0x02\n    BTFSS STATUS, 0 ; C\n    ADDLW 0x01\n    SUBWF 0x39, F"),
+        "byte 1 const borrow folds without a park:\n{asm}"
     );
+    assert!(
+        !asm.contains("INCFSZ 0x70, W"),
+        "no const park remains in this sub:\n{asm}"
+    );
+}
+
+#[test]
+fn sub32_const_ff_byte_folds_without_park() {
+    // epic-cc#1192: a_i - 0xFF - borrow is a_i + 1 - borrow, so adding
+    // the 1 only when there is no borrow keeps the true borrow-out.
+    let m = parse(
+        "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 %a, 16711681\n    store i32 %r @out\n    ret void\n",
+    );
+    // 16711681 = 0x00FF0001: byte 2 is the 0xFF fold.
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert!(
+        asm.contains("    MOVF 0x22, W\n    MOVWF 0x3A\n    MOVLW 0x01\n    BTFSC STATUS, 0 ; C\n    ADDWF 0x3A, F"),
+        "0xFF byte folds without a park:\n{asm}"
+    );
+    assert!(
+        !asm.contains("INCFSZ 0x70, W"),
+        "no const park remains in this sub:\n{asm}"
+    );
+    // 0x01000000 - 0x0000FFFF = 0x00FF0001: the 0xFF byte at byte 1
+    // takes a borrow in and passes a borrow out to byte 2.
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 %a, 65535\n    store i32 %r @out\n    ret void\n";
+    let map = [("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x00), (0x23, 0x01)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0x01, 0x00, 0xFF, 0x00],
+        "borrow through the 0xFF fold"
+    );
+    // 0x0000FF00 - 0x0000FFFF = 0xFFFFFF01: byte 1's 0xFF fold takes a
+    // borrow in (a_0 = 0x00 under the 0xFF) and must pass it to byte 2.
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 %a, 65535\n    store i32 %r @out\n    ret void\n";
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0x00), (0x21, 0xFF), (0x22, 0x00), (0x23, 0x00)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0x01, 0xFF, 0xFF, 0xFF],
+        "borrow-in through the 0xFF fold"
+    );
+}
+
+#[test]
+fn sub_const_lhs_ff_byte_simulates() {
+    // epic-cc#1189/#1192: a 0xFF minuend byte subtracts the borrow
+    // from the complement of a_i instead of adding a wrapped literal.
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 65280, %a\n    store i32 %r @out\n    ret void\n";
+    let map = [("x", 0x20), ("out", 0x24), ("main::r", 0x38)];
+    let m = parse(ir);
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert!(
+        asm.contains("COMF 0x39, F\n    MOVLW 0x01\n    BTFSS STATUS, 0 ; C\n    SUBWF 0x39, F"),
+        "0xFF byte uses the complement fold:\n{asm}"
+    );
+    // 0x0000FF00 - 0x0000FF01 = 0xFFFFFFFF: byte 1 is 0xFF against
+    // a_i = 0xFF with a borrow in, and byte 2 borrows again.
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0x01), (0x21, 0xFF), (0x22, 0x00), (0x23, 0x00)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0xFF, 0xFF, 0xFF, 0xFF],
+        "borrow through the 0xFF byte"
+    );
+    // 0x0000FF00 - 0x00000100 = 0x0000FE00: the 0xFF byte takes no borrow.
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0x00), (0x21, 0x01), (0x22, 0x00), (0x23, 0x00)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0x00, 0xFE, 0x00, 0x00],
+        "no borrow into the 0xFF byte"
+    );
+}
+
+#[test]
+fn icmp_const_ff_byte_simulates() {
+    // epic-cc#1192: the compare folds a 0xFF const byte in W as
+    // a_i + 1 - borrow, keeping the borrow-out for the higher bytes.
+    let ir = "global x i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %c = icmp ult i32 %a, 16711680\n    store i8 %c @out\n    ret void\n";
+    let map = [
+        ("x", 0x20),
+        ("out", 0x24),
+        ("main::a", 0x30),
+        ("main::c", 0x38),
+    ];
+    let m = parse(ir);
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert!(
+        asm.contains("    MOVF 0x32, W\n    BTFSC STATUS, 0 ; C\n    ADDLW 0x01"),
+        "0xFF compare byte folds in W:\n{asm}"
+    );
+    // 16711680 = 0x00FF0000. 0x0100FF00 puts a 0x00 low byte under the
+    // 0xFF byte, so the fold takes the borrow-in path and must still
+    // pass the borrow out to byte 3.
+    for (x, want) in [
+        (0x00FE_FFFFu32, 1u8),
+        (0x00FF_0000, 0),
+        (0x00FF_0001, 0),
+        (0x0100_0000, 0),
+        (0x0100_FF00, 0),
+        (0x0000_0000, 1),
+    ] {
+        let seed: Vec<(u16, u8)> = (0..4)
+            .map(|i| (0x20 + i as u16, (x >> (i * 8)) as u8))
+            .collect();
+        let got = sim_run_bytes(ir, &str_map(&map), &seed, 0x24, 1);
+        assert_eq!(got[0], want, "ult 0x00FF0000 with a = 0x{x:08X}");
+    }
 }
 
 #[test]
@@ -7041,13 +7403,11 @@ fn sub32_simulates_with_borrow_chain() {
 }
 
 #[test]
-fn sub_const_lhs_no_borrow_fold_reloads_the_subtrahend() {
-    // const-LHS `d = k - a`: each higher byte preloads k_i into dst and
-    // folds the borrow with INCFSZ's skip. On the no-borrow path the skip
-    // means SUBWF must find the subtrahend in W, reloaded from scratch
-    // after the MOVLW/MOVWF pair (the pair leaves W holding k_i); without
-    // it SUBWF computes k_i - k_i = 0, zeroing every no-borrow byte (fuzz
-    // corpus seed 128). Bytes 1-3 below all fold no-borrow.
+fn sub_const_lhs_complement_fold_simulates_no_borrow_bytes() {
+    // const-LHS `d = k - a`: each higher byte complements a_i in the
+    // destination and adds k_i + 1 - borrow. On the no-borrow path the
+    // added literal is k_i + 1, so bytes 1-3 must not zero (fuzz corpus
+    // seed 128). Bytes 1-3 below all fold no-borrow.
     let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 305419896, %a\n    store i32 %r @out\n    ret void\n";
     let map = [
         ("x", 0x20),
@@ -11157,6 +11517,53 @@ fn walk_refuses_double_trunc_use() {
 }
 
 #[test]
+fn walk_latch_out_loop_uses_down_counter() {
+    // epic-cc#1169: a latch-out loop (load/xor in the header, latch in
+    // a later block) walks too: the header seeds the trip, every access
+    // re-derives FSR from the count, and the latch DECFSZ closes it. The
+    // inner counter-free down loop keeps its own walk inside the region.
+    let m = parse(
+        "global buf i8\nglobal out i16\nfn main(void) ()\n  block entry:\n    br head\n  block head:\n    %i = phi i16 0 entry %inc latch\n    %c = phi i16 0 entry %nxt latch\n    %p = gep @buf +0 +1*%i\n    %x = load i8 %p\n    %e = zext i8 %x to i16\n    %acc = xor i16 %e %c\n    br inner\n  block inner:\n    %k = phi i8 2 head %dec inner\n    %d = phi i16 %acc head %nxt inner\n    %s = shl i16 %d 1\n    %nxt = xor i16 %s 7\n    %dec = add i8 %k -1\n    %t = icmp eq i8 %dec 0\n    br i1 %t latch inner\n  block latch:\n    %inc = add i16 %i 1\n    %done = icmp eq i16 %inc 2\n    br i1 %done exit head\n  block exit:\n    store i16 %nxt @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("out", 0x22),
+        ("main::i", 0x25),
+        ("main::c", 0x27),
+        ("main::x", 0x29),
+        ("main::e", 0x2Au16),
+        ("main::acc", 0x2C),
+        ("main::k", 0x30),
+        ("main::d", 0x31),
+        ("main::s", 0x33),
+        ("main::nxt", 0x35),
+        ("main::dec", 0x37),
+        ("main::t", 0x38),
+        ("main::inc", 0x39),
+        ("main::done", 0x3B),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        asm.contains("MOVLW 0x02\n    MOVWF 0x25"),
+        "outer trip seed replaces the zero init:\n{asm}"
+    );
+    assert!(
+        asm.contains("DECFSZ 0x25, F"),
+        "outer down-counter latch:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x02\n    MOVWF 0x30"),
+        "inner trip seed re-arms per outer iteration:\n{asm}"
+    );
+    assert!(asm.contains("DECFSZ 0x30, F"), "inner latch:\n{asm}");
+    assert!(asm.contains("SUBLW 0x22"), "buf FSR from count:\n{asm}");
+    assert!(
+        !asm.contains("XORLW 0x02"),
+        "16-bit outer latch gone:\n{asm}"
+    );
+}
+
+#[test]
 fn icmp_ne_i16_zero_ors_file_bytes() {
     // epic-cc#1079: `a != 0` needs no scratch park. Byte 0's load pops
     // as dead (the byte stays addressable) and the high byte ORs the
@@ -11178,6 +11585,46 @@ fn icmp_ne_i16_zero_ors_file_bytes() {
     assert!(
         !asm.contains("MOVWF 0x70"),
         "no scratch park for != 0:\n{asm}"
+    );
+}
+
+#[test]
+fn walk_latch_out_loop_computes_in_sim() {
+    // The latch-out walk runs for real: buf [5, 6] xors through the
+    // inner shl/xor nest to 101, proving header, nested body, and latch
+    // compose in order.
+    use pic14_sim::Pic14;
+    let m = parse(
+        "global buf i8\nglobal out i16\nfn main(void) ()\n  block entry:\n    br head\n  block head:\n    %i = phi i16 0 entry %inc latch\n    %c = phi i16 0 entry %nxt latch\n    %p = gep @buf +0 +1*%i\n    %x = load i8 %p\n    %e = zext i8 %x to i16\n    %acc = xor i16 %e %c\n    br inner\n  block inner:\n    %k = phi i8 2 head %dec inner\n    %d = phi i16 %acc head %nxt inner\n    %s = shl i16 %d 1\n    %nxt = xor i16 %s 7\n    %dec = add i8 %k -1\n    %t = icmp eq i8 %dec 0\n    br i1 %t latch inner\n  block latch:\n    %inc = add i16 %i 1\n    %done = icmp eq i16 %inc 2\n    br i1 %done exit head\n  block exit:\n    store i16 %nxt @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("out", 0x22),
+        ("main::i", 0x25),
+        ("main::c", 0x27),
+        ("main::x", 0x29),
+        ("main::e", 0x2Au16),
+        ("main::acc", 0x2C),
+        ("main::k", 0x30),
+        ("main::d", 0x31),
+        ("main::s", 0x33),
+        ("main::nxt", 0x35),
+        ("main::dec", 0x37),
+        ("main::t", 0x38),
+        ("main::inc", 0x39),
+        ("main::done", 0x3B),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    p.ram_mut()[0x20] = 5;
+    p.ram_mut()[0x21] = 6;
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    assert_eq!(
+        [p.ram()[0x22], p.ram()[0x23]],
+        [101, 0],
+        "latch-out walk computes across the nest:\n{asm}"
     );
 }
 
@@ -11204,6 +11651,551 @@ fn icmp_ne_i16_const_folds_carry_free_byte() {
         !asm.contains("MOVWF 0x70"),
         "no scratch park for != const:\n{asm}"
     );
+}
+
+#[test]
+fn walk_latch_out_seeds_on_walk_latch_exit() {
+    // epic-cc#1169: when the preheader is itself a walk loop, the outer
+    // trip seed runs on the inner latch's exit path before the jump out.
+    let m = parse(
+        "global tmp i8\nglobal buf i8\nglobal dst i8\nfn main(void) ()\n  block entry:\n    br pre\n  block pre:\n    %j = phi i16 0 entry %jinc pre\n    %q = gep @tmp +0 +1*%j\n    store i8 9 %q\n    %jinc = add i16 %j 1\n    %jc = icmp eq i16 %jinc 2\n    br i1 %jc head pre\n  block head:\n    %i = phi i16 0 pre %inc latch\n    %p1 = gep @buf +0 +1*%i\n    %x = load i8 %p1\n    %p2 = gep @dst +0 +1*%i\n    store i8 %x %p2\n    br latch\n  block latch:\n    %inc = add i16 %i 1\n    %d = icmp eq i16 %inc 3\n    br i1 %d exit head\n  block exit:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("tmp", 0x40u16),
+        ("buf", 0x20),
+        ("dst", 0x34),
+        ("main::j", 0x25),
+        ("main::jinc", 0x27),
+        ("main::jc", 0x29),
+        ("main::i", 0x2A),
+        ("main::x", 0x2C),
+        ("main::inc", 0x2E),
+        ("main::d", 0x30),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        asm.contains("MOVLW 0x03\n    MOVWF 0x2A"),
+        "outer trip seed on the inner latch exit:\n{asm}"
+    );
+    assert!(
+        asm.contains("DECFSZ 0x2A, F"),
+        "outer down-counter latch:\n{asm}"
+    );
+}
+
+#[test]
+fn walk_refuses_middle_branch() {
+    // A conditional branch inside the region (an early exit past the
+    // latch) keeps the old lowering: the trip proof needs one latch.
+    let m = parse(
+        "global buf i8\nfn main(void) ()\n  block entry:\n    br head\n  block head:\n    %i = phi i16 0 entry %inc latch\n    %p = gep @buf +0 +1*%i\n    %x = load i8 %p\n    br mid\n  block mid:\n    %z = icmp eq i8 %x 0\n    br i1 %z latch other\n  block latch:\n    %inc = add i16 %i 1\n    %d = icmp eq i16 %inc 4\n    br i1 %d exit head\n  block other:\n    br latch\n  block exit:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("main::i", 0x25),
+        ("main::x", 0x27),
+        ("main::z", 0x28),
+        ("main::inc", 0x29),
+        ("main::d", 0x2B),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("DECFSZ 0x25, F"),
+        "no walk with a branch inside the region:\n{asm}"
+    );
+    assert!(asm.contains("XORLW 0x04"), "old latch survives:\n{asm}");
+}
+
+#[test]
+fn walk_refuses_branch_cond_preheader() {
+    // Entry seeds ride an unconditional edge or a walk latch exit; a
+    // plain conditional preheader keeps the old lowering.
+    let m = parse(
+        "global buf i8\nglobal flag i8\nfn main(void) ()\n  block entry:\n    %f = load i8 @flag\n    %z = icmp eq i8 %f 0\n    br i1 %z head done0\n  block head:\n    %i = phi i16 0 entry %inc latch\n    %p = gep @buf +0 +1*%i\n    %x = load i8 %p\n    br latch\n  block latch:\n    %inc = add i16 %i 1\n    %d = icmp eq i16 %inc 4\n    br i1 %d exit head\n  block done0:\n    ret void\n  block exit:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("flag", 0x21),
+        ("main::f", 0x25),
+        ("main::z", 0x26),
+        ("main::i", 0x27),
+        ("main::x", 0x29),
+        ("main::inc", 0x2A),
+        ("main::d", 0x2C),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("DECFSZ 0x27, F"),
+        "no walk off a conditional preheader:\n{asm}"
+    );
+    assert!(asm.contains("XORLW 0x04"), "old latch survives:\n{asm}");
+}
+
+#[test]
+fn nul_strlen_loop_scans_indf() {
+    // epic-cc#1170: a `while (base[i])` loop with a lone counter becomes
+    // an FSR-held scan: the byte tests straight out of INDF, the loop
+    // walks FSR on, and the counter home counts up for the exit read.
+    // No 16-bit GEP, increment, or compare survives.
+    let m = parse(
+        "global s1 i8\nglobal out i16\nfn main(void) ()\n  block 1:\n    br 2\n  block 2:\n    %3 = phi i16 0 1 %7 2\n    %4 = gep @s1 +0 +1*%3\n    %5 = load i8 %4\n    %6 = icmp eq i8 %5 0\n    %7 = add i16 %3 1\n    br i1 %6 8 2\n  block 8:\n    store i16 %3 @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("s1", 0x20u16),
+        ("out", 0x30),
+        ("main::3", 0x25),
+        ("main::5", 0x27),
+        ("main::6", 0x28),
+        ("main::7", 0x29),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        asm.contains("MOVLW 0x20\n    MOVWF FSR"),
+        "FSR seeds to the base:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVF INDF, W\n    BTFSC STATUS, 2"),
+        "NUL tests straight out of INDF:\n{asm}"
+    );
+    assert!(asm.contains("INCF FSR, F"), "pointer walks on:\n{asm}");
+    assert!(
+        asm.contains("INCF 0x25, F"),
+        "counter home counts up:\n{asm}"
+    );
+    assert!(!asm.contains("XORLW"), "16-bit compare gone:\n{asm}");
+}
+
+#[test]
+fn nul_strlen_loop_counts_in_sim() {
+    // The scan runs for real: `hello` counts 5, proving the exit read
+    // sees the homed count and the loop stops on the NUL.
+    use pic14_sim::Pic14;
+    let m = parse(
+        "global s1 i8\nglobal out i16\nfn main(void) ()\n  block 1:\n    br 2\n  block 2:\n    %3 = phi i16 0 1 %7 2\n    %4 = gep @s1 +0 +1*%3\n    %5 = load i8 %4\n    %6 = icmp eq i8 %5 0\n    %7 = add i16 %3 1\n    br i1 %6 8 2\n  block 8:\n    store i16 %3 @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("s1", 0x20u16),
+        ("out", 0x30),
+        ("main::3", 0x28),
+        ("main::5", 0x2A),
+        ("main::6", 0x2B),
+        ("main::7", 0x2C),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    for (o, v) in [104u8, 101, 108, 108, 111, 0].iter().enumerate() {
+        p.ram_mut()[0x20 + o] = *v;
+    }
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    assert_eq!(
+        [p.ram()[0x30], p.ram()[0x31]],
+        [5, 0],
+        "scan counts to the NUL:\n{asm}"
+    );
+}
+
+#[test]
+fn nul_strlen_param_base_seeds_fsr() {
+    // A string loop over a pointer parameter seeds FSR from the param
+    // slot pair, IRP included: the strlen kernel shape.
+    let m = parse(
+        "global out i16\nfn strlen(i16) (0=ptr)\n  block 1:\n    br 2\n  block 2:\n    %3 = phi i16 0 1 %7 2\n    %4 = gep %0 +0 +1*%3\n    %5 = load i8 %4\n    %6 = icmp eq i8 %5 0\n    %7 = add i16 %3 1\n    br i1 %6 8 2\n  block 8:\n    store i16 %3 @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("out", 0x30u16),
+        ("strlen::0", 0x45),
+        ("strlen::3", 0x25),
+        ("strlen::5", 0x27),
+        ("strlen::6", 0x28),
+        ("strlen::7", 0x29),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        asm.contains("MOVF 0x45, W\n    MOVWF FSR"),
+        "FSR seeds from the param low byte:\n{asm}"
+    );
+    assert!(
+        asm.contains("BTFSC 0x46, 0"),
+        "IRP seeds from the param high bit:\n{asm}"
+    );
+    assert!(asm.contains("INCF FSR, F"), "pointer walks on:\n{asm}");
+}
+
+#[test]
+fn nul_loop_ne_latch_uses_btfss() {
+    // A `ne` latch that exits on nonzero keeps walking while the byte
+    // is zero: the skip polarity flips to BTFSS.
+    let m = parse(
+        "global s1 i8\nglobal out i16\nfn main(void) ()\n  block 1:\n    br 2\n  block 2:\n    %3 = phi i16 0 1 %7 2\n    %4 = gep @s1 +0 +1*%3\n    %5 = load i8 %4\n    %6 = icmp ne i8 %5 0\n    %7 = add i16 %3 1\n    br i1 %6 8 2\n  block 8:\n    store i16 %3 @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("s1", 0x20u16),
+        ("out", 0x30),
+        ("main::3", 0x25),
+        ("main::5", 0x27),
+        ("main::6", 0x28),
+        ("main::7", 0x29),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        asm.contains("MOVF INDF, W\n    BTFSS STATUS, 2"),
+        "nonzero exits under BTFSS:\n{asm}"
+    );
+}
+
+#[test]
+fn nul_refuses_second_access() {
+    // Two loads in the header need two pointers but the scan holds one
+    // FSR: the loop keeps the old lowering.
+    let m = parse(
+        "global s1 i8\nglobal s2 i8\nglobal out i16\nfn main(void) ()\n  block 1:\n    br 2\n  block 2:\n    %3 = phi i16 0 1 %7 2\n    %4 = gep @s1 +0 +1*%3\n    %5 = load i8 %4\n    %9 = gep @s2 +0 +1*%3\n    %10 = load i8 %9\n    %6 = icmp eq i8 %5 %10\n    %7 = add i16 %3 1\n    br i1 %6 8 2\n  block 8:\n    store i16 %3 @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("s1", 0x20u16),
+        ("s2", 0x40),
+        ("out", 0x30),
+        ("main::3", 0x25),
+        ("main::5", 0x27),
+        ("main::9", 0x29),
+        ("main::10", 0x2A),
+        ("main::6", 0x2B),
+        ("main::7", 0x2C),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("INCF FSR, F"),
+        "no scan with two accesses:\n{asm}"
+    );
+}
+
+#[test]
+fn nul_refuses_carried_sum() {
+    // A carried reduction needs a home the latch does not maintain: the
+    // loop keeps the old lowering.
+    let m = parse(
+        "global s1 i8\nglobal out i16\nfn main(void) ()\n  block 1:\n    br 2\n  block 2:\n    %3 = phi i16 0 1 %7 2\n    %s = phi i8 0 1 %acc 2\n    %4 = gep @s1 +0 +1*%3\n    %5 = load i8 %4\n    %acc = add i8 %5 %s\n    %6 = icmp eq i8 %5 0\n    %7 = add i16 %3 1\n    br i1 %6 8 2\n  block 8:\n    store i16 %3 @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("s1", 0x20u16),
+        ("out", 0x30),
+        ("main::3", 0x25),
+        ("main::s", 0x27),
+        ("main::5", 0x28),
+        ("main::acc", 0x29),
+        ("main::6", 0x2A),
+        ("main::7", 0x2B),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("INCF FSR, F"),
+        "no scan with a carried sum:\n{asm}"
+    );
+}
+
+#[test]
+fn walk_masked_index_store_rebuilds_with_andlw() {
+    // epic-cc#1170: `buf[i] = base + ((i & 7))` rebuilds the value as
+    // `base + ((K - count) & mask)`: the AND goes dead, one ANDLW joins
+    // the per-store rebuild.
+    let m = parse(
+        "global buf i8\nglobal base i8\nfn main(void) ()\n  block entry:\n    %b = load i8 @base\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p = gep @buf +0 +1*%i\n    %t = trunc i16 %i to i8\n    %m = and i8 %t 7\n    %v = add i8 %b %m\n    store i8 %v %p\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 16\n    br i1 %c done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("base", 0x21),
+        ("main::b", 0x26),
+        ("main::i", 0x25),
+        ("main::t", 0x27),
+        ("main::m", 0x28),
+        ("main::v", 0x29),
+        ("main::inc", 0x2A),
+        ("main::c", 0x2C),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(asm.contains("SUBLW 0x10"), "index from count:\n{asm}");
+    assert!(asm.contains("ANDLW 0x07"), "mask joins the rebuild:\n{asm}");
+    assert!(asm.contains("DECFSZ 0x25, F"), "down-counter latch:\n{asm}");
+}
+
+#[test]
+fn walk_shared_masked_chain_writes_both_in_sim() {
+    // The strlen-seed shape: two stores share one masked chain, each
+    // rebuilding it from the count. Seed 0x30 over 4 trips must write
+    // 0x30..0x33 to both buffers in order.
+    use pic14_sim::Pic14;
+    let m = parse(
+        "global s1 i8\nglobal s2 i8\nglobal seed i8\nfn main(void) ()\n  block 0:\n    br 1\n  block 1:\n    %2 = phi i16 0 0 %8 1\n    %3 = load volatile i8 @seed\n    %tmp = trunc i16 %2 to i8\n    %4 = and i8 %tmp 7\n    %5 = add i8 %3 %4\n    %p1 = gep @s1 +0 +1*%2\n    store i8 %5 %p1\n    %7 = add i8 %3 %4\n    %p2 = gep @s2 +0 +1*%2\n    store i8 %7 %p2\n    %8 = add i16 %2 1\n    %9 = icmp eq i16 %8 4\n    br i1 %9 done 1\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("s1", 0x20u16),
+        ("s2", 0x30),
+        ("seed", 0x34),
+        ("main::2", 0x25),
+        ("main::3", 0x27),
+        ("main::tmp", 0x29),
+        ("main::4", 0x2A),
+        ("main::5", 0x2B),
+        ("main::7", 0x2C),
+        ("main::8", 0x2D),
+        ("main::9", 0x2F),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(asm.contains("ANDLW 0x07"), "mask joins the rebuild:\n{asm}");
+    assert!(asm.contains("DECFSZ 0x25, F"), "down-counter latch:\n{asm}");
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    p.ram_mut()[0x34] = 0x30;
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    assert_eq!(
+        [p.ram()[0x20], p.ram()[0x21], p.ram()[0x22], p.ram()[0x23]],
+        [0x30, 0x31, 0x32, 0x33],
+        "first buffer walks the masked index:\n{asm}"
+    );
+    assert_eq!(
+        [p.ram()[0x30], p.ram()[0x31], p.ram()[0x32], p.ram()[0x33]],
+        [0x30, 0x31, 0x32, 0x33],
+        "second buffer shares the chain:\n{asm}"
+    );
+}
+
+#[test]
+fn nul_two_block_scans_strcmp_shape() {
+    // epic-cc#1170: the rotated strcmp shape (header loads both bytes
+    // and exits on mismatch, latch tests for NUL) walks with two FSR
+    // setups re-derived from the homed counter: no 16-bit GEP,
+    // increment, or compare survives.
+    let m = parse(
+        "global s1 i8\nglobal s2 i8\nglobal out i16\nfn main(void) ()\n  block entry:\n    br head\n  block head:\n    %j = phi i16 0 entry %nxt latch\n    %g1 = gep @s1 +0 +1*%j\n    %a = load i8 %g1\n    %g2 = gep @s2 +0 +1*%j\n    %b = load i8 %g2\n    %e = icmp eq i8 %a %b\n    br i1 %e latch crit\n  block latch:\n    %t = icmp eq i8 %a 0\n    %nxt = add i16 %j 1\n    br i1 %t exit head\n  block crit:\n    %z = zext i8 %a to i16\n    br exit\n  block exit:\n    %idx = phi i16 %j crit %j latch\n    %val = phi i16 %z crit 0 latch\n    %ge = gep @s2 +0 +1*%idx\n    %gb = load i8 %ge\n    %w = zext i8 %gb to i16\n    %r = sub i16 %val %w\n    store i16 %r @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("s1", 0x20u16),
+        ("s2", 0x24),
+        ("out", 0x28),
+        ("main::j", 0x30),
+        ("main::a", 0x32),
+        ("main::b", 0x33),
+        ("main::e", 0x34),
+        ("main::t", 0x35),
+        ("main::nxt", 0x36),
+        ("main::z", 0x38),
+        ("main::idx", 0x3A),
+        ("main::val", 0x3C),
+        ("main::gb", 0x3E),
+        ("main::w", 0x3F),
+        ("main::r", 0x41),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        asm.contains("MOVWF 0x32"),
+        "tested byte spills home:\n{asm}"
+    );
+    assert!(
+        asm.contains("SUBWF 0x32, W"),
+        "mismatch compares against the spill:\n{asm}"
+    );
+    assert!(
+        asm.contains("INCF 0x30, F"),
+        "counter home counts up:\n{asm}"
+    );
+    assert!(!asm.contains("XORLW"), "16-bit latch gone:\n{asm}");
+}
+
+#[test]
+fn nul_two_block_mismatch_in_sim() {
+    // `abc` vs `abd` mismatches at index 2: the exit returns
+    // 'c' - 'd' = -1, proving the spill, the counter, and the exit
+    // copies compose.
+    use pic14_sim::Pic14;
+    let m = parse(
+        "global s1 i8\nglobal s2 i8\nglobal out i16\nfn main(void) ()\n  block entry:\n    br head\n  block head:\n    %j = phi i16 0 entry %nxt latch\n    %g1 = gep @s1 +0 +1*%j\n    %a = load i8 %g1\n    %g2 = gep @s2 +0 +1*%j\n    %b = load i8 %g2\n    %e = icmp eq i8 %a %b\n    br i1 %e latch crit\n  block latch:\n    %t = icmp eq i8 %a 0\n    %nxt = add i16 %j 1\n    br i1 %t exit head\n  block crit:\n    %z = zext i8 %a to i16\n    br exit\n  block exit:\n    %idx = phi i16 %j crit %j latch\n    %val = phi i16 %z crit 0 latch\n    %ge = gep @s2 +0 +1*%idx\n    %gb = load i8 %ge\n    %w = zext i8 %gb to i16\n    %r = sub i16 %val %w\n    store i16 %r @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("s1", 0x20u16),
+        ("s2", 0x24),
+        ("out", 0x28),
+        ("main::j", 0x30),
+        ("main::a", 0x32),
+        ("main::b", 0x33),
+        ("main::e", 0x34),
+        ("main::t", 0x35),
+        ("main::nxt", 0x36),
+        ("main::z", 0x38),
+        ("main::idx", 0x3A),
+        ("main::val", 0x3C),
+        ("main::gb", 0x3E),
+        ("main::w", 0x3F),
+        ("main::r", 0x41),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    for (o, v) in [97u8, 98, 99, 0].iter().enumerate() {
+        p.ram_mut()[0x20 + o] = *v;
+        p.ram_mut()[0x24 + o] = *v;
+    }
+    p.ram_mut()[0x26] = 100;
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    assert_eq!(
+        [p.ram()[0x28], p.ram()[0x29]],
+        [255, 255],
+        "mismatch returns -1:\n{asm}"
+    );
+}
+
+#[test]
+fn nul_two_block_equal_strings_in_sim() {
+    // Equal strings run to the NUL and return zero: the latch exit
+    // carries the homed counter into the index.
+    use pic14_sim::Pic14;
+    let m = parse(
+        "global s1 i8\nglobal s2 i8\nglobal out i16\nfn main(void) ()\n  block entry:\n    br head\n  block head:\n    %j = phi i16 0 entry %nxt latch\n    %g1 = gep @s1 +0 +1*%j\n    %a = load i8 %g1\n    %g2 = gep @s2 +0 +1*%j\n    %b = load i8 %g2\n    %e = icmp eq i8 %a %b\n    br i1 %e latch crit\n  block latch:\n    %t = icmp eq i8 %a 0\n    %nxt = add i16 %j 1\n    br i1 %t exit head\n  block crit:\n    %z = zext i8 %a to i16\n    br exit\n  block exit:\n    %idx = phi i16 %j crit %j latch\n    %val = phi i16 %z crit 0 latch\n    %ge = gep @s2 +0 +1*%idx\n    %gb = load i8 %ge\n    %w = zext i8 %gb to i16\n    %r = sub i16 %val %w\n    store i16 %r @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("s1", 0x20u16),
+        ("s2", 0x24),
+        ("out", 0x28),
+        ("main::j", 0x30),
+        ("main::a", 0x32),
+        ("main::b", 0x33),
+        ("main::e", 0x34),
+        ("main::t", 0x35),
+        ("main::nxt", 0x36),
+        ("main::z", 0x38),
+        ("main::idx", 0x3A),
+        ("main::val", 0x3C),
+        ("main::gb", 0x3E),
+        ("main::w", 0x3F),
+        ("main::r", 0x41),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    for (o, v) in [97u8, 98, 99, 0].iter().enumerate() {
+        p.ram_mut()[0x20 + o] = *v;
+        p.ram_mut()[0x24 + o] = *v;
+    }
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    assert_eq!(
+        [p.ram()[0x28], p.ram()[0x29]],
+        [0, 0],
+        "equal strings return zero:\n{asm}"
+    );
+}
+
+#[test]
+fn nul_two_block_refuses_extra_latch_alu() {
+    // An extra ALU op in the latch breaks the strict shape: the loop
+    // keeps the old lowering.
+    let m = parse(
+        "global s1 i8\nglobal s2 i8\nglobal out i16\nfn main(void) ()\n  block entry:\n    br head\n  block head:\n    %j = phi i16 0 entry %nxt latch\n    %g1 = gep @s1 +0 +1*%j\n    %a = load i8 %g1\n    %g2 = gep @s2 +0 +1*%j\n    %b = load i8 %g2\n    %e = icmp eq i8 %a %b\n    br i1 %e latch crit\n  block latch:\n    %t = icmp eq i8 %a 0\n    %nxt = add i16 %j 1\n    %x = add i16 %nxt 1\n    br i1 %t exit head\n  block crit:\n    %z = zext i8 %a to i16\n    br exit\n  block exit:\n    %idx = phi i16 %j crit %j latch\n    %val = phi i16 %z crit 0 latch\n    %ge = gep @s2 +0 +1*%idx\n    %gb = load i8 %ge\n    %w = zext i8 %gb to i16\n    %r = sub i16 %val %w\n    store i16 %r @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("s1", 0x20u16),
+        ("s2", 0x24),
+        ("out", 0x28),
+        ("main::j", 0x30),
+        ("main::a", 0x32),
+        ("main::b", 0x33),
+        ("main::e", 0x34),
+        ("main::t", 0x35),
+        ("main::nxt", 0x36),
+        ("main::x", 0x38),
+        ("main::z", 0x3A),
+        ("main::idx", 0x3C),
+        ("main::val", 0x3E),
+        ("main::gb", 0x40),
+        ("main::w", 0x41),
+        ("main::r", 0x42),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("SUBWF 0x32, W"),
+        "no walk with latch ALU:\n{asm}"
+    );
+}
+
+#[test]
+fn walk_latch_out_covers_middle_block_ops() {
+    // epic-cc#1169: a straight-line middle block's access joins the
+    // region with its own FSR re-derivation; the header and latch keep
+    // theirs.
+    let m = parse(
+        "global src i8\nglobal dst i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    br head\n  block head:\n    %i = phi i16 0 entry %inc latch\n    %p1 = gep @src +0 +1*%i\n    %x = load i8 %p1\n    br mid\n  block mid:\n    %p2 = gep @dst +0 +1*%i\n    store i8 %x %p2\n    br latch\n  block latch:\n    %inc = add i16 %i 1\n    %d = icmp eq i16 %inc 4\n    br i1 %d exit head\n  block exit:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("src", 0x20u16),
+        ("dst", 0x30),
+        ("out", 0x21),
+        ("main::i", 0x25),
+        ("main::x", 0x27),
+        ("main::inc", 0x28),
+        ("main::d", 0x2A),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        asm.contains("MOVLW 0x04\n    MOVWF 0x25"),
+        "trip seed replaces the zero init:\n{asm}"
+    );
+    assert!(asm.contains("SUBLW 0x24"), "src FSR from count:\n{asm}");
+    assert!(asm.contains("SUBLW 0x34"), "dst FSR from count:\n{asm}");
+    assert!(asm.contains("DECFSZ 0x25, F"), "down-counter latch:\n{asm}");
+    assert!(!asm.contains("XORLW 0x04"), "16-bit latch gone:\n{asm}");
+}
+
+#[test]
+fn nul_i8_counter_scans_without_carry() {
+    // epic-cc#1170: a byte counter needs one INCF and no carry arm.
+    let m = parse(
+        "global s1 i8\nglobal out i8\nfn main(void) ()\n  block 1:\n    br 2\n  block 2:\n    %3 = phi i8 0 1 %7 2\n    %4 = gep @s1 +0 +1*%3\n    %5 = load i8 %4\n    %6 = icmp eq i8 %5 0\n    %7 = add i8 %3 1\n    br i1 %6 8 2\n  block 8:\n    store i8 %3 @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("s1", 0x20u16),
+        ("out", 0x30),
+        ("main::3", 0x28),
+        ("main::5", 0x2A),
+        ("main::6", 0x2B),
+        ("main::7", 0x2C),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(asm.contains("INCF 0x28, F"), "counter counts up:\n{asm}");
+    assert!(
+        !asm.contains("INCF 0x29, F"),
+        "no high carry for a byte count:\n{asm}"
+    );
+    assert!(asm.contains("INCF FSR, F"), "pointer walks on:\n{asm}");
+}
+
+#[test]
+fn walk_refuses_partially_shared_chain() {
+    // epic-cc#1170: a masked link read outside any masked add (here a
+    // plain global store) keeps the old lowering: the link would read
+    // a home the walk never writes.
+    let m = parse(
+        "global buf i8\nglobal base i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %b = load i8 @base\n    br loop\n  block loop:\n    %i = phi i16 0 entry %inc loop\n    %p = gep @buf +0 +1*%i\n    %t = trunc i16 %i to i8\n    %m = and i8 %t 7\n    %v = add i8 %b %m\n    store i8 %v %p\n    store i8 %m @out\n    %inc = add i16 %i 1\n    %c = icmp eq i16 %inc 16\n    br i1 %c done loop\n  block done:\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("buf", 0x20u16),
+        ("base", 0x21),
+        ("out", 0x22),
+        ("main::b", 0x27),
+        ("main::i", 0x25),
+        ("main::t", 0x28),
+        ("main::m", 0x29),
+        ("main::v", 0x2A),
+        ("main::inc", 0x2B),
+        ("main::c", 0x2D),
+    ]);
+    let asm = select(&PIC16F877A, &m, &map);
+    assert!(
+        !asm.contains("DECFSZ 0x25, F"),
+        "no walk on a partially shared chain:\n{asm}"
+    );
+    assert!(asm.contains("XORLW 0x10"), "old latch survives:\n{asm}");
 }
 
 #[test]
@@ -11271,8 +12263,8 @@ fn page_tight_module(main_pad: usize, work_pad: usize) -> (ir::Module, HashMap<S
 
 #[test]
 fn page_tight_perturbations_never_oscillate() {
-    for main_pad in [660usize, 670, 680, 690, 700] {
-        for work_pad in [80usize, 120, 160, 200] {
+    for main_pad in [300usize, 420, 660, 670, 680, 690, 700] {
+        for work_pad in [40usize, 80, 120, 160, 200] {
             let (m, map) = page_tight_module(main_pad, work_pad);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 select(&PIC16F877A, &m, &map)
@@ -11288,6 +12280,118 @@ fn page_tight_perturbations_never_oscillate() {
                     assert!(
                         !msg.contains("oscillat"),
                         "main_pad={main_pad} work_pad={work_pad} oscillated: {msg}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// Two single-block functions: main fills most of page 0 and work takes
+// another page. `extra` load/store pairs in main shift its size by 2
+// words each, so the sweep steps main's page-0 end through every
+// residue the 3-word pad increments skip.
+fn page_tail_module(
+    main_pad: usize,
+    work_pad: usize,
+    extra: usize,
+) -> (ir::Module, HashMap<String, u16>) {
+    fn pads(n: usize, v: &str) -> String {
+        let mut s = String::new();
+        for _ in 0..n {
+            s.push_str(&format!("    %{v} = add i8 %{v}, 1\n"));
+        }
+        s
+    }
+    let mut text = String::from(
+        "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @in\n    %d = add i8 %a, 0\n",
+    );
+    text.push_str(&pads(main_pad, "d"));
+    for _ in 0..extra {
+        text.push_str("    %q = load i8 @in\n    store i8 %q @out\n");
+    }
+    text.push_str("    %t = call i8 @work(i8 %d)\n    store i8 %t @out\n    ret void\n");
+    text.push_str("fn work(i8) (x)\n  block entry:\n    %e = add i8 %x, 0\n");
+    text.push_str(&pads(work_pad, "e"));
+    text.push_str("    %r = add i8 %e, 1\n    ret i8 %r\n");
+    let m = parse(&text);
+    let map = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::a", 0x25),
+        ("main::d", 0x26),
+        ("main::t", 0x27),
+        ("work::x", 0x30),
+        ("work::e", 0x31),
+        ("work::r", 0x32),
+        ("main::q", 0x33),
+    ]);
+    (m, map)
+}
+
+// Free words at the end of each used page, in page order.
+fn page_remainders(asm: &str) -> Vec<usize> {
+    let mut org = 0usize;
+    let mut ends = [0usize; 8];
+    for raw in asm.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
+            continue;
+        }
+        if let Some(r) = line.strip_prefix("org ") {
+            org = usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).unwrap();
+            continue;
+        }
+        if line == "end" {
+            break;
+        }
+        if line.ends_with(':') || line.contains(" equ ") || line.starts_with(".table ") {
+            continue;
+        }
+        if let Some(n) = line.strip_prefix(".align ") {
+            let n: usize = n.trim().parse().unwrap();
+            org = (org + n - 1) & !(n - 1);
+            continue;
+        }
+        ends[org / 0x800] = ends[org / 0x800].max(org + 1);
+        org += 1;
+    }
+    ends.iter()
+        .enumerate()
+        .filter(|(_, e)| **e > 0)
+        .map(|(p, e)| (p + 1) * 0x800 - e)
+        .collect()
+}
+
+#[test]
+fn page_tail_sweep_never_ends_inside_placement_slack() {
+    for main_pad in 674usize..=678 {
+        for extra in 0usize..=2 {
+            let (m, map) = page_tail_module(main_pad, 100, extra);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                select(&PIC16F877A, &m, &map)
+            }));
+            match outcome {
+                Ok(asm) => {
+                    verify_page_fit(&m, &asm);
+                    let rems = page_remainders(&asm);
+                    if rems.len() > 1 {
+                        assert!(
+                            rems[0] >= 2,
+                            "main_pad={main_pad} extra={extra} ends page 0 with {} free words, inside the placement slack",
+                            rems[0]
+                        );
+                    }
+                }
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    assert!(
+                        !msg.contains("oscillat"),
+                        "main_pad={main_pad} extra={extra} oscillated: {msg}"
                     );
                 }
             }
@@ -11339,4 +12443,84 @@ fn cross_page_reader_keeps_parking_entry() {
         1,
         "table[1] = 1 through the full entry:\n{asm}"
     );
+}
+
+/// Signed widening multiply (epic-cc#1174): `__mul_s16` takes two i16
+/// patterns and returns the signed 32-bit product. The loop multiplies
+/// the patterns unsigned; the pre-seed corrects each negative operand.
+/// Literals pin the pid-step factors, the sign matrix, and the
+/// INT16_MIN corners; the stride sweep checks the rest against host
+/// `i32` arithmetic (an independent oracle, like the u8 exhaustive test).
+#[test]
+fn mul_s16_wide_simulates_signed_products() {
+    let ir = "global ina i16\n\
+         global inb i16\n\
+         global out i32\n\
+         fn __mul_s16(i32) (a=i16, b=i16)\n\
+           block entry:\n\
+             %__scr = alloca 6\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = load i16 @ina\n\
+             %y = load i16 @inb\n\
+             %r = call i32 @__mul_s16(i16 %x, i16 %y)\n\
+             store i32 %r @out\n\
+             ret void\n";
+    let map = [
+        ("ina".to_string(), 0x20),
+        ("inb".to_string(), 0x22),
+        ("out".to_string(), 0x24),
+        ("main::x".to_string(), 0x28),
+        ("main::y".to_string(), 0x2A),
+        ("main::r".to_string(), 0x2C),
+        ("__mul_s16::a".to_string(), 0x40),
+        ("__mul_s16::b".to_string(), 0x42),
+        ("__mul_s16::__scr".to_string(), 0x44),
+    ];
+    let run = |a: i16, b: i16| -> [u8; 4] {
+        let seed = [
+            (0x20, a as u16 as u8),
+            (0x21, (a as u16 >> 8) as u8),
+            (0x22, b as u16 as u8),
+            (0x23, (b as u16 >> 8) as u8),
+        ];
+        let got = sim_run_bytes(ir, &map, &seed, 0x24, 4);
+        [got[0], got[1], got[2], got[3]]
+    };
+    let check = |a: i16, b: i16| {
+        let want = (a as i32).wrapping_mul(b as i32).to_le_bytes();
+        assert_eq!(run(a, b), want, "__mul_s16({a}, {b}) must be {want:?}");
+    };
+    // The pid-step factors and the sign matrix around them.
+    for &(a, b) in &[
+        (256, 40),
+        (64, 40),
+        (0, 40),
+        (40, 0),
+        (1, 1),
+        (1, -1),
+        (-1, 1),
+        (-1, -1),
+        (0, 0),
+        (-32768, 1),
+        (1, -32768),
+        (-32768, -1),
+        (-1, -32768),
+        (-32768, -32768),
+        (32767, 32767),
+        (32767, -32768),
+        (-32768, 32767),
+        (32767, -1),
+        (0x5555, 0x2AAA),
+        (-0x5556, 0x2AAA),
+    ] {
+        check(a, b);
+    }
+    // Deterministic stride across all four quadrants plus the extremes.
+    for i in 0..64u16 {
+        let a = (i.wrapping_mul(1009).wrapping_add(7)) as i16;
+        let b = (i.wrapping_mul(631).wrapping_add(0x8000)) as i16;
+        check(a, b);
+        check(b, a);
+    }
 }

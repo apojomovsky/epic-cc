@@ -46,6 +46,16 @@
 //!     cost-model guessing. Skipped entirely (falls back to the base
 //!     `PASSES` list) when no candidates are found (epic-cc#205,
 //!     epic-cc#204).
+//!   - The same marking also folds a multi-call-site function when every
+//!     direct call site passes a literal at one argument position, the
+//!     literals differ across sites, and that argument indexes a
+//!     constant table in the body (epic-cc#1214). `ipsccp` keeps the
+//!     shared body for that shape, so the table lookup survives at
+//!     every site; a constant index into a constant table folds to
+//!     literal fields, which is what makes the duplicated body
+//!     collapse. Site-count and body-size caps bound the duplication,
+//!     and entry callers stay excluded, so the folded locals still
+//!     reclaim when the caller returns.
 //!
 //! On top of that baseline, two further independent fixes stack:
 //! consolidating `printf`'s per-call-site literal staging buffer into one
@@ -60,6 +70,13 @@
 //! PIC14 backend used to miscompile those, reading an `alloca`'s bytes
 //! where the walk needed its frame address, which is fixed (epic-cc#647),
 //! so both cores run it now.
+//! After the base list, a guarded second run tries to fold an
+//! all-constant search loop (the `compute_period` shape, epic-cc#1212):
+//! it removes the `llvm.loop.unroll.disable` mark only from loops
+//! holding a constant divide, unrolls at a raised threshold, and
+//! cleans up. The result ships only when every marked loop's
+//! function shrinks and no other function grows, so sibling runtime
+//! loops stay rolled. Skipped at `-O0`: control flow untouched.
 use crate::cli::OptLevel;
 
 use std::path::Path;
@@ -269,10 +286,199 @@ fn noinline_functions(lines: &[&str], funcs: &[FuncSpan]) -> std::collections::H
 /// never returns. The line cap bounds that RAM cost to small helpers;
 /// a large single-use driver stays out of line on purpose.
 const MAX_ENTRY_INLINE_LINES: usize = 100;
+/// Caps for the multi-call-site constant-argument fold: the body is
+/// duplicated once per site before the post-inline cleanup folds it, so
+/// both bounds price the worst case where that fold does not fire.
+const MAX_CONST_ARG_INLINE_SITES: usize = 8;
+const MAX_CONST_ARG_INLINE_LINES: usize = 64;
+
+/// Split a parenthesised list's contents at top-level commas. Nested
+/// parens, brackets and braces (aggregate types, constant expressions)
+/// and quoted strings keep their commas.
+fn split_top_level(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut start = 0usize;
+    for (i, c) in text.char_indices() {
+        if in_str {
+            if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(text[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+    parts
+}
+
+/// The argument texts of the list opening at `open` in `line`, or `None`
+/// when the list never closes on this line.
+fn list_arguments(line: &str, open: usize) -> Option<Vec<String>> {
+    let inner_start = open + 1;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    for (i, c) in line[inner_start..].char_indices() {
+        if in_str {
+            if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth == 0 => {
+                let inner = &line[inner_start..inner_start + i];
+                return Some(if inner.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    split_top_level(inner)
+                });
+            }
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The literal an argument text passes, when it passes one this fold
+/// keys on: an integer or boolean token in value position.
+fn literal_token(arg: &str) -> Option<&str> {
+    let tok = arg.split_whitespace().last()?;
+    if tok == "true" || tok == "false" || tok.parse::<i64>().is_ok() {
+        Some(tok)
+    } else {
+        None
+    }
+}
+
+/// Parameter positions that are a literal at every call site with at
+/// least two distinct values across sites. A single shared value is
+/// `ipsccp`'s case and keeps the out-of-line body; a runtime value at
+/// any site means the folded body would still need the general path.
+fn varying_constant_positions(params: &[String], sites: &[Vec<String>]) -> Vec<usize> {
+    if params.iter().any(|p| p.trim() == "...") {
+        return Vec::new();
+    }
+    (0..params.len())
+        .filter(|&pos| {
+            let mut values: std::collections::HashSet<&str> = Default::default();
+            sites.iter().all(|args| {
+                args.len() == params.len()
+                    && literal_token(&args[pos]).is_some_and(|v| {
+                        values.insert(v);
+                        true
+                    })
+            }) && values.len() >= 2
+        })
+        .collect()
+}
+
+/// Whether `line` mentions the SSA value `tok` as a whole token.
+fn mentions_value(line: &str, tok: &str) -> bool {
+    line.match_indices(tok).any(|(i, _)| {
+        let after = line[i + tok.len()..].chars().next();
+        after.is_none_or(|c| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '$')))
+    })
+}
+
+/// Whether one `getelementptr` line has a constant global as its base
+/// operand and the parameter in its index operands. Merely mentioning
+/// both on one line is not enough: a fixed-slot table address passed
+/// alongside the parameter indexes nothing.
+fn gep_indexes_param(
+    line: &str,
+    tok: &str,
+    const_globals: &std::collections::HashSet<&str>,
+) -> bool {
+    let Some(at) = line.find("getelementptr") else {
+        return false;
+    };
+    let rest = &line[at + "getelementptr".len()..];
+    let operands = match rest.find('(') {
+        // Constant-expression form: operands sit inside the parens.
+        Some(open) => {
+            let mut depth = 0i32;
+            let mut close = None;
+            for (i, c) in rest[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else { return false };
+            &rest[open + 1..close]
+        }
+        None => rest,
+    };
+    let segs = split_top_level(operands);
+    segs.len() >= 3
+        && const_globals
+            .iter()
+            .any(|g| mentions_value(&segs[1], &format!("@{g}")))
+        && segs[2..].iter().any(|s| mentions_value(s, tok))
+}
+
+/// Whether the parameter at `pos` indexes a constant global in the
+/// body. That shape folds to literal field values once the argument
+/// is a literal, so the duplicated body collapses. A constant that
+/// only bounds a loop or picks a branch has no such guarantee and
+/// keeps the shared body (the menu demo's serial writer regressed on
+/// exactly that shape).
+fn indexes_constant_table(
+    lines: &[&str],
+    f: &FuncSpan,
+    params: &[String],
+    pos: usize,
+    const_globals: &std::collections::HashSet<&str>,
+) -> bool {
+    let Some(tok) = params[pos].split_whitespace().last() else {
+        return false;
+    };
+    if !tok.starts_with('%') {
+        return false;
+    }
+    lines[f.start..=f.end]
+        .iter()
+        .any(|line| gep_indexes_param(line, tok, const_globals))
+}
 fn always_inline_candidates(ll_text: &str, aggressive: bool) -> Vec<String> {
     let lines: Vec<&str> = ll_text.lines().collect();
     let funcs = function_spans(&lines);
     let defined: std::collections::HashSet<&str> = funcs.iter().map(|f| f.name.as_str()).collect();
+    let const_globals: std::collections::HashSet<&str> = lines
+        .iter()
+        .filter(|l| l.starts_with('@') && l.split_whitespace().any(|t| t == "constant"))
+        .filter_map(|l| {
+            let end = l[1..]
+                .find(|c: char| c == '=' || c.is_whitespace())
+                .map(|i| i + 1)
+                .unwrap_or(l.len());
+            Some(&l[1..end])
+        })
+        .collect();
     let noinline = noinline_functions(&lines, &funcs);
 
     // caller function index for each line (None outside any function body,
@@ -291,6 +497,7 @@ fn always_inline_candidates(ll_text: &str, aggressive: bool) -> Vec<String> {
         funcs.iter().map(|f| (f.start, f.name.as_str())).collect();
 
     let mut call_sites: std::collections::HashMap<&str, Vec<usize>> = Default::default();
+    let mut site_args: std::collections::HashMap<&str, Vec<Vec<String>>> = Default::default();
     let mut address_taken: std::collections::HashSet<&str> = Default::default();
 
     for (li, line) in lines.iter().enumerate() {
@@ -317,6 +524,11 @@ fn always_inline_candidates(ll_text: &str, aggressive: bool) -> Vec<String> {
                         .entry(name)
                         .or_default()
                         .push(line_owner[li].unwrap_or(usize::MAX));
+                    let open = name_end + (line[name_end..].len() - after.len());
+                    site_args
+                        .entry(name)
+                        .or_default()
+                        .push(list_arguments(line, open).unwrap_or_default());
                 } else {
                     address_taken.insert(name);
                 }
@@ -327,30 +539,139 @@ fn always_inline_candidates(ll_text: &str, aggressive: bool) -> Vec<String> {
         }
     }
 
-    funcs
-        .iter()
-        .filter(|f| !f.is_entry)
-        .filter(|f| !address_taken.contains(f.name.as_str()))
-        .filter(|f| !noinline.contains(f.name.as_str()))
-        .filter_map(|f| {
-            let sites = call_sites.get(f.name.as_str())?;
-            if sites.len() != 1 {
-                return None;
-            }
+    let mut singles: Vec<String> = Vec::new();
+    let mut multis: Vec<String> = Vec::new();
+    for (fi, f) in funcs.iter().enumerate() {
+        if f.is_entry
+            || address_taken.contains(f.name.as_str())
+            || noinline.contains(f.name.as_str())
+        {
+            continue;
+        }
+        let Some(sites) = call_sites.get(f.name.as_str()) else {
+            continue;
+        };
+        if sites.len() == 1 {
             let caller = sites[0];
             if caller == usize::MAX {
-                return None;
+                continue;
             }
-            if funcs[caller].is_entry {
-                if !aggressive {
-                    return None;
+            if funcs[caller].is_entry
+                && (!aggressive || f.end - f.start + 1 > MAX_ENTRY_INLINE_LINES)
+            {
+                continue;
+            }
+            singles.push(f.name.clone());
+            continue;
+        }
+        if sites.len() > MAX_CONST_ARG_INLINE_SITES
+            || f.end - f.start + 1 > MAX_CONST_ARG_INLINE_LINES
+        {
+            continue;
+        }
+        if sites
+            .iter()
+            .any(|&caller| caller == usize::MAX || caller == fi || funcs[caller].is_entry)
+        {
+            continue;
+        }
+        let define = lines[f.start];
+        let Some(params) = define.find('(').and_then(|o| list_arguments(define, o)) else {
+            continue;
+        };
+        let Some(args) = site_args.get(f.name.as_str()) else {
+            continue;
+        };
+        if varying_constant_positions(&params, args)
+            .iter()
+            .any(|&pos| indexes_constant_table(&lines, f, &params, pos, &const_globals))
+        {
+            multis.push(f.name.clone());
+        }
+    }
+
+    // A multi-site body that calls a marked function, or is called by
+    // another multi-site body, duplicates past its own caps when the
+    // marked callees expand inside each copy. One reached from an
+    // entry through a chain of marked functions lands in the entry
+    // frame the direct-caller check above meant to keep it out of.
+    // Drop those to a fixpoint: unmarking one can clear another.
+    let index_of: std::collections::HashMap<&str, usize> = funcs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.as_str(), i))
+        .collect();
+    let callees_of = |name: &str| -> Vec<String> {
+        let Some(&idx) = index_of.get(name) else {
+            return Vec::new();
+        };
+        call_sites
+            .iter()
+            .filter(|(_, callers)| callers.contains(&idx))
+            .map(|(callee, _)| callee.to_string())
+            .collect()
+    };
+    loop {
+        let marked: std::collections::HashSet<&str> = singles
+            .iter()
+            .chain(multis.iter())
+            .map(String::as_str)
+            .collect();
+        let multi_set: std::collections::HashSet<&str> =
+            multis.iter().map(String::as_str).collect();
+        // Candidates an entry caller pulls in, then candidates those
+        // pull in, in turn: the aggressive tier folds the first kind
+        // into the entry, and the rest follow it there.
+        let mut entry_bound: std::collections::HashSet<&str> = Default::default();
+        loop {
+            let mut grew = false;
+            for name in &marked {
+                if entry_bound.contains(name) {
+                    continue;
                 }
-                if f.end - f.start + 1 > MAX_ENTRY_INLINE_LINES {
-                    return None;
+                let pulled = call_sites.get(name).is_some_and(|callers| {
+                    callers.iter().any(|&c| {
+                        c != usize::MAX
+                            && (funcs[c].is_entry || entry_bound.contains(funcs[c].name.as_str()))
+                    })
+                });
+                if pulled {
+                    entry_bound.insert(name);
+                    grew = true;
                 }
             }
-            Some(f.name.clone())
-        })
+            if !grew {
+                break;
+            }
+        }
+        let violators: std::collections::HashSet<String> = multis
+            .iter()
+            .filter(|m| {
+                entry_bound.contains(m.as_str())
+                    || callees_of(m).iter().any(|c| marked.contains(c.as_str()))
+                    || call_sites.get(m.as_str()).is_some_and(|callers| {
+                        callers
+                            .iter()
+                            .any(|&c| c != usize::MAX && multi_set.contains(funcs[c].name.as_str()))
+                    })
+            })
+            .cloned()
+            .collect();
+        if violators.is_empty() {
+            break;
+        }
+        multis.retain(|m| !violators.contains(m));
+    }
+
+    let keep: std::collections::HashSet<&str> = singles
+        .iter()
+        .chain(multis.iter())
+        .map(String::as_str)
+        .collect();
+    funcs
+        .iter()
+        .filter(|f| keep.contains(f.name.as_str()))
+        .map(|f| f.name.clone())
         .collect()
 }
 
@@ -404,16 +725,360 @@ fn mark_always_inline(ll_text: &str, candidates: &[String]) -> String {
     out
 }
 
+/// Cleanup after a forced unroll: `sccp`/`adce` collapse the unrolled
+/// constant chain that plain `dce` leaves behind.
+const FOLD_PASSES: &str =
+    "loop-unroll,instcombine,simplifycfg,sccp,adce,instcombine,simplifycfg,dce";
+/// Raised unroll threshold for the fold run. The default (a few hundred)
+/// stops just short of the 3x16x2 search body; this clears it while the
+/// per-function guard in `run` bounds what can actually ship.
+const FOLD_UNROLL_THRESHOLD: &str = "1024";
+
+/// One divide or remainder with a constant operand (`udiv i32 5000, %pq`).
+fn is_const_div_line(t: &str) -> bool {
+    ["udiv", "sdiv", "urem", "srem"].iter().any(|op| {
+        let Some(pos) = t.find(&format!(" {op} ")) else {
+            return false;
+        };
+        let rest = &t[pos + op.len() + 2..];
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let _ty = parts.next();
+        let Some(operands) = parts.next() else {
+            return false;
+        };
+        operands.split(',').any(|o| {
+            let o = o.trim();
+            o.strip_prefix('-')
+                .unwrap_or(o)
+                .starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
+}
+
+/// A basic block in one function: successor labels, the loop ids on
+/// its branches, and whether any instruction divides by or of a
+/// constant.
+struct BlockInfo {
+    name: String,
+    succs: Vec<String>,
+    loop_ids: Vec<String>,
+    has_const_div: bool,
+}
+
+/// The `label %name` targets in one terminator line.
+fn label_targets(t: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = t;
+    while let Some(pos) = rest.find("label %") {
+        let tok = &rest[pos + "label %".len()..];
+        let name: String = tok
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+            .collect();
+        if !name.is_empty() {
+            out.push(name.clone());
+        }
+        rest = &tok[name.len().max(1)..];
+    }
+    out
+}
+
+/// The `!llvm.loop !N` ids attached to one line.
+fn loop_ids_on(t: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = t;
+    while let Some(pos) = rest.find("!llvm.loop !") {
+        let num = &rest[pos + "!llvm.loop !".len()..];
+        let id: String = num.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if id.is_empty() {
+            break;
+        }
+        out.push(id.clone());
+        rest = &num[id.len()..];
+    }
+    out
+}
+
+/// Basic blocks of one function span. A label line is a head before
+/// any `;` comment that ends in `:` with no whitespace or `=` in it;
+/// the entry block keeps the empty name.
+fn blocks_of(lines: &[&str], span: &FuncSpan) -> Vec<BlockInfo> {
+    let mut blocks = vec![BlockInfo {
+        name: String::new(),
+        succs: Vec::new(),
+        loop_ids: Vec::new(),
+        has_const_div: false,
+    }];
+    for line in &lines[span.start + 1..span.end] {
+        let t = line.trim();
+        let head = t.split(';').next().unwrap_or("").trim();
+        if head.ends_with(':')
+            && !head[..head.len() - 1].contains(|c: char| c.is_whitespace() || c == '=')
+        {
+            blocks.push(BlockInfo {
+                name: head[..head.len() - 1].to_string(),
+                succs: Vec::new(),
+                loop_ids: Vec::new(),
+                has_const_div: false,
+            });
+            continue;
+        }
+        let b = blocks.last_mut().expect("entry block exists");
+        b.succs.extend(label_targets(t));
+        b.loop_ids.extend(loop_ids_on(t));
+        if is_const_div_line(t) {
+            b.has_const_div = true;
+        }
+    }
+    blocks
+}
+
+/// Loop metadata ids in the nest of a constant divide: loops whose
+/// natural loop holds a divide, and loops nested inside or enclosing
+/// one. The natural loop of a back edge latch to header is the header
+/// and every block reaching the latch without passing the header.
+/// The whole nest must unroll to evaluate the search; a sequential
+/// sibling loop is disjoint and stays rolled.
+fn const_div_loops(lines: &[&str], span: &FuncSpan) -> (Vec<String>, bool) {
+    let blocks = blocks_of(lines, span);
+    let index: std::collections::HashMap<&str, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.name.as_str(), i))
+        .collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
+    for (i, b) in blocks.iter().enumerate() {
+        for s in &b.succs {
+            if let Some(&j) = index.get(s.as_str()) {
+                preds[j].push(i);
+            }
+        }
+    }
+    // Dominators: a back edge's header dominates its latch. Reachability
+    // alone also admits forward successors inside a shared outer cycle,
+    // which would invent loops that LLVM does not see.
+    let n_blocks = blocks.len();
+    let mut dom = vec![vec![true; n_blocks]; n_blocks];
+    if n_blocks > 0 {
+        dom[0] = vec![false; n_blocks];
+        dom[0][0] = true;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for n in 1..n_blocks {
+                let mut new = vec![true; n_blocks];
+                for p in &preds[n] {
+                    for i in 0..n_blocks {
+                        new[i] = new[i] && dom[*p][i];
+                    }
+                }
+                new[n] = true;
+                if new != dom[n] {
+                    dom[n] = new;
+                    changed = true;
+                }
+            }
+        }
+    }
+    let mut loops: Vec<(Vec<String>, Vec<bool>)> = Vec::new();
+    for (latch, b) in blocks.iter().enumerate() {
+        if b.loop_ids.is_empty() {
+            continue;
+        }
+        for header_name in &b.succs {
+            let Some(&header) = index.get(header_name.as_str()) else {
+                continue;
+            };
+            if !dom[latch][header] {
+                continue;
+            }
+            let mut in_loop = vec![false; blocks.len()];
+            in_loop[header] = true;
+            let mut stack = vec![latch];
+            while let Some(n) = stack.pop() {
+                if in_loop[n] {
+                    continue;
+                }
+                in_loop[n] = true;
+                stack.extend(preds[n].iter().copied());
+            }
+            loops.push((b.loop_ids.clone(), in_loop));
+        }
+    }
+    let has_div = |set: &Vec<bool>| {
+        blocks
+            .iter()
+            .zip(set)
+            .any(|(blk, inside)| *inside && blk.has_const_div)
+    };
+    let div_sets: Vec<&Vec<bool>> = loops
+        .iter()
+        .map(|(_, set)| set)
+        .filter(|set| has_div(set))
+        .collect();
+    // Innermost divide loops: no other divide loop strictly inside.
+    // The nest is their ancestors and descendants; a sibling loop
+    // inside a shared outer loop is neither and stays rolled.
+    let subset = |a: &Vec<bool>, b: &Vec<bool>| a.iter().zip(b.iter()).all(|(x, y)| !x || *y);
+    let innermost: Vec<&Vec<bool>> = div_sets
+        .iter()
+        .filter(|set| {
+            !div_sets
+                .iter()
+                .any(|other| subset(other, set) && !subset(set, other))
+        })
+        .copied()
+        .collect();
+    let mut ids: Vec<String> = Vec::new();
+    for (loop_ids, set) in &loops {
+        let in_nest = innermost
+            .iter()
+            .any(|div_set| subset(div_set, set) || subset(set, div_set));
+        if in_nest {
+            for id in loop_ids {
+                if !ids.contains(id) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+    }
+    let any = !ids.is_empty();
+    (ids, any)
+}
+
+/// Remove `llvm.loop.unroll.disable` from the nest of a constant
+/// divide, returning the edited text and the functions owning those
+/// loops. clang `-O1` stamps the mark on every loop and the
+/// unroller honours it unconditionally, so no threshold alone can
+/// unroll `-O1` IR. Scoping to the nest keeps sibling loops rolled.
+fn strip_unroll_disable(ll_text: &str) -> (String, Vec<String>) {
+    strip_unroll_disable_for(ll_text, None)
+}
+
+/// `strip_unroll_disable` restricted to the named functions, used to
+/// rerun the fold with only the targets that actually shrank.
+fn strip_unroll_disable_for(ll_text: &str, only: Option<&[String]>) -> (String, Vec<String>) {
+    let lines: Vec<&str> = ll_text.lines().collect();
+    let mut disable_ids: Vec<String> = Vec::new();
+    for line in &lines {
+        let t = line.trim();
+        if (t.contains("= !{!\"llvm.loop.unroll.disable\"}")
+            || t.contains("= distinct !{!\"llvm.loop.unroll.disable\"}"))
+            && t.starts_with('!')
+        {
+            if let Some(eq) = t.find(" =") {
+                disable_ids.push(t[1..eq].to_string());
+            }
+        }
+    }
+    if disable_ids.is_empty() {
+        return (ll_text.to_string(), Vec::new());
+    }
+    let mut loop_ids: Vec<String> = Vec::new();
+    let mut targets: Vec<String> = Vec::new();
+    for span in function_spans(&lines) {
+        if let Some(only) = only {
+            if !only.contains(&span.name) {
+                continue;
+            }
+        }
+        let (ids, any) = const_div_loops(&lines, &span);
+        if any {
+            targets.push(span.name.clone());
+            for id in ids {
+                if !loop_ids.contains(&id) {
+                    loop_ids.push(id);
+                }
+            }
+        }
+    }
+    if loop_ids.is_empty() {
+        return (ll_text.to_string(), Vec::new());
+    }
+    let mut out = String::with_capacity(ll_text.len());
+    for line in &lines {
+        let t = line.trim_start();
+        if !loop_ids.iter().any(|id| t.starts_with(&format!("!{id} ="))) {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let mut owned = line.to_string();
+        for id in &disable_ids {
+            let tok = format!("!{id}");
+            owned = owned
+                .replace(&format!(", {tok},"), ",")
+                .replace(&format!(", {tok}}}"), "}")
+                .replace(&format!(", {tok})"), ")")
+                .replace(&format!("{{{tok}, "), "{");
+        }
+        out.push_str(&owned);
+        out.push('\n');
+    }
+    (out, targets)
+}
+
+/// One instruction line inside a function body, debug excluded.
+fn is_instruction(t: &str) -> bool {
+    !t.starts_with("#dbg")
+        && !t.ends_with(':')
+        && (t.starts_with('%')
+            || t.starts_with("store ")
+            || t.starts_with("br ")
+            || t.starts_with("call ")
+            || t.starts_with("tail call ")
+            || t.starts_with("ret ")
+            || t.starts_with("switch ")
+            || t.starts_with("unreachable"))
+}
+
+/// Per-function IR instruction counts. The fold guard compares
+/// these: every target must shrink and no other function may grow.
+fn function_instruction_counts(ll_text: &str) -> std::collections::HashMap<String, usize> {
+    let lines: Vec<&str> = ll_text.lines().collect();
+    let mut out = std::collections::HashMap::new();
+    for span in function_spans(&lines) {
+        let n = lines[span.start + 1..span.end]
+            .iter()
+            .filter(|l| is_instruction(l.trim()))
+            .count();
+        out.insert(span.name.clone(), n);
+    }
+    out
+}
+
+/// One `opt` invocation: `input` to `out`, returning the output text.
+fn run_opt(
+    opt_bin: &Path,
+    input: &Path,
+    out: &Path,
+    passes: &str,
+    args: &[String],
+) -> Result<String, String> {
+    let mut cmd = Command::new(opt_bin);
+    cmd.arg("-S").arg(format!("-passes={passes}"));
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.arg(input).args(["-o", out.to_str().unwrap()]);
+    let res = cmd.output().map_err(|e| format!("run opt: {e}"))?;
+    if !res.status.success() {
+        return Err(String::from_utf8_lossy(&res.stderr).into_owned());
+    }
+    std::fs::read_to_string(out).map_err(|e| format!("read {}: {e}", out.display()))
+}
+
 /// Run the curated whole-program cleanup over `merged_path` (the
 /// `llvm-link` output), writing the result to `out_path`. Returns the
 /// optimized `.ll` text. The profile selects the pipeline, not clang's
 /// flags (clang stays at `-O1` under every profile): `-O0` folds
 /// whole-program constants only (`PASSES_O0`, control flow untouched, for
 /// stepping and bisection); `-O1` runs the base `PASSES` with no
-/// cross-function folding; `-Os` adds the single-call-site folds into
-/// ordinary callers (today's pipeline exactly); `-O2` additionally folds
-/// small single-call-site callees into `main`/ISR roots and leaves code
-/// factoring to the driver (which disables it under `-O2`).
+/// cross-function folding; `-Os` adds the single-call-site and
+/// constant-argument folds into ordinary callers (today's pipeline
+/// exactly); `-O2` additionally folds small single-call-site callees
+/// into `main`/ISR roots and leaves code factoring to the driver
+/// (which disables it under `-O2`).
 pub fn run(
     opt_bin: &Path,
     merged_path: &Path,
@@ -459,17 +1124,67 @@ pub fn run(
     };
     std::fs::write(merged_path, &marked)
         .map_err(|e| format!("write {}: {e}", merged_path.display()))?;
-    let mut cmd = Command::new(opt_bin);
-    cmd.arg("-S")
-        .arg(format!("--internalize-public-api-list={}", api.join(",")))
-        .arg(format!("-passes={passes}"))
-        .arg(merged_path)
-        .args(["-o", out_path.to_str().unwrap()]);
-    let out = cmd.output().map_err(|e| format!("run opt: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    let api_arg = format!("--internalize-public-api-list={}", api.join(","));
+    let base_text = run_opt(opt_bin, merged_path, out_path, &passes, &[api_arg])?;
+    if opt_level == OptLevel::O0 {
+        return Ok(base_text);
     }
-    std::fs::read_to_string(out_path).map_err(|e| format!("read {}: {e}", out_path.display()))
+    // Fold attempt (epic-cc#1212): unroll the now-constant search.
+    // Gated on the strip actually changing the text, and kept only
+    // when a target function shrinks and no function grows. Targets
+    // that do not shrink are dropped and the fold reruns without
+    // them, so their loops are never unrolled in the shipped text.
+    let (stripped, targets) = strip_unroll_disable(&base_text);
+    if targets.is_empty() || stripped == base_text {
+        return Ok(base_text);
+    }
+    let fold_in = out_path.with_extension("fold_in.ll");
+    let fold_out = out_path.with_extension("fold.ll");
+    let threshold = format!("--unroll-threshold={FOLD_UNROLL_THRESHOLD}");
+    let attempt = |text: &str| -> Option<String> {
+        std::fs::write(&fold_in, text).ok()?;
+        run_opt(
+            opt_bin,
+            &fold_in,
+            &fold_out,
+            FOLD_PASSES,
+            &[threshold.clone()],
+        )
+        .ok()
+    };
+    let Some(mut folded) = attempt(&stripped) else {
+        return Ok(base_text);
+    };
+    let base_counts = function_instruction_counts(&base_text);
+    let shrunk = |counts: &std::collections::HashMap<String, usize>, name: &str| {
+        counts.get(name).copied().unwrap_or(0) < base_counts.get(name).copied().unwrap_or(0)
+    };
+    let first_counts = function_instruction_counts(&folded);
+    let shrinking: Vec<String> = targets
+        .iter()
+        .filter(|name| shrunk(&first_counts, name))
+        .cloned()
+        .collect();
+    if shrinking.is_empty() {
+        return Ok(base_text);
+    }
+    if shrinking.len() != targets.len() {
+        let (reduced, _) = strip_unroll_disable_for(&base_text, Some(&shrinking));
+        let Some(rerun) = attempt(&reduced) else {
+            return Ok(base_text);
+        };
+        folded = rerun;
+    }
+    let fold_counts = function_instruction_counts(&folded);
+    let any_target_shrinks = shrinking.iter().any(|name| shrunk(&fold_counts, name));
+    let nothing_grows = fold_counts
+        .iter()
+        .all(|(name, n)| *n <= base_counts.get(name).copied().unwrap_or(0));
+    if !any_target_shrinks || !nothing_grows {
+        return Ok(base_text);
+    }
+    std::fs::write(out_path, &folded).map_err(|e| format!("write {}: {e}", out_path.display()))?;
+    Ok(folded)
 }
 
 #[cfg(test)]
@@ -594,6 +1309,268 @@ define internal void @shared() #0 {
     }
 
     #[test]
+    fn always_inline_finds_a_multi_call_site_varying_constant_arg() {
+        let ll = "\
+@table = internal constant [16 x i8] zeroinitializer
+define internal void @a() #0 {
+  tail call void @shared(i16 noundef 4)
+  ret void
+}
+define internal void @b() #0 {
+  tail call void @shared(i16 noundef 9)
+  ret void
+}
+define internal void @shared(i16 noundef %0) #0 {
+  %1 = getelementptr inbounds [16 x i8], ptr @table, i16 0, i16 %0
+  %2 = load i8, ptr %1
+  ret void
+}
+";
+        assert_eq!(
+            always_inline_candidates(ll, false),
+            vec!["shared".to_string()],
+            "every site passes a literal and the literals differ, so each caller folds its own copy"
+        );
+    }
+
+    #[test]
+    fn always_inline_finds_a_constant_arg_indexing_in_expression_form() {
+        // clang emits the constant-expression form (operands parenthesised)
+        // when the GEP is an operand of another instruction.
+        let ll = "\
+@table = internal constant [16 x i8] zeroinitializer
+define internal void @a() #0 {
+  tail call void @shared(i16 noundef 4)
+  ret void
+}
+define internal void @b() #0 {
+  tail call void @shared(i16 noundef 9)
+  ret void
+}
+define internal void @shared(i16 noundef %0) #0 {
+  %1 = call i8 @use(ptr getelementptr inbounds ([16 x i8], ptr @table, i16 0, i16 %0))
+  ret void
+}
+declare i8 @use(ptr)
+";
+        assert_eq!(
+            always_inline_candidates(ll, false),
+            vec!["shared".to_string()],
+            "the parenthesised form must parse to the same base and index operands"
+        );
+    }
+
+    #[test]
+    fn always_inline_leaves_a_constant_merely_mentioned_on_a_gep_line() {
+        let ll = "\
+@table = internal constant [16 x i8] zeroinitializer
+define internal void @a() #0 {
+  tail call void @shared(i16 noundef 4)
+  ret void
+}
+define internal void @b() #0 {
+  tail call void @shared(i16 noundef 9)
+  ret void
+}
+define internal void @shared(i16 noundef %0) #0 {
+  %1 = getelementptr inbounds [16 x i8], ptr @table, i16 0, i16 0
+  %2 = load i8, ptr %1
+  %3 = add i16 %0, 1
+  ret void
+}
+";
+        assert!(
+            always_inline_candidates(ll, false).is_empty(),
+            "the table address is fixed and the parameter only rides along, nothing folds"
+        );
+    }
+
+    #[test]
+    fn always_inline_leaves_a_multi_call_site_chain() {
+        let ll = "\
+@table = internal constant [16 x i8] zeroinitializer
+define internal void @a() #0 {
+  tail call void @outer(i16 noundef 4)
+  ret void
+}
+define internal void @b() #0 {
+  tail call void @outer(i16 noundef 9)
+  tail call void @inner(i16 noundef 3)
+  ret void
+}
+define internal void @c() #0 {
+  tail call void @inner(i16 noundef 5)
+  ret void
+}
+define internal void @outer(i16 noundef %0) #0 {
+  %1 = getelementptr inbounds [16 x i8], ptr @table, i16 0, i16 %0
+  %2 = load i8, ptr %1
+  tail call void @inner(i16 noundef 3)
+  ret void
+}
+define internal void @inner(i16 noundef %0) #0 {
+  %1 = getelementptr inbounds [16 x i8], ptr @table, i16 0, i16 %0
+  %2 = load i8, ptr %1
+  ret void
+}
+";
+        assert!(
+            always_inline_candidates(ll, false).is_empty(),
+            "marked copies inside marked copies duplicate past either body's own caps"
+        );
+    }
+
+    #[test]
+    fn always_inline_leaves_a_multi_call_site_behind_an_entry_fold() {
+        let ll = "\
+@table = internal constant [16 x i8] zeroinitializer
+define dso_local i16 @main() #0 {
+  tail call void @mid()
+  ret i16 0
+}
+define internal void @mid() #0 {
+  tail call void @shared(i16 noundef 4)
+  tail call void @shared(i16 noundef 9)
+  ret void
+}
+define internal void @shared(i16 noundef %0) #0 {
+  %1 = getelementptr inbounds [16 x i8], ptr @table, i16 0, i16 %0
+  %2 = load i8, ptr %1
+  ret void
+}
+";
+        assert_eq!(
+            always_inline_candidates(ll, false),
+            vec!["shared".to_string()],
+            "at the default tier mid stays out of line, so shared folds into an ordinary frame"
+        );
+        assert_eq!(
+            always_inline_candidates(ll, true),
+            vec!["mid".to_string()],
+            "at the aggressive tier mid folds into main, so shared must not follow it there"
+        );
+    }
+
+    #[test]
+    fn always_inline_leaves_a_multi_call_site_shared_constant_arg() {
+        let ll = "\
+define internal void @a() #0 {
+  tail call void @shared(i16 noundef 4)
+  ret void
+}
+define internal void @b() #0 {
+  tail call void @shared(i16 noundef 4)
+  ret void
+}
+define internal void @shared(i16 noundef %0) #0 {
+  ret void
+}
+";
+        assert!(
+            always_inline_candidates(ll, false).is_empty(),
+            "one shared literal is ipsccp's case, the out-of-line body stays"
+        );
+    }
+
+    #[test]
+    fn always_inline_leaves_a_multi_call_site_with_a_runtime_arg() {
+        let ll = "\
+define internal void @a(i16 noundef %0) #0 {
+  tail call void @shared(i16 noundef %0)
+  ret void
+}
+define internal void @b() #0 {
+  tail call void @shared(i16 noundef 9)
+  ret void
+}
+define internal void @shared(i16 noundef %0) #0 {
+  ret void
+}
+";
+        assert!(
+            always_inline_candidates(ll, false).is_empty(),
+            "a runtime value at one site means the general body is still needed"
+        );
+    }
+
+    #[test]
+    fn always_inline_leaves_a_constant_arg_callee_called_from_main() {
+        let ll = "\
+@table = internal constant [16 x i8] zeroinitializer
+define dso_local i16 @main() #0 {
+  tail call void @shared(i16 noundef 4)
+  ret i16 0
+}
+define internal void @b() #0 {
+  tail call void @shared(i16 noundef 9)
+  ret void
+}
+define internal void @shared(i16 noundef %0) #0 {
+  %1 = getelementptr inbounds [16 x i8], ptr @table, i16 0, i16 %0
+  %2 = load i8, ptr %1
+  ret void
+}
+";
+        assert!(
+            always_inline_candidates(ll, false).is_empty(),
+            "a main caller never returns, so its folded locals would stay live for good"
+        );
+        assert!(
+            always_inline_candidates(ll, true).is_empty(),
+            "the aggressive tier only widens the single-call-site fold, not this one"
+        );
+    }
+
+    #[test]
+    fn always_inline_leaves_a_varying_constant_that_indexes_no_table() {
+        let ll = "\
+define internal void @a() #0 {
+  tail call void @shared(i16 noundef 4)
+  ret void
+}
+define internal void @b() #0 {
+  tail call void @shared(i16 noundef 9)
+  ret void
+}
+define internal void @shared(i16 noundef %0) #0 {
+  %1 = icmp eq i16 %0, 0
+  ret void
+}
+";
+        assert!(
+            always_inline_candidates(ll, false).is_empty(),
+            "a constant that only picks a branch or bounds a loop may not shrink the body, so it stays shared"
+        );
+    }
+
+    #[test]
+    fn always_inline_caps_constant_arg_site_count_and_body_size() {
+        let mut many = String::from("@table = internal constant [16 x i8] zeroinitializer\n");
+        for i in 0..(MAX_CONST_ARG_INLINE_SITES + 1) {
+            many.push_str(&format!(
+                "define internal void @c{i}() #0 {{\n  tail call void @shared(i16 noundef {i})\n  ret void\n}}\n"
+            ));
+        }
+        many.push_str("define internal void @shared(i16 noundef %0) #0 {\n  %1 = getelementptr inbounds [16 x i8], ptr @table, i16 0, i16 %0\n  ret void\n}\n");
+        assert!(
+            always_inline_candidates(&many, false).is_empty(),
+            "past the site cap the duplicated bodies price worse than the shared one"
+        );
+
+        let mut big = String::from(
+            "@table = internal constant [16 x i8] zeroinitializer\ndefine internal void @a() #0 {\n  tail call void @shared(i16 noundef 4)\n  ret void\n}\ndefine internal void @b() #0 {\n  tail call void @shared(i16 noundef 9)\n  ret void\n}\ndefine internal void @shared(i16 noundef %0) #0 {\n  %1 = getelementptr inbounds [16 x i8], ptr @table, i16 0, i16 %0\n",
+        );
+        for _ in 0..MAX_CONST_ARG_INLINE_LINES {
+            big.push_str("  %x = add i16 %0, 1\n");
+        }
+        big.push_str("  ret void\n}\n");
+        assert!(
+            always_inline_candidates(&big, false).is_empty(),
+            "past the body cap the duplicated bodies price worse than the shared one"
+        );
+    }
+
+    #[test]
     fn always_inline_excludes_address_taken_functions() {
         let ll = "\
 define internal void @caller() #0 {
@@ -653,6 +1630,25 @@ define internal void @driver() #0 {
     }
 
     #[test]
+    fn strip_unroll_disable_keeps_sibling_nested_in_a_shared_outer_loop() {
+        let ll = "define i16 @main() #0 {\n  br label %ohead\nohead:\n  br label %shead\nshead:\n  %n = udiv i32 5000, %pq\n  br i1 %c, label %shead, label %rhead, !llvm.loop !4\nrhead:\n  %m = mul i32 %a, 3\n  br i1 %d, label %rhead, label %onext, !llvm.loop !7\nonext:\n  br i1 %e, label %ohead, label %exit, !llvm.loop !9\nexit:\n  ret i16 0\n}\n!4 = distinct !{!4, !6}\n!7 = distinct !{!7, !6}\n!9 = distinct !{!9, !6}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
+        let (out, targets) = strip_unroll_disable(ll);
+        assert_eq!(targets, vec!["main".to_string()]);
+        assert!(
+            out.contains("!4 = distinct !{!4}"),
+            "search loop unmarked: {out}"
+        );
+        assert!(
+            out.contains("!9 = distinct !{!9}"),
+            "outer loop unmarked: {out}"
+        );
+        assert!(
+            out.contains("!7 = distinct !{!7, !6}"),
+            "nested sibling keeps its mark: {out}"
+        );
+    }
+
+    #[test]
     fn aggressive_leaves_a_large_single_call_site_callee_out_of_line() {
         let mut ll = String::from(
             "define dso_local i16 @main() #0 {\n  tail call void @big()\n  ret i16 0\n}\ndefine internal void @big() #0 {\n",
@@ -685,5 +1681,69 @@ define internal void @driver() #0 {
             marked,
             "define internal void @helper(i16 %0) local_unnamed_addr #3 alwaysinline {\n}\n"
         );
+    }
+
+    #[test]
+    fn strip_unroll_disable_covers_loops_nested_in_a_const_div_loop() {
+        let ll = "define i16 @main() #0 {\n  br label %shead\nshead:\n  %n = udiv i32 5000, %pq\n  br label %ihead\nihead:\n  %m = mul i32 %a, 3\n  br i1 %c, label %ihead, label %snext, !llvm.loop !7\nsnext:\n  br i1 %d, label %shead, label %exit, !llvm.loop !4\nexit:\n  ret i16 0\n}\n!4 = distinct !{!4, !6}\n!7 = distinct !{!7, !6}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
+        let (out, targets) = strip_unroll_disable(ll);
+        assert_eq!(targets, vec!["main".to_string()]);
+        assert!(
+            out.contains("!4 = distinct !{!4}"),
+            "outer loop unmarked: {out}"
+        );
+        assert!(
+            out.contains("!7 = distinct !{!7}"),
+            "nested loop unmarked: {out}"
+        );
+    }
+    #[test]
+    fn strip_unroll_disable_removes_mark_from_const_div_loops() {
+        let ll = "define i16 @main() #0 {\n  br label %head\nhead:\n  %n = udiv i32 5000, %pq\n  br i1 %c, label %head, label %exit, !llvm.loop !4\nexit:\n  ret i16 0\n}\n!4 = distinct !{!4, !5, !6}\n!5 = !{!\"llvm.loop.mustprogress\"}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
+        let (out, targets) = strip_unroll_disable(ll);
+        assert_eq!(targets, vec!["main".to_string()]);
+        assert!(
+            out.contains("!4 = distinct !{!4, !5}"),
+            "mark removed from loop node: {out}"
+        );
+        assert!(out.contains("!llvm.loop !4"), "loop attachment kept: {out}");
+    }
+
+    #[test]
+    fn strip_unroll_disable_keeps_sibling_runtime_loop_marks() {
+        let ll = "define i16 @main() #0 {\n  br label %shead\nshead:\n  %n = udiv i32 5000, %pq\n  br i1 %c, label %shead, label %rhead, !llvm.loop !4\nrhead:\n  %m = mul i32 %a, 3\n  br i1 %d, label %rhead, label %exit, !llvm.loop !7\nexit:\n  ret i16 0\n}\n!4 = distinct !{!4, !6}\n!7 = distinct !{!7, !6}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
+        let (out, targets) = strip_unroll_disable(ll);
+        assert_eq!(targets, vec!["main".to_string()]);
+        assert!(
+            out.contains("!4 = distinct !{!4}"),
+            "search loop unmarked: {out}"
+        );
+        assert!(
+            out.contains("!7 = distinct !{!7, !6}"),
+            "runtime loop keeps its mark: {out}"
+        );
+    }
+
+    #[test]
+    fn strip_unroll_disable_keeps_runtime_loop_marks() {
+        let ll = "define i16 @main() #0 {\n  br label %head\nhead:\n  br i1 %c, label %head, label %exit, !llvm.loop !4\nexit:\n  ret i16 0\n}\n!4 = distinct !{!4, !5, !6}\n!5 = !{!\"llvm.loop.mustprogress\"}\n!6 = !{!\"llvm.loop.unroll.disable\"}\n";
+        let (out, targets) = strip_unroll_disable(ll);
+        assert!(targets.is_empty());
+        assert_eq!(out, ll);
+    }
+
+    #[test]
+    fn strip_unroll_disable_without_node_is_identity() {
+        let ll = "define i16 @main() #0 {\n  ret i16 0\n}\n";
+        let (out, targets) = strip_unroll_disable(ll);
+        assert!(targets.is_empty());
+        assert_eq!(out, ll);
+    }
+
+    #[test]
+    fn function_instruction_counts_skips_debug_and_metadata() {
+        let ll = "define i16 @main() #0 !dbg !9 {\n  %a = add i16 1, 2\n  #dbg_value(i16 %a, !1, !DIExpression(), !2)\n  store i16 %a, ptr @g\n  ret i16 %a\n}\n!9 = !{}\n";
+        let counts = function_instruction_counts(ll);
+        assert_eq!(counts.get("main"), Some(&3));
     }
 }

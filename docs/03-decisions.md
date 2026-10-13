@@ -49,6 +49,7 @@ one-line index entry here, e.g.:
 - ADR-049: Opcode-level MPLAB SIM sweep in four shards (one lane per ALU opcode, lane-tagged mismatch logs, banked PIC14 table; per-op jobs and per-core jobs rejected), 2026-10-09
 - ADR-050: PIC18 refuses pointer phi cycles that need a copy temp (swap fixture pinned as a refusal; 2-byte temp tracked in #1127), 2026-10-11
 - ADR-051: Short const-table readers share their base's page (caller sets full HIGH(base), 2-word entries; pic14e port in #1188), 2026-10-12
+- ADR-052: All-constant search loops fold by guarded unrolling (unroll-disable scoped off constant-divide functions, fold kept only when IR shrinks; encoder-sim 6495 to 5215 words), 2026-10-12
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 

@@ -78,10 +78,12 @@ already type.
 - The cycle ladder (#840, built in parallel) makes the `-Os`/`-O2`
   cycle baselines profile-aware, whichever lands second.
 - Speed levers land behind `-O2` as `isel::Options` flags set only by the
-  driver's O2 arm (`fast_divmod` #895, `fast_mul_u8` #974), so `-Os`
-  output stays byte-identical by construction. `fast_mul_u8` unrolls
-  `__mul_u8` into eight straight-line passes: it trades flash for
-  cycles, and the measured per-row cost is in `cycle_baseline.toml`.
+  driver's O2 arm (`fast_divmod` #895, `fast_mul_u8` #974, `fast_shift`
+  #1171), so `-Os` output stays byte-identical by construction.
+  `fast_mul_u8` unrolls `__mul_u8` into eight straight-line passes, and
+  `fast_shift` moves whole bytes first in the u16/u32 shift routines:
+  both trade flash for cycles, and the measured per-row cost is in
+  `cycle_baseline.toml`.
 
 ## Rejected alternatives
 

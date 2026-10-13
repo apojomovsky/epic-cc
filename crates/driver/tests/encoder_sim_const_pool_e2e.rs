@@ -1,11 +1,11 @@
 //! epic-cc#931 (with epic-cc#923): the `epic-encoder` sim slice links
-//! under `--const-pool`. `main` spans pages as a single planned chunk while
-//! the final banking grows it across a page boundary; isel now measures the
-//! real final-context sizes and repairs (re-split, re-place) instead of
-//! shipping the straddle. The fixture is the vendored
-//! `hal-pic16-encoder-full` tree plus the four sim-variant files from the
-//! same epic-hal pin (see its PROVENANCE.md), compiled like
-//! `epic_build.py --module epic-encoder --variant sim` with `--const-pool`.
+//! under the pooled table, default since epic-cc#1211. `main` spans pages
+//! as a single planned chunk while the final banking grows it across a
+//! page boundary; isel now measures the real final-context sizes and
+//! repairs (re-split, re-place) instead of shipping the straddle. The
+//! fixture is the vendored `hal-pic16-encoder-full` tree plus the four
+//! sim-variant files from the same epic-hal pin (see its PROVENANCE.md),
+//! compiled like `epic_build.py --module epic-encoder --variant sim`.
 
 use iselcore::is_directive;
 use std::process::Command;
@@ -81,12 +81,35 @@ fn encoder_sim_links_under_const_pool() {
     assert!(!words.is_empty(), "the sim build must produce flash words");
 }
 
-/// Emit the sim slice without `--const-pool` and walk the text with the
-/// assembler's pass-1 counting (`.org` jumps, `.align` pads, labels and
-/// directives emit none). epic-cc#923 failed here with a backward `.org`
-/// when a page's content outgrew its pad; the walk pins that exact failure
-/// without assembling (the default-flags program is 46 words past device
-/// flash, so assembling stays a loud capacity error).
+#[test]
+fn encoder_sim_constant_irq_calls_have_no_out_of_line_bodies() {
+    // epic-cc#1214: every EPIC_IRQ_Enable/DisableSrc/ClearFlag call site
+    // in this firmware passes a constant irq, so the whole-program fold
+    // inlines each body at its sites and the table lookup collapses.
+    // No runtime-indexed reader of irq_table survives in this firmware
+    // (EPIC_IRQ_GetFlag has no live caller), so the table drops too.
+    let asm = asm_text();
+    for body in [
+        "EPIC_IRQ_Enable:",
+        "EPIC_IRQ_DisableSrc:",
+        "EPIC_IRQ_ClearFlag:",
+    ] {
+        assert!(
+            !asm.lines().any(|l| l.trim() == body),
+            "{body} survived as an out-of-line body, constant irq calls were not folded"
+        );
+    }
+    assert!(
+        !asm.contains("irq_table"),
+        "no folded call site may still chase the irq_table"
+    );
+}
+
+/// Emit the sim slice under default flags (pooled, epic-cc#1211) and walk
+/// the text with the assembler's pass-1 counting (`.org` jumps, `.align`
+/// pads, labels and directives emit none). epic-cc#923 failed here with a
+/// backward `.org` when a page's content outgrew its pad; the walk pins
+/// that exact failure without assembling.
 fn asm_text() -> String {
     let (includes, inputs, defines) = sim_case();
     let asm_path =
@@ -117,6 +140,10 @@ fn encoder_sim_default_flags_layout_fits_pages() {
     // content outgrowing its pad. Passing-after: every `.org` jumps
     // forward and no page holds more than 2048 words.
     let asm = asm_text();
+    assert!(
+        asm.contains("__const_pool"),
+        "default flags must emit the pooled table (epic-cc#1211):\n{asm}"
+    );
     let mut org = 0usize;
     let mut loads = [0usize; 5];
     for raw in asm.lines() {

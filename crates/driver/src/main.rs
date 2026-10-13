@@ -526,8 +526,8 @@ fn main() {
     }
 
     // 6. alloc: complete overlay address map (globals + locals per function).
-    // `--const-pool` (epic-cc#816) also gates pooled-const RAM copies here,
-    // so the map agrees with isel's pooled address rewrite below.
+    // The pooled table (epic-cc#816, default per epic-cc#1211) also gates
+    // pooled-const RAM copies here, so the map agrees with isel below.
     let layout = alloc::allocate_with_pool(device, &m, &callgraph::edges_text(&cg), cli.const_pool);
     if let Some(map_path) = &cli.map {
         std::fs::write(map_path, driver::report::map_text(&device, &layout)).expect("write map");
@@ -557,21 +557,22 @@ fn main() {
     let (asm, mut locs) = match device.core {
         device::Core::Pic14 => {
             // Pooled string table (epic-cc#815, addresses and gating per
-            // epic-cc#816): additive and default off, so unflagged output
-            // stays bit-identical. The pool forms over alloc's
-            // address-taken set; emission reuses the per-const table path
-            // inside isel.
+            // epic-cc#816, default per epic-cc#1211): the pool forms over
+            // alloc's address-taken set; emission reuses the per-const
+            // table path inside isel.
             let pool = if cli.const_pool {
                 isel::build_pool(&m, &layout.address_taken_consts)
             } else {
                 isel::ConstPool::empty()
             };
-            // Speed-profile codegen: normalized divide loops (epic-cc#895) and
-            // the unrolled `__mul_u8` (epic-cc#974). Both trade flash for cycles.
+            // Speed-profile codegen: normalized divide loops (epic-cc#895),
+            // the unrolled `__mul_u8` (epic-cc#974), and byte-granular
+            // variable shifts (epic-cc#1171). All trade flash for cycles.
             let is_o2 = matches!(cli.opt_level, driver::cli::OptLevel::O2);
             let opts = isel::Options {
                 fast_divmod: is_o2,
                 fast_mul_u8: is_o2,
+                fast_shift: is_o2,
             };
             let (asm, locs, c, b) =
                 isel::select_with_opts(device, &m, &addrs, &layout.staged_consts, &pool, opts);
