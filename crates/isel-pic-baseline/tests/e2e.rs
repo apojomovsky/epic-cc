@@ -963,8 +963,8 @@ fn mul_edges_u16_wraps_mod_65536() {
 
 /// Early-exit `__mul_u32` on the banked PIC16F505: zero multiplier, the
 /// short-a / long-b swap shape, a wrap mod 2^32, and all-ones. Runs on the
-/// 16F505 because the routine's scratch overflows the 12F509 layout; the
-/// gpasm oracle is 12F509-only, so this test does not call `gpasm_agrees`.
+/// 16F505 because the edge fixture's operand arrays do not fit the 12F509
+/// map; the gpasm oracle is 12F509-only, so this test does not call `gpasm_agrees`.
 #[test]
 fn mul_edges_u32_wraps_and_exits_on_zero() {
     let _guard = E2E_LOCK.lock();
