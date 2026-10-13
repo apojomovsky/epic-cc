@@ -9,7 +9,7 @@
 //! byte can be live in several frames, so the report states the
 //! definition on the line.
 
-use super::sidecar;
+use super::sidecar::{self, VarLoc};
 use alloc::AllocLayout;
 use device::Device;
 use ir::{Bin, BinOp, Icmp, Inst, MemLen, Module, SrcLoc, Ty, Val};
@@ -88,7 +88,9 @@ pub fn map_text(device: &Device, layout: &AllocLayout) -> String {
 /// against `AllocLayout`: globals by C name, locals through the SSA key
 /// their `#dbg_*` record names. A variable with no allocation (promoted,
 /// constant-folded, or otherwise optimized away) stays omitted; the TYPE
-/// field is the flat debug print, the in-process table stays the DWARF source.
+/// field is the flat debug print, the in-process table stays the DWARF
+/// source. A local whose pieces SROA split apart in RAM gets one record
+/// per piece, each ending `; bytes OFFSET+LEN`.
 pub fn var_table_text(device: &Device, layout: &AllocLayout, vars: &DebugVars) -> String {
     let mut out = String::new();
     out.push_str(&format!("; epic-cc var table for {}\n", device.name));
@@ -113,13 +115,40 @@ pub fn var_table_text(device: &Device, layout: &AllocLayout, vars: &DebugVars) -
     }
     for v in &vars.locals {
         let Some(func) = &v.func else { continue };
-        let Some(ssa) = &v.ssa else { continue };
-        if let Some(&addr) = layout.locals.get(&format!("{func}::{ssa}")) {
-            out.push_str(&format!(
-                "local {func}::{name} 0x{addr:02X} {ty}\n",
-                name = v.name,
-                ty = vars.type_string(v.ty)
-            ));
+        let ty = vars.type_string(v.ty);
+        match sidecar::local_loc(layout, v) {
+            None => {}
+            Some(VarLoc::Whole(addr)) => {
+                out.push_str(&format!(
+                    "local {func}::{name} 0x{addr:02X} {ty}\n",
+                    name = v.name
+                ));
+            }
+            Some(VarLoc::Pieces(pieces)) => {
+                // Pieces laid out back to back from offset 0 read as one
+                // object at the first address; anything else is one record
+                // per piece, since no single base reaches every byte.
+                let base = pieces[0].addr;
+                let contiguous = pieces
+                    .iter()
+                    .all(|p| u32::from(p.addr) == u32::from(base) + p.offset);
+                if contiguous && pieces[0].offset == 0 {
+                    out.push_str(&format!(
+                        "local {func}::{name} 0x{base:02X} {ty}\n",
+                        name = v.name
+                    ));
+                } else {
+                    for p in &pieces {
+                        out.push_str(&format!(
+                            "local {func}::{name} 0x{addr:02X} {ty} ; bytes {off}+{len}\n",
+                            name = v.name,
+                            addr = p.addr,
+                            off = p.offset,
+                            len = p.size
+                        ));
+                    }
+                }
+            }
         }
     }
     out

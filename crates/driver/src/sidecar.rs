@@ -1,14 +1,15 @@
 //! The ELF+DWARF sidecar encoder: the compile-time artifact gdb loads
 //! alongside `epic-cc-gdbserver` (epic-cc#259). It joins the line rows and
 //! the typed variable table into one DWARF compile unit with aggregate
-//! DIEs (struct/union members, array subranges, enums), every location a
-//! `DW_OP_addr(constant)` per docs/34 §1, inside an `EM_386` ELF container
+//! DIEs (struct/union members, array subranges, enums), every location
+//! constant addresses (`DW_OP_addr`, chained with `DW_OP_piece` for a split
+//! local) per docs/34 §1, inside an `EM_386` ELF container
 //! (docs/34 §3: the session runs as i386, so the sidecar declares the
 //! architecture gdb uses).
 
 use alloc::AllocLayout;
 use ir::SrcLoc;
-use irparse::{DebugVars, DiTypeNode};
+use irparse::{DebugVars, DiTypeNode, DiVar};
 use iselcore::is_directive;
 
 use gimli::write::{
@@ -21,15 +22,56 @@ use gimli::{constants, Encoding, Format, RunTimeEndian, SectionId};
 /// program word address it compiled to.
 pub type LineRow = (SrcLoc, u16);
 
+/// Where the join placed a variable.
+pub enum VarLoc {
+    /// One contiguous object at this address.
+    Whole(u16),
+    /// A variable SROA split into separately colored pieces, sorted by
+    /// offset and non-overlapping. Bytes between pieces have no storage.
+    Pieces(Vec<Piece>),
+}
+
+/// One byte range of a split variable and the RAM address it landed at.
+pub struct Piece {
+    pub offset: u32,
+    pub size: u32,
+    pub addr: u16,
+}
+
+/// Join a local's recorded storage against the allocation. A variable
+/// with fragment records is described by its pieces alone: the allocator
+/// colors each piece's alloca separately, so the first piece's address
+/// is not the variable's base. A piece the allocator has no slot for
+/// (folded away) leaves a hole; `None` when nothing is mapped.
+pub fn local_loc(layout: &AllocLayout, v: &DiVar) -> Option<VarLoc> {
+    let func = v.func.as_ref()?;
+    let addr_of = |ssa: &String| layout.locals.get(&format!("{func}::{ssa}")).copied();
+    if v.pieces.is_empty() {
+        return addr_of(v.ssa.as_ref()?).map(VarLoc::Whole);
+    }
+    let pieces: Vec<Piece> = v
+        .pieces
+        .iter()
+        .filter_map(|p| {
+            Some(Piece {
+                offset: p.offset,
+                size: p.size,
+                addr: addr_of(&p.ssa)?,
+            })
+        })
+        .collect();
+    (!pieces.is_empty()).then_some(VarLoc::Pieces(pieces))
+}
+
 /// One mapped variable of the phase-2 join: a plain C name, its RAM
-/// address, and its type-graph root. Names are deliberately flat (no
+/// location, and its type-graph root. Names are deliberately flat (no
 /// `{func}::` prefix): gdb parses `::` as C++ scope resolution, so a
 /// prefixed name is unprintable in a C session. Same-named variables
 /// in different functions collide (first in sorted order wins); the
 /// phase-2 text artifact keeps the qualified names.
 pub struct VarRecord {
     pub name: String,
-    pub addr: u16,
+    pub loc: VarLoc,
     pub ty: u32,
 }
 
@@ -39,29 +81,23 @@ pub struct VarRecord {
 pub fn joined_vars(layout: &AllocLayout, vars: &DebugVars) -> Vec<VarRecord> {
     let mut out = Vec::new();
     for v in &vars.globals {
-        if let Some(func) = &v.func {
-            if let Some(&addr) = layout.globals.get(&format!("{func}.{}", v.name)) {
-                out.push(VarRecord {
-                    name: v.name.clone(),
-                    addr,
-                    ty: v.ty,
-                });
-            }
-        } else if let Some(&addr) = layout.globals.get(&v.name) {
+        let key = match &v.func {
+            Some(func) => format!("{func}.{}", v.name),
+            None => v.name.clone(),
+        };
+        if let Some(&addr) = layout.globals.get(&key) {
             out.push(VarRecord {
                 name: v.name.clone(),
-                addr,
+                loc: VarLoc::Whole(addr),
                 ty: v.ty,
             });
         }
     }
     for v in &vars.locals {
-        let Some(func) = &v.func else { continue };
-        let Some(ssa) = &v.ssa else { continue };
-        if let Some(&addr) = layout.locals.get(&format!("{func}::{ssa}")) {
+        if let Some(loc) = local_loc(layout, v) {
             out.push(VarRecord {
                 name: v.name.clone(),
-                addr,
+                loc,
                 ty: v.ty,
             });
         }
@@ -73,6 +109,32 @@ pub fn joined_vars(layout: &AllocLayout, vars: &DebugVars) -> Vec<VarRecord> {
     let mut seen = std::collections::HashSet::new();
     out.retain(|v| seen.insert(v.name.clone()));
     out
+}
+
+/// The DWARF location of a variable: one `DW_OP_addr`, or for a split
+/// variable a `DW_OP_piece` chain with an empty piece for every byte that
+/// has no storage, so gdb reads those as optimized out instead of
+/// reading whatever RAM follows the last piece.
+fn location_expr(loc: &VarLoc, size: Option<u32>) -> Expression {
+    let mut expr = Expression::raw(Vec::new());
+    match loc {
+        VarLoc::Whole(addr) => expr.op_addr(Address::Constant(u64::from(*addr))),
+        VarLoc::Pieces(pieces) => {
+            let mut end = 0;
+            for p in pieces {
+                if p.offset > end {
+                    expr.op_piece(u64::from(p.offset - end));
+                }
+                expr.op_addr(Address::Constant(u64::from(p.addr)));
+                expr.op_piece(u64::from(p.size));
+                end = p.offset + p.size;
+            }
+            if let Some(size) = size.filter(|&size| size > end) {
+                expr.op_piece(u64::from(size - end));
+            }
+        }
+    }
+    expr
 }
 
 /// The line rows the phase-1 table walks out of the final asm text,
@@ -168,7 +230,7 @@ impl<'a> TypeEncoder<'a> {
                 );
                 die
             }
-            Some(DiTypeNode::Pointer { base }) => {
+            Some(DiTypeNode::Pointer { base, .. }) => {
                 let die = unit.add(root, constants::DW_TAG_pointer_type);
                 self.done.insert(id, die);
                 set(
@@ -469,13 +531,11 @@ pub fn encode(rows: &[LineRow], layout: &AllocLayout, vars: &DebugVars) -> Vec<u
             constants::DW_AT_type,
             AttributeValue::UnitRef(ty_die),
         );
-        let mut expr = Expression::raw(Vec::new());
-        expr.op_addr(Address::Constant(u64::from(v.addr)));
         set(
             &mut unit,
             die,
             constants::DW_AT_location,
-            AttributeValue::Exprloc(expr),
+            AttributeValue::Exprloc(location_expr(&v.loc, vars.type_size(v.ty))),
         );
     }
 
