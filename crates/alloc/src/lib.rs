@@ -3640,11 +3640,13 @@ fn allocate_inner(
                             }
                         }
                     }
-                    // A const reaching a pointer phi keeps its RAM copy:
-                    // iselcore seeds the phi as an indirect slot and every
-                    // read through it derefs RAM (the LSR chase shape whose
-                    // flash lowering is epic-cc#811). A gated address here
-                    // would deref flash as RAM.
+                    // A const reaching a pointer phi needs a RAM copy: iselcore
+                    // seeds the phi as an indirect slot, and every read through
+                    // it derefs RAM (the LSR chase shape, epic-cc#811). Without
+                    // a copy the slot holds a flash label and the walk reads RAM
+                    // there (epic-cc#1197, epic-cc#1203). The copy is never
+                    // staged (the buffer is clobbered mid-walk) or pool-gated.
+                    // Over 255 bytes no copy exists and isel refuses the walk.
                     if let ir::Inst::Phi(p) = inst {
                         if p.ptr {
                             for (v, _) in &p.incoming {
@@ -3660,6 +3662,12 @@ fn allocate_inner(
                                     ir::Val::Const(_) => None,
                                 };
                                 if let Some(g) = base {
+                                    let small =
+                                        m.globals.iter().any(|gl| gl.name == g && gl.size <= 255);
+                                    if small && matches!(device.core, Core::Pic14 | Core::Pic14e) {
+                                        const_to_ram.insert(g.clone());
+                                        const_derived.insert(g.clone());
+                                    }
                                     const_phi.insert(g);
                                 }
                             }

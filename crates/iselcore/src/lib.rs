@@ -1613,6 +1613,55 @@ pub fn add_flash_walks(
     }
 }
 
+/// Walk marks for the PIC14 family: `add_flash_walks` over the consts that
+/// keep no RAM copy (not in `addrs`, not `staged`) and are not C++ vtables.
+/// Those consts' addresses are flash labels, which a pointer slot hands to
+/// FSR/INDF as if RAM (epic-cc#1197, epic-cc#1203).
+pub fn pic14_flash_walks(
+    m: &Module,
+    addrs: &HashMap<String, u16>,
+    staged: &HashSet<String>,
+) -> FlashProvenance {
+    let flash_consts: HashSet<&str> = m
+        .globals
+        .iter()
+        .filter(|g| {
+            g.is_const
+                && !g.name.starts_with("_ZTV")
+                && !staged.contains(&g.name)
+                && !addrs.contains_key(&g.name)
+        })
+        .map(|g| g.name.as_str())
+        .collect();
+    let mut walks = FlashProvenance::default();
+    add_flash_walks(&mut walks, m, |n| flash_consts.contains(n));
+    walks
+}
+
+/// Refusal text when slot `slot` of `func` holds a flash-walk address (or a
+/// pointer joining flash and RAM): a load, store, or memcpy through it would
+/// read or write RAM at a flash address, and the PIC14 family has no
+/// variable-index flash reader. `issue` is the backend's tracking ticket.
+pub fn flash_walk_refusal(
+    walks: &FlashProvenance,
+    func: &str,
+    slot: &str,
+    issue: &str,
+) -> Option<String> {
+    let key = ssa_key(func, slot);
+    if walks.flash.contains(&key) {
+        Some(format!(
+            "pointer access through flash walk %{slot} (flash walks read program memory, PIC18-only, epic-cc#1091, epic-cc#{issue})"
+        ))
+    } else if walks.mixed.contains(&key) {
+        Some(format!(
+            "pointer access through maybe-flash %{slot} (a pointer joining flash and RAM, PIC18-only, epic-cc#1099, epic-cc#{issue})"
+        ))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_directive, resolve_pointers, Base};

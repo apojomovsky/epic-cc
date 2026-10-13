@@ -41,7 +41,7 @@
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    add_flash_walks, find_value_folds, flash_provenance, is_directive, log_pool_site,
+    find_value_folds, flash_provenance, flash_walk_refusal, is_directive, log_pool_site,
     resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot, LOG_POOL_CALLEE,
     LOG_POOL_VARIANT,
 };
@@ -180,6 +180,10 @@ struct Gen<'m> {
     /// store through a flash-derived reg is C++ virtual dispatch over a
     /// flash vtable, PIC18-only, so this backend panics on it (epic-cc#832).
     prov: FlashProvenance,
+    /// Flash-walk marks for the PIC14 family (`iselcore::pic14_flash_walks`):
+    /// a slot-held address over a const with no RAM copy is a flash label,
+    /// so a deref through it panics instead of reading RAM (epic-cc#1203).
+    walks: FlashProvenance,
     scratch: u16,
     retval_lo: u16,
     /// Normalized divide loops (epic-cc#895): under the speed profile the
@@ -682,6 +686,26 @@ impl<'m> Gen<'m> {
         self.m.funcs.iter().any(|f| f.name == name)
     }
 
+    /// Whether `v` is a flash address no RAM copy backs: a flash const's
+    /// label (vtables, functions, and staged consts aside) or a pointer reg
+    /// the walk marks flag. A RAM store of one is read back as RAM later
+    /// (epic-cc#1203).
+    fn is_flash_address(&self, v: &Val) -> bool {
+        match v {
+            Val::Global(g) => {
+                !g.starts_with("_ZTV")
+                    && !self.is_function(g)
+                    && !self.staged.contains(g)
+                    && self.global_is_const(g)
+            }
+            Val::Reg(r) => {
+                let key = ssa_key(self.cur_func, r);
+                self.walks.flash.contains(&key) || self.walks.mixed.contains(&key)
+            }
+            Val::Const(_) => false,
+        }
+    }
+
     /// The byte size of a global: a const table's size selects the reader
     /// shape (≤ 255 single entry; ≥ 256 two chunked entries, chunk 1 empty
     /// for exactly 256 bytes).
@@ -835,6 +859,13 @@ impl<'m> Gen<'m> {
                         // A plain pointer param's slot holds the address rather
                         // than being the object, so it is read like an `sret`
                         // slot (a `byval` param's slot IS the object).
+                        if *indirect {
+                            if let Some(why) =
+                                flash_walk_refusal(&self.walks, self.cur_func, sname, "1203")
+                            {
+                                panic!("isel: {why}");
+                            }
+                        }
                         if *indirect || self.param_holds_addr(sname) {
                             self.emit_fsr_indirect(sa, k, &terms, byte_off);
                             Addr::Indirect
@@ -3698,6 +3729,12 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Store(s) => {
+                if self.is_flash_address(&s.val) {
+                    panic!(
+                        "isel: store of a ROM address into RAM is not supported: {:?} (PIC18-only, epic-cc#1101, epic-cc#1203)",
+                        s.val
+                    );
+                }
                 // Pool log variant (epic-cc#817): derived slots hold
                 // indices, so a store through one has no address.
                 if self.pool_log
@@ -7991,6 +8028,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         pool: g.pool,
         resolved: g.resolved,
         prov: g.prov.clone(),
+        walks: g.walks.clone(),
         scratch: g.scratch,
         retval_lo: g.retval_lo,
         fast_divmod: g.fast_divmod,
@@ -11429,24 +11467,15 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
                 .find(|&i| !emitted[i] && pending[i].src.is_some())
                 .unwrap_or_else(|| panic!("isel: cyclic phi copies not supported"));
             // A cycle over flash addresses cannot stage: the temp would
-            // preserve the address while INDF still misreads it. Walk marks
-            // are computed here, on demand: stalls only fire on cyclic
-            // edges, so the fixpoint never runs for acyclic code.
+            // preserve the address while INDF still misreads it.
             if let Val::Reg(r) = &pending[pick].val {
                 let key = ssa_key(g.cur_func, r);
-                let mut walks = FlashProvenance::default();
-                add_flash_walks(&mut walks, g.m, |n| {
-                    !n.starts_with("_ZTV")
-                        && !g.staged.contains(n)
-                        && !g.addrs.contains_key(n)
-                        && g.m.globals.iter().any(|gl| gl.name == n && gl.is_const)
-                });
-                if walks.flash.contains(&key) {
+                if g.walks.flash.contains(&key) {
                     panic!(
                         "isel: pointer phi cycle over a flash address (flash walks read program memory, PIC18-only, epic-cc#1091, epic-cc#1141)"
                     );
                 }
-                if walks.mixed.contains(&key) {
+                if g.walks.mixed.contains(&key) {
                     panic!(
                         "isel: pointer phi cycle over a maybe-flash address (a pointer joining flash and RAM, PIC18-only, epic-cc#1099, epic-cc#1141)"
                     );
@@ -13454,6 +13483,9 @@ pub fn select_with_opts(
     // Flash-pointer provenance for the C++ dispatch panic below: computed
     // once beside the pointer resolution (epic-cc#832).
     let prov = flash_provenance(m);
+    // Walk marks for the flash-walk deref refusal (epic-cc#1203): the
+    // fixpoint runs once per module, beside the vptr provenance.
+    let walks = iselcore::pic14_flash_walks(m, addrs, staged);
     // The pool table ships only with a routed reader (epic-cc#1088):
     // a gated member or a routed log call, decided once here so every
     // pass and the section below agree.
@@ -13516,6 +13548,7 @@ pub fn select_with_opts(
                 pool: &pool,
                 resolved: &resolved,
                 prov: prov.clone(),
+                walks: walks.clone(),
                 scratch,
                 retval_lo,
                 fast_divmod: opts.fast_divmod,
@@ -13753,6 +13786,7 @@ pub fn select_with_opts(
                     pool: &pool,
                     resolved: &resolved,
                     prov: prov.clone(),
+                    walks: walks.clone(),
                     scratch,
                     retval_lo,
                     fast_divmod: opts.fast_divmod,
@@ -14078,6 +14112,7 @@ pub fn select_with_opts(
                                 pool: &pool,
                                 resolved: &resolved,
                                 prov: prov.clone(),
+                                walks: walks.clone(),
                                 scratch,
                                 retval_lo,
                                 fast_divmod: opts.fast_divmod,
