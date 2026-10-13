@@ -105,8 +105,9 @@ fn injected_routines_get_param_and_scratch_slots_allocated() {
 }
 
 /// `__mul_u32` scratch follows the core: the classic AN526 frame (11), the
-/// pic14e in-place frame (4), the baseline multiplicand-copy frame (8). The
-/// default and PIC18 entries keep classic sizing.
+/// pic14e in-place frame (4), the baseline retval-product frame (4, only the
+/// multiplicand copy needs scratch). The default and PIC18 entries keep
+/// classic sizing.
 #[test]
 fn mul_u32_scratch_is_sized_per_core() {
     let src = "global in i32\n\
@@ -137,7 +138,7 @@ fn mul_u32_scratch_is_sized_per_core() {
             parse(src),
             device::Core::PicBaseline
         )),
-        8
+        4
     );
 }
 
