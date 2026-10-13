@@ -4133,3 +4133,113 @@ fn pic14e_multi_use_load_keeps_its_slot() {
         out.locals
     );
 }
+
+#[test]
+fn packable_flags_share_one_byte_on_pic18() {
+    // Three internal i1 flags with only plain loads and const stores
+    // pack into one byte (epic-cc#1162): same address, bits 0/1/2 in
+    // name order, and `after` sits adjacent to the shared byte.
+    let m = parse(
+        "global fa i1 internal\n\
+         global fb i1 internal\n\
+         global fc i1 internal\n\
+         global after i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i1 @fa\n\
+             br i1 %1 t f\n\
+           block t:\n\
+             store i1 1 @fb\n\
+             br f\n\
+           block f:\n\
+             store i1 0 @fc\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert_eq!(out.globals["fa"], out.globals["fb"]);
+    assert_eq!(out.globals["fb"], out.globals["fc"]);
+    assert_eq!(out.packed_bits.get("fa"), Some(&0));
+    assert_eq!(out.packed_bits.get("fb"), Some(&1));
+    assert_eq!(out.packed_bits.get("fc"), Some(&2));
+    // The three flags cost one byte: `after` sits adjacent to the shared
+    // byte in either order, never two bytes past it.
+    let gap = out.globals["after"] as i32 - out.globals["fa"] as i32;
+    assert_eq!(
+        gap.abs(),
+        1,
+        "flags must occupy one byte: {:?}",
+        out.globals
+    );
+}
+
+#[test]
+fn packed_singleton_keeps_its_byte() {
+    // One flag shares nothing, so it stays a plain byte: packing it
+    // would only trade a MOVFF for bit ops with no RAM saved.
+    let m = parse(
+        "global fa i1 internal\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i1 1 @fa\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert!(out.packed_bits.is_empty());
+    assert!(out.globals.contains_key("fa"));
+}
+
+#[test]
+fn packed_gate_rejects_dynamic_store() {
+    // A register-valued store needs a read-modify-write the byte path
+    // gets for free, so the flag keeps its byte.
+    let m = parse(
+        "global fa i1 internal\n\
+         global fb i1 internal\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i1 @fa\n\
+             store i1 %1 @fb\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert!(out.packed_bits.is_empty());
+}
+
+#[test]
+fn packed_gate_rejects_address_taken() {
+    // A flag passed as a call argument is observable as an address, so
+    // neither flag packs even though the other looks packable.
+    let m = parse(
+        "global fa i1 internal\n\
+         global fb i1 internal\n\
+         fn callee(i8) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i1 1 @fa\n\
+             store i1 0 @fb\n\
+             call void @callee(i8 @fa)\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main callee\ndepth 2\n");
+    assert!(out.packed_bits.is_empty());
+}
+
+#[test]
+fn packed_flags_stay_bytes_off_pic18() {
+    // The PIC14 backends lower i1 as whole bytes and never read the bit
+    // map, so the same module packs nothing there.
+    let m = parse(
+        "global fa i1 internal\n\
+         global fb i1 internal\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i1 1 @fa\n\
+             store i1 0 @fb\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert!(out.packed_bits.is_empty());
+    assert_ne!(out.globals["fa"], out.globals["fb"]);
+}

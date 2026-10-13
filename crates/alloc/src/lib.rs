@@ -31,6 +31,125 @@ use device::{Core, Device};
 use ir::{Inst, Module};
 use iselcore::{find_value_folds, resolve_pointers, ssa_key, Base, PtrResolution, ValueFolds};
 
+/// One shared flag byte (epic-cc#1162): the synthetic holder placed in
+/// the floating list, plus member globals with bit positions. isel-pic18
+/// lowers packed accesses to bit ops off the shared address.
+struct PackedByte {
+    holder: String,
+    members: Vec<(String, u8)>,
+}
+
+/// Internal i1 flag globals sharing one byte per 8. Packable means every
+/// access is a whole-flag read or const write: internal linkage, no
+/// pinned address, at most a 0/1 initializer, and every use a plain
+/// non-volatile i1 load or a const 0/1 store. Any other mention keeps
+/// the byte: bit-addressed lowerings cannot serve a byte reader, which
+/// would observe the packed neighbors. PIC18 only; groups of one keep
+/// their byte, sharing nothing.
+fn find_packed_bytes(device: &Device, m: &Module) -> Vec<PackedByte> {
+    if device.core != Core::Pic18 {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = m
+        .globals
+        .iter()
+        .filter(|g| {
+            g.ty == ir::Ty::I1
+                && g.size == 1
+                && g.internal
+                && !g.is_const
+                && g.addr.is_none()
+                && g.refs.is_empty()
+                && g.bytes.len() <= 1
+                && g.bytes.iter().all(|&b| b <= 1)
+                && uses_packable(m, &g.name)
+        })
+        .map(|g| g.name.clone())
+        .collect();
+    names.sort();
+    let mut out = Vec::new();
+    let mut idx = 0u32;
+    for chunk in names.chunks(8) {
+        if chunk.len() < 2 {
+            continue;
+        }
+        let mut holder = format!("__pbit{idx}");
+        while m.globals.iter().any(|g| g.name == holder) {
+            idx += 1;
+            holder = format!("__pbit{idx}");
+        }
+        out.push(PackedByte {
+            holder,
+            members: chunk
+                .iter()
+                .enumerate()
+                .map(|(bit, n)| (n.clone(), bit as u8))
+                .collect(),
+        });
+        idx += 1;
+    }
+    out
+}
+
+/// Every mention of an i1 global is a plain load or const 0/1 store.
+/// Dynamic bit values would need a read-modify-write the byte path
+/// gets for free, so they stay unpacked.
+fn uses_packable(m: &Module, name: &str) -> bool {
+    let at = format!("@{name}");
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                match inst {
+                    Inst::Load(l) if l.ptr == at => {
+                        if l.ty != ir::Ty::I1 || l.ptr_ty || l.volatile {
+                            return false;
+                        }
+                    }
+                    Inst::Store(s) if s.ptr == at => {
+                        if s.ty != ir::Ty::I1
+                            || s.volatile
+                            || !matches!(&s.val, ir::Val::Const(0) | ir::Val::Const(1))
+                        {
+                            return false;
+                        }
+                    }
+                    Inst::Gep(g) => {
+                        if matches!(&g.base, ir::GepBase::Global(n) if n == name) {
+                            return false;
+                        }
+                    }
+                    Inst::Asm(a) => {
+                        if a.operands.iter().any(|o| o.ptr == at) || a.template.contains(name) {
+                            return false;
+                        }
+                    }
+                    _ => {
+                        let mut found = HashSet::new();
+                        ir::collect_global_vals(inst, &mut found);
+                        if found.contains(name) {
+                            return false;
+                        }
+                        // Operand shapes collect_global_vals skips.
+                        let extra = match inst {
+                            Inst::BrCond(b) => {
+                                matches!(&b.cond, ir::Val::Global(n) if n == name)
+                            }
+                            Inst::Switch(s) => {
+                                matches!(&s.val, ir::Val::Global(n) if n == name)
+                            }
+                            Inst::VaArg(v) => v.ptr == at,
+                            _ => false,
+                        };
+                        if extra {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    !m.module_asm.iter().any(|l| l.contains(name))
+}
 /// Complete address map: globals keyed by name, locals keyed `{func}::{name}`,
 /// plus the total overlay span (in bytes) across all banks. `const_globals`
 /// lists the names of const globals (no RAM address; their bytes live in
@@ -52,6 +171,11 @@ pub struct AllocLayout {
     /// table's input. Flash-bound today; their uses resolve through
     /// the pool from epic-cc#816 on (epic-cc#815).
     pub address_taken_consts: HashSet<String>,
+    /// Packed flag bits (epic-cc#1162): member global name to bit number
+    /// in its shared byte. Members also appear in `globals` at the shared
+    /// address, so byte-granular folds stay conservative; only the
+    /// packed-aware lowerings read this map. Empty off PIC18.
+    pub packed_bits: HashMap<String, u8>,
 
     /// Per-bank high-water bytes (both main and ISR contexts): the highest
     /// allocated address in each GPR bank minus the bank start, floored at
@@ -2622,6 +2746,21 @@ fn allocate_inner(
             vs
         }
     }
+    // Flag-bit packing (epic-cc#1162): packable i1 globals share one
+    // byte per 8. The fold gate must not name them: the folds read
+    // whole bytes, so a folded packed access would observe the packed
+    // neighbors instead of the flag.
+    let packed_bytes = find_packed_bytes(device, m);
+    let packed_names: HashSet<String> = packed_bytes
+        .iter()
+        .flat_map(|p| p.members.iter().map(|(n, _)| n.clone()))
+        .collect();
+    let gate_filtered: Option<HashSet<String>> = gate.map(|s| {
+        s.iter()
+            .filter(|n| !packed_names.contains(*n))
+            .cloned()
+            .collect()
+    });
     // iselcore's pointer resolution: a pointer select seeded as an indirect
     // slot materializes its two address bytes into the dst slot, so the
     // dst needs a RAM slot; a folded select is virtual and defines none.
@@ -2637,7 +2776,12 @@ fn allocate_inner(
     let folds: HashMap<String, ValueFolds> = if fold_core {
         m.funcs
             .iter()
-            .map(|f| (f.name.clone(), find_value_folds(f, m, &resolved, gate)))
+            .map(|f| {
+                (
+                    f.name.clone(),
+                    find_value_folds(f, m, &resolved, gate_filtered.as_ref()),
+                )
+            })
             .collect()
     } else {
         HashMap::new()
@@ -3916,6 +4060,8 @@ fn allocate_inner(
             const_globals.insert(g.name.clone());
         } else if let Some(a) = g.addr {
             fixed.push((g.name.clone(), a, g.size));
+        } else if packed_names.contains(&g.name) {
+            // Its group's holder below reserves the shared byte.
         } else {
             floating.push(g);
         }
@@ -3938,6 +4084,24 @@ fn allocate_inner(
         });
         floating.extend(stage_holder.iter());
     }
+    // One placed byte per packed group. The holder never reaches the
+    // address map: members map onto its byte below, so the report and
+    // the high-water accounting see each shared byte once per member
+    // address, never as a synthetic name.
+    let mut pbit_holder: Vec<ir::Global> = Vec::new();
+    for pb in &packed_bytes {
+        pbit_holder.push(ir::Global {
+            name: pb.holder.clone(),
+            ty: ir::Ty::I8,
+            is_const: false,
+            size: 1,
+            bytes: vec![0],
+            refs: Vec::new(),
+            addr: None,
+            internal: true,
+        });
+    }
+    floating.extend(pbit_holder.iter());
     // Floating globals are placed with the same sequential -> bin-pack
     // strategy as before, but pinned addresses are respected and the
     // sequential cursor is bumped past any overlap.
@@ -4087,6 +4251,18 @@ fn allocate_inner(
     } else {
         device.gpr_start()
     };
+    // Packed members share their group's byte; the bit map rides the
+    // layout for the packed-aware lowerings.
+    let mut packed_bits: HashMap<String, u8> = HashMap::new();
+    for pb in &packed_bytes {
+        let byte = *floating_map
+            .get(&pb.holder)
+            .expect("alloc: packed holder unplaced");
+        for (name, bit) in &pb.members {
+            globals.insert(name.clone(), byte);
+            packed_bits.insert(name.clone(), *bit);
+        }
+    }
     globals.extend(floating_map);
     // Value-fold placement check (epic-cc#863, epic-cc#875): every
     // dropped slot's globals must be addressable in the final map, or
@@ -4345,6 +4521,7 @@ fn allocate_inner(
             total_bank0,
             const_globals,
             staged_consts: staged,
+            packed_bits,
             address_taken_consts,
             bank_used,
             isr_bytes,

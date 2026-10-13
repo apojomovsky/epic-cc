@@ -333,6 +333,10 @@ struct PtrWalk {
 struct Gen<'m> {
     m: &'m Module,
     addrs: &'m HashMap<String, u16>,
+    /// Packed flag bits (epic-cc#1162): member global name to bit number
+    /// in its shared byte. Members also appear in `addrs` at the shared
+    /// address; only the packed-aware lowerings read this map.
+    packed_bits: &'m HashMap<String, u8>,
     /// Every pointer reg in the module, keyed `{func}::{reg}`, resolved to
     /// its folded `(base, k, terms)` by `iselcore::resolve_pointers`; see
     /// ADR-009.
@@ -969,6 +973,53 @@ impl<'m> Gen<'m> {
         }
         Some(c)
     }
+    /// A packed flag load its `BrCond` absorbs (epic-cc#1162): the block
+    /// tail is `[.., Load, BrCond]` with the load reading one packed bit
+    /// straight into the branch condition. The branch tests the bit in
+    /// place, so the load's slot never materializes. Adjacency is what
+    /// makes the fusion sound, same as `fusable_icmp`: anything between
+    /// would be skipped by the fused exits. Any other reader, including
+    /// a fold that would skip or redirect the load, keeps the
+    /// materializing path instead.
+    fn fusable_bitload(g: &Gen, f: &Func, b: &Block) -> Option<(String, u16, u8)> {
+        let [.., Inst::Load(l), Inst::BrCond(bc)] = b.insts.as_slice() else {
+            return None;
+        };
+        if l.ty != Ty::I1 || l.ptr_ty || l.volatile {
+            return None;
+        }
+        let name = l.ptr.strip_prefix('@')?;
+        let bit = g.packed_bits.get(name)?;
+        let Val::Reg(cond) = &bc.cond else {
+            return None;
+        };
+        if *cond != l.dst {
+            return None;
+        }
+        if g.store_fwd.contains_key(&l.dst)
+            || g.w_folds.loads.contains_key(&l.dst)
+            || g.bin_w_srcs.contains(&l.dst)
+            || g.lane_consumed.contains(&l.dst)
+            || g.bit_lanes.contains_key(&l.dst)
+        {
+            return None;
+        }
+        let Some(bi_own) = f.blocks.iter().position(|bb| std::ptr::eq(bb, b)) else {
+            return None;
+        };
+        let branch_idx = b.insts.len() - 1;
+        for (bi, bb) in f.blocks.iter().enumerate() {
+            for (ii, inst) in bb.insts.iter().enumerate() {
+                if bi == bi_own && ii == branch_idx {
+                    continue;
+                }
+                if ir::read_vals(inst).iter().any(|v| v == cond) {
+                    return None;
+                }
+            }
+        }
+        Some((l.dst.clone(), g.global_addr(name), *bit))
+    }
     /// Rewrites a fused compare's lane sources to read in place: either
     /// side defined by a single-use same-block `Load` from a RAM global
     /// becomes that global, and the load joins `consumed`. The chain
@@ -1006,7 +1057,10 @@ impl<'m> Gen<'m> {
             let Some(name) = l.ptr.strip_prefix('@') else {
                 continue;
             };
-            if g.addrs.get(name).is_none() || g.global_is_const(name) {
+            if g.addrs.get(name).is_none()
+                || g.global_is_const(name)
+                || g.packed_bits.contains_key(name)
+            {
                 continue;
             }
             // A signed ordering compare re-reads the high byte (sign check
@@ -1619,6 +1673,12 @@ impl<'m> Gen<'m> {
                 let Some(dst) = Self::static_base(g, &f.name, &s.ptr) else {
                     continue;
                 };
+                if s.ptr
+                    .strip_prefix('@')
+                    .is_some_and(|d| g.packed_bits.contains_key(d))
+                {
+                    continue;
+                }
                 let Some(pi) = b.insts[..si].iter().rposition(|i| match i {
                     Inst::Load(l) => &l.dst == r,
                     Inst::Bin(q) => &q.dst == r,
@@ -1658,7 +1718,7 @@ impl<'m> Gen<'m> {
                             continue;
                         }
                         if let Some(gb) = l.ptr.strip_prefix('@') {
-                            if g.global_is_const(gb) {
+                            if g.global_is_const(gb) || g.packed_bits.contains_key(gb) {
                                 continue;
                             }
                         }
@@ -2234,7 +2294,7 @@ impl<'m> Gen<'m> {
             let Some(known) = g.m.globals.iter().find(|x| x.name == dg) else {
                 continue;
             };
-            if known.is_const {
+            if known.is_const || g.packed_bits.contains_key(dg) {
                 continue;
             }
             out.insert(p.dst.clone());
@@ -2273,7 +2333,7 @@ impl<'m> Gen<'m> {
                 let Some(known) = g.m.globals.iter().find(|x| x.name == dg) else {
                     continue;
                 };
-                if known.is_const {
+                if known.is_const || g.packed_bits.contains_key(dg) {
                     continue;
                 }
                 out.insert(s.dst.clone());
@@ -2313,7 +2373,7 @@ impl<'m> Gen<'m> {
                 let Some(known) = g.m.globals.iter().find(|x| x.name == gname) else {
                     continue;
                 };
-                if known.is_const {
+                if known.is_const || g.packed_bits.contains_key(gname) {
                     continue;
                 }
                 if uses.get(&l.dst).copied().unwrap_or(0) != 1 {
@@ -5847,6 +5907,14 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// Shared byte address and bit number for a packed flag global,
+    /// `None` for ordinary globals. The address matches `addrs`; the
+    /// bit selects the flag within it.
+    fn packed_bit(&self, name: &str) -> Option<(u16, u8)> {
+        let bit = *self.packed_bits.get(name)?;
+        Some((self.global_addr(name), bit))
+    }
+
     /// Panics with a user error when `name` has no address. Alloc gives a
     /// RAM copy only to consts of 255 bytes or fewer, so a larger flash
     /// const with no address is a user error, not an internal invariant.
@@ -8292,7 +8360,11 @@ impl<'m> Gen<'m> {
                 )
             }
             Val::Global(g) => {
-                if width != 1 || self.is_function(g) || self.global_is_const(g) {
+                if width != 1
+                    || self.is_function(g)
+                    || self.global_is_const(g)
+                    || self.packed_bits.contains_key(g)
+                {
                     return None;
                 }
                 Some(vec![MulOp::Lit((self.addrs.get(g)? & 0xFF) as u8)])
@@ -8643,6 +8715,23 @@ impl<'m> Gen<'m> {
         self.cur_loc = i.loc().cloned();
         match i {
             Inst::Load(l) => {
+                // A packed flag materializes its bit as a 0/1 byte. The
+                // fused branch skips these loads at the block loop, so a
+                // load reaching here has another consumer. The slot starts
+                // clear and bit ops preserve W, so the result is exact.
+                if let Some(name) = l.ptr.strip_prefix('@') {
+                    if let Some((addr, bit)) = self.packed_bit(name) {
+                        assert!(
+                            l.ty == Ty::I1 && !l.ptr_ty && !l.volatile,
+                            "isel-pic18: packed load of @{name} must stay a plain i1 load"
+                        );
+                        let dst = self.slot_addr(self.cur_func, &l.dst).direct();
+                        self.emit_banked("CLRF", dst, "");
+                        self.emit_banked("BTFSC", addr, &format!(", {bit}"));
+                        self.emit_banked("BSF", dst, ", 0");
+                        return;
+                    }
+                }
                 if self.lane_consumed.contains(&l.dst) {
                     return;
                 }
@@ -8870,6 +8959,25 @@ impl<'m> Gen<'m> {
                 } else {
                     panic!("isel-pic18: malformed store pointer operand {:?}", s.ptr);
                 };
+                // A packed flag const store sets or clears its bit in
+                // place. The gate allows only const 0/1 values, so any
+                // other value is a gate break, never a wider truthy byte.
+                if let Val::Global(g) = &ptr_val {
+                    if let Some((addr, bit)) = self.packed_bit(g) {
+                        assert_eq!(
+                            s.ty,
+                            Ty::I1,
+                            "isel-pic18: packed store to @{g} must stay an i1 store"
+                        );
+                        let op = match &s.val {
+                            Val::Const(0) => "BCF",
+                            Val::Const(1) => "BSF",
+                            _ => panic!("isel-pic18: packed store of non-const-0/1 to @{g}"),
+                        };
+                        self.emit_banked(op, addr, &format!(", {bit}"));
+                        return;
+                    }
+                }
                 // the flash const: a store through a `const` (flash) base is a write to
                 // ROM. It must panic (matching PIC14's
                 // store-through-const panic), never silently emit a
@@ -14039,6 +14147,54 @@ fn emit_cond_branches<'m>(
     }
 }
 
+/// Emit a fused packed-bit branch (epic-cc#1162): the `BTFSC`/`BTFSS`
+/// entry tests the flag bit in place, then the same edge-copy routing
+/// `emit_cond_branches` uses. Bit-test skips never touch W or STATUS Z,
+/// so the branch needs no materialized byte first.
+fn emit_bit_cond_branches<'m>(
+    g: &mut Gen<'m>,
+    addr: u16,
+    bit: u8,
+    lt: &str,
+    lf: &str,
+    t_copies: &Option<Vec<(String, Ty, Val)>>,
+    f_copies: &Option<Vec<(String, Ty, Val)>>,
+    b: &ir::Block,
+    doms: &HashMap<String, HashSet<String>>,
+    bc: &ir::BrCond,
+) {
+    let test = format!(", {bit}");
+    match (t_copies, f_copies) {
+        (None, None) => {
+            g.emit_banked("BTFSC", addr, &test);
+            g.emit(format!("    BRA {lt}"));
+            g.emit(format!("    BRA {lf}"));
+        }
+        (None, Some(cf)) => {
+            g.emit_banked("BTFSC", addr, &test);
+            g.emit(format!("    BRA {lt}"));
+            emit_phi_copies(g, cf, doms[&b.label].contains(&bc.f));
+            g.emit(format!("    BRA {lf}"));
+        }
+        (Some(ct), None) => {
+            g.emit_banked("BTFSS", addr, &test);
+            g.emit(format!("    BRA {lf}"));
+            emit_phi_copies(g, ct, doms[&b.label].contains(&bc.t));
+            g.emit(format!("    BRA {lt}"));
+        }
+        (Some(ct), Some(cf)) => {
+            let l_fcopies = g.fresh_label();
+            g.emit_banked("BTFSS", addr, &test);
+            g.emit(format!("    BRA {l_fcopies}"));
+            emit_phi_copies(g, ct, doms[&b.label].contains(&bc.t));
+            g.emit(format!("    BRA {lt}"));
+            g.emit_label(&l_fcopies);
+            emit_phi_copies(g, cf, doms[&b.label].contains(&bc.f));
+            g.emit(format!("    BRA {lf}"));
+        }
+    }
+}
+
 /// Whether a phi copy emits no lines: a register copy whose source slot is
 /// its destination slot. `emit_copy_byte_or_w` drops those before staging,
 /// so routing the edge straight to its target matches a trampoline holding
@@ -15256,6 +15412,7 @@ pub fn select_with_locs(
         isr_save,
         isr_hi_save,
         Options::default(),
+        &HashMap::new(),
     )
 }
 
@@ -15268,6 +15425,10 @@ fn is_flash_const_global(m: &Module, addrs: &HashMap<String, u16>, name: &str) -
 /// `select_with_locs` with codegen options. The driver passes
 /// `copy_loop: false` under the speed profile, so long staged runs stay
 /// straight `MOVFF`s instead of trading cycles for flash (epic-cc#883).
+/// `packed` maps packed flag globals to their bit number (epic-cc#1162):
+/// member name to bit in its shared byte. `alloc` guarantees every packed
+/// access is a plain i1 load or const 0/1 store; the packed-aware
+/// lowerings read this map and every byte-granular fold ignores members.
 pub fn select_with_opts(
     device: &Device,
     m: &Module,
@@ -15276,6 +15437,7 @@ pub fn select_with_opts(
     isr_save: Option<u16>,
     isr_hi_save: Option<u16>,
     opts: Options,
+    packed: &HashMap<String, u8>,
 ) -> (String, Vec<Option<SrcLoc>>) {
     let (common_lo, _) = device
         .fixed_retval
@@ -15460,6 +15622,7 @@ pub fn select_with_opts(
             let mut g = Gen {
                 m,
                 addrs,
+                packed_bits: packed,
                 resolved: &resolved,
                 prov: prov.clone(),
                 retval_lo: common_lo,
@@ -15543,6 +15706,7 @@ pub fn select_with_opts(
         let mut g = Gen {
             m,
             addrs,
+            packed_bits: packed,
             resolved: &resolved,
             prov: prov.clone(),
             retval_lo: common_lo,
@@ -15601,9 +15765,12 @@ pub fn select_with_opts(
         // never stages. Same predicate `alloc` places by, over the same
         // bank test on the final map, so a skipped load reads an
         // address both stages agree on.
+        // Packed flag members never fold: every fold reads whole bytes,
+        // which would observe the packed neighbors, not the flag.
         let access_safe: HashSet<String> =
             g.m.globals
                 .iter()
+                .filter(|x| !g.packed_bits.contains_key(&x.name))
                 .filter(|x| g.addrs.get(&x.name).is_some_and(|a| *a <= g.access_bank_hi))
                 .map(|x| x.name.clone())
                 .collect();
@@ -15863,6 +16030,10 @@ pub fn select_with_opts(
                     fc.icmp.b = g.fold_reg(&fc.icmp.b);
                     fc
                 });
+            // A packed flag load this block's terminator absorbs (see
+            // `fusable_bitload`): the branch tests the bit in place, so
+            // the load emits nothing here.
+            let fused_bit: Option<(String, u16, u8)> = Gen::fusable_bitload(&g, f, b);
             let mut terminator: Option<&Inst> = None;
             for (ii, inst) in b.insts.iter().enumerate() {
                 g.cur_site = (b.label.clone(), ii);
@@ -15881,6 +16052,7 @@ pub fn select_with_opts(
                         if fused
                             .as_ref()
                             .is_some_and(|fc| fc.consumed.contains(&l.dst)) => {}
+                    Inst::Load(l) if fused_bit.as_ref().is_some_and(|fb| fb.0 == l.dst) => {}
                     other => g.emit_inst(other),
                 }
             }
@@ -16056,26 +16228,36 @@ pub fn select_with_opts(
                             doms[&b.label].contains(&bc.f),
                         ),
                         (None, None, None, None) => {
-                            // Same hazard class as `Select`'s cond (the select guard, see
-                            // `emit_inst`'s `Inst::Select` arm): `emit_load_w`'s
-                            // `Val::Const` arm emits only `MOVLW`, which does not
-                            // set the Z flag (`crates/sim/src/lib.rs`), so a
-                            // literal cond here would make `BZ` test a stale flag
-                            // from whatever came before instead of `cond`'s real
-                            // value. Fail instead of silently miscompiling.
-                            assert!(
-                                !matches!(bc.cond, Val::Const(_)),
-                                "isel-pic18: const cond BrCond not yet supported"
-                            );
-                            // Same skip as the Select arm above: a reload
-                            // of a just-computed byte only feeds this
-                            // branch's `Z` test. (epic-cc#668)
-                            if !g.branch_reload_redundant(&bc.cond) {
-                                g.emit_load_w(&bc.cond, 0, true);
+                            // A packed flag load feeding this branch lowers
+                            // here: the bit test is the branch, so the
+                            // load's slot never materializes.
+                            if let Some((_, addr, bit)) = &fused_bit {
+                                emit_bit_cond_branches(
+                                    &mut g, *addr, *bit, &lt, &lf, &t_copies, &f_copies, b, &doms,
+                                    bc,
+                                );
+                            } else {
+                                // Same hazard class as `Select`'s cond (the select guard, see
+                                // `emit_inst`'s `Inst::Select` arm): `emit_load_w`'s
+                                // `Val::Const` arm emits only `MOVLW`, which does not
+                                // set the Z flag (`crates/sim/src/lib.rs`), so a
+                                // literal cond here would make `BZ` test a stale flag
+                                // from whatever came before instead of `cond`'s real
+                                // value. Fail instead of silently miscompiling.
+                                assert!(
+                                    !matches!(bc.cond, Val::Const(_)),
+                                    "isel-pic18: const cond BrCond not yet supported"
+                                );
+                                // Same skip as the Select arm above: a reload
+                                // of a just-computed byte only feeds this
+                                // branch's `Z` test. (epic-cc#668)
+                                if !g.branch_reload_redundant(&bc.cond) {
+                                    g.emit_load_w(&bc.cond, 0, true);
+                                }
+                                emit_cond_branches(
+                                    &mut g, &lt, &lf, &t_copies, &f_copies, b, &doms, bc,
+                                );
                             }
-                            emit_cond_branches(
-                                &mut g, &lt, &lf, &t_copies, &f_copies, b, &doms, bc,
-                            );
                         }
                     }
                 }
@@ -16439,6 +16621,7 @@ pub fn select_with_opts(
         let mut g = Gen {
             m,
             addrs,
+            packed_bits: packed,
             resolved: &resolved,
             prov: prov.clone(),
             retval_lo: common_lo,
@@ -16606,13 +16789,24 @@ pub fn select_with_opts(
     // every run loops, even short ones, to keep a single emission path.
     // (epic-cc#561)
     {
+        // Packed flag members share one byte: clear each shared byte
+        // once, not once per member.
+        let mut packed_cleared: HashSet<u16> = HashSet::new();
         let mut sorted: Vec<(u16, usize)> = m
             .globals
             .iter()
             .filter(|g| {
                 addrs.contains_key(&g.name) && !g.is_const && !g.needs_ram_init() && g.size > 0
             })
-            .map(|g| (addrs[&g.name], g.size as usize))
+            .filter_map(|g| {
+                if packed.contains_key(&g.name) {
+                    packed_cleared
+                        .insert(addrs[&g.name])
+                        .then_some((addrs[&g.name], 1))
+                } else {
+                    Some((addrs[&g.name], g.size as usize))
+                }
+            })
             .collect();
         sorted.sort();
         let mut runs: Vec<(u32, usize)> = Vec::new();
@@ -16650,7 +16844,7 @@ pub fn select_with_opts(
             // silently reads as zero (epic-cc#454). `irparse` keeps `bytes`
             // empty for a zero-initialized global, so there is nothing to
             // emit for one and no init cost is added.
-            if addrs.contains_key(&g.name) && g.needs_ram_init() {
+            if addrs.contains_key(&g.name) && g.needs_ram_init() && !packed.contains_key(&g.name) {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
                     let addr = base + i as u16;
@@ -16698,6 +16892,25 @@ pub fn select_with_opts(
                         }
                         init.push(format!("    MOVWF 0x{addr:03X},B"));
                     }
+                }
+            }
+        }
+        // Packed flags with a set initializer: the zero runs above
+        // cleared the shared byte, so set each true bit in place. A
+        // byte write here would clobber the co-packed flags.
+        for g in &m.globals {
+            if packed.contains_key(&g.name) && g.bytes == [1] {
+                let addr = addrs[&g.name];
+                let bit = packed[&g.name];
+                if addr <= access_bank_hi || addr >= PIC18_SFR_ACCESS_LO {
+                    init.push(format!("    BSF 0x{addr:03X}, {bit},A"));
+                } else {
+                    let bsr = (addr >> 8) as u8;
+                    if init_bsr != Some(bsr) {
+                        init.push(format!("    MOVLB 0x{bsr:02X}"));
+                        init_bsr = Some(bsr);
+                    }
+                    init.push(format!("    BSF 0x{addr:03X}, {bit},B"));
                 }
             }
         }
@@ -16809,6 +17022,14 @@ fn empty_global_addrs() -> &'static HashSet<u16> {
     EMPTY.get_or_init(HashSet::new)
 }
 
+/// The packed-bit map for the unit tests below: they exercise emitters
+/// directly, with no module-level packing, so no global is packed.
+#[cfg(test)]
+fn empty_packed_bits() -> &'static HashMap<String, u8> {
+    static EMPTY: std::sync::LazyLock<HashMap<String, u8>> = std::sync::LazyLock::new(HashMap::new);
+    &EMPTY
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -16829,6 +17050,7 @@ mod tests {
             let mut g = Gen {
                 m: &m,
                 addrs: &addrs,
+                packed_bits: empty_packed_bits(),
                 resolved: &resolved,
                 prov: FlashProvenance::default(),
                 retval_lo: 0,
@@ -16878,6 +17100,7 @@ mod tests {
             let mut g = Gen {
                 m: &m,
                 addrs: &addrs,
+                packed_bits: empty_packed_bits(),
                 resolved: &resolved,
                 prov: FlashProvenance::default(),
                 retval_lo: 0,
@@ -17021,6 +17244,7 @@ mod p3_gen_tests {
         Gen {
             m,
             addrs,
+            packed_bits: empty_packed_bits(),
             resolved,
             prov: FlashProvenance::default(),
             retval_lo: 0,
