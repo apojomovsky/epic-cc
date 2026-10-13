@@ -4360,3 +4360,57 @@ fn packed_holders_stay_out_of_the_address_map() {
         "map text must not leak holders:\n{text}"
     );
 }
+
+/// A branch-absorbed compare and its operand load reserve no overlay
+/// slot on PIC18 (epic-cc#862): isel lowers the fused branch without
+/// writing the 0/1 byte or staging the sources.
+#[test]
+fn fused_compare_regs_take_no_pic18_slot() {
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %2 = icmp eq i8 %1, 0\n\
+             br i1 %2 t f\n\
+           block t:\n\
+             store i8 1 @out\n\
+             ret void\n\
+           block f:\n\
+             store i8 2 @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert!(
+        !out.locals.keys().any(|k| k == "main::1" || k == "main::2"),
+        "fused regs must be slotless: {:?}",
+        out.locals
+    );
+}
+
+/// A one-byte all-const phi consumed only by the merge store reserves no
+/// overlay slot on PIC18 (epic-cc#862): each edge leaves the byte in W.
+#[test]
+fn const_phi_into_store_takes_no_pic18_slot() {
+    let m = parse(
+        "global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br t\n\
+           block t:\n\
+             br merge\n\
+           block f:\n\
+             br merge\n\
+           block merge:\n\
+             %p = phi i8 10 t 11 f\n\
+             store i8 %p @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert!(
+        !out.locals.keys().any(|k| k == "main::p"),
+        "const phi must be slotless: {:?}",
+        out.locals
+    );
+}
