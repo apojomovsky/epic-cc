@@ -12,7 +12,7 @@
 |---|---|---|
 | 1 | `driver` | `.c` files → invokes clang → `.ll` |
 | 2 | `irparse` | `.ll` text → our IR |
-| 3 | `wholeprog` | N modules → one merged module, externs resolved |
+| 3 | `wholeprog` | N modules → one merged module, externs resolved, proven-range u16 globals narrowed to u8 |
 | 4 | `legalize` | i16/i32/float ops → i8 sequences + runtime calls |
 | 5 | `callgraph` | merged IR → call graph, recursion check, ISR trees, HW-stack depth check |
 | 6 | `alloc` | call graph + locals → static addresses across 4 banks |
