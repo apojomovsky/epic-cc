@@ -6821,12 +6821,13 @@ fn param(name: &str, width: u8) -> Param {
 /// `__mul_u32` scratch bytes per core: the classic AN526 recipe keeps its
 /// multiplier backup, counter, product and multiplicand in scratch (11),
 /// while pic14e shifts both operands in their param slots (4) and baseline
-/// copies only the multiplicand (8). PIC18 keeps 11, its hw recipe is out
-/// of this ticket's scope.
+/// accumulates the product in the fixed retval slots, so only the
+/// multiplicand copy needs scratch (4, epic-cc#1179). PIC18 keeps 11, its
+/// hw recipe is out of this ticket's scope.
 fn mul_u32_scratch(core: device::Core) -> u8 {
     match core {
         device::Core::Pic14e => 4,
-        device::Core::PicBaseline => 8,
+        device::Core::PicBaseline => 4,
         device::Core::Pic14 | device::Core::Pic18 => 11,
     }
 }
@@ -6864,7 +6865,7 @@ fn mul_u32_scratch(core: device::Core) -> u8 {
 /// | `__sdivmod_i16` | 7 | same frame as `__sdiv_i16`: both halves negate in place, quotient to retval, remainder to the spill slot |
 /// | `__shl_u8`, `__lshr_u8`, `__ashr_i8` | 3 | `cnt`@0 (masked count / loop counter: the value shifts in the `val` param slot), `spare`@1-2 (recipe scratch) |
 /// | `__shl_u16`, `__lshr_u16`, `__ashr_i16` | 4 | `cnt`@0-1 (masked count / loop counter), `spare`@2-3 (recipe scratch) |
-/// | `__mul_u32` | 11 classic/PIC18, 4 pic14e, 8 baseline | classic: `bk_lo`@0 / `bk_hi`@1 (multiplier backup: 2 bytes, the low 16 bits first, reloaded from `b`'s high half for the second 16 of the 32 iterations), `cnt`@2 (loop counter, 32), `r`@3-6 (32-bit running product: the low 32 bits of the full product), `t`@7-10 (shifted multiplicand: 4 bytes, shifting left with wraparound, so the shifted-out high bits drop and i32 `mul` wraps). pic14e keeps `r`@0-3 only (both operands shift in their param slots); baseline keeps `r`@0-3 plus `t`@4-7 (only the multiplicand copy needs scratch, the multiplier shifts in place) |
+/// | `__mul_u32` | 11 classic/PIC18, 4 pic14e and baseline | classic: `bk_lo`@0 / `bk_hi`@1 (multiplier backup: 2 bytes, the low 16 bits first, reloaded from `b`'s high half for the second 16 of the 32 iterations), `cnt`@2 (loop counter, 32), `r`@3-6 (32-bit running product: the low 32 bits of the full product), `t`@7-10 (shifted multiplicand: 4 bytes, shifting left with wraparound, so the shifted-out high bits drop and i32 `mul` wraps). pic14e keeps `r`@0-3 only (both operands shift in their param slots); baseline keeps `t`@0-3 only (the product accumulates in the fixed retval slots, the multiplier shifts in place) |
 /// | `__udiv_u32`, `__urem_u32` | 10 | `rem`@0-3 (partial remainder: full 32 bits, with no carry out for a 32/32 divide), `den`@4-7 (denominator copy: the divmod subtracts/restores against this, so the param slot stays untouched), `cnt`@8 (loop counter, 32), `spare`@9 (recipe scratch) |
 /// | `__udec_u32` | 11 | `den`@0-3 (baked divisor 10, set once: the loop divides by a constant), `rem`@4-7 (divmod remainder, digit source), `cnt`@8 (bit counter, 32), `digit`@9 (ASCII digit staging), `n`@10 (digit count, the return value) |
 /// | `__udec_u16_5` | 7 | `den`@0-1 (baked divisor 10), `rem`@2-3 (divmod remainder, digit source), `dcnt`@4 (bit counter, 16), `iter`@5 (digit counter, 5), `digit`@6 (binary digit staging) |

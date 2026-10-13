@@ -38,7 +38,7 @@
 //!     direct call site, into an ordinary (non-`main`, non-ISR) caller,
 //!     never referenced any other way. That caller already reclaims its
 //!     frame on return, so the callee's locals do too, same as before the
-//!     fold; this is free on every axis, no RAM/flash trade, unlike inlining
+//!     fold; below the single-site budget this is free on every axis, no RAM/flash trade, unlike inlining
 //!     into `main`/an ISR root (that shape trades flash for permanent RAM
 //!     and needs the `-O2` "aggressive" tier's explicit budget check).
 //!     Marks candidates with `alwaysinline` textually, so LLVM's
@@ -278,6 +278,9 @@ fn noinline_functions(lines: &[&str], funcs: &[FuncSpan]) -> std::collections::H
 /// same as before, so this list is unconditionally safe to always-inline,
 /// no RAM/flash trade to weigh, unlike a fold into `main`/an ISR (that
 /// shape is the `-O2` "aggressive" tier's job, not this one, epic-cc#204).
+/// Both sides large is the exception: past `MAX_SINGLE_CALLEE_LINES`
+/// and `MAX_SINGLE_CALLER_LINES` the merged frame spans BSR banks
+/// (epic-cc#1226), so those stay out of line.
 ///
 /// With `aggressive`, entry callers count too, but only for small
 /// callees: at most `MAX_ENTRY_INLINE_LINES` IR lines. The fold still
@@ -286,6 +289,14 @@ fn noinline_functions(lines: &[&str], funcs: &[FuncSpan]) -> std::collections::H
 /// never returns. The line cap bounds that RAM cost to small helpers;
 /// a large single-use driver stays out of line on purpose.
 const MAX_ENTRY_INLINE_LINES: usize = 100;
+/// Budget for a single-call-site fold: refuse when the callee costs
+/// more than `MAX_SINGLE_CALLEE_LINES` IR lines and its caller more
+/// than `MAX_SINGLE_CALLER_LINES`. Duplicating a large body into an
+/// already large caller builds a bank-crossing frame (bridge task,
+/// epic-cc#1226: keeping poll out saves 26 RAM bytes). Either side
+/// small still folds, tiny wrappers and cold init chains included.
+const MAX_SINGLE_CALLEE_LINES: usize = 175;
+const MAX_SINGLE_CALLER_LINES: usize = 200;
 /// Caps for the multi-call-site constant-argument fold: the body is
 /// duplicated once per site before the post-inline cleanup folds it, so
 /// both bounds price the worst case where that fold does not fire.
@@ -601,6 +612,37 @@ fn always_inline_candidates(ll_text: &str, aggressive: bool) -> Vec<String> {
         .enumerate()
         .map(|(i, f)| (f.name.as_str(), i))
         .collect();
+    // Caller-side budget (epic-cc#1226): duplicating a large body
+    // into an already large caller builds a bank-crossing frame, so
+    // those stay out of line. Either side small still folds. A kept
+    // callee stays an out-of-line frame, so its own singles still
+    // fold into it; the budget protects merged frames, nothing else.
+    let span = |i: usize| funcs[i].end - funcs[i].start + 1;
+    let over = |name: &str| -> bool {
+        let Some(&callee) = index_of.get(name) else {
+            return false;
+        };
+        let Some(sites) = call_sites.get(name) else {
+            return false;
+        };
+        sites.len() == 1
+            && sites[0] != usize::MAX
+            && span(callee) > MAX_SINGLE_CALLEE_LINES
+            && span(sites[0]) > MAX_SINGLE_CALLER_LINES
+    };
+    let refused: std::collections::HashSet<String> = singles
+        .iter()
+        .filter(|n| over(n))
+        .map(|n| n.clone())
+        .collect();
+    singles.retain(|name| {
+        let back = call_sites.get(name.as_str()).is_some_and(|sites| {
+            sites.len() == 1
+                && sites[0] != usize::MAX
+                && refused.contains(funcs[sites[0]].name.as_str())
+        });
+        !refused.contains(name.as_str()) || back
+    });
     let callees_of = |name: &str| -> Vec<String> {
         let Some(&idx) = index_of.get(name) else {
             return Vec::new();
@@ -1567,6 +1609,71 @@ define internal void @shared(i16 noundef %0) #0 {
         assert!(
             always_inline_candidates(&big, false).is_empty(),
             "past the body cap the duplicated bodies price worse than the shared one"
+        );
+    }
+
+    fn sized_fn(name: &str, total: usize, callee: Option<&str>) -> String {
+        let mut s = format!("define internal void @{name}() #0 {{\n");
+        let extra = usize::from(callee.is_some());
+        for _ in 0..total - 3 - extra {
+            s.push_str("  %x = add i32 0, 1\n");
+        }
+        if let Some(c) = callee {
+            s.push_str(&format!("  tail call void @{c}()\n"));
+        }
+        s.push_str("  ret void\n}\n");
+        s
+    }
+
+    #[test]
+    fn always_inline_refuses_large_body_into_large_caller() {
+        let ll = sized_fn("caller", MAX_SINGLE_CALLER_LINES + 10, Some("callee"))
+            + &sized_fn("callee", MAX_SINGLE_CALLEE_LINES + 10, None);
+        assert!(
+            always_inline_candidates(&ll, false).is_empty(),
+            "duplicating a large body into an already large caller builds a bank-crossing frame, so it stays out of line"
+        );
+        assert!(
+            always_inline_candidates(&ll, true).is_empty(),
+            "the aggressive tier widens entry folding, not the caller-side budget"
+        );
+    }
+
+    #[test]
+    fn always_inline_folds_when_either_side_is_small() {
+        let big_callee = sized_fn("caller", 10, Some("callee"))
+            + &sized_fn("callee", MAX_SINGLE_CALLEE_LINES + 10, None);
+        assert_eq!(
+            always_inline_candidates(&big_callee, false),
+            vec!["callee".to_string()],
+            "a large body folded into a small caller stays within one bank"
+        );
+        let big_caller = sized_fn("caller", MAX_SINGLE_CALLER_LINES + 10, Some("callee"))
+            + &sized_fn("callee", 10, None);
+        assert_eq!(
+            always_inline_candidates(&big_caller, false),
+            vec!["callee".to_string()],
+            "a tiny body adds no bank pressure wherever it folds"
+        );
+        let edge = sized_fn("caller", MAX_SINGLE_CALLER_LINES, Some("callee"))
+            + &sized_fn("callee", MAX_SINGLE_CALLEE_LINES, None);
+        assert_eq!(
+            always_inline_candidates(&edge, false),
+            vec!["callee".to_string()],
+            "the budget fires past the caps, not at them"
+        );
+    }
+
+    #[test]
+    fn always_inline_keeps_folding_into_a_kept_callee() {
+        let ll = "define void @main() #0 {\n  tail call void @mid()\n  ret void\n}\n".to_string()
+            + &sized_fn("mid", MAX_SINGLE_CALLER_LINES + 50, Some("big"))
+            + &sized_fn("big", MAX_SINGLE_CALLEE_LINES + 200, Some("small"))
+            + &sized_fn("small", MAX_SINGLE_CALLEE_LINES + 50, None);
+        assert_eq!(
+            always_inline_candidates(&ll, false),
+            vec!["small".to_string()],
+            "big stays out of line, and small still folds into that out-of-line frame"
         );
     }
 
