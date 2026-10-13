@@ -25,11 +25,14 @@
 //! progression jumps past it); common RAM holds the fixed scratch and
 //! retval bytes instead (see `isel`).
 
+mod retain;
+
 use std::collections::{HashMap, HashSet};
 
 use device::{Core, Device};
 use ir::{Inst, Module};
 use iselcore::{find_value_folds, resolve_pointers, ssa_key, Base, PtrResolution, ValueFolds};
+use retain::Retention;
 
 /// One shared flag byte (epic-cc#1162): the synthetic holder placed in
 /// the floating list, plus member globals with bit positions. isel-pic18
@@ -629,6 +632,7 @@ fn first_fit(
 fn frame_layout(
     f: &ir::Func,
     resolved: &PtrResolution,
+    retention: &Retention,
     va_size: u16,
     unplaced: &HashSet<String>,
     retval_homed: &HashSet<String>,
@@ -759,10 +763,10 @@ fn frame_layout(
             _ => None,
         }
     };
-    // An object whose address escapes (stored to RAM, returned, or merged
-    // into a reseeded select/phi whose uses resolve elsewhere) keeps the
-    // full-function interval below. Call args stay uses: the callee only
-    // touches the bytes during the call.
+    // An object whose address escapes (stored to RAM, returned, merged
+    // into a reseeded select/phi whose uses resolve elsewhere, or passed
+    // to a callee that retains it) keeps the full-function interval below.
+    // A call arg no callee retains is a plain use at the call point.
     let mut escaped: HashSet<String> = HashSet::new();
     for b in &order {
         for inst in &b.insts {
@@ -778,6 +782,17 @@ fn frame_layout(
                     if let ir::Val::Reg(r) = v {
                         if let Some(o) = base_obj(r) {
                             escaped.insert(o);
+                        }
+                    }
+                }
+                ir::Inst::Call(c) => {
+                    for (i, a) in c.args.iter().enumerate() {
+                        if let ir::Val::Reg(r) = &a.val {
+                            if let Some(o) = base_obj(r) {
+                                if !escaped.contains(&o) && retention.call_retains(c, i) {
+                                    escaped.insert(o);
+                                }
+                            }
                         }
                     }
                 }
@@ -2879,6 +2894,7 @@ fn allocate_inner(
     // slot materializes its two address bytes into the dst slot, so the
     // dst needs a RAM slot; a folded select is virtual and defines none.
     let resolved = resolve_pointers(m);
+    let retention = Retention::new(m);
     // Value folds (epic-cc#863, epic-cc#875, epic-cc#902): producers needing
     // no slot, computed by the predicate the PIC18, PIC14, and PIC14E
     // backends share, so a dropped slot is never read. Other cores keep
@@ -3028,6 +3044,7 @@ fn allocate_inner(
         let fl = frame_layout(
             f,
             &resolved,
+            &retention,
             floored_va_size(f, &va_sizes),
             unplaced_in(&f.name),
             &retval_in(&f.name),
@@ -4486,6 +4503,7 @@ fn allocate_inner(
         let fl = frame_layout(
             f,
             &resolved,
+            &retention,
             floored_va_size(f, &va_sizes),
             unplaced_in(&f.name),
             &retval_in(&f.name),
