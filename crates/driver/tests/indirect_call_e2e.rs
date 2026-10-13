@@ -102,7 +102,6 @@ fn run_one(device_name: &str, device: &device::Device, sel: u8) {
         device::Core::Pic14e => panic!("indirect_call e2e: pic14e not implemented"),
         device::Core::PicBaseline => panic!("indirect_call e2e: pic-baseline not implemented"),
     }
-    let _ = std::fs::remove_file(&hex_path);
 }
 
 #[test]

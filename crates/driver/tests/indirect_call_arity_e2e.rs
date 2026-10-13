@@ -78,5 +78,4 @@ fn arity_filtered_indirect_call_dispatches_both_sites() {
     assert!(p.halted(), "machine must halt after the ISR returns");
     assert_eq!(p.ram()[out_addr], 0x55, "1-arg site dispatched on_b");
     assert_eq!(p.ram()[out2_addr], 1, "0-arg site dispatched on_a");
-    let _ = std::fs::remove_dir_all(&dir);
 }
