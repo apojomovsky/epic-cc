@@ -9180,6 +9180,12 @@ impl<'m> Gen<'m> {
         if g.prov.flash.contains(&key) || g.prov.mixed.contains(&key) {
             return None;
         }
+        // A walk-marked pointer holds a flash label: the scan would read
+        // RAM at it, so the NUL walk stays out and normal lowering refuses
+        // loudly instead (epic-cc#1197, epic-cc#1203).
+        if g.walks.flash.contains(&key) || g.walks.mixed.contains(&key) {
+            return None;
+        }
         let (base, k_gep, terms) = g.resolved.get(&key)?.clone();
         if terms.len() != 1 || terms[0].0 != 1 || terms[0].1 != cntreg {
             return None;
@@ -10470,6 +10476,12 @@ impl<'m> Gen<'m> {
     fn nul_seed(g: &Gen, f: &ir::Func, gep_dst: &str, cntreg: &str) -> Option<(NulSeed, u16)> {
         let key = ssa_key(&f.name, gep_dst);
         if g.prov.flash.contains(&key) || g.prov.mixed.contains(&key) {
+            return None;
+        }
+        // A walk-marked pointer holds a flash label: the scan would read
+        // RAM at it, so the NUL walk stays out and normal lowering refuses
+        // loudly instead (epic-cc#1197, epic-cc#1203).
+        if g.walks.flash.contains(&key) || g.walks.mixed.contains(&key) {
             return None;
         }
         let (base, k_gep, terms) = g.resolved.get(&key)?.clone();

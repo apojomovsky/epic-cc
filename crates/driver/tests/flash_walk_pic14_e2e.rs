@@ -209,7 +209,9 @@ fn large_flash_index_walk_is_correct_on_pic14_and_pic14e() {
 }
 
 /// A pointer walk over a const too long to copy is refused on every core
-/// that would otherwise read RAM at the flash address.
+/// that would otherwise read RAM at the flash address. The counter-index
+/// shape is refused too: its counter-plus-gep form is what the NUL-walk
+/// planner seeks, and the planner stays out for the same reason.
 #[test]
 fn large_flash_pointer_walk_is_refused_on_pic14_and_pic14e() {
     expect_refusal(
@@ -220,6 +222,16 @@ fn large_flash_pointer_walk_is_refused_on_pic14_and_pic14e() {
     expect_refusal(
         "p16f1937",
         "tests/fixtures/flash_walk_large_pointer.c",
+        "pointer access through flash walk",
+    );
+    expect_refusal(
+        "p16f877a",
+        "tests/fixtures/flash_walk_counter_index.c",
+        "pointer access through flash walk",
+    );
+    expect_refusal(
+        "p16f1937",
+        "tests/fixtures/flash_walk_counter_index.c",
         "pointer access through flash walk",
     );
 }
