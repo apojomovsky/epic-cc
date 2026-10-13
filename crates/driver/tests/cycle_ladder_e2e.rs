@@ -228,6 +228,7 @@ fn kernel(stem: &str, device: &'static str, file: &str) -> Case {
         "16F877A" => "16f877a",
         "16F1937" => "16f1937",
         "16F505" => "16f505",
+        "12F509" => "12f509",
         _ => panic!("cycle ladder: no row suffix for device {device}"),
     };
     Case {
@@ -270,11 +271,13 @@ fn cases() -> Vec<Case> {
     }
     // epic-cc#1067: the loop above covers 18F4550 and 16F877A only, so
     // the pic14e and baseline __mul_u32 routines had no cycle row. The
-    // 12F509 cannot run this kernel (41 GPR bytes fit neither the 12
-    // operand/result bytes nor the 8-byte baseline __scr, epic-cc#1179),
-    // so the baseline row targets the 16F505.
+    // full two-volatile kernel still cannot allocate on the 12F509 (two
+    // live 4-byte operands plus the routine frame exceed its 16-byte
+    // bank), so the 509 row runs the const-operand reduced kernel, which
+    // pins the same routine with the identical product (epic-cc#1179).
     out.push(kernel("speed-mul-u32", "16F1937", "speed-mul-u32.c"));
     out.push(kernel("speed-mul-u32", "16F505", "speed-mul-u32.c"));
+    out.push(kernel("speed-mul-u32", "12F509", "speed-mul-u32-12f509.c"));
     // One PID update through the vendored epic-pid: PIC18 only, like the
     // demo it comes from.
     out.push(Case {
@@ -531,6 +534,7 @@ fn expected_results(name: &str) -> Vec<(&'static str, Vec<u8>)> {
         .or_else(|| name.strip_suffix("-16f877a"))
         .or_else(|| name.strip_suffix("-16f1937"))
         .or_else(|| name.strip_suffix("-16f505"))
+        .or_else(|| name.strip_suffix("-12f509"))
         .unwrap_or(name);
     match stem {
         // 200/13 = 15 rem 5.
@@ -606,9 +610,16 @@ fn measure_marks(hex: &str, map: &str, device: &str, name: &str) -> (u64, Option
             map,
             name,
         ),
-        // Baseline core: 12-bit words over an 8-bit file map.
+        // Baseline core: 12-bit words over an 8-bit file map, one arm per
+        // part so the device geometry stays explicit.
         "16F505" => timed_marks(
             &mut pic14_sim::PicBaseline::with_device(&device::PIC16F505, pic14_sim::parse_hex(hex)),
+            addr,
+            map,
+            name,
+        ),
+        "12F509" => timed_marks(
+            &mut pic14_sim::PicBaseline::with_device(&device::PIC12F509, pic14_sim::parse_hex(hex)),
             addr,
             map,
             name,
