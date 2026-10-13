@@ -502,6 +502,9 @@ fn main() {
     let preserve_switches = device.core == device::Core::Pic18;
     let mut m = irparse::parse_ll_opts(&ll_text, preserve_switches);
     m = wholeprog::merge(m);
+    // Proven-range narrowing (epic-cc#856) runs on the merged module: only
+    // whole-program visibility proves a global's stores all fit in a byte.
+    m = wholeprog::narrow_proven_range(m);
     if cli.emit == cli::Emit::Ir {
         std::fs::write(&cli.output, ir::serialize(&m)).expect("write ir");
         return;
