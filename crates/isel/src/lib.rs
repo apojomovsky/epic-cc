@@ -2192,51 +2192,58 @@ impl<'m> Gen<'m> {
         self.emit(format!("    SUBWF 0x{aa:02X}, W"));
         for i in 1..n {
             if signed && i == high {
-                // Both sides are complemented at the high byte. The b-side
-                // is folded COMPLEMENTED via INCFSZ's skip (0x71 as a
-                // second temp, no live retval during a compare), because
-                // the complemented fold wraps at b_hi ^ 0x80 = 0xFF
-                // (b_hi = 0x7F + borrow): the skip keeps C = borrow-in = 0,
-                // the true borrow-out. A fold on the *uncomplemented* byte
-                // would repair only the b_hi = 0xFF wrap; b_hi = 0x7F +
-                // borrow would wrap invisibly and corrupt the final C.
                 match b {
                     Val::Const(k) => {
                         let kb = ((k >> (high as u32 * 8)) & 0xFF) as u8 ^ 0x80;
-                        self.emit(format!("    MOVLW 0x{kb:02X}"));
+                        self.emit("    MOVLW 0x80".to_string());
+                        self.emit(format!("    XORWF 0x{:02X}, W", aa + u16::from(high)));
+                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                        if kb == 0xFF {
+                            // a' - 0xFF - borrow is a' + 1 - borrow in W:
+                            // the ADDLW carry is the true borrow-out, and a
+                            // skipped ADDLW keeps C = borrow-in = 0.
+                            self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                            self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                            self.emit("    ADDLW 0x01".to_string());
+                        } else {
+                            self.emit(format!("    MOVLW 0x{kb:02X}"));
+                            self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                            self.emit("    ADDLW 0x01".to_string());
+                            self.emit(format!("    SUBWF 0x{:02X}, W", self.scratch));
+                        }
                     }
                     _ => {
                         let addr = self.val_addr(b).direct() + u16::from(high);
                         self.emit("    MOVLW 0x80".to_string());
                         self.emit(format!("    XORWF 0x{addr:02X}, W"));
+                        self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo));
+                        self.emit("    MOVLW 0x80".to_string());
+                        self.emit(format!("    XORWF 0x{:02X}, W", aa + u16::from(high)));
+                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                        // The a-side complement clobbered W; reload the complemented
+                        // b-side before the fold.
+                        self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                        self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                        self.emit(format!("    INCFSZ 0x{:02X}, W", self.retval_lo));
+                        self.emit(format!("    SUBWF 0x{:02X}, W", self.scratch));
                     }
                 }
-                self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo));
-                self.emit("    MOVLW 0x80".to_string());
-                self.emit(format!("    XORWF 0x{:02X}, W", aa + u16::from(high)));
-                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                // The a-side complement clobbered W; reload the complemented
-                // b-side before the fold.
-                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                self.emit(format!("    INCFSZ 0x{:02X}, W", self.retval_lo));
-                self.emit(format!("    SUBWF 0x{:02X}, W", self.scratch));
             } else {
                 match b {
                     Val::Const(k) => {
                         let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
-                        self.emit(format!("    MOVLW 0x{kb:02X}"));
-                        // The borrow folds into the constant in W, not through
-                        // a scratch copy: `k + 1` never wraps except at 0xFF,
-                        // where only INCFSZ's skip keeps the true borrow-out
-                        // (epic-cc#1078).
                         if kb == 0xFF {
-                            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                            self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                            self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                            // a_i - 0xFF - borrow is a_i + 1 - borrow in W:
+                            // the ADDLW carry is the true borrow-out, and a
+                            // skipped ADDLW keeps C = borrow-in = 0.
+                            self.emit(format!("    MOVF 0x{:02X}, W", aa + u16::from(i)));
+                            self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                            self.emit("    ADDLW 0x01".to_string());
                         } else {
+                            self.emit(format!("    MOVLW 0x{kb:02X}"));
                             self.emit("    BTFSS STATUS, 0 ; C".to_string());
                             self.emit("    ADDLW 0x01".to_string());
+                            self.emit(format!("    SUBWF 0x{:02X}, W", aa + u16::from(i)));
                         }
                     }
                     _ => {
@@ -2244,9 +2251,9 @@ impl<'m> Gen<'m> {
                         let addr = self.val_addr(b).direct() + u16::from(i);
                         self.emit("    BTFSS STATUS, 0 ; C".to_string());
                         self.emit(format!("    INCFSZ 0x{addr:02X}, W"));
+                        self.emit(format!("    SUBWF 0x{:02X}, W", aa + u16::from(i)));
                     }
                 }
-                self.emit(format!("    SUBWF 0x{:02X}, W", aa + u16::from(i)));
             }
         }
     }
@@ -2790,12 +2797,13 @@ impl<'m> Gen<'m> {
     }
 
     /// `d = k - a` (const LHS) for `bytes`-wide values. Byte 0 uses SUBLW
-    /// with exact C and no borrow-in; higher bytes fold the borrow with the
-    /// wrap-correct INCFSZ idiom: `k_i` preloads into the dst, `a_i` copies
-    /// to scratch, and `SUBWF` computes `k_i - (a_i + borrow)` in place.
-    /// At the wrap the skip leaves dst at `k_i` with C as the true
-    /// borrow-out, where the naive `ADDLW 1` fold corrupted it and every
-    /// higher byte mis-subtracted (epic-cc#1).
+    /// with exact C and no borrow-in; higher bytes complement `a_i` in
+    /// place in the destination and add `k_i + 1 - borrow` through the
+    /// ADDLW fold, which is `k_i - a_i - borrow` mod 256 with the true
+    /// borrow-out. At `k_i = 0xFF` that fold wraps the added literal, so
+    /// the byte subtracts the borrow from the complement instead.
+    /// Reading `a_i` into W before storing the destination keeps an
+    /// in-place destination (dst overlaying `a`) correct.
     fn emit_sub_const_lhs(&mut self, k: &i64, a: &Val, dst: u16, bytes: u8) {
         let aa = self.val_addr(a).direct();
         self.emit(format!("    MOVF 0x{aa:02X}, W"));
@@ -2803,18 +2811,19 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVWF 0x{dst:02X}"));
         for i in 1..bytes {
             let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
-            // Subtrahend to scratch (dst preload may overlay a), k_i into
-            // dst, then W reloaded from scratch before the fold: on the
-            // no-borrow path the skip leaves k_i in W, so SUBWF would
-            // compute k_i - k_i without the reload.
             self.emit(format!("    MOVF 0x{:02X}, W", aa + u16::from(i)));
-            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-            self.emit(format!("    MOVLW 0x{kb:02X}"));
             self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
-            self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
-            self.emit("    BTFSS STATUS, 0 ; C".to_string());
-            self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
-            self.emit(format!("    SUBWF 0x{:02X}, F", dst + u16::from(i)));
+            self.emit(format!("    COMF 0x{:02X}, F", dst + u16::from(i)));
+            if kb == 0xFF {
+                self.emit("    MOVLW 0x01".to_string());
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit(format!("    SUBWF 0x{:02X}, F", dst + u16::from(i)));
+            } else {
+                self.emit(format!("    MOVLW 0x{kb:02X}"));
+                self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                self.emit("    ADDLW 0x01".to_string());
+                self.emit(format!("    ADDWF 0x{:02X}, F", dst + u16::from(i)));
+            }
         }
     }
 
@@ -2896,19 +2905,19 @@ impl<'m> Gen<'m> {
                     let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
                     self.emit(format!("    MOVF 0x{:02X}, W", ra + u16::from(i)));
                     self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
-                    self.emit(format!("    MOVLW 0x{kb:02X}"));
-                    // The carry folds into the constant in W, not through a
-                    // scratch copy: `k + 1` never wraps except at 0xFF, where
-                    // only INCFSZ's skip keeps the true carry-out (epic-cc#1078).
                     if kb == 0xFF {
-                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                        self.emit("    BTFSC STATUS, 0 ; C".to_string());
-                        self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                        // a_i + 0xFF + carry is a_i - 1 + carry: subtract
+                        // the 1 only when carry is clear. A skipped SUBWF
+                        // keeps C = 1 and Z from the MOVF of the result.
+                        self.emit("    MOVLW 0x01".to_string());
+                        self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                        self.emit(format!("    SUBWF 0x{:02X}, F", dst + u16::from(i)));
                     } else {
+                        self.emit(format!("    MOVLW 0x{kb:02X}"));
                         self.emit("    BTFSC STATUS, 0 ; C".to_string());
                         self.emit("    ADDLW 0x01".to_string());
+                        self.emit(format!("    ADDWF 0x{:02X}, F", dst + u16::from(i)));
                     }
-                    self.emit(format!("    ADDWF 0x{:02X}, F", dst + u16::from(i)));
                 }
             }
             Val::Global(_) => panic!("isel: add32 with a global operand"),
@@ -2916,14 +2925,13 @@ impl<'m> Gen<'m> {
     }
 
     /// `d = a - b` for i32: byte 0 subtracts with the borrow out exact
-    /// (SUBWF), then each higher byte folds the borrow into a scratch copy
-    /// of the subtrahend and subtracts from the destination in place. The
-    /// fold uses INCFSZ's skip rather than the i16 chain's `ADDLW 1`: when
-    /// the fold wraps (b_i = 0xFF + borrow-in = 0x100) the skip leaves the
-    /// destination at `a_i`, the correct mod-256 result, with C =
-    /// borrow-in = 0, the true borrow-out. The i16 fold's C would be
-    /// corrupted at an intermediate byte (C = (a_i >= 0) = 1), silently
-    /// mis-subtracting every higher byte.
+    /// (SUBWF), then each higher byte subtracts from the destination in
+    /// place. A const byte folds the borrow into the constant in W with
+    /// ADDLW; at 0xFF that literal wraps, so the byte instead adds the
+    /// 1 only when there is no borrow (a_i - 0xFF - borrow is
+    /// a_i + 1 - borrow), and a skipped ADDWF keeps C = 0 and Z from
+    /// the MOVF of the result. A register subtrahend keeps the scratch
+    /// INCFSZ fold, whose wrap keeps the true borrow-out.
     fn emit_sub32(&mut self, a: &Val, b: &Val, dst: u16) {
         let aa = self.val_addr(a).direct();
         match b {
@@ -2935,11 +2943,16 @@ impl<'m> Gen<'m> {
                     let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
                     self.emit(format!("    MOVF 0x{:02X}, W", aa + u16::from(i)));
                     self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
-                    self.emit(format!("    MOVLW 0x{kb:02X}"));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                    self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                    self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
-                    self.emit(format!("    SUBWF 0x{:02X}, F", dst + u16::from(i)));
+                    if kb == 0xFF {
+                        self.emit("    MOVLW 0x01".to_string());
+                        self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                        self.emit(format!("    ADDWF 0x{:02X}, F", dst + u16::from(i)));
+                    } else {
+                        self.emit(format!("    MOVLW 0x{kb:02X}"));
+                        self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                        self.emit("    ADDLW 0x01".to_string());
+                        self.emit(format!("    SUBWF 0x{:02X}, F", dst + u16::from(i)));
+                    }
                 }
             }
             Val::Reg(rb) => {
