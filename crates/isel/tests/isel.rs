@@ -2285,6 +2285,67 @@ fn icmp_signed_i8_complements_sign_bit() {
 }
 
 #[test]
+fn icmp_signed_i8_const_folds_complement_into_addlw() {
+    // epic-cc#1079: x - kb and x + (0 - kb) carry identically for
+    // kb != 0, so a const RHS folds into an ADDLW and the scratch
+    // park drops. -1 complements to 0x7F, folded as ADDLW 0x81.
+    // -128 complements to 0x00 and keeps the park.
+    let m = parse(
+        "global x i8\nglobal o1 i8\nglobal o2 i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %r1 = icmp sge i8 %a, -1\n    store i8 %r1 @o1\n    %r2 = icmp sge i8 %a, -128\n    store i8 %r2 @o2\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("o1", 0x21),
+        ("o2", 0x22),
+        ("main::a", 0x25),
+        ("main::r1", 0x26),
+        ("main::r2", 0x27),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        asm.contains("    ADDLW 0x81"),
+        "sge -1 folds the complemented byte:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("SUBWF 0x70, W").count(),
+        1,
+        "only the kb == 0 (-128) compare keeps its park:\n{asm}"
+    );
+}
+
+#[test]
+fn icmp_signed_i8_const_fold_simulates() {
+    // The ADDLW fold must match the SUBWF park on C and Z across the
+    // sign boundary, for every predicate that reads them.
+    let ir = "global x i8\nglobal o1 i8\nglobal o2 i8\nglobal o3 i8\nglobal o4 i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %r1 = icmp slt i8 %a, -1\n    store i8 %r1 @o1\n    %r2 = icmp sge i8 %a, -1\n    store i8 %r2 @o2\n    %r3 = icmp sgt i8 %a, -1\n    store i8 %r3 @o3\n    %r4 = icmp sle i8 %a, -1\n    store i8 %r4 @o4\n    ret void\n";
+    let map = [
+        ("x", 0x20),
+        ("o1", 0x21),
+        ("o2", 0x22),
+        ("o3", 0x23),
+        ("o4", 0x24),
+        ("main::a", 0x25),
+        ("main::r1", 0x26),
+        ("main::r2", 0x27),
+        ("main::r3", 0x28),
+        ("main::r4", 0x29),
+    ];
+    for a in [-128i8, -2, -1, 0, 1, 126, 127] {
+        let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, a as u8)], 0x21, 4);
+        assert_eq!(
+            got,
+            vec![
+                (a < -1) as u8,
+                (a >= -1) as u8,
+                (a > -1) as u8,
+                (a <= -1) as u8,
+            ],
+            "signed i8 vs -1 with a = {a}"
+        );
+    }
+}
+
+#[test]
 fn icmp_ne_i8_inverts_eq_materialization() {
     // ne = !Z: the same XOR accumulation as eq, but BTFSS instead of BTFSC
     // so the i1 is 1 exactly when the accumulator is non-zero (a != b).
@@ -2445,13 +2506,6 @@ fn icmp_const_operands_use_literal_paths() {
     assert!(
         asm.contains("MOVF 0x2A, W\n    SUBLW 0x05"),
         "const LHS via SUBLW:\n{asm}"
-    );
-    // signed const RHS: sign complement folded into the literal:
-    // MOVLW (0xFF ^ 0x80) = 0x7F; SUBWF scratch,W (the signed file-LHS
-    // compares against the complemented a stored in scratch).
-    assert!(
-        asm.contains("MOVLW 0x7F\n    SUBWF 0x70, W"),
-        "signed const RHS folds ^0x80 into the literal:\n{asm}"
     );
     // signed const LHS: MOVLW 0x80; XORWF b,W; SUBLW (5 ^ 0x80) = 0x85.
     assert!(
