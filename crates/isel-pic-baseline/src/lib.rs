@@ -2506,17 +2506,24 @@ impl<'m> Gen<'m> {
                 self.store_retval(r0, 2);
                 self.emit("    RETLW 0x00".to_string());
             }
-            // 32x32 -> 32 shift-add with a zero exit. The multiplicand is
-            // copied into __scr (t) because the INCFSZ carry idiom needs r
-            // and t in one bank, which only the shared scratch guarantees
-            // on banked parts. The multiplier b is shifted in place, and
-            // the loop exits once its 4 bytes are zero. The i32 result is
-            // the low 32 bits, so the product wraps mod 2^32.
+            // 32x32 -> 32 shift-add with a zero exit. The product accumulates
+            // in the fixed retval slots (dead on entry as the call's own
+            // output channel), so only the multiplicand copy t needs __scr.
+            // t's select precedes the MOVF outside the skip pair and
+            // common-RAM r selects nothing, so the carry chain stays atomic.
+            // An ISR copy would share these slots, so a future vectored part
+            // needs per-context retval before an ISR may multiply; both
+            // current parts are vector-free.
             "__mul_u32" => {
                 let a = self.slot_addr(&name, "a").direct();
                 let b = self.slot_addr(&name, "b").direct();
-                let r = [scr, scr + 1, scr + 2, scr + 3];
-                let t = [scr + 4, scr + 5, scr + 6, scr + 7];
+                let r = [
+                    self.retval_lo,
+                    self.retval_lo + 1,
+                    self.retval_lo + 2,
+                    self.retval_lo + 3,
+                ];
+                let t = [scr, scr + 1, scr + 2, scr + 3];
                 let l_loop = self.fresh_label();
                 let l_skip = self.fresh_label();
                 let l_noswap = self.fresh_label();
@@ -2564,8 +2571,9 @@ impl<'m> Gen<'m> {
                 for i in 1..4usize {
                     self.emit_bank_select(t[i]);
                     self.emit(format!("    MOVF {}, W", self.fop(t[i])));
-                    // Atomic carry chain: t and r both sit in __scr's bank,
-                    // and a skip must not land on a bank select.
+                    // Atomic carry chain: t's select precedes the MOVF outside
+                    // the skip pair, and common-RAM r selects nothing, so no
+                    // bank select can land between the test and its target.
                     self.emit("    BTFSC STATUS, 0 ; C".to_string());
                     self.emit(format!("    INCFSZ {}, W", self.fop(t[i])));
                     self.emit(format!("    ADDWF {}, F", self.fop(r[i])));
@@ -2589,7 +2597,7 @@ impl<'m> Gen<'m> {
                 }
                 self.emit("    BTFSS STATUS, 2 ; Z".to_string()); // Z = (b == 0)
                 self.emit(format!("    GOTO {l_loop}"));
-                self.store_retval(scr, 4);
+                // No store_retval: the product already sits in retval.
                 self.emit("    RETLW 0x00".to_string());
             }
             // 32/32 restoring division (32 iterations): den copied into
