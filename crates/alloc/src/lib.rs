@@ -2518,14 +2518,12 @@ pub fn allocate_with_pool(
     pool: bool,
 ) -> AllocLayout {
     // The fold-gate selection below, run without the per-site dip, with
-    // the dip inside the ISR contexts only, and with it everywhere: a dip
-    // that does not shrink reported RAM only churns addresses (outliner
-    // sharing, select placement), so candidates rank by RAM, then by the
-    // disjoint ISR region, a reported span the bank-used sum can mask
-    // when another frame in the same bank reaches past the ISR end.
-    // Full ties keep the earlier, less dipped candidate, so a layout the
-    // dip cannot improve stays bit for bit the old one. Fixed bytes are
-    // identical either way (same device and ISR).
+    // the dip inside the ISR contexts only, and with it everywhere:
+    // candidates rank by RAM, then by the disjoint ISR region, a span the
+    // bank-used sum can mask when another frame in the same bank reaches
+    // past the ISR end. A dip that shrinks neither only churns addresses
+    // (outliner sharing, select placement), and full ties keep the
+    // earlier candidate. Fixed bytes are identical either way.
     let select = |dip: Dip| -> AllocLayout {
         let (nofold, fit) = allocate_inner(device, m, edges_text, None, pool, dip);
         if matches!(device.core, Core::Pic14 | Core::Pic14e) {
