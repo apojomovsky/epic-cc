@@ -3435,6 +3435,30 @@ fn allocate_inner(
                             if let ir::Val::Global(g) = &s.val {
                                 addr_taken.insert(g.clone());
                             }
+                            // A const whose address is stored into memory is
+                            // read back through RAM pointers, which cannot name
+                            // flash: it keeps a RAM copy like a phi incoming
+                            // (epic-cc#1223).
+                            let stored = match &s.val {
+                                ir::Val::Global(g) => Some(g.clone()),
+                                ir::Val::Reg(r) => find_const_base(r).or_else(|| {
+                                    match resolved.get(&ssa_key(&f.name, r)) {
+                                        Some((Base::Global(cg), _, _)) => Some(cg.clone()),
+                                        _ => None,
+                                    }
+                                }),
+                                ir::Val::Const(_) => None,
+                            };
+                            if let Some(g) = stored {
+                                if let Some(gl) =
+                                    m.globals.iter().find(|gl| gl.name == g && gl.is_const)
+                                {
+                                    if gl.size <= 255 {
+                                        const_to_ram.insert(g.clone());
+                                        const_phi.insert(g);
+                                    }
+                                }
+                            }
                         }
                         ir::Inst::Asm(a) => {
                             for op in &a.operands {
