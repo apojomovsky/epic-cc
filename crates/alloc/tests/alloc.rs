@@ -4699,3 +4699,28 @@ fn value_live_across_va_span_keeps_its_slot() {
     let out = allocate(&PIC16F877A, &m, "depth 1\n");
     assert_ne!(out.locals["vprintf::__va"], out.locals["vprintf::v"]);
 }
+
+/// printf reads its va_list slot and passes the address on to a callee that
+/// walks the region during the call: the region must keep its slot against
+/// a value defined after `va_start`, or the callee's frame lands on it.
+#[test]
+fn va_list_handed_to_a_callee_keeps_the_region_slot() {
+    let m = parse(
+        "global out i8\n\
+         fn printf(i16) (fmt, ...)\n\
+           block entry:\n\
+             %ap = alloca 2\n\
+             va_start ap\n\
+             %l = load ptr %ap\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             %r = call i16 @walk(%l)\n\
+             ret i16 %r\n\
+         fn walk(i16) (p=ptr)\n\
+           block entry:\n\
+             %v = load i16 %p\n\
+             ret i16 %v\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge printf walk\n");
+    assert_ne!(out.locals["printf::__va"], out.locals["printf::z"]);
+}
