@@ -269,6 +269,45 @@ fn array_c_runs_correctly() {
     assert!(p.halted());
 }
 
+/// Scaled GEP terms: a stride-3 record index and a two-term matrix index
+/// accumulate in W before FSR is set. Every cell holds a distinct value,
+/// so a dropped or repeated add reads a neighbouring cell.
+#[test]
+fn scaled_index_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (_, globals, asm) = compile_asm("tests/fixtures/scaled_index.c");
+    assert!(
+        asm.contains("ADDWF"),
+        "the scaled index must accumulate through ADDWF:\n{asm}"
+    );
+    for i in 0u8..2 {
+        for j in 0u8..3 {
+            let words = assemble_words(&device::PIC12F509, &asm);
+            let mut p = PicBaseline::with_device(&device::PIC12F509, words);
+            for n in 0..9u8 {
+                p.ram_mut()[globals["tab"] as usize + n as usize] = 0x10 + n;
+            }
+            for n in 0..6u8 {
+                p.ram_mut()[globals["m"] as usize + n as usize] = 0x40 + n;
+            }
+            p.ram_mut()[globals["in_i"] as usize] = i;
+            p.ram_mut()[globals["in_j"] as usize] = j;
+            p.run(10_000);
+            assert!(p.halted(), "i={i} j={j}:\n{asm}");
+            assert_eq!(
+                p.ram()[globals["out_r"] as usize],
+                0x10 + 3 * i + 1,
+                "tab[{i}].b"
+            );
+            assert_eq!(
+                p.ram()[globals["out_m"] as usize],
+                0x40 + 3 * i + j,
+                "m[{i}][{j}]"
+            );
+        }
+    }
+}
+
 /// P3 structs acceptance: byval calls (sum/pick) and a dynamic
 /// array-in-struct through FSR/INDF. Expected: out == 0x48.
 #[test]

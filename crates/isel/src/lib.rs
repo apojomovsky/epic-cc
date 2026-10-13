@@ -17,7 +17,7 @@
 //! constant offset (no terms) reads/writes the plain file register; dynamic
 //! terms set `FSR` to `base + k + Σ s×%r` (single scale-1 term keeps the
 //! `MOVF %r,W; ADDLW base+k; MOVWF FSR` fast path; general sums accumulate
-//! in the fixed scratch byte); an indirect base takes the target address
+//! in W as an `ADDWF %r,W` chain); an indirect base takes the target address
 //! from the slot's contents. Pointers into const (flash) globals load via
 //! `CALL __read_<name>`: a RETLW table emitted after the functions, and a
 //! store through a const base panics (ROM is not writable). `memcpy`
@@ -1223,7 +1223,7 @@ impl<'m> Gen<'m> {
     /// bank-2/3 access leaves STATUS bit 7 = 1, so skipping the set on a
     /// bank-0/1 base would mis-address into bank 2/3. A single scale-1
     /// term keeps the fast shape (`MOVF %r,W; ADDLW lit; MOVWF FSR`);
-    /// general sums accumulate in the fixed scratch byte first. The ADDLW
+    /// general sums accumulate in W first. The ADDLW
     /// literal is `(base_addr + k + byte_off) & 0xFF`: FSR holds the low
     /// byte; IRP carries bit 8.
     fn emit_fsr_to(
@@ -1256,7 +1256,6 @@ impl<'m> Gen<'m> {
             }
             _ => {
                 self.emit_accum_terms(terms);
-                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 self.emit(format!("    ADDLW 0x{lit:02X}"));
                 self.emit("    MOVWF FSR".to_string());
             }
@@ -1294,35 +1293,42 @@ impl<'m> Gen<'m> {
             self.emit("    MOVWF FSR".to_string());
         } else {
             self.emit_accum_terms(terms);
-            self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
-            self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch));
+            self.emit(format!("    ADDWF 0x{slot_addr:02X}, W"));
             self.emit(format!("    ADDLW 0x{kk:02X}"));
             self.emit("    MOVWF FSR".to_string());
         }
     }
 
-    /// `scratch = Σ scale×%reg`: W = 0, then per term
-    /// `MOVF %r,W; ADDWF scratch,W; MOVWF scratch` repeated `scale` times.
-    /// ADDWF f,W computes W = f + W, so W holds %r only until the first
-    /// ADDWF: it MUST be reloaded before each repetition or a scaled term
-    /// accumulates 2×scratch + %r (silent wrong-address miscompile).
+    /// `W = Σ scale×%reg` (mod 256): the first repetition loads
+    /// `MOVF %r,W`, every later one is `ADDWF %r,W`, so the sum never
+    /// leaves W and the scratch byte stays untouched. `ADDWF f,W` is
+    /// W = f + W, which is the accumulate: no reload of W is needed, the
+    /// register is the operand. An empty sum is `MOVLW 0`.
+    ///
+    /// Flags: each `ADDWF` rewrites C, DC and Z from its two operands, and
+    /// the sum commutes, so after two or more adds the flags equal the old
+    /// `scratch` chain's last `ADDWF`. A one-add sum ends on a `MOVF`
+    /// (Z only), and every caller follows the chain with an `ADDLW` or an
+    /// `ADDWF` that rewrites all three before any reader.
     fn emit_accum_terms(&mut self, terms: &[(u16, String)]) {
-        self.emit("    MOVLW 0x00".to_string());
-        self.emit_w_store(self.scratch);
+        let mut first = true;
         for (scale, r) in terms {
             let a = self.val_addr(&Val::Reg(r.clone())).direct();
             for _ in 0..*scale {
-                self.emit(format!("    MOVF 0x{a:02X}, W"));
-                self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch));
-                self.emit_w_store(self.scratch);
+                let op = if first { "MOVF" } else { "ADDWF" };
+                self.emit(format!("    {op} 0x{a:02X}, W"));
+                first = false;
             }
+        }
+        if first {
+            self.emit("    MOVLW 0x00".to_string());
         }
     }
 
     /// `W = k + byte_off + Σ scale×%reg`: the byte index into a const
     /// (flash) table before `CALL __read_<name>`. A single scale-1 term
     /// keeps the `MOVF %r,W` shape (ADDLW only when k + off is nonzero);
-    /// general sums accumulate in scratch.
+    /// general sums accumulate in W.
     fn emit_ptr_index_w(&mut self, k: u16, terms: &[(u16, String)], byte_off: u8) {
         // `k` can arrive wrapped from a negative GEP, so a plain sum could
         // overflow past the bound check below; `checked_add` keeps the
@@ -1344,7 +1350,6 @@ impl<'m> Gen<'m> {
             }
             _ => {
                 self.emit_accum_terms(terms);
-                self.emit_w_load(self.scratch);
                 self.emit(format!("    ADDLW 0x{kk:02X}"));
             }
         }

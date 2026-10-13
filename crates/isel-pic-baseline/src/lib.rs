@@ -1307,7 +1307,6 @@ impl<'m> Gen<'m> {
             }
             _ => {
                 self.emit_accum_terms(terms);
-                self.emit(format!("    MOVF {}, W", self.fop(self.scratch)));
                 self.emit_add_w_const(lit);
             }
         }
@@ -1390,7 +1389,6 @@ impl<'m> Gen<'m> {
             }
             _ => {
                 self.emit_accum_terms(terms);
-                self.emit(format!("    MOVF {}, W", self.fop(self.scratch)));
                 self.emit_add_w_const(lit as u8);
                 self.emit("    MOVWF FSR".to_string());
             }
@@ -1415,25 +1413,41 @@ impl<'m> Gen<'m> {
         } else {
             self.emit_accum_terms(terms);
             self.emit_bank_select(slot_addr);
-            self.emit(format!("    MOVF {}, W", self.fop(slot_addr)));
-            self.emit(format!("    ADDWF {}, W", self.fop(self.scratch)));
+            self.emit(format!("    ADDWF {}, W", self.fop(slot_addr)));
             self.emit_add_w_const(kk as u8);
             self.emit("    MOVWF FSR".to_string());
         }
     }
 
-    /// `scratch = Σ scale×%reg`.
+    /// `W = Σ scale×%reg` (mod 256): the first repetition loads
+    /// `MOVF %r,W`, every later one is `ADDWF %r,W`, so the sum never
+    /// leaves W and the scratch byte stays untouched. `ADDWF f,W` is
+    /// W = f + W, which is the accumulate: no reload of W is needed, the
+    /// register is the operand. An empty sum is `MOVLW 0`. The bank
+    /// select is emitted once per term: nothing between repetitions
+    /// changes the `FSR` bank bits.
+    ///
+    /// Flags: each `ADDWF` rewrites C, DC and Z from its two operands, and
+    /// the sum commutes, so after two or more adds the flags equal the old
+    /// `scratch` chain's last `ADDWF`. A one-add sum ends on a `MOVF`
+    /// (Z only), and every caller follows the chain with an `ADDWF` (in
+    /// `emit_add_w_const`) that rewrites all three before any reader.
     fn emit_accum_terms(&mut self, terms: &[(u16, String)]) {
-        self.emit("    MOVLW 0x00".to_string());
-        self.emit_w_store(self.scratch);
+        let mut first = true;
         for (scale, r) in terms {
-            let a = self.val_addr(&Val::Reg(r.clone())).direct();
-            for _ in 0..*scale {
-                self.emit_bank_select(a);
-                self.emit(format!("    MOVF {}, W", self.fop(a)));
-                self.emit(format!("    ADDWF {}, W", self.fop(self.scratch)));
-                self.emit_w_store(self.scratch);
+            if *scale == 0 {
+                continue;
             }
+            let a = self.val_addr(&Val::Reg(r.clone())).direct();
+            self.emit_bank_select(a);
+            for _ in 0..*scale {
+                let op = if first { "MOVF" } else { "ADDWF" };
+                self.emit(format!("    {op} {}, W", self.fop(a)));
+                first = false;
+            }
+        }
+        if first {
+            self.emit("    MOVLW 0x00".to_string());
         }
     }
 
