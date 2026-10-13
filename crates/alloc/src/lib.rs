@@ -833,19 +833,41 @@ fn frame_layout(
     for (o, u) in extra {
         uses.entry(o).or_default().insert(u);
     }
+    // va_start stores an address into the region in the list slot, so any
+    // other read of that slot (printf loads it and hands it to vprintf)
+    // passes the address to code the intervals cannot see: the region
+    // then keeps its whole-function interval.
+    let mut va_pinned = false;
     if va_size > 0 {
+        let mut va_lists: HashSet<String> = HashSet::new();
+        for b in &order {
+            for inst in &b.insts {
+                let list = match inst {
+                    ir::Inst::VaStart(v) => &v.list,
+                    ir::Inst::VaArg(v) => &v.ptr,
+                    _ => continue,
+                };
+                va_lists.insert(base_obj(list).unwrap_or_else(|| list.clone()));
+            }
+        }
         for (i, b) in order.iter().enumerate() {
             for (pos, inst) in b.insts.iter().enumerate() {
                 if matches!(inst, ir::Inst::VaArg(_) | ir::Inst::VaStart(_)) {
                     uses.entry("__va".to_string())
                         .or_default()
                         .insert((i, pos as u16));
+                } else if ir::read_vals(inst)
+                    .iter()
+                    .any(|r| va_lists.contains(&base_obj(r).unwrap_or_else(|| r.clone())))
+                {
+                    va_pinned = true;
                 }
             }
         }
     }
-    // Full-function holdouts: byval/sret params plus escaped allocas.
-    // Every other memory object colors from its bounded range.
+    // Full-function holdouts: byval/sret params plus escaped allocas, and
+    // the va region when its address leaves the function. Every other
+    // memory object colors from its bounded range.
     let mut fixed: HashSet<String> = HashSet::new();
     for p in &f.params {
         if p.byval.is_some() || p.sret {
@@ -853,6 +875,9 @@ fn frame_layout(
         }
     }
     fixed.extend(escaped.into_iter());
+    if va_pinned {
+        fixed.insert("__va".to_string());
+    }
 
     // Loop-aware liveness: a value used in a loop body is live across the
     // back-edge, so its slot is occupied at the body's end and the header's
