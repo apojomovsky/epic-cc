@@ -2517,13 +2517,17 @@ pub fn allocate_with_pool(
     edges_text: &str,
     pool: bool,
 ) -> AllocLayout {
-    // The fold-gate selection below, run with and without the per-site dip:
-    // a dip that does not shrink reported RAM only churns addresses
-    // (outliner sharing, select placement), so ties keep the old layout.
-    // Fixed bytes are identical either way (same device and ISR), so the
-    // bank-used sum is the whole comparison.
-    let select = |allow_dip: bool| -> AllocLayout {
-        let (nofold, fit) = allocate_inner(device, m, edges_text, None, pool, allow_dip);
+    // The fold-gate selection below, run without the per-site dip, with
+    // the dip inside the ISR contexts only, and with it everywhere: a dip
+    // that does not shrink reported RAM only churns addresses (outliner
+    // sharing, select placement), so candidates rank by RAM, then by the
+    // disjoint ISR region, a reported span the bank-used sum can mask
+    // when another frame in the same bank reaches past the ISR end.
+    // Full ties keep the earlier, less dipped candidate, so a layout the
+    // dip cannot improve stays bit for bit the old one. Fixed bytes are
+    // identical either way (same device and ISR).
+    let select = |dip: Dip| -> AllocLayout {
+        let (nofold, fit) = allocate_inner(device, m, edges_text, None, pool, dip);
         if matches!(device.core, Core::Pic14 | Core::Pic14e) {
             // Globals-first is exact, not monotone: global placement reads
             // only the module's globals, never the frame widths the gated
@@ -2535,7 +2539,7 @@ pub fn allocate_with_pool(
                 .filter(|g| !g.is_const && nofold.globals.contains_key(&g.name))
                 .map(|g| g.name.clone())
                 .collect();
-            return allocate_inner(device, m, edges_text, Some(&safe), pool, allow_dip).0;
+            return allocate_inner(device, m, edges_text, Some(&safe), pool, dip).0;
         }
         if device.core != Core::Pic18 || !fit {
             return nofold;
@@ -2551,16 +2555,34 @@ pub fn allocate_with_pool(
             .filter(|g| !g.is_const && nofold.globals.get(&g.name).is_some_and(|a| *a <= hi))
             .map(|g| g.name.clone())
             .collect();
-        allocate_inner(device, m, edges_text, Some(&safe), pool, allow_dip).0
+        allocate_inner(device, m, edges_text, Some(&safe), pool, dip).0
     };
-    let dipped = select(true);
-    let plain = select(false);
     let ram = |l: &AllocLayout| l.bank_used.iter().sum::<u16>();
-    if ram(&plain) <= ram(&dipped) {
-        plain
+    let mut best = select(Dip::Off);
+    // Without an ISR the ISR-scoped layout is the plain one bit for bit.
+    let scopes: &[Dip] = if m.funcs.iter().any(|f| f.isr) {
+        &[Dip::Isr, Dip::All]
     } else {
-        dipped
+        &[Dip::All]
+    };
+    for &scope in scopes {
+        let cand = select(scope);
+        if (ram(&cand), cand.isr_bytes) < (ram(&best), best.isr_bytes) {
+            best = cand;
+        }
     }
+    best
+}
+
+/// Which call sites admit the per-site live-high dip (epic-cc#855):
+/// nowhere, inside the ISR contexts only, or everywhere. The ISR-only
+/// scope folds the dispatch fan-out without rebasing main-context
+/// frames, whose dip the region span never reports.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dip {
+    Off,
+    Isr,
+    All,
 }
 
 /// Address allocation with a value-fold gate (epic-cc#863). `None`
@@ -2568,16 +2590,16 @@ pub fn allocate_with_pool(
 /// public `allocate` pairs a bounding pass with the gated one. The
 /// `bool` reports whether the frames fit below the globals; when they
 /// do not, the globals-first fallback owns the layout instead. `pool`
-/// gates pooled-const RAM copies on PIC14 (epic-cc#816). `allow_dip`
-/// admits the per-site live-high dip (epic-cc#855); without it every base
-/// follows the caller-end rule, the pre-dip layout bit for bit.
+/// gates pooled-const RAM copies on PIC14 (epic-cc#816). `dip` scopes
+/// the per-site live-high dip; `Dip::Off` follows the caller-end rule
+/// everywhere, the pre-dip layout bit for bit.
 fn allocate_inner(
     device: &Device,
     m: &Module,
     edges_text: &str,
     gate: Option<&HashSet<String>>,
     pool: bool,
-    allow_dip: bool,
+    dip: Dip,
 ) -> (AllocLayout, bool) {
     // The va region size frame_layout reserves: the widest call site, with
     // a one-byte floor so a variadic function whose call sites pass no
@@ -2865,7 +2887,7 @@ fn allocate_inner(
                 // A callee that receives homed args keeps the caller-end
                 // rule: its homed addresses are invisible to the coloring
                 // (see `homed_callee`), so no dip.
-                let dipped = if !allow_dip || homed_callee.contains(f) {
+                let dipped = if dip != Dip::All || homed_callee.contains(f) {
                     None
                 } else {
                     match sites.get(f) {
@@ -2990,7 +3012,7 @@ fn allocate_inner(
                                     .map(|p| frame_end(device, base[p], &locals_widths[p]))
                                     .max()
                                     .expect("alloc: empty caller list");
-                                let dipped = if !allow_dip || homed_callee.contains(f) {
+                                let dipped = if dip == Dip::Off || homed_callee.contains(f) {
                                     None
                                 } else {
                                     sites.get(f).map(|ss| {
@@ -4122,7 +4144,7 @@ fn allocate_inner(
     // frames keep it in step 7. Any other frame keeps today's heat order:
     // its callees start at its physical end, which no permutation moves.
     let mut dipped: HashSet<String> = HashSet::new();
-    if allow_dip {
+    if dip != Dip::Off {
         for (t, ss) in &sites {
             let Some(&bt) = base.get(t) else {
                 continue;

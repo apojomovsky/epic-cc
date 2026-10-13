@@ -3996,6 +3996,58 @@ fn isr_copies_share_one_frame_when_dispatch_slots_are_dead() {
     );
 }
 
+/// epic-cc#1185: a pinned global above the overlay holds the bank
+/// high-water mark fixed, so the plain and dipped layouts tie on RAM
+/// while the dipped ISR region is smaller. The selection then takes
+/// the ISR-scoped dip: the dispatch copies share one frame, and the
+/// main-context callee keeps its caller-end base, so no main frame
+/// rebases for a span only the ISR report reads.
+#[test]
+fn isr_region_shrink_wins_a_ram_tie_without_dipping_main() {
+    let m = parse(
+        "global sink i8\n\
+         global pin i8 @0x40\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %dead0 = add i8 1, 2\n\
+             call void @work()\n\
+             ret void\n\
+         fn work(void) ()\n\
+           block entry:\n\
+             %w0 = add i8 3, 4\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             call void @dispatch_isr()\n\
+             ret void\n\
+         fn dispatch_isr(void) ()\n\
+           block entry:\n\
+             %d0 = add i8 5, 6\n\
+             call void @h1_isr()\n\
+             call void @h2_isr()\n\
+             ret void\n\
+         fn h1_isr(void) ()\n\
+           block entry:\n\
+             %h0 = add i16 7, 8\n\
+             ret void\n\
+         fn h2_isr(void) ()\n\
+           block entry:\n\
+             %h1 = add i8 9, 10\n\
+             ret void\n",
+    );
+    let out = allocate(
+        &PIC18F4550,
+        &m,
+        "edge main work\nedge isr dispatch_isr\nedge dispatch_isr h1_isr\nedge dispatch_isr h2_isr\n",
+    );
+    // The pin at 0x40 holds the high-water mark in every candidate.
+    assert_eq!(out.bank_used, vec![0x41 - 0x10]);
+    assert_eq!(out.isr_bytes, 2);
+    assert_eq!(out.locals["h1_isr::h0"], out.locals["dispatch_isr::d0"]);
+    assert_eq!(out.locals["h2_isr::h1"], out.locals["dispatch_isr::d0"]);
+    assert_ne!(out.locals["work::w0"], out.locals["main::dead0"]);
+}
+
 #[test]
 fn pic14e_drops_direct_load_slot_but_keeps_bin_slot() {
     // The add shape (epic-cc#902): `%1` reads `@in` in W, so its slot
