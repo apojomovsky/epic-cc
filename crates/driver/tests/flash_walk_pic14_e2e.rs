@@ -4,8 +4,9 @@
 //! walk wrote 'E' (0x45, the first byte) instead of the trailing '\n'. The
 //! family has no variable-index flash reader, so a const that reaches a
 //! pointer phi now keeps a RAM copy (up to 255 bytes) and the walk reads
-//! that. Over 255 bytes there is no copy and the backends refuse loudly,
-//! as they do for storing a flash address into RAM. The baseline core
+//! that. Over 255 bytes there is no copy and the backends refuse loudly.
+//! A stored flash address of a small const keeps the same kind of RAM copy
+//! (epic-cc#1223), so the slot holds a RAM address. The baseline core
 //! keeps no RAM copy and refuses at slot lookup. Shapes that never hold a
 //! flash address in a slot read through the RETLW reader and stay correct.
 
@@ -263,17 +264,29 @@ fn flash_string_walk_is_refused_on_pic_baseline() {
     );
 }
 
-/// Storing a flash address into RAM hands a later load a RAM address:
-/// the stored literal, walk, and runtime value all refuse, as on p18.
+/// Storing a small flash address into RAM keeps a RAM copy of the const, so
+/// a later load through the slot reads the literal bytes (epic-cc#1223),
+/// as on p18.
 #[test]
-fn storing_a_flash_address_is_refused_on_pic14_and_pic14e() {
+fn storing_a_flash_address_reads_ram_copy_on_pic14_and_pic14e() {
     for device in FLASH_CORES {
-        for fixture in [
+        let v = run(
+            device,
             "tests/fixtures/flash_walk_store_address_const.c",
+            &["out"],
+        );
+        assert_eq!(v, [b'P'], "{device}: constant offset into the RAM copy");
+        let v = run(
+            device,
             "tests/fixtures/flash_walk_store_address_walk.c",
+            &["out"],
+        );
+        assert_eq!(v, [b'C'], "{device}: walked pointer into the RAM copy");
+        let v = run(
+            device,
             "tests/fixtures/flash_walk_store_address_runtime.c",
-        ] {
-            expect_refusal(device, fixture, "store of a ROM address into RAM");
-        }
+            &["out"],
+        );
+        assert_eq!(v, [b'C'], "{device}: runtime offset into the RAM copy");
     }
 }

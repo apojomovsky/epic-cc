@@ -11,6 +11,25 @@
 use ir::SrcLoc;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+/// Whether the `db` bytes immediately before line `upto` (labels and
+/// blanks aside) number an odd count. The assembler packs `db` bytes with
+/// no padding, so code placed after such a run would start mid-word.
+fn data_run_is_odd(lines: &[&str], upto: usize) -> bool {
+    let mut bytes = 0usize;
+    for raw in lines[..upto].iter().rev() {
+        let t = raw.split(';').next().unwrap_or("").trim();
+        if t.is_empty() || t.ends_with(':') {
+            continue;
+        }
+        if t.len() > 3 && t[..3].eq_ignore_ascii_case("db ") {
+            bytes += t[3..].split(',').filter(|v| !v.trim().is_empty()).count();
+        } else {
+            break;
+        }
+    }
+    bytes % 2 == 1
+}
+
 /// Knobs for [`factor_with_locs`].
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -715,6 +734,9 @@ fn rewrite(
     };
     for (i, raw) in lines.iter().enumerate() {
         if Some(i) == end {
+            if !far.is_empty() && data_run_is_odd(lines, i) {
+                push("    db 0x00", None, &mut out);
+            }
             for (t, lc) in far.drain(..) {
                 push(&t, lc, &mut out);
             }
@@ -737,6 +759,9 @@ fn rewrite(
                 push(t, lc.clone(), &mut out);
             }
         }
+    }
+    if !far.is_empty() && data_run_is_odd(lines, lines.len()) {
+        push("    db 0x00", None, &mut out);
     }
     for (t, lc) in far.drain(..) {
         push(&t, lc, &mut out);

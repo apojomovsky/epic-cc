@@ -90,6 +90,54 @@ fn cross_function_bodies_use_long_calls_and_go_before_end() {
     );
 }
 
+/// A three-function program (one shared run) with `data` between
+/// `__start` and `end`, the layout isel emits for flash consts.
+fn program_with_data(data: &str) -> String {
+    let src = program(
+        &[
+            with_run("f", "NOP"),
+            with_run("g", "INCF 0x030,F,A"),
+            with_run("h", "DECF 0x031,F,A"),
+        ],
+        &["f", "g", "h"],
+    );
+    src.replace("    end\n", &format!("{data}    end\n"))
+}
+
+#[test]
+fn odd_trailing_data_is_padded_before_far_bodies() {
+    // The assembler packs `db` bytes unpadded, so a far body
+    // placed after an odd run would start mid-word and OR the last data
+    // byte into its first opcode.
+    let out = factor(
+        &program_with_data("blob:\n    db 0x01, 0x02\n    db 0x03\n"),
+        &Options::default(),
+    );
+    let pad = out.find("    db 0x00").expect("pad byte");
+    let body = out.find("__pa0:").unwrap();
+    assert!(out.find("db 0x03").unwrap() < pad && pad < body, "{out}");
+}
+
+#[test]
+fn even_trailing_data_gets_no_pad() {
+    let out = factor(
+        &program_with_data("blob:\n    db 0x01, 0x02\n"),
+        &Options::default(),
+    );
+    assert!(out.contains("__pa0:"), "{out}");
+    assert!(!out.contains("db 0x00"), "{out}");
+}
+
+#[test]
+fn odd_trailing_data_is_padded_without_end() {
+    let src = program_with_data("blob:\n    db 0x01, 0x02\n    db 0x03\n")
+        .replace("    SLEEP\n    end\n", "    SLEEP\n");
+    let out = factor(&src, &Options::default());
+    let pad = out.find("    db 0x00").expect("pad byte");
+    let body = out.find("__pa0:").unwrap();
+    assert!(out.find("db 0x03").unwrap() < pad && pad < body, "{out}");
+}
+
 #[test]
 fn local_repeats_use_rcall_and_sit_after_their_function() {
     let mut body: Vec<&str> = Vec::new();
