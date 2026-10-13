@@ -230,7 +230,41 @@ fn pooled_const_select_arms_materialize_pool_addresses() {
     // consts absent from the map to chunk addresses, for directly
     // named arms and clean GEP-derived arms alike. Production alloc
     // never sends select arms here copyless (they keep their copies);
-    // this pins the emission contract for the hand-mapped path.
+    // this pins the emission contract for the hand-mapped path. No load
+    // follows: a load through a copyless flash select holds a flash
+    // label in the slot and refuses (next test, epic-cc#1197).
+    let mut m = ir::parse(
+        "const a i8\n\
+         const b i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %c = icmp eq i8 1, 1\n\
+             %g = gep @b +0\n\
+             %s = select i1 %c, ptr %g, ptr @a\n\
+             ret void\n",
+    );
+    m.globals[0].bytes = b"a\0".to_vec();
+    m.globals[0].size = 2;
+    m.globals[1].bytes = b"b\0".to_vec();
+    m.globals[1].size = 2;
+    let set: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+    let pool = isel::build_pool(&m, &set);
+    let mut addrs = HashMap::new();
+    addrs.insert("main::c".to_string(), 0x20);
+    addrs.insert("main::s".to_string(), 0x21);
+    let asm = isel::select_with_locs(&device::PIC16F877A, &m, &addrs, &HashSet::new(), &pool).0;
+    assert!(
+        asm.contains("MOVLW LOW(__const_pool)") && asm.contains("MOVLW LOW(__const_pool+2)"),
+        "both select arms must carry pool addresses:\n{asm}"
+    );
+}
+
+/// A load through a select over copyless flash consts would read RAM at
+/// the slot's flash label. The slot is a flash walk, so it refuses loudly
+/// instead (epic-cc#1197, epic-cc#1203).
+#[test]
+#[should_panic(expected = "pointer access through flash walk")]
+fn pooled_const_select_load_refuses_flash_walk() {
     let mut m = ir::parse(
         "const a i8\n\
          const b i8\n\
@@ -252,9 +286,5 @@ fn pooled_const_select_arms_materialize_pool_addresses() {
     addrs.insert("main::c".to_string(), 0x20);
     addrs.insert("main::s".to_string(), 0x21);
     addrs.insert("main::v".to_string(), 0x23);
-    let asm = isel::select_with_locs(&device::PIC16F877A, &m, &addrs, &HashSet::new(), &pool).0;
-    assert!(
-        asm.contains("MOVLW LOW(__const_pool)") && asm.contains("MOVLW LOW(__const_pool+2)"),
-        "both select arms must carry pool addresses:\n{asm}"
-    );
+    let _ = isel::select_with_locs(&device::PIC16F877A, &m, &addrs, &HashSet::new(), &pool).0;
 }

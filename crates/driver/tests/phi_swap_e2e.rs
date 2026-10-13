@@ -2,10 +2,10 @@
 //! phis swap each iteration with one advancing through a gep over the
 //! other, so the back-edge copies form a true cycle. Each backend stages
 //! one arm through the first two retval bytes (dead at every block edge,
-//! ISR-saved) and replays it once its destination is free. Flash string
-//! literals stay p18-only on this family (variable-pointer loads read RAM
-//! at the flash address), so all three backends prove the cycle over two
-//! RAM buffers instead.
+//! ISR-saved) and replays it once its destination is free. The ticket
+//! fixtures cover both shapes: RAM buffers, and flash string literals,
+//! which keep a RAM copy on the 14-bit cores once they reach a walk phi
+//! (epic-cc#1197, epic-cc#1203).
 
 use std::process::Command;
 
@@ -65,46 +65,37 @@ fn phi_swap_ram_pointers_on_pic14() {
     assert!(halted);
 }
 
-/// The flash-string swap has no RAM base on PIC14: its walk slots hold
-/// flash addresses, which variable-pointer loads would read as RAM. The
-/// backend refuses loudly instead of miscompiling (epic-cc#1141); p18
-/// TBLRDs the same fixture.
+/// The flash-string swap on PIC14: both literals reach the walk phis, so
+/// each keeps a RAM copy and the cycle runs over RAM bytes. The values are
+/// the p18 ones (a hand trace of the six swaps gives 162 and 'D').
 #[test]
-fn phi_swap_flash_strings_refused_on_pic14() {
-    let hex_path =
-        std::env::temp_dir().join(format!("phi_swap_refused_{}.hex", std::process::id()));
-    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["--device", "p16f877a", "-o"])
-        .arg(&hex_path)
-        .arg("tests/fixtures/flash_walk_swap.c")
-        .output()
-        .expect("run driver");
-    let _ = std::fs::remove_file(&hex_path);
-    assert!(!out.status.success(), "a flash walk must fail the build");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("phi cycle over a flash address"),
-        "the error must name the flash cycle: {}",
-        String::from_utf8_lossy(&out.stderr)
+fn phi_swap_flash_strings_on_pic14() {
+    let (hex, map) = compile(
+        "p16f877a",
+        "tests/fixtures/flash_walk_swap.c",
+        "flash_pic14",
+    );
+    let (ram, halted) = run_pic14(&device::PIC16F877A, &hex);
+    assert_eq!(ram[map_addr(&map, "sum")], 162, "sum over the swap walk");
+    assert_eq!(ram[map_addr(&map, "out")], 68, "b[0] after 6 swaps is 'D'");
+    assert!(halted);
+}
+
+/// The baseline core keeps no RAM copy of the literals, so the swap never
+/// reaches the walk: lowering refuses loudly at slot lookup. This pin
+/// guards that gate: a future change that RAM-copies consts there must
+/// route walks correctly or refuse with its own message, never read RAM
+/// at a flash address silently.
+#[test]
+fn phi_swap_flash_strings_refused_on_pic_baseline() {
+    expect_refusal(
+        "p12f509",
+        "tests/fixtures/flash_walk_swap.c",
+        "no address for @.str",
     );
 }
 
-/// The flash-string swap never reaches the backend on pic14e and baseline:
-/// string literals keep no RAM address there, so lowering refuses loudly
-/// at slot lookup instead of staging flash addresses. These pins guard
-/// that gate: a future change that RAM-copies consts there must route
-/// walks correctly or refuse with its own message, never read RAM at a
-/// flash address silently.
-#[test]
-fn phi_swap_flash_strings_refused_on_pic14e() {
-    expect_refusal("p16f1937", "no address for @.str");
-}
-
-#[test]
-fn phi_swap_flash_strings_refused_on_pic_baseline() {
-    expect_refusal("p12f509", "no address for @.str");
-}
-
-fn expect_refusal(device: &str, needle: &str) {
+fn expect_refusal(device: &str, fixture: &str, needle: &str) {
     let hex_path = std::env::temp_dir().join(format!(
         "phi_swap_refused_{device}_{}.hex",
         std::process::id()
@@ -112,14 +103,14 @@ fn expect_refusal(device: &str, needle: &str) {
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["--device", device, "-o"])
         .arg(&hex_path)
-        .arg("tests/fixtures/flash_walk_swap.c")
+        .arg(fixture)
         .output()
         .expect("run driver");
     let _ = std::fs::remove_file(&hex_path);
     assert!(!out.status.success(), "a flash walk must fail the build");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(needle),
-        "the error must name the missing address: {}",
+        "the error must contain {needle:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -146,6 +137,20 @@ fn phi_swap_ram_pointers_on_pic14e() {
         76,
         "b[0] after 6 swaps must be 'L'"
     );
+    assert!(halted);
+}
+
+/// Same flash-string swap on PIC14E: the literals keep a RAM copy there too.
+#[test]
+fn phi_swap_flash_strings_on_pic14e() {
+    let (hex, map) = compile(
+        "p16f1937",
+        "tests/fixtures/flash_walk_swap.c",
+        "flash_pic14e",
+    );
+    let (ram, halted) = run_pic14e(&hex);
+    assert_eq!(ram[map_addr(&map, "sum")], 162, "sum over the swap walk");
+    assert_eq!(ram[map_addr(&map, "out")], 68, "b[0] after 6 swaps is 'D'");
     assert!(halted);
 }
 
