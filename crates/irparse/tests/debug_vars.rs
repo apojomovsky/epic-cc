@@ -159,3 +159,71 @@ fn globals_resolve_names_and_types() {
     let buf = v.globals.iter().find(|g| g.name == "buf").unwrap();
     assert_eq!(v.type_string(buf.ty), "int[4]");
 }
+
+/// `volatile int arr[4]` as clang 20.1.8 emits it after SROA split the
+/// alloca: one `#dbg_assign` per surviving piece, the unused tail a
+/// fragment on `ptr undef`. `e` carries the records that must not
+/// become pieces.
+const SPLIT_MODULE: &str = r#"
+define dso_local i16 @main() local_unnamed_addr #1 !dbg !30 {
+  %1 = alloca i16, align 2, !DIAssignID !39
+    #dbg_assign(i1 undef, !34, !DIExpression(DW_OP_LLVM_fragment, 0, 16), !39, ptr %1, !DIExpression(), !40)
+  %2 = alloca i16, align 2, !DIAssignID !41
+    #dbg_assign(i1 undef, !34, !DIExpression(DW_OP_LLVM_fragment, 16, 16), !41, ptr %2, !DIExpression(), !40)
+    #dbg_assign(i1 undef, !34, !DIExpression(DW_OP_LLVM_fragment, 32, 32), !42, ptr undef, !DIExpression(), !40)
+  %4 = load volatile i16, ptr %1, align 2
+    #dbg_assign(i16 %4, !34, !DIExpression(DW_OP_LLVM_fragment, 16, 16), !58, ptr %2, !DIExpression(), !40)
+    #dbg_value(i16 %4, !50, !DIExpression(DW_OP_LLVM_fragment, 0, 16), !40)
+    #dbg_value(i16 %2, !50, !DIExpression(DW_OP_LLVM_fragment, 8, 16), !40)
+    #dbg_value(i16 %2, !50, !DIExpression(DW_OP_LLVM_fragment, 16, 4), !40)
+    #dbg_value(i16 %4, !50, !DIExpression(DW_OP_plus_uconst, 2, DW_OP_stack_value, DW_OP_LLVM_fragment, 16, 16), !40)
+    #dbg_assign(i16 %4, !51, !DIExpression(), !59, ptr %1, !DIExpression(), !40)
+  ret i16 0
+}
+!30 = distinct !DISubprogram(name: "main", scope: !3, file: !3, line: 15, type: !31, scopeLine: 15, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !2)
+!34 = !DILocalVariable(name: "arr", scope: !30, file: !3, line: 16, type: !35)
+!35 = !DICompositeType(tag: DW_TAG_array_type, baseType: !36, size: 64, elements: !37)
+!36 = !DIDerivedType(tag: DW_TAG_volatile_type, baseType: !6)
+!37 = !{!38}
+!38 = !DISubrange(count: 4)
+!6 = !DIBasicType(name: "int", size: 16, encoding: DW_ATE_signed)
+!50 = !DILocalVariable(name: "e", scope: !30, file: !3, line: 17, type: !6)
+!51 = !DILocalVariable(name: "w", scope: !30, file: !3, line: 18, type: !6)
+"#;
+
+#[test]
+fn sroa_split_array_keeps_each_fragment_as_a_piece() {
+    let v = parse_debug_vars(SPLIT_MODULE);
+    let arr = local_named(&v, "arr", "main");
+    let pieces: Vec<_> = arr
+        .pieces
+        .iter()
+        .map(|p| (p.offset, p.size, p.ssa.as_str()))
+        .collect();
+    // The `ptr undef` tail names no storage; the later record naming the
+    // stored value `%4` for bytes 2..4 must not displace the address `%2`.
+    assert_eq!(pieces, vec![(0, 2, "1"), (2, 2, "2")]);
+    assert_eq!(arr.ssa, None);
+    assert_eq!(v.type_size(arr.ty), Some(8));
+}
+
+#[test]
+fn fragments_that_are_not_plain_storage_are_dropped() {
+    let v = parse_debug_vars(SPLIT_MODULE);
+    let e = local_named(&v, "e", "main");
+    // Bytes 0..2 win over the overlapping 1..3 fragment; the 4-bit
+    // fragment has no byte range; the computed-value fragment is not
+    // the piece's storage.
+    let pieces: Vec<_> = e
+        .pieces
+        .iter()
+        .map(|p| (p.offset, p.size, p.ssa.as_str()))
+        .collect();
+    assert_eq!(pieces, vec![(0, 2, "4")]);
+}
+
+#[test]
+fn dbg_assign_address_beats_the_stored_value() {
+    let v = parse_debug_vars(SPLIT_MODULE);
+    assert_eq!(local_named(&v, "w", "main").ssa.as_deref(), Some("1"));
+}

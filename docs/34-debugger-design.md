@@ -43,6 +43,13 @@ frame-base computation, register-relative DWARF location expressions
 (`DW_OP_fbreg`, `DW_OP_call_frame_cfa`). Every location this project ever
 needs to express is `DW_OP_addr(constant)`, the simplest form DWARF has.
 
+One refinement: SROA can split a local aggregate into several allocas, which
+the allocator colors independently, so no single address reaches every
+element. Such a local is a chain of `DW_OP_addr(constant)` +
+`DW_OP_piece` (an empty piece for bytes with no storage), one piece per
+`DW_OP_LLVM_fragment` record; the textual `--var-table` gives each piece
+its own `; bytes OFFSET+LEN` record. Still constants only (epic-cc#1242).
+
 The driver already produces half of the variable-debug-info problem for
 free: `--map` (`crates/driver/src/report.rs:map_text`) emits `global <name>
 0xNN` / `local {func}::{name} 0xNN` today, for exactly this reason.
