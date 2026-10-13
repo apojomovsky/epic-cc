@@ -263,6 +263,27 @@ fn banked_ptr_c_runs_correctly() {
     assert!(p.halted());
 }
 
+/// epic-cc#1237: `arrB3[arrB2[2]] = 0x40` stores a constant, so it cannot
+/// take the `PLUSW0` lowering (`W` carries both index and data) and adds
+/// the whole zext index into `FSR0`. The narrowing scan used to count the
+/// access as a lane-0-only read: the zext skipped its high-byte clear and
+/// the add read whatever the slot held. `touch` leaves a nonzero byte
+/// there, which turned the store into a write 0x100 bytes off.
+#[test]
+fn banked_ptr_const_store_clears_zext_high_lane() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/banked_ptr_stale_hi.c"
+    ));
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0xB8,
+        "out == hand-computed 0xB8 (touch only writes arrB3[1], never read)"
+    );
+    assert!(p.halted());
+}
+
 #[test]
 fn struct_global_index_c_runs_correctly() {
     // epic-cc#468: struct copy into a runtime-indexed global array

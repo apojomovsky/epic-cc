@@ -1281,3 +1281,144 @@ fn flash_walk_refusal_names_the_slot_and_the_kind() {
     assert!(iselcore::flash_walk_refusal(&walks, "main", "r", "1203").is_none());
     assert!(iselcore::flash_walk_refusal(&walks, "other", "p", "1203").is_none());
 }
+
+/// A branch-absorbed compare and the loads feeding it need no slot
+/// (epic-cc#862): the lowering branches straight to the exits and reads
+/// the sources in place.
+#[test]
+fn fused_compare_drops_icmp_and_operand_loads() {
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %2 = icmp eq i8 %1, 0\n\
+             br i1 %2 t f\n\
+           block t:\n\
+             store i8 1 @out\n\
+             ret void\n\
+           block f:\n\
+             store i8 2 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let regs = iselcore::fused_compare_regs(&m.funcs[0], &m, &r, &std::collections::HashMap::new());
+    assert!(regs.contains("2"), "icmp result needs no slot: {regs:?}");
+    assert!(regs.contains("1"), "operand load reads in place: {regs:?}");
+}
+
+/// A compare read anywhere besides its branch materializes (epic-cc#862).
+#[test]
+fn twice_used_compare_keeps_its_slot() {
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         global out2 i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %2 = icmp eq i8 %1, 0\n\
+             br i1 %2 t f\n\
+           block t:\n\
+             store i8 %2 @out\n\
+             ret void\n\
+           block f:\n\
+             store i8 2 @out2\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let regs = iselcore::fused_compare_regs(&m.funcs[0], &m, &r, &std::collections::HashMap::new());
+    assert!(!regs.contains("2"), "second use keeps the slot: {regs:?}");
+}
+
+/// Signed chains read slot addresses, so the alloc view declines them
+/// (epic-cc#862): `fused_compare_regs` answers `signed_ok = false`.
+#[test]
+fn signed_compare_keeps_its_slot_for_alloc() {
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %2 = icmp slt i8 %1, 0\n\
+             br i1 %2 t f\n\
+           block t:\n\
+             store i8 1 @out\n\
+             ret void\n\
+           block f:\n\
+             store i8 2 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let regs = iselcore::fused_compare_regs(&m.funcs[0], &m, &r, &std::collections::HashMap::new());
+    assert!(regs.is_empty(), "signed compare stays placed: {regs:?}");
+}
+
+/// A one-byte all-const phi consumed only by the merge store threads W
+/// (epic-cc#862): edges emit `MOVLW`, the store one `MOVWF`.
+#[test]
+fn const_phi_into_store_needs_no_slot() {
+    let m = parse(
+        "global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br t\n\
+           block t:\n\
+             br merge\n\
+           block f:\n\
+             br merge\n\
+           block merge:\n\
+             %p = phi i8 10 t 11 f\n\
+             store i8 %p @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let regs = iselcore::const_w_phi_regs(&m.funcs[0], &m, &r, &std::collections::HashMap::new());
+    assert!(regs.contains("p"), "const phi threads W: {regs:?}");
+}
+
+/// A register incoming breaks the W thread (epic-cc#862).
+#[test]
+fn phi_with_reg_incoming_keeps_its_slot() {
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = load i8 @in\n\
+             br t\n\
+           block t:\n\
+             br merge\n\
+           block f:\n\
+             br merge\n\
+           block merge:\n\
+             %p = phi i8 10 t %x f\n\
+             store i8 %p @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let regs = iselcore::const_w_phi_regs(&m.funcs[0], &m, &r, &std::collections::HashMap::new());
+    assert!(!regs.contains("p"), "reg incoming stages: {regs:?}");
+}
+
+/// A two-constant select consumed by the next-inst store threads W too
+/// (epic-cc#862).
+#[test]
+fn const_select_into_store_needs_no_slot() {
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %2 = icmp ne i8 %1, 0\n\
+             %3 = select i1 %2 i8 10 i8 20\n\
+             store i8 %3 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let regs = iselcore::const_w_phi_regs(&m.funcs[0], &m, &r, &std::collections::HashMap::new());
+    assert!(regs.contains("3"), "const select threads W: {regs:?}");
+}
