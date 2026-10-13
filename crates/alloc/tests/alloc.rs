@@ -3997,9 +3997,9 @@ fn isr_copies_share_one_frame_when_dispatch_slots_are_dead() {
 }
 
 /// epic-cc#1185: a pinned global above the overlay holds the bank
-/// high-water mark fixed, so the plain and dipped layouts tie on RAM
-/// while the dipped ISR region is smaller. The selection then takes
-/// the ISR-scoped dip: the dispatch copies share one frame, and the
+/// high-water mark fixed, so the plain and ISR-scoped layouts tie on RAM
+/// while the ISR-scoped region is smaller. The region-aware tiebreak
+/// then adopts that scope: the dispatch copies share one frame, and the
 /// main-context callee keeps its caller-end base, so no main frame
 /// rebases for a span only the ISR report reads.
 #[test]
@@ -4045,7 +4045,9 @@ fn isr_region_shrink_wins_a_ram_tie_without_dipping_main() {
     assert_eq!(out.isr_bytes, 2);
     assert_eq!(out.locals["h1_isr::h0"], out.locals["dispatch_isr::d0"]);
     assert_eq!(out.locals["h2_isr::h1"], out.locals["dispatch_isr::d0"]);
-    assert_ne!(out.locals["work::w0"], out.locals["main::dead0"]);
+    // work keeps its caller-end base: the ISR-scoped dip never reaches a
+    // main-context frame, so the dead slot above it is not reused.
+    assert_eq!(out.locals["work::w0"], out.locals["main::dead0"] + 1);
 }
 
 #[test]

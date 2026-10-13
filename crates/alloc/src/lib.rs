@@ -2576,8 +2576,12 @@ pub fn allocate_with_pool(
 
 /// Which call sites admit the per-site live-high dip (epic-cc#855):
 /// nowhere, inside the ISR contexts only, or everywhere. The ISR-only
-/// scope folds the dispatch fan-out without rebasing main-context
-/// frames, whose dip the region span never reports.
+/// scope folds the dispatch fan-out, and cannot rebase a main-context
+/// frame: every ISR context is re-derived from a base above the whole
+/// main context (the disjoint-region rule), so no main caller's frame
+/// end can exceed an ISR copy's base, and the step-7 `dipped` set stays
+/// empty for main frames. Main-context dips only ever land through the
+/// everywhere scope, which the region-aware selection weighs directly.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dip {
     Off,
