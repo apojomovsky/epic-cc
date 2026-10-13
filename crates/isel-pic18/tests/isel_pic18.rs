@@ -1313,7 +1313,17 @@ fn inline_u16_call_emits_three_partials_under_the_speed_profile() {
         sdiv_prescale: false,
         inline_mul16: true,
     };
-    let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+    let asm = isel_pic18::select_with_opts(
+        &PIC18F4550,
+        &m,
+        &addrs,
+        None,
+        None,
+        None,
+        opts,
+        &HashMap::new(),
+    )
+    .0;
     assert!(
         !asm.contains("CALL __mul_u16"),
         "no call on the inline path:\n{asm}"
@@ -1355,7 +1365,17 @@ fn inline_u16_with_a_banked_operand_keeps_the_call() {
         sdiv_prescale: false,
         inline_mul16: true,
     };
-    let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+    let asm = isel_pic18::select_with_opts(
+        &PIC18F4550,
+        &m,
+        &addrs,
+        None,
+        None,
+        None,
+        opts,
+        &HashMap::new(),
+    )
+    .0;
     assert!(
         asm.contains("CALL __mul_u16"),
         "banked site keeps the call:\n{asm}"
@@ -1407,7 +1427,17 @@ fn udivmod_u16_recipe_spills_remainder_and_returns_quotient() {
             sdiv_prescale: false,
             inline_mul16: false,
         };
-        let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+        let asm = isel_pic18::select_with_opts(
+            &PIC18F4550,
+            &m,
+            &addrs,
+            None,
+            None,
+            None,
+            opts,
+            &HashMap::new(),
+        )
+        .0;
         assert_eq!(
             asm.matches("RLCF").count(),
             4,
@@ -1569,7 +1599,17 @@ fn sdiv_prescale_routines_simulate_signed_halves() {
             sdiv_prescale: true,
             inline_mul16: false,
         };
-        let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+        let asm = isel_pic18::select_with_opts(
+            &PIC18F4550,
+            &m,
+            &addrs,
+            None,
+            None,
+            None,
+            opts,
+            &HashMap::new(),
+        )
+        .0;
         assert!(
             asm.contains("    BZ tmp"),
             "{name} must carry the prescale den check:\n{asm}"
@@ -4238,7 +4278,17 @@ fn speed_profile_drains_long_copy_runs_straight() {
         sdiv_prescale: false,
         inline_mul16: false,
     };
-    let asm = isel_pic18::select_with_opts(&PIC18F4550, &m, &addrs, None, None, None, opts).0;
+    let asm = isel_pic18::select_with_opts(
+        &PIC18F4550,
+        &m,
+        &addrs,
+        None,
+        None,
+        None,
+        opts,
+        &HashMap::new(),
+    )
+    .0;
     for i in 0..12u16 {
         let expect = format!("MOVFF 0x{:03X}, 0x{:03X}", 0x100 + i, 0x110 + i);
         let expect_nospace = format!("MOVFF 0x{:03X},0x{:03X}", 0x100 + i, 0x110 + i);
@@ -4758,6 +4808,7 @@ fn speed_profile_unrolls_short_const_memcpy_only() {
         None,
         None,
         opts,
+        &HashMap::new(),
     )
     .0;
     assert_eq!(
@@ -4801,6 +4852,7 @@ fn speed_profile_unrolls_short_const_memcpy_only() {
         None,
         None,
         opts,
+        &HashMap::new(),
     )
     .0;
     assert_eq!(

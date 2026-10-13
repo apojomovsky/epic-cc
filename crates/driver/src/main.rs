@@ -603,6 +603,7 @@ fn main() {
                 layout.isr_save,
                 layout.isr_hi_save,
                 opts,
+                &layout.packed_bits,
             )
         }
         device::Core::Pic14e => {
