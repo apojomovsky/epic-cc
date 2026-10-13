@@ -3826,6 +3826,93 @@ fn byte_index_zext_and_add_keep_only_the_low_lane() {
 }
 
 #[test]
+fn byte_index_const_store_keeps_the_zext_high_lane() {
+    // A literal stored through `ram[e]` cannot use `PLUSW0` (`W` is both
+    // index and data), so the access adds the whole 16-bit index into
+    // `FSR0`. The zext must therefore fill its high lane: a stale byte
+    // there moved the write 0x100 per unit (epic-cc#1237).
+    let m = parse(
+        "global ram i64\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %e = zext i8 %i to i16\n\
+             %p = gep @ram +0 +1*%e\n\
+             store i8 64 %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x130),
+        ("main::i", 0x132),
+        ("main::e", 0x133),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains("CLRF"),
+        "full-width index add needs the zext high fill:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..8u8 {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        for b in 0..8u8 {
+            p.ram_mut()[0x120 + b as usize] = 0;
+        }
+        p.ram_mut()[0x130] = x;
+        p.ram_mut()[0x134] = 1;
+        p.run(200);
+        assert!(p.halted());
+        for b in 0..8u8 {
+            assert_eq!(
+                p.ram()[0x120 + b as usize],
+                if b == x { 64 } else { 0 },
+                "const store at index {x} touches only lane {x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn byte_index_register_store_still_drops_the_zext_high_lane() {
+    // The same shape with a register value stores through `PLUSW0`,
+    // which reads lane 0 only, so the narrowing stays (epic-cc#968).
+    let m = parse(
+        "global ram i64\n\
+         global idx i8\n\
+         global val i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %v = load i8 @val\n\
+             %e = zext i8 %i to i16\n\
+             %p = gep @ram +0 +1*%e\n\
+             store i8 %v %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x130),
+        ("val", 0x131),
+        ("main::i", 0x132),
+        ("main::v", 0x133),
+        ("main::e", 0x134),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.contains(", 0xFEB"),
+        "register store goes through PLUSW0:\n{asm}"
+    );
+    assert!(
+        !main_asm.contains("CLRF"),
+        "PLUSW0 reads lane 0 only, so the high fill is dead:\n{asm}"
+    );
+}
+
+#[test]
 fn branch_on_computed_byte_skips_the_reload() {
     // `if (a & 3)`: the `ANDWF,W` already sets `Z` from the result
     // byte, and the `MOVWF` into the result slot preserves it, so the
