@@ -934,6 +934,33 @@ define internal void @shared(i16 noundef %0) #0 {
     }
 
     #[test]
+    fn always_inline_finds_a_constant_arg_indexing_in_expression_form() {
+        // clang emits the constant-expression form (operands parenthesised)
+        // when the GEP is an operand of another instruction.
+        let ll = "\
+@table = internal constant [16 x i8] zeroinitializer
+define internal void @a() #0 {
+  tail call void @shared(i16 noundef 4)
+  ret void
+}
+define internal void @b() #0 {
+  tail call void @shared(i16 noundef 9)
+  ret void
+}
+define internal void @shared(i16 noundef %0) #0 {
+  %1 = call i8 @use(ptr getelementptr inbounds ([16 x i8], ptr @table, i16 0, i16 %0))
+  ret void
+}
+declare i8 @use(ptr)
+";
+        assert_eq!(
+            always_inline_candidates(ll, false),
+            vec!["shared".to_string()],
+            "the parenthesised form must parse to the same base and index operands"
+        );
+    }
+
+    #[test]
     fn always_inline_leaves_a_constant_merely_mentioned_on_a_gep_line() {
         let ll = "\
 @table = internal constant [16 x i8] zeroinitializer
