@@ -28,8 +28,9 @@ use ir::{BinOp, Global, Inst, Module, Placed, Store, Ty, Val};
 use std::collections::HashMap;
 
 /// Registers whose byte write differs from a bit op (indirect access,
-/// program counter, flag-bearing status).
-const EXCLUDED: [u16; 3] = [0x00, 0x02, 0x03];
+/// program counter, flag-bearing status, FSR, PCLATH), with the bank-1
+/// aliases of INDF, PCL and STATUS.
+const EXCLUDED: [u16; 8] = [0x00, 0x02, 0x03, 0x04, 0x0A, 0x80, 0x82, 0x83];
 
 pub fn run(m: &mut Module, core: Core) {
     if !matches!(core, Core::Pic14) {
@@ -214,9 +215,9 @@ mod tests {
     #[test]
     fn status_and_mismatched_addresses_stay() {
         let mut m = module(
-            "  %1 = load volatile i8, ptr inttoptr (i16 3 to ptr), align 2\n  %2 = or i8 %1, 2\n  store volatile i8 %2, ptr inttoptr (i16 3 to ptr), align 2\n  %3 = load volatile i8, ptr inttoptr (i16 6 to ptr), align 2\n  %4 = or i8 %3, 2\n  store volatile i8 %4, ptr inttoptr (i16 7 to ptr), align 2",
+            "  %1 = load volatile i8, ptr inttoptr (i16 131 to ptr), align 2\n  %2 = or i8 %1, 32\n  store volatile i8 %2, ptr inttoptr (i16 131 to ptr), align 2\n  %5 = load volatile i8, ptr inttoptr (i16 3 to ptr), align 2\n  %6 = or i8 %5, 2\n  store volatile i8 %6, ptr inttoptr (i16 3 to ptr), align 2\n  %3 = load volatile i8, ptr inttoptr (i16 6 to ptr), align 2\n  %4 = or i8 %3, 2\n  store volatile i8 %4, ptr inttoptr (i16 7 to ptr), align 2",
         );
         run(&mut m, Core::Pic14);
-        assert_eq!(count_stores(&m), (0, 2));
+        assert_eq!(count_stores(&m), (0, 3));
     }
 }
