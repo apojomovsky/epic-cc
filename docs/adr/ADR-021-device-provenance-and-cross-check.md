@@ -37,8 +37,9 @@
   map cited in its `[provenance]` (pack, ini path, ini sha256, datasheet
   document and section). The RAM half uses a record only when gputils ships
   no `.lkr`, the flash half only when `gpasm -p` rejects the name; a part
-  where the halves disagree fails loudly as a broken install. The compared
-  fields are `flash_words`, `ram_banks`, `common_ram`, `access_bank` and
+  where the halves disagree fails loudly as a broken install. The SFR header
+  check is skipped the same way when gputils ships no header for the part.
+  The compared fields are `flash_words`, `ram_banks`, `common_ram`, `access_bank` and
   the ISR carves (`isr_w_shadow`, `isr_home_window`), all exactly, and the
   gate reports the record stale once gputils learns the part. A newer
   gputils was measured and rejected: upstream trunk has no 16F13145
