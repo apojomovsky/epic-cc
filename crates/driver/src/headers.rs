@@ -43,12 +43,7 @@ pub fn pic_header(device: &Device) -> Option<String> {
         emit_register(&mut out, sfr, &taken);
     }
     emit_aliases(&mut out, device);
-    out.push_str("\n#ifndef NO_BIT_DEFINES\n");
-    out.push_str("/* Bare bit names (RB0) stay out: object-like macros expand after\n");
-    out.push_str(" * `.`, so `#define RB0 ...` breaks `PORTBbits.RB0` (epic-cc#707).\n");
-    out.push_str(" * They return with a real bit entity; keep passing NO_BIT_DEFINES\n");
-    out.push_str(" * to ignore that future spelling. */\n");
-    out.push_str("#endif /* NO_BIT_DEFINES */\n");
+    emit_bare_bits(&mut out, device, &taken);
     out.push_str(&format!("\n#endif /* PIC{}_H */\n", stem.to_uppercase()));
     Some(out)
 }
@@ -142,6 +137,52 @@ fn emit_aliases(out: &mut String, device: &Device) {
             }
         }
     }
+}
+/// Bare bit declarations (`GIE = 1`, epic-cc#707): one `extern volatile`
+/// entity per single-bit field, placed by a section the backend reads.
+/// Macros cannot do this (they expand after `.`, #688); multi-bit fields
+/// and taken names get no declaration. PIC14 only until the PIC18 lane
+/// settles its shared-name rule; other cores keep the empty guard.
+fn emit_bare_bits(out: &mut String, device: &Device, taken: &HashSet<String>) {
+    out.push_str("\n#ifndef NO_BIT_DEFINES\n");
+    if device.core != device::Core::Pic14 {
+        out.push_str("/* Bare bit names stay out on this core (epic-cc#707). */\n");
+        out.push_str("#endif /* NO_BIT_DEFINES */\n");
+        return;
+    }
+    out.push_str("/* Bare bit names as real entities: the section binds\n");
+    out.push_str(" * (register, bit) in the backend; `-DNO_BIT_DEFINES`\n");
+    out.push_str(" * keeps the old spelling out. */\n");
+    out.push_str("#ifdef __cplusplus\n#define __epic_bit_t bool\n#else\n#define __epic_bit_t _Bool\n#endif\n");
+    let mut bound: std::collections::HashMap<&str, (u16, u8)> = std::collections::HashMap::new();
+    for sfr in device.sfrs {
+        if sfr.width != 1 {
+            continue;
+        }
+        for f in sfr.fields {
+            if f.mask.count_ones() != 1 || taken.contains(f.name) {
+                continue;
+            }
+            let bit = f.mask.trailing_zeros() as u8;
+            match bound.get(f.name) {
+                Some(prev) if *prev != (sfr.addr, bit) => panic!(
+                    "headers: bare bit {} binds two sites on {}",
+                    f.name, device.name
+                ),
+                Some(_) => continue,
+                None => {
+                    bound.insert(f.name, (sfr.addr, bit));
+                }
+            }
+            out.push_str(&format!(
+                "extern volatile __epic_bit_t {n} __attribute__((section(\".epic.bit.{a:#X}.{b}\")));\n",
+                n = f.name,
+                a = sfr.addr,
+                b = bit,
+            ));
+        }
+    }
+    out.push_str("#endif /* NO_BIT_DEFINES */\n");
 }
 
 /// The real `<xc.h>`: picks the generated per-device header by part macro,
@@ -273,12 +314,39 @@ mod tests {
     }
 
     #[test]
-    fn bare_bits_stay_out_until_a_real_bit_entity_lands() {
+    fn bare_bits_land_as_section_placed_entities() {
         let h = pic_header(dev("p16f877a")).unwrap();
         assert!(h.contains("#ifndef NO_BIT_DEFINES"));
         assert!(
+            h.contains(
+                "extern volatile __epic_bit_t GIE __attribute__((section(\".epic.bit.0xB.7\")));"
+            ),
+            "GIE binds INTCON bit 7 through the backend-read section"
+        );
+        assert!(
+            h.contains(
+                "extern volatile __epic_bit_t RB0 __attribute__((section(\".epic.bit.0x6.0\")));"
+            ),
+            "RB0 binds PORTB bit 0"
+        );
+        assert!(
             !h.contains("#define RB0 PORTBbits"),
             "macros expand after `.`"
+        );
+        assert!(
+            !h.contains("extern volatile __epic_bit_t T1CKPS "),
+            "multi-bit fields get no bare name (T1CKPS0 stays)"
+        );
+        assert!(h.contains("#define __epic_bit_t _Bool"), "C entity");
+        assert!(h.contains("#define __epic_bit_t bool"), "C++ entity");
+    }
+    #[test]
+    fn pic18_keeps_the_empty_bit_guard() {
+        let h = pic_header(dev("p18f4550")).unwrap();
+        assert!(h.contains("#ifndef NO_BIT_DEFINES"));
+        assert!(
+            !h.contains("extern volatile __epic_bit_t"),
+            "shared names wait for the PIC18 binding rule"
         );
     }
     #[test]

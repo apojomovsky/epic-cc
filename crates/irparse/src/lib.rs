@@ -2893,11 +2893,55 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                 continue;
             }
             let after = line[eq + 1..].trim();
-            // A bare `external` declaration names a symbol no TU defined
-            // (llvm-link leaves it in place). It carries no bytes, so it
-            // is not a definition: skip it and let wholeprog report any
-            // use of it as an undefined symbol (epic-cc#909).
+            // A bare-bit declaration carries its placement in the section
+            // name (`extern volatile _Bool GIE` with
+            // `.epic.bit.0x0B.7`, epic-cc#707). No TU defines it, so it
+            // must be retained here: downstream resolves every use by
+            // name, and wholeprog would otherwise report it undefined.
             if after.starts_with("external ") {
+                if let Some(i) = line.find("section \".epic.bit.") {
+                    let rest = &line[i + "section \".epic.bit.".len()..];
+                    let sec = rest.split('"').next().unwrap_or("");
+                    let (a, b) = sec.split_once('.').unwrap_or_else(|| {
+                        panic!("irparse: bad .epic.bit section {sec:?} on @{name}")
+                    });
+                    let byte =
+                        u16::from_str_radix(a.trim_start_matches("0x"), 16).unwrap_or_else(|_| {
+                            panic!("irparse: bad .epic.bit address {a:?} on @{name}")
+                        });
+                    let bit: u8 = b.parse().unwrap_or_else(|_| {
+                        panic!("irparse: bad .epic.bit number {b:?} on @{name}")
+                    });
+                    assert!(
+                        bit < 8,
+                        "irparse: bit entity @{name} names bit {bit}, want 0-7"
+                    );
+                    let kind_at = after.find("global ").or_else(|| after.find("constant "));
+                    let ty_str = kind_at
+                        .map(|k| {
+                            let rest = after[k..].split_whitespace().nth(1).unwrap_or("");
+                            rest.trim_end_matches(',').to_string()
+                        })
+                        .unwrap_or_default();
+                    let ty = ty_of(&ty_str, None);
+                    assert!(
+                        ty == Ty::I8,
+                        "irparse: bit entity @{name} must be i8 (_Bool), found {ty_str:?}"
+                    );
+                    globals.push(Global {
+                        name,
+                        ty,
+                        is_const: false,
+                        size: 1,
+                        bytes: Vec::new(),
+                        refs: Vec::new(),
+                        addr: Some(ir::Placed {
+                            byte,
+                            bit: Some(bit),
+                        }),
+                        internal: false,
+                    });
+                }
                 continue;
             }
             // Linkage rides ahead of the kind keyword (`@g = internal
@@ -3084,7 +3128,8 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                     u16::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or_else(|_| {
                         panic!("irparse: bad EPIC_AT address {hex:?} on @{name}")
                     })
-                });
+                })
+                .map(|byte| ir::Placed { byte, bit: None });
             globals.push(Global {
                 name,
                 ty,
