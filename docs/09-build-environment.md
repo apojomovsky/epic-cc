@@ -150,10 +150,11 @@ flags and profile as every other build, so there is no separate cache to
 poison, and cargo replays cached warnings on a fresh build, so the gate
 still fires when the units are already compiled (#889). Under the default
 mount both serialize through the same `.build.lock` (an explicit
-`TARGET_CACHE_MOUNT` override moves the Makefile side to its own dir and
-lock, so keep the hook on the default when overriding); a commit during
-`make test` queues instead of racing it. `make shell` holds the lock for
-its whole session, and the hook says so instead of waiting silently.
+`TARGET_CACHE_MOUNT` override names a base that the Makefile suffixes with
+the worktree key, so two worktrees sharing one base still land in distinct
+dirs with distinct locks; keep the hook on the default when overriding).
+A commit during `make test` queues instead of racing it. `make shell` holds
+the lock for its whole session, and the hook says so instead of waiting silently.
 
 Caches are never pruned automatically, and removing a worktree does not
 remove its cache (the caches live outside the repo). To reclaim the space of
