@@ -1,5 +1,5 @@
 //! HAL PIC18 slice acceptance (epic-cc#75): the vendored
-//! `pic16f88x-hal`-analog pic18fxx5x-hal blink and epic-tick programs,
+//! `hal/pic14/16f88x`-analog hal/pic18/18fxx5x blink and epic-tick programs,
 //! compiled through the real `epic-cc` binary (`--target 18F4550`, the
 //! config-word TU exercising CC-3) and run on the `Pic18` simulator.
 //!

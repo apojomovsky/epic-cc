@@ -1,4 +1,4 @@
-/* Vendored slice of the real epic-hal pic18fxx5x-hal GPIO driver for the
+/* Vendored slice of the real epic-hal hal/pic18/18fxx5x GPIO driver for the
  * PIC18F4550 (DS39632E §10.0), adapted to compile under epic-cc. Reduced
  * to the blink surface: RB0 as an output, toggled through the LATx latch.
  *

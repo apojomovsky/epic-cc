@@ -1,4 +1,4 @@
-/* Vendored slice of the real epic-hal epic-tick module, the 1 ms timebase
+/* Vendored slice of the real epic-hal lib/tick module, the 1 ms timebase
  * on Timer2, adapted to compile under epic-cc. The real target driver
  * advances `g_tick_ms` from a Timer2 overflow callback invoked through a
  * function pointer (open epic-cc#73); under epic-cc the tick advances

@@ -19,8 +19,8 @@
 and the two ship together as a fully open-source 8-bit PIC ecosystem, reachable from
 PlatformIO and from a one-line installer that touches nothing on Microchip's servers.
 
-**Definition of done:** every `epic-*` module and `pic16f87xa-hal`, `pic16f88x-hal` and
-`pic18fxx5x-hal` build and pass their gates under epic-cc, per module, on all three families.
+**Definition of done:** every `epic-*` module and `hal/pic14/16f87xa`, `hal/pic14/16f88x` and
+`hal/pic18/18fxx5x` build and pass their gates under epic-cc, per module, on all three families.
 `pic16f193x-hal` (enhanced mid-range) is **deferred**: epic-cc has no backend for that core,
 and adding one is a separate decision the user intends to revisit.
 
@@ -68,8 +68,8 @@ silicon," and that is where the work is.
 
 ### D-1: Parity means three families, per module
 
-**Decision, amended 2026-08-24.** Every `epic-*` module, on `pic16f87xa-hal`,
-`pic16f88x-hal` and `pic18fxx5x-hal`. `pic16f193x-hal` is deferred.
+**Decision, amended 2026-08-24.** Every `epic-*` module, on `hal/pic14/16f87xa`,
+`hal/pic14/16f88x` and `hal/pic18/18fxx5x`. `pic16f193x-hal` is deferred.
 
 **Rationale.** epic-cc's device registry holds `p16f877a`, `p16f887` and `p18f4550`
 (`crates/device/devices/`), which line up exactly with those three HAL families.
@@ -667,7 +667,7 @@ PIC18 family parity but nothing on the PIC14 path.
 
 ### Chosen order: PIC14 first as the pathfinder
 
-`CC-1` .. `CC-4`, then `HAL-1` .. `HAL-4` against `pic16f87xa-hal`, then `CC-5`, then PIC18
+`CC-1` .. `CC-4`, then `HAL-1` .. `HAL-4` against `hal/pic14/16f87xa`, then `CC-5`, then PIC18
 integration along the proven path, then `HAL-5` and the PlatformIO repo.
 
 **Why.** epic-cc's PIC14 backend is already feature-complete: interrupts, `long`, soft-float,

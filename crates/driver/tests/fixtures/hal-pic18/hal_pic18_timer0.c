@@ -1,4 +1,4 @@
-/* Vendored slice of the real epic-hal pic18fxx5x-hal Timer0 driver
+/* Vendored slice of the real epic-hal hal/pic18/18fxx5x Timer0 driver
  * (DS39632E §11.0), adapted to compile under epic-cc. Reduced to the
  * blink surface: 8-bit mode, internal Fosc/4, 1:256 prescaler, reload 0.
  * The ISR clears TMR0IF; the overflow callback is not invoked under

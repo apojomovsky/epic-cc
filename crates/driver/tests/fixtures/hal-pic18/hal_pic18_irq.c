@@ -1,4 +1,4 @@
-/* Vendored slice of the real epic-hal pic18fxx5x-hal IRQ controller
+/* Vendored slice of the real epic-hal hal/pic18/18fxx5x IRQ controller
  * (DS39632E §9.0), adapted to compile under epic-cc. The smoke only needs
  * the global master enable (INTCON GIE); the Timer0/Timer2 source enables
  * and flags are written inline by the vendored timer drivers (the real

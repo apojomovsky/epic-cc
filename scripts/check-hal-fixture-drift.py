@@ -617,28 +617,28 @@ SKIP_NAMES = {"PROVENANCE.md"}
 
 CONFIGS = [
     (
-        "epic-menu-demo",
+        "demos/menu",
         "18F4550",
         "sim",
         "hal-pic18-menu-demo/config_18F4550.c",
         "config_18F4550.c",
     ),
     (
-        "epic-control-demo",
+        "demos/control",
         "18F4550",
         "sim",
         "hal-pic18-control-demo/config_18F4550.c",
         "config_18F4550.c",
     ),
     (
-        "epic-pid",
+        "lib/pid",
         "18F4550",
         "sim",
         "hal-pic18-pid/config_18F4550.c",
         "config_18F4550.c",
     ),
     (
-        "epic-bridge-demo",
+        "demos/bridge",
         "18F4550",
         "sim",
         "hal-pic18-bridge-demo/config_18F4550.c",
@@ -647,7 +647,7 @@ CONFIGS = [
 ]
 
 ENCODER_CONFIG = (
-    "epic-encoder",
+    "lib/encoder",
     "16F877A",
     "target",
     "hal-pic16-encoder-full/config.c",
