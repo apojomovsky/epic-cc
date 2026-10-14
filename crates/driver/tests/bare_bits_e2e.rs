@@ -94,7 +94,8 @@ fn bare_bits_lower_to_single_bit_ops() {
     // The TRISB1 store (bank 1) must select its bank first, or the bit op
     // lands on PORTB again (the #112 shape, one bank up): the nearest
     // preceding RP0 op must be a set, never a clear.
-    let op = asm.find("    BSF 0x06, 1").expect("TRISB1 store");
+    // PORTBbits.RB1 fuses to the same text; the TRISB1 store is the later one.
+    let op = asm.rfind("    BSF 0x06, 1").expect("TRISB1 store");
     let before = &asm[..op];
     let set = before.rfind("    BSF STATUS, 5");
     let clr = before.rfind("    BCF STATUS, 5");
@@ -147,4 +148,81 @@ fn address_of_a_bare_bit_is_rejected() {
         stderr.contains("cannot take the address of bit entity @GIE"),
         "names the rule: {stderr}"
     );
+}
+
+#[test]
+fn struct_bit_rmw_fuses_to_single_bit_ops() {
+    let asm = build_to(
+        "tests/fixtures/struct_bit_rmw.c",
+        "p16f877a",
+        "struct_bit_rmw",
+        "asm",
+    );
+    for op in [
+        "    BSF 0x06, 0",
+        "    BSF 0x06, 1",
+        "    BCF 0x06, 0",
+        "    BSF 0x06, 3",
+        "    BSF 0x06, 4",
+        "    BCF 0x06, 6",
+        "    BCF 0x06, 7",
+        "    BSF 0x06, 2",
+        "    BSF 0x0B, 7",
+    ] {
+        assert!(asm.contains(op), "missing {op}:\n{asm}");
+    }
+    // The multi-bit 0xC0 mask keeps the byte read-modify-write.
+    assert!(
+        asm.contains("    IORLW 0xC0"),
+        "0xC0 stays a byte RMW:\n{asm}"
+    );
+    // Every single-bit mask fused: no byte OR/AND of those masks remains.
+    for lit in [
+        "IORLW 0x02",
+        "IORLW 0x08",
+        "IORLW 0x10",
+        "ANDLW 0xFE",
+        "ANDLW 0xBF",
+    ] {
+        assert!(!asm.contains(lit), "{lit} must have fused:\n{asm}");
+    }
+}
+
+#[test]
+fn struct_bit_rmw_matches_the_byte_semantics_in_the_simulator() {
+    let hex_path = "tests/fixtures/struct_bit_rmw_p16f877a.hex";
+    let map_path = "tests/fixtures/struct_bit_rmw_p16f877a.map";
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            "tests/fixtures/struct_bit_rmw.c",
+            "-o",
+            hex_path,
+            "--map",
+            map_path,
+            "--device",
+            "p16f877a",
+        ])
+        .output()
+        .expect("run driver");
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hex = std::fs::read_to_string(hex_path).expect("read hex");
+    let map = std::fs::read_to_string(map_path).expect("read map");
+    let _ = std::fs::remove_file(hex_path);
+    let _ = std::fs::remove_file(map_path);
+    // The synthesized bit entities take no map entry.
+    assert!(
+        !map.lines().any(|l| l.contains("__epic_bit")),
+        "bit entities must not appear in the map:\n{map}"
+    );
+    let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
+    p.run(200_000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x06], 0x1A, "PORTB after the struct writes");
+    assert_eq!(p.ram()[0x86], 0x04, "TRISB2 via the bank-1 struct write");
+    assert_eq!(p.ram()[0x0B], 0x80, "GIE via the INTCON struct write");
+    assert_eq!(p.ram()[map_addr(&map, "out")], 0x1A, "out reads PORTB back");
 }
