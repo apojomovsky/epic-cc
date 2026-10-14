@@ -6793,18 +6793,23 @@ fn add32_reg_reg_emits_four_byte_carry_chain() {
     let m = parse(&i32_ab_module("add"));
     let asm = select(&PIC16F877A, &m, &addrs(&i32_map()));
     // Byte 0 is a plain ADDWF (C = carry out exact); bytes 1-3 fold the
-    // carry into a scratch copy of b via INCFSZ's skip — the wrap (b_i =
-    // 0xFF + carry) must keep C = carry-in (the true carry-out), so the
-    // naive ADDLW 1 fold would corrupt byte i+1. a=0x30, b=@y=0x24,
-    // r=0x38: `%b` folds and the add reads `@y` directly (epic-cc#875).
+    // carry onto b's own file byte via INCFSZ's skip (the wrap b_i =
+    // 0xFF + carry keeps C = carry-in, the true carry-out), so no
+    // scratch park is needed when dst leaves b addressable in the same
+    // bank (epic-cc#1255). All three bytes here are bank-0 with no
+    // overlay: x=0x20, y=0x24, r=0x38.
+    // b=@y=0x24: `%b` folds and the add reads `@y` directly (epic-cc#875).
     assert!(
         asm.contains("    MOVF 0x24, W\n    ADDWF 0x30, W\n    MOVWF 0x38"),
         "byte 0 add:\n{asm}"
     );
-    assert_eq!(
-        asm.matches("    INCFSZ 0x70, W").count(),
-        3,
-        "one carry fold per high byte:\n{asm}"
+    assert!(
+        !asm.contains("    INCFSZ 0x70, W"),
+        "no scratch carry park remains:\n{asm}"
+    );
+    assert!(
+        !asm.contains("    MOVWF 0x70"),
+        "no scratch park store remains:\n{asm}"
     );
     assert_eq!(
         asm.matches("    ADDWF 0x39, F").count(),
@@ -6822,12 +6827,85 @@ fn add32_reg_reg_emits_four_byte_carry_chain() {
         "byte 3 accumulate:\n{asm}"
     );
     assert!(
-        asm.contains("    MOVF 0x25, W\n    MOVWF 0x70\n    MOVF 0x31, W\n    MOVWF 0x39\n    MOVF 0x70, W\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x39, F"),
-        "byte 1 carry chain:\n{asm}"
+        asm.contains("    MOVF 0x31, W\n    MOVWF 0x39\n    MOVF 0x25, W\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x25, W\n    ADDWF 0x39, F"),
+        "byte 1 park-free carry fold:\n{asm}"
+    );
+}
+
+#[test]
+fn add32_reg_reg_overlay_keeps_scratch_fold() {
+    // dst overlaying the addend: the preload would destroy b_i before
+    // the fold rereads it, so the scratch park stays (epic-cc#1255).
+    let m = parse(&i32_ab_module("add"));
+    let map = vec![
+        ("x", 0x20),
+        ("y", 0x24),
+        ("out", 0x28),
+        ("main::a", 0x30),
+        ("main::b", 0x34),
+        ("main::r", 0x24),
+    ];
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert_eq!(
+        asm.matches("    INCFSZ 0x70, W").count(),
+        3,
+        "overlayed bytes keep the scratch fold:\n{asm}"
     );
     assert!(
-        asm.contains("    MOVF 0x27, W\n    MOVWF 0x70\n    MOVF 0x33, W\n    MOVWF 0x3B\n    MOVF 0x70, W\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x3B, F"),
-        "byte 3 carry chain:\n{asm}"
+        asm.contains("    MOVF 0x25, W\n    MOVWF 0x70\n    MOVF 0x31, W\n    MOVWF 0x25\n    MOVF 0x70, W\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x25, F"),
+        "byte 1 overlay carry chain:\n{asm}"
+    );
+}
+
+#[test]
+fn add32_reg_reg_cross_bank_keeps_scratch_fold() {
+    // Addend in bank 1, augend and dst in bank 0: rereading b_i
+    // after the preload costs the saved words back in BANKSELs, so the
+    // common-RAM park stays (epic-cc#1255).
+    let m = parse(&i32_ab_module("add"));
+    let map = vec![
+        ("x", 0x20),
+        ("y", 0xA0),
+        ("out", 0x28),
+        ("main::a", 0x30),
+        ("main::b", 0x34),
+        ("main::r", 0x38),
+    ];
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert_eq!(
+        asm.matches("    INCFSZ 0x70, W").count(),
+        3,
+        "cross-bank bytes keep the scratch fold:\n{asm}"
+    );
+    assert!(
+        asm.contains("    MOVF 0xA1, W\n    MOVWF 0x70\n    MOVF 0x31, W\n    MOVWF 0x39\n    MOVF 0x70, W\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x39, F"),
+        "byte 1 cross-bank carry chain:\n{asm}"
+    );
+}
+
+#[test]
+fn add32_reg_reg_in_place_dst_skips_preload() {
+    // dst overlaying the augend: no preload is needed, the fold reads
+    // b_i and accumulates in place (epic-cc#1255).
+    let m = parse(&i32_ab_module("add"));
+    let map = vec![
+        ("x", 0x20),
+        ("y", 0x24),
+        ("out", 0x28),
+        ("main::a", 0x30),
+        ("main::b", 0x34),
+        ("main::r", 0x30),
+    ];
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert!(
+        !asm.contains("    INCFSZ 0x70, W"),
+        "no scratch carry park remains:\n{asm}"
+    );
+    assert!(
+        asm.contains(
+            "    MOVF 0x25, W\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x25, W\n    ADDWF 0x31, F"
+        ),
+        "byte 1 in-place carry fold:\n{asm}"
     );
 }
 
@@ -7548,6 +7626,87 @@ fn add32_simulates_with_carry_chain() {
         &got[..],
         &[0x00, 0x00, 0x01, 0x00],
         "0x0000FF80 + 0x80 must be 0x00010000"
+    );
+    // Carry-in at a 0xFF addend byte with a carry-out: 0x00050000 +
+    // 0x0003FF80 = 0x0008FF80. Byte 1's fold wraps (0xFF + carry) and
+    // must pass the carry to byte 2.
+    let got = sim_run_bytes(
+        &ir,
+        &sim32_map(),
+        &[
+            (0x20, 0x00),
+            (0x21, 0x00),
+            (0x22, 0x05),
+            (0x23, 0x00),
+            (0x24, 0x80),
+            (0x25, 0xFF),
+            (0x26, 0x03),
+            (0x27, 0x00),
+        ],
+        0x28,
+        4,
+    );
+    assert_eq!(
+        &got[..],
+        &[0x80, 0xFF, 0x08, 0x00],
+        "0x00050000 + 0x0003FF80 must be 0x0008FF80"
+    );
+
+    // No-carry bytes stay exact: 0x12345678 + 0x01010101 = 0x13355779.
+    let got = sim_run_bytes(
+        &ir,
+        &sim32_map(),
+        &[
+            (0x20, 0x78),
+            (0x21, 0x56),
+            (0x22, 0x34),
+            (0x23, 0x12),
+            (0x24, 0x01),
+            (0x25, 0x01),
+            (0x26, 0x01),
+            (0x27, 0x01),
+        ],
+        0x28,
+        4,
+    );
+    assert_eq!(
+        &got[..],
+        &[0x79, 0x57, 0x35, 0x13],
+        "0x12345678 + 0x01010101 must be 0x13355779"
+    );
+}
+
+#[test]
+fn add32_overlay_dst_simulates() {
+    // dst overlaying the addend keeps the scratch fold and must
+    // still add exactly (epic-cc#1255).
+    let ir = i32_ab_module("add");
+    let map = [
+        ("x", 0x20),
+        ("y", 0x24),
+        ("out", 0x28),
+        ("main::a", 0x30),
+        ("main::b", 0x34),
+        ("main::r", 0x24),
+    ];
+    // 0x0000FFFF + 1 = 0x00010000 through the overlaid destination.
+    let got = sim_run_bytes(
+        &ir,
+        &str_map(&map),
+        &[
+            (0x20, 0xFF),
+            (0x21, 0xFF),
+            (0x22, 0x00),
+            (0x23, 0x00),
+            (0x24, 0x01),
+        ],
+        0x28,
+        4,
+    );
+    assert_eq!(
+        &got[..],
+        &[0x00, 0x00, 0x01, 0x00],
+        "overlayed dst must not corrupt the carry chain"
     );
 }
 
