@@ -41,6 +41,9 @@
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use iselcore::{
+    chunk::{
+        block_asm_label, block_asm_labels, code_of, line_is_word, slice_banked_lines, word_size,
+    },
     find_value_folds, flash_provenance, flash_walk_refusal, is_directive, log_pool_site,
     resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot, LOG_POOL_CALLEE,
     LOG_POOL_VARIANT,
@@ -11583,14 +11586,6 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
     }
 }
 
-/// The word size of a function's emitted lines: 1 word per instruction
-/// line, mirroring the asm crate's pass-1 counting so the page-fit
-/// decisions match the addresses the assembler will assign. Shares its
-/// rule with `line_is_word`, so placement and chunking agree exactly.
-fn word_size(lines: &[String]) -> usize {
-    lines.iter().filter(|raw| line_is_word(raw)).count()
-}
-
 /// Words the `__start` init copy loop occupies: 2 per byte of every const
 /// global resident in RAM, one `MOVLW`/`MOVWF` pair each. The packer's
 /// page-0 base must count them (epic-cc#207).
@@ -11602,16 +11597,6 @@ fn start_init_words(m: &Module, addrs: &HashMap<String, u16>) -> usize {
         .sum()
 }
 
-/// Asm label of a function's block, the scheme `emit_func_body` uses: the
-/// entry block is the bare function name, every other block `{func}_L{label}`.
-fn block_asm_label(func: &str, index: usize, label: &str) -> String {
-    if index == 0 {
-        func.to_string()
-    } else {
-        format!("{func}_L{label}")
-    }
-}
-
 /// A function placed across pages (epic-cc#841): its banked lines for
 /// placement sizing plus the ordered chunk entry labels. Pass B emits the
 /// raw final text (kept beside the plan), split at the same entries.
@@ -11619,11 +11604,6 @@ struct SplitPlan {
     entries: Vec<String>,
     lines: Vec<String>,
     locs: Vec<Option<SrcLoc>>,
-}
-
-/// The code part of a line: comments carry no words and never match.
-fn code_of(line: &str) -> &str {
-    line.split(';').next().unwrap_or("").trim()
 }
 
 /// The target of a `GOTO` line when it names a label defined in these
@@ -11636,33 +11616,6 @@ fn goto_target(line: &str, defined: &HashSet<String>) -> Option<String> {
     }
     let target = rest.to_string();
     defined.contains(&target).then_some(target)
-}
-
-/// Slice one function's banked lines from whole-text banking: from its
-/// label to the next function/`__start` label (or the text end). Function
-/// labels are unique, so the slice is exactly the lines banking measured
-/// for placement.
-fn slice_banked_lines(banked: &str, func: &str, func_names: &HashSet<&str>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut inside = false;
-    for raw in banked.lines() {
-        let code = code_of(raw);
-        if code.ends_with(':') && !code.contains(' ') {
-            let label = code.trim_end_matches(':');
-            if label == func {
-                inside = true;
-            } else if func_names.contains(label) || label == "__start" {
-                if inside {
-                    break;
-                }
-                continue;
-            }
-        }
-        if inside {
-            out.push(raw.to_string());
-        }
-    }
-    out
 }
 
 /// Insert `MOVLW PAGE(target); MOVWF PCLATH` before every intra-function
@@ -12171,37 +12124,6 @@ fn post_pass(device: &Device, asm: &str) -> String {
         device,
         &schedule::schedule(device, asm),
     ))
-}
-
-/// Whether a banked line occupies a flash word, the `word_size` rule one
-/// line at a time so the chunk walk counts exactly what placement counts.
-fn line_is_word(raw: &str) -> bool {
-    let line = code_of(raw);
-    if line.is_empty() {
-        return false;
-    }
-    if is_directive(line, "list") || is_directive(line, "radix") {
-        return false;
-    }
-    if line.starts_with("org ") {
-        return false;
-    }
-    if is_directive(line, "end") {
-        return false;
-    }
-    if line.ends_with(':') {
-        return false;
-    }
-    if line.contains(" equ ") {
-        return false;
-    }
-    if line.starts_with(".align ") {
-        return false;
-    }
-    if line.starts_with(".table ") {
-        return false;
-    }
-    true
 }
 
 /// Slice lines into chunks at the entry labels: one (entry, lines, locs)
@@ -13920,12 +13842,7 @@ pub fn select_with_opts(
                     continue;
                 }
                 let slice = slice_banked_lines(&banked2, &f.name, &func_names);
-                let block_labels: Vec<String> = f
-                    .blocks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| block_asm_label(&f.name, i, &b.label))
-                    .collect();
+                let block_labels: Vec<String> = block_asm_labels(f);
                 // Repair overrides the planned entries with ones re-derived
                 // from real final-context block sizes; the raw lines split at
                 // the same block labels either way.
