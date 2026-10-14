@@ -233,6 +233,19 @@ struct WalkLoop {
     /// Body ops in IR order.
     body: Vec<WalkOp>,
 }
+/// A two-block counted loop lowered as an FSR walk (epic-cc#1204). The
+/// header holds the counter phi and the body with an unconditional edge
+/// into the middle; the latch holds the increment plus the `eq` compare
+/// branching back. The middle is inner counted walks with no pointers,
+/// so every `FSR` stays quiet across the region. The shared `WalkLoop`
+/// seeds, body ops, and latch emit it; only the scan and the edge
+/// routing know about the split.
+#[derive(Clone)]
+struct OuterWalk {
+    plan: WalkLoop,
+    header: String,
+    latch: String,
+}
 #[derive(Clone)]
 struct WalkPtr {
     fsr: u8,
@@ -3799,6 +3812,892 @@ impl<'m> Gen<'m> {
             body: paired,
         })
     }
+    /// Outer-walk pre-scan (epic-cc#1204): two-block counted loops whose
+    /// header holds the counter phi and a `PLUSW`-shaped body with an
+    /// unconditional edge into nested counted walks, closed by a latch
+    /// block holding the increment compared against 1..=255. Keyed by
+    /// header label; runs after every other walk scan so the middle proof
+    /// reads their plans. Anything the checks reject stays out and lowers
+    /// through the normal arms.
+    fn find_outer_walks(
+        g: &Gen,
+        f: &Func,
+        walks: &HashMap<String, WalkLoop>,
+        nuls: &HashMap<String, NulWalk>,
+        ptrs: &HashMap<String, PtrWalk>,
+    ) -> HashMap<String, OuterWalk> {
+        let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut order: HashMap<&str, usize> = HashMap::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            order.insert(b.label.as_str(), bi);
+            let targets: Vec<&str> = match b.insts.last() {
+                Some(Inst::Br(br)) => vec![br.target.as_str()],
+                Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+                _ => vec![],
+            };
+            for t in targets {
+                preds.entry(t).or_default().push(b.label.as_str());
+            }
+        }
+        let mut uses: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        for b in &f.blocks {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() || r.starts_with('@') {
+                        continue;
+                    }
+                    uses.entry(r).or_default().push((b.label.clone(), ii));
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        for b in &f.blocks {
+            if let Some(plan) =
+                Self::outer_plan_for(g, f, b, &preds, &order, &uses, walks, nuls, ptrs)
+            {
+                out.insert(b.label.clone(), plan);
+            }
+        }
+        out
+    }
+
+    /// One header block's outer plan, or `None` on the first failed check.
+    /// The header ends with an unconditional branch (a `BrCond` header
+    /// belongs to the single-block scan); the latch is the predecessor
+    /// holding the increment and the back-branching compare.
+    fn outer_plan_for(
+        g: &Gen,
+        f: &Func,
+        h: &Block,
+        preds: &HashMap<&str, Vec<&str>>,
+        order: &HashMap<&str, usize>,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+        walks: &HashMap<String, WalkLoop>,
+        nuls: &HashMap<String, NulWalk>,
+        ptrs: &HashMap<String, PtrWalk>,
+    ) -> Option<OuterWalk> {
+        let mid0 = match h.insts.last() {
+            Some(Inst::Br(br)) => br.target.clone(),
+            _ => return None,
+        };
+        let ps = preds.get(h.label.as_str())?;
+        if ps.len() != 2 || ps[0] == ps[1] {
+            return None;
+        }
+        if ps.contains(&h.label.as_str()) {
+            return None;
+        }
+        // Either predecessor may hold the latch (the entry often ends
+        // with a fused compare-branch too); the increment-to-phi link
+        // below tells them apart.
+        for latch in [ps[0].to_string(), ps[1].to_string()] {
+            let pre = if latch == ps[0] {
+                ps[1].to_string()
+            } else {
+                ps[0].to_string()
+            };
+            if let Some(plan) = Self::outer_latch_for(
+                g, f, h, &mid0, &latch, &pre, preds, order, uses, walks, nuls, ptrs,
+            ) {
+                return Some(plan);
+            }
+        }
+        None
+    }
+
+    /// The latch-half checks for one header/predecessor assignment: the
+    /// latch shape, the counter phi link, the region entry proof, and
+    /// the header body. The entry predecessor must end with a branch the
+    /// seed routing knows (`Br`, `BrCond`, or a walk latch); a `Switch`
+    /// or `Ret` entry would bypass the seeds.
+    fn outer_latch_for(
+        g: &Gen,
+        f: &Func,
+        h: &Block,
+        mid0: &str,
+        latch: &str,
+        pre: &str,
+        preds: &HashMap<&str, Vec<&str>>,
+        order: &HashMap<&str, usize>,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+        walks: &HashMap<String, WalkLoop>,
+        nuls: &HashMap<String, NulWalk>,
+        ptrs: &HashMap<String, PtrWalk>,
+    ) -> Option<OuterWalk> {
+        let l = f.blocks.iter().find(|x| x.label == latch)?;
+        // The latch is exactly the increment, the compare, and the
+        // back-branch: anything else there keeps the normal arms.
+        if l.insts.len() != 3 {
+            return None;
+        }
+        let (incb, latch_cmp, bc) = match (&l.insts[0], &l.insts[1], &l.insts[2]) {
+            (Inst::Bin(q), Inst::Icmp(c), Inst::BrCond(bc)) => (q.clone(), c.clone(), bc.clone()),
+            _ => return None,
+        };
+        if bc.t == bc.f {
+            return None;
+        }
+        let exit = if bc.t == h.label {
+            bc.f.clone()
+        } else if bc.f == h.label {
+            bc.t.clone()
+        } else {
+            return None;
+        };
+        if exit == h.label || exit == latch {
+            return None;
+        }
+        let Val::Reg(cond) = &bc.cond else {
+            return None;
+        };
+        if latch_cmp.dst != *cond || latch_cmp.pred != "eq" {
+            return None;
+        }
+        // A materialized second use would survive the fused branch; the
+        // walk drops the compare, so it must be the branch's alone.
+        if uses.get(&latch_cmp.dst).map(|v| v.len()) != Some(1) {
+            return None;
+        }
+        let (increg, cmp_c) = match (&latch_cmp.a, &latch_cmp.b) {
+            (Val::Reg(r), Val::Const(c)) | (Val::Const(c), Val::Reg(r)) => (r.clone(), *c),
+            _ => return None,
+        };
+        if incb.dst != increg {
+            return None;
+        }
+        // Up-counting from zero only: a down walk visits base+k down to
+        // base+1 while the `POSTINC` walk visits base up, so the
+        // addresses map wrong (the single-block scan's down rule).
+        let cntreg = match (&incb.op, &incb.a, &incb.b) {
+            (ir::BinOp::Add, Val::Reg(q), Val::Const(1)) => q.clone(),
+            (ir::BinOp::Add, Val::Const(1), Val::Reg(q)) => q.clone(),
+            _ => return None,
+        };
+        if cntreg == increg {
+            return None;
+        }
+        if !(1..=255).contains(&cmp_c) {
+            return None;
+        }
+        let phi = h.insts.iter().find_map(|i| match i {
+            Inst::Phi(p) if p.dst == cntreg => Some(p.clone()),
+            _ => None,
+        })?;
+        if !(phi.ty.bytes() == 1 || phi.ty.bytes() == 2) || phi.ptr {
+            return None;
+        }
+        if phi.incoming.len() != 2 {
+            return None;
+        }
+        // The back edge carries the counter forward, the entry starts at
+        // zero; any other pairing belongs to another loop shape.
+        let mut back_ok = false;
+        let mut pre_ok = false;
+        for (v, e) in &phi.incoming {
+            if e == latch {
+                let bv = g.fold_reg(v);
+                if bv != Val::Reg(cntreg.clone()) && bv != Val::Reg(increg.clone()) {
+                    return None;
+                }
+                back_ok = true;
+            } else if e == pre {
+                let init = match v {
+                    Val::Const(c) => *c,
+                    _ => match g.fold_reg(v) {
+                        Val::Const(c) => c,
+                        _ => return None,
+                    },
+                };
+                if init != 0 {
+                    return None;
+                }
+                pre_ok = true;
+            } else {
+                return None;
+            }
+        }
+        if !back_ok || !pre_ok {
+            return None;
+        }
+        if pre == h.label || pre == exit {
+            return None;
+        }
+        // A second increment folded into the counter home would compute
+        // into the down-counter mid-loop and corrupt it.
+        if g.phi_fold.get(&increg).is_some_and(|p| p != &cntreg) {
+            return None;
+        }
+        for inst in h.insts.iter().chain(l.insts.iter()) {
+            if let Inst::Bin(q) = inst {
+                if q.dst != increg && g.phi_fold.get(&q.dst).is_some_and(|p| p == &cntreg) {
+                    return None;
+                }
+            }
+        }
+        let pre_block = f.blocks.iter().find(|x| x.label == pre)?;
+        if !matches!(
+            pre_block.insts.last(),
+            Some(Inst::Br(_)) | Some(Inst::BrCond(_))
+        ) {
+            return None;
+        }
+        if nuls.contains_key(pre) || ptrs.contains_key(pre) {
+            return None;
+        }
+        let (Some(&pi), Some(&hi), Some(&li)) = (
+            order.get(pre),
+            order.get(h.label.as_str()),
+            order.get(latch),
+        ) else {
+            return None;
+        };
+        if pi >= hi || hi >= li {
+            return None;
+        }
+        let count_slot = *g.addrs.get(&iselcore::ssa_key(&f.name, &cntreg))?;
+        // The middle is every block laid out between the header and the
+        // latch: the region the walking pointer stays live across.
+        let mut middle: Vec<&Block> = f
+            .blocks
+            .iter()
+            .filter(|x| order[&x.label.as_str()] > hi && order[&x.label.as_str()] < li)
+            .collect();
+        middle.sort_by_key(|x| order[&x.label.as_str()]);
+        let first = if middle.is_empty() {
+            latch.to_string()
+        } else {
+            middle[0].label.clone()
+        };
+        if mid0 != first {
+            return None;
+        }
+        let last_pred = if middle.is_empty() {
+            h.label.clone()
+        } else {
+            middle[middle.len() - 1].label.clone()
+        };
+        match preds.get(latch) {
+            Some(ps) if ps.len() == 1 && ps[0] == last_pred => {}
+            _ => return None,
+        }
+        let region: HashSet<String> = std::iter::once(h.label.clone())
+            .chain(middle.iter().map(|x| x.label.clone()))
+            .collect();
+        for m in &middle {
+            match preds.get(m.label.as_str()) {
+                Some(ps) if !ps.is_empty() && ps.iter().all(|p| region.contains(*p)) => {}
+                _ => return None,
+            }
+        }
+        for m in &middle {
+            Self::outer_middle_ok(g, f, m, &region, &h.label, count_slot, walks)?;
+        }
+        Self::outer_body(
+            g,
+            f,
+            h,
+            uses,
+            pre.to_string(),
+            exit,
+            cntreg,
+            increg,
+            cmp_c as u16,
+            count_slot,
+            latch,
+        )
+    }
+
+    /// One middle block's quiet proof: a counted walk with no pointers
+    /// over FSR-free IR, entered from inside the region. Anything that
+    /// could seed, advance, or drain through an `FSR` stays out: calls,
+    /// table/copy helpers, and indexed accesses. The staged-copy drain
+    /// proxy mirrors the single-block scan's own threshold, and the
+    /// counter slot must stay disjoint from the outer down-counter.
+    fn outer_middle_ok(
+        _g: &Gen,
+        _f: &Func,
+        m: &Block,
+        region: &HashSet<String>,
+        header: &str,
+        count_slot: u16,
+        walks: &HashMap<String, WalkLoop>,
+    ) -> Option<()> {
+        let inner = walks.get(&m.label)?;
+        if !inner.ptrs.is_empty() {
+            return None;
+        }
+        if inner.preheader != header && !region.contains(&inner.preheader) {
+            return None;
+        }
+        if inner.count_slot == count_slot {
+            return None;
+        }
+        // The latch compare never stages (the branch absorbs it), so it
+        // stays out of the budget exactly like the single-block scan's
+        // skipped latch.
+        let latch_dst: Option<Val> = match m.insts.last() {
+            Some(Inst::BrCond(bc)) => Some(bc.cond.clone()),
+            _ => None,
+        };
+        let mut pairs: usize = 0;
+        for inst in &m.insts {
+            match inst {
+                Inst::Phi(p) => {
+                    if p.dst != inner.idx {
+                        pairs += usize::from(p.ty.bytes());
+                    }
+                }
+                Inst::Trunc(t) => pairs += usize::from(t.to.bytes()),
+                Inst::Zext(z) => pairs += usize::from(z.to.bytes()),
+                Inst::Sext(s) => pairs += usize::from(s.to.bytes()),
+                Inst::Icmp(c) => {
+                    if latch_dst.as_ref() != Some(&Val::Reg(c.dst.clone())) {
+                        pairs += 1;
+                    }
+                }
+                Inst::Select(s) => pairs += usize::from(s.ty.bytes()),
+                // Global memops stage like the single-block scan's own
+                // budget counts them; indexed ones seed an `FSR` per use.
+                Inst::Load(l) if l.ptr.starts_with('@') => {
+                    pairs += usize::from(l.ty.bytes());
+                }
+                Inst::Store(s) if s.ptr.starts_with('@') => {
+                    pairs += usize::from(s.ty.bytes());
+                }
+                // Pure ALU, virtual address math, and the terminators a
+                // region block may end with. Anything else (calls, table
+                // helpers, indexed accesses, new variants) stays out.
+                Inst::Bin(_)
+                | Inst::Gep(_)
+                | Inst::Freeze(_)
+                | Inst::IntToPtr(_)
+                | Inst::Br(_)
+                | Inst::BrCond(_) => {}
+                _ => return None,
+            }
+        }
+        if pairs >= COPY_LOOP_MIN_PAIRS {
+            return None;
+        }
+        Some(())
+    }
+    /// Header body scan: validates every inst, builds the op list, and
+    /// proves the counter feeds only the pattern. Identical arms to the
+    /// single-block scan, but the increment and latch live in the latch
+    /// block, so only the counter phi and the unconditional terminator
+    /// skip here. Memory ops must be byte `PLUSW`-shaped walks over the
+    /// counter; the index-as-value chain goes dead.
+    fn outer_body(
+        g: &Gen,
+        f: &Func,
+        h: &Block,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+        pre: String,
+        exit: String,
+        cntreg: String,
+        increg: String,
+        k: u16,
+        count_slot: u16,
+        latch: &str,
+    ) -> Option<OuterWalk> {
+        let last = h.insts.len() - 1;
+        if !matches!(&h.insts[last], Inst::Br(_)) {
+            return None;
+        }
+        let phi_ii = h
+            .insts
+            .iter()
+            .position(|i| matches!(i, Inst::Phi(p) if p.dst == cntreg))?;
+        let mut ctr_truncs: HashMap<String, usize> = HashMap::new();
+        for (ii, inst) in h.insts.iter().enumerate() {
+            if let Inst::Trunc(t) = inst {
+                if t.val == Val::Reg(cntreg.clone()) {
+                    ctr_truncs.insert(t.dst.clone(), ii);
+                }
+            }
+        }
+        let mut body: Vec<WalkOp> = Vec::new();
+        let mut groups: Vec<(u16, u16)> = Vec::new();
+        let mut vadds: HashMap<String, (usize, Option<usize>, Val)> = HashMap::new();
+        let mut gep_users: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut term_sites: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        let mut consumed_vadds: HashSet<String> = HashSet::new();
+        let mut dead_ops: HashSet<usize> = HashSet::new();
+        let mut stage_pairs: usize = 0;
+        for (ii, inst) in h.insts.iter().enumerate() {
+            if ii == last || ii == phi_ii {
+                continue;
+            }
+            match inst {
+                Inst::Phi(_) | Inst::Gep(_) => {}
+                Inst::Bin(q) => match Self::walk_value_add(
+                    &q.op,
+                    &q.a,
+                    &q.b,
+                    q.ty.bytes(),
+                    &cntreg,
+                    &increg,
+                    &ctr_truncs,
+                ) {
+                    WalkAdd::No => {
+                        if !Self::walk_plain_bin(q) {
+                            return None;
+                        }
+                        body.push(WalkOp::Emit(ii));
+                    }
+                    WalkAdd::PostInc => return None,
+                    WalkAdd::Direct(base) => {
+                        vadds.insert(q.dst.clone(), (ii, None, base));
+                    }
+                    WalkAdd::ViaTrunc(tii, base) => {
+                        vadds.insert(q.dst.clone(), (ii, Some(tii), base));
+                    }
+                },
+                Inst::Trunc(t) => {
+                    stage_pairs += usize::from(t.to.bytes());
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Zext(z) => {
+                    stage_pairs += usize::from(z.to.bytes());
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Sext(s) => {
+                    stage_pairs += usize::from(s.to.bytes());
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Icmp(_) => {
+                    stage_pairs += 1;
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Select(s) => {
+                    stage_pairs += usize::from(s.ty.bytes());
+                    body.push(WalkOp::Emit(ii));
+                }
+                Inst::Load(l) => {
+                    if l.ptr.starts_with('@') {
+                        stage_pairs += usize::from(l.ty.bytes());
+                        body.push(WalkOp::Emit(ii));
+                        continue;
+                    }
+                    if l.ty.bytes() != 1 || l.ptr_ty {
+                        return None;
+                    }
+                    let fsr = Self::walk_memop(
+                        g,
+                        f,
+                        &cntreg,
+                        &mut groups,
+                        &mut term_sites,
+                        &mut gep_users,
+                        h.label.clone(),
+                        ii,
+                        &l.ptr,
+                    )?;
+                    if g.lane_consumed.contains(&l.dst)
+                        || g.w_folds.loads.contains_key(&l.dst)
+                        || g.bin_w_srcs.contains(&l.dst)
+                        || g.tablat_fwd.contains(&l.dst)
+                        || g.store_fwd.contains_key(&l.dst)
+                        || g.store_consumed.contains(&l.dst)
+                    {
+                        return None;
+                    }
+                    let slot = *g.addrs.get(&iselcore::ssa_key(&f.name, &l.dst))?;
+                    body.push(WalkOp::Load {
+                        slot,
+                        fsr,
+                        dst: l.dst.clone(),
+                        loc: l.loc.clone(),
+                    });
+                }
+                Inst::Store(s) => {
+                    if s.ptr.starts_with('@') {
+                        stage_pairs += usize::from(s.ty.bytes());
+                        body.push(WalkOp::Emit(ii));
+                        continue;
+                    }
+                    if s.ty.bytes() != 1 {
+                        return None;
+                    }
+                    if Self::walk_stores_rom(g, f, &s.val) {
+                        return None;
+                    }
+                    if let Val::Reg(v) = &s.val {
+                        if let Some((aii, tii, base)) = vadds.get(v).cloned() {
+                            if uses.get(v).map(|u| u.len()) != Some(1) {
+                                return None;
+                            }
+                            let (wbase, dead_load) =
+                                Self::walk_value_base(g, f, h, uses, &cntreg, &increg, aii, base)?;
+                            let fsr = Self::walk_memop(
+                                g,
+                                f,
+                                &cntreg,
+                                &mut groups,
+                                &mut term_sites,
+                                &mut gep_users,
+                                h.label.clone(),
+                                ii,
+                                &s.ptr,
+                            )?;
+                            consumed_vadds.insert(v.clone());
+                            if let Some(t) = tii {
+                                if let Some(treg) = ctr_truncs
+                                    .iter()
+                                    .find_map(|(r, i)| (*i == t).then(|| r.clone()))
+                                {
+                                    consumed_vadds.insert(treg);
+                                }
+                            }
+                            if let Some(dii) = dead_load {
+                                dead_ops.insert(dii);
+                            }
+                            body.push(WalkOp::StoreVal {
+                                base: wbase,
+                                n: k,
+                                fsr,
+                                loc: s.loc.clone(),
+                            });
+                            continue;
+                        }
+                    }
+                    let src = Self::walk_store_src(g, f, &s.val)?;
+                    let fsr = Self::walk_memop(
+                        g,
+                        f,
+                        &cntreg,
+                        &mut groups,
+                        &mut term_sites,
+                        &mut gep_users,
+                        h.label.clone(),
+                        ii,
+                        &s.ptr,
+                    )?;
+                    body.push(WalkOp::Store {
+                        src,
+                        fsr,
+                        ii,
+                        loc: s.loc.clone(),
+                    });
+                }
+                _ => return None,
+            }
+        }
+        // Same drain guard as the single-block scan: a mid-body flush at
+        // the threshold becomes a seeded `POSTINC` loop of its own and
+        // would move the live walk pointers.
+        let mut pairs = stage_pairs;
+        for inst in &h.insts {
+            if let Inst::Phi(p) = inst {
+                if p.dst != cntreg {
+                    pairs += usize::from(p.ty.bytes());
+                }
+            }
+        }
+        // No pointer, no walk: a body with nothing to hoist keeps the
+        // narrowed up-counter latch (epic-cc#1149), which preserves the
+        // counter home where the down-counter would redefine it.
+        if groups.is_empty() {
+            return None;
+        }
+        if pairs >= COPY_LOOP_MIN_PAIRS {
+            return None;
+        }
+        Self::outer_finish(
+            h,
+            uses,
+            pre,
+            exit,
+            cntreg,
+            increg,
+            k,
+            count_slot,
+            latch,
+            body,
+            groups,
+            vadds,
+            gep_users,
+            term_sites,
+            consumed_vadds,
+            ctr_truncs,
+            dead_ops,
+            phi_ii,
+        )
+    }
+
+    /// Outer-walk epilogue: the single-block consumption proofs with use
+    /// sites spanning the header and the latch. The counter regs must
+    /// feed only the pattern across the whole function, which is also
+    /// what keeps the middle quiet: any middle read of either reg fails
+    /// here. Every pointer must read and write in one direction only.
+    fn outer_finish(
+        h: &Block,
+        uses: &HashMap<String, Vec<(String, usize)>>,
+        pre: String,
+        exit: String,
+        cntreg: String,
+        increg: String,
+        k: u16,
+        count_slot: u16,
+        latch: &str,
+        body: Vec<WalkOp>,
+        groups: Vec<(u16, u16)>,
+        vadds: HashMap<String, (usize, Option<usize>, Val)>,
+        gep_users: HashMap<String, Vec<usize>>,
+        term_sites: HashMap<String, Vec<(String, usize)>>,
+        consumed_vadds: HashSet<String>,
+        ctr_truncs: HashMap<String, usize>,
+        mut dead_ops: HashSet<usize>,
+        phi_ii: usize,
+    ) -> Option<OuterWalk> {
+        // The latch block holds exactly increment, compare, branch at
+        // positions 0, 1, 2 (proven by the latch shape check).
+        let (inc_ii, latch_ii) = (0usize, 1usize);
+        let here_h = |ii: usize| (h.label.clone(), ii);
+        let here_l = |ii: usize| (latch.to_string(), ii);
+        for dst in vadds.keys() {
+            if consumed_vadds.contains(dst) {
+                continue;
+            }
+            if uses.get(dst).is_some_and(|u| !u.is_empty()) {
+                return None;
+            }
+        }
+        let mut trunc_sites: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        for (dst, (aii, tii, _)) in &vadds {
+            if !consumed_vadds.contains(dst) {
+                continue;
+            }
+            if let Some(t) = tii {
+                if let Some(treg) = ctr_truncs
+                    .iter()
+                    .find_map(|(r, i)| (*i == *t).then(|| r.clone()))
+                {
+                    trunc_sites.entry(treg).or_default().push(here_h(*aii));
+                }
+            }
+        }
+        for (treg, tii) in &ctr_truncs {
+            let allowed = trunc_sites.get(treg);
+            match uses.get(treg) {
+                None => {
+                    dead_ops.insert(*tii);
+                }
+                Some(u) => {
+                    if !allowed.is_some_and(|a| u.iter().all(|s| a.contains(s))) {
+                        return None;
+                    }
+                    dead_ops.insert(*tii);
+                }
+            }
+        }
+        for inst in &h.insts {
+            if let Inst::Gep(gp) = inst {
+                let allowed = gep_users.get(&gp.dst);
+                let ok = match uses.get(&gp.dst) {
+                    None => true,
+                    Some(u) => allowed
+                        .is_some_and(|a| u.iter().all(|s| s.0 == h.label && a.contains(&s.1))),
+                };
+                if !ok {
+                    return None;
+                }
+            }
+        }
+        let mut cnt_allowed: HashSet<(String, usize)> =
+            HashSet::from([here_h(phi_ii), here_l(inc_ii)]);
+        let mut inc_allowed: HashSet<(String, usize)> =
+            HashSet::from([here_h(phi_ii), here_l(latch_ii)]);
+        for (_, (aii, tii, _)) in &vadds {
+            cnt_allowed.insert(here_h(*aii));
+            if let Some(t) = tii {
+                cnt_allowed.insert(here_h(*t));
+            }
+        }
+        for (ii, inst) in h.insts.iter().enumerate() {
+            if matches!(inst, Inst::Gep(_)) {
+                cnt_allowed.insert(here_h(ii));
+                inc_allowed.insert(here_h(ii));
+            }
+        }
+        if let Some(sites) = term_sites.get(&cntreg) {
+            cnt_allowed.extend(sites.iter().cloned());
+        }
+        if let Some(sites) = term_sites.get(&increg) {
+            inc_allowed.extend(sites.iter().cloned());
+        }
+        if uses
+            .get(&cntreg)
+            .is_some_and(|u| !u.iter().all(|s| cnt_allowed.contains(s)))
+        {
+            return None;
+        }
+        if uses
+            .get(&increg)
+            .is_some_and(|u| !u.iter().all(|s| inc_allowed.contains(s)))
+        {
+            return None;
+        }
+        let live: Vec<WalkOp> = body
+            .into_iter()
+            .filter(|op| !matches!(op, WalkOp::Emit(ii) if dead_ops.contains(ii)))
+            .collect();
+        let mut paired: Vec<WalkOp> = Vec::with_capacity(live.len());
+        let mut i = 0;
+        while i < live.len() {
+            if i + 1 < live.len() {
+                if let (
+                    WalkOp::Load {
+                        slot, fsr: sf, dst, ..
+                    },
+                    WalkOp::Store {
+                        src: WalkBase::Addr(s),
+                        fsr: df,
+                        ii: sii,
+                        loc,
+                    },
+                ) = (&live[i], &live[i + 1])
+                {
+                    if *s == *slot
+                        && *sf != *df
+                        && uses.get(dst) == Some(&vec![(h.label.clone(), *sii)])
+                    {
+                        paired.push(WalkOp::Bridge {
+                            src_fsr: *sf,
+                            dst_fsr: *df,
+                            loc: loc.clone(),
+                        });
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+            paired.push(live[i].clone());
+            i += 1;
+        }
+        // Exactly one access per pointer per iteration: every walk op
+        // advances its `POSTINC` once, so a second access through the
+        // same pointer would address the next cell, not the same one.
+        let mut hits = [0; 2];
+        for op in &paired {
+            match op {
+                WalkOp::Emit(_) => {}
+                WalkOp::Load { fsr, .. } => hits[*fsr as usize] += 1,
+                WalkOp::Load16 { fsr, .. } | WalkOp::Skip { fsr } => hits[*fsr as usize] += 1,
+                WalkOp::Store { fsr, .. } | WalkOp::StoreVal { fsr, .. } => {
+                    hits[*fsr as usize] += 1;
+                }
+                WalkOp::Bridge {
+                    src_fsr, dst_fsr, ..
+                } => {
+                    hits[*src_fsr as usize] += 1;
+                    hits[*dst_fsr as usize] += 1;
+                }
+            }
+        }
+        for fsr in 0..groups.len() {
+            if hits[fsr] != 1 {
+                return None;
+            }
+        }
+        let ptrs = groups
+            .iter()
+            .enumerate()
+            .map(|(i, (base, kk))| WalkPtr {
+                fsr: i as u8,
+                seed: base.wrapping_add(*kk) & 0xFFF,
+            })
+            .collect();
+        Some(OuterWalk {
+            plan: WalkLoop {
+                preheader: pre,
+                exit,
+                idx: cntreg,
+                k,
+                count_slot,
+                ptrs,
+                body: paired,
+            },
+            header: h.label.clone(),
+            latch: latch.to_string(),
+        })
+    }
+
+    /// Emits one walk body op at its header block: `Emit` lowers the inst
+    /// normally, every other arm walks a `POSTINC` pointer. Shared by the
+    /// single-block latch and the outer header (epic-cc#1204), whose body
+    /// lives in a different block than its latch.
+    fn emit_walk_body_op(&mut self, plan: &WalkLoop, b: &Block, op: &WalkOp) {
+        let postinc = |fsr: u8| if fsr == 0 { 0xFEE } else { 0xFE6 };
+        match op {
+            WalkOp::Emit(ii) => {
+                self.cur_site = (b.label.clone(), *ii);
+                self.emit_inst(&b.insts[*ii]);
+            }
+            WalkOp::Load { slot, fsr, loc, .. } => {
+                self.cur_loc = loc.clone();
+                self.emit(format!("    MOVFF 0x{:03X}, 0x{slot:03X}", postinc(*fsr)));
+            }
+            WalkOp::Load16 { slot_lo, fsr, loc } => {
+                self.cur_loc = loc.clone();
+                self.emit(format!(
+                    "    MOVFF 0x{:03X}, 0x{slot_lo:03X}",
+                    postinc(*fsr)
+                ));
+                self.emit(format!(
+                    "    MOVFF 0x{:03X}, 0x{:03X}",
+                    postinc(*fsr),
+                    slot_lo.wrapping_add(1)
+                ));
+            }
+            WalkOp::Skip { fsr } => {
+                self.emit(format!("    MOVF 0x{:03X},W,A", postinc(*fsr)));
+            }
+            WalkOp::Store { src, fsr, loc, .. } => {
+                self.cur_loc = loc.clone();
+                let post = postinc(*fsr);
+                match src {
+                    WalkBase::Addr(a) => {
+                        self.emit(format!("    MOVFF 0x{a:03X}, 0x{post:03X}"));
+                    }
+                    WalkBase::Imm(kk) => {
+                        self.emit(format!("    MOVLW 0x{kk:02X}"));
+                        self.emit(format!("    MOVWF 0x{post:03X},A"));
+                    }
+                }
+            }
+            WalkOp::Bridge {
+                src_fsr,
+                dst_fsr,
+                loc,
+            } => {
+                self.cur_loc = loc.clone();
+                self.emit(format!("    MOVF 0x{:03X},W,A", postinc(*src_fsr)));
+                self.emit(format!("    MOVWF 0x{:03X},A", postinc(*dst_fsr)));
+            }
+            WalkOp::StoreVal {
+                base, n, fsr, loc, ..
+            } => {
+                self.cur_loc = loc.clone();
+                let (a, f) = self.operand(plan.count_slot);
+                let abit = if a == 0 { "A" } else { "B" };
+                self.emit(format!("    MOVF 0x{f:03X},W,{abit}"));
+                match base {
+                    WalkBase::Imm(c) => {
+                        let lit = c.wrapping_add(*n as u8);
+                        self.emit(format!("    SUBLW 0x{lit:02X}"));
+                    }
+                    WalkBase::Addr(aa) => {
+                        self.emit(format!("    SUBLW 0x{n:02X}", n = *n as u8));
+                        let (ba, bf) = self.operand(*aa);
+                        let bbit = if ba == 0 { "A" } else { "B" };
+                        self.emit(format!("    ADDWF 0x{bf:03X},W,{bbit}"));
+                    }
+                }
+                self.emit(format!("    MOVWF 0x{:03X},A", postinc(*fsr)));
+            }
+        }
+    }
     /// Emits a walk loop's header: body ops in IR order, carried backedge
     /// copies, then the down-counter latch with the exit copies on the
     /// `DECFSZ` fall-through. The counter slot already holds the trip
@@ -3814,77 +4713,33 @@ impl<'m> Gen<'m> {
         back_dom: bool,
         exit_dom: bool,
     ) {
-        let postinc = |fsr: u8| if fsr == 0 { 0xFEE } else { 0xFE6 };
         for op in &plan.body {
-            match op {
-                WalkOp::Emit(ii) => {
-                    self.cur_site = (b.label.clone(), *ii);
-                    self.emit_inst(&b.insts[*ii]);
-                }
-                WalkOp::Load { slot, fsr, loc, .. } => {
-                    self.cur_loc = loc.clone();
-                    self.emit(format!("    MOVFF 0x{:03X}, 0x{slot:03X}", postinc(*fsr)));
-                }
-                WalkOp::Load16 { slot_lo, fsr, loc } => {
-                    self.cur_loc = loc.clone();
-                    self.emit(format!(
-                        "    MOVFF 0x{:03X}, 0x{slot_lo:03X}",
-                        postinc(*fsr)
-                    ));
-                    self.emit(format!(
-                        "    MOVFF 0x{:03X}, 0x{:03X}",
-                        postinc(*fsr),
-                        slot_lo.wrapping_add(1)
-                    ));
-                }
-                WalkOp::Skip { fsr } => {
-                    self.emit(format!("    MOVF 0x{:03X},W,A", postinc(*fsr)));
-                }
-                WalkOp::Store { src, fsr, loc, .. } => {
-                    self.cur_loc = loc.clone();
-                    let post = postinc(*fsr);
-                    match src {
-                        WalkBase::Addr(a) => {
-                            self.emit(format!("    MOVFF 0x{a:03X}, 0x{post:03X}"));
-                        }
-                        WalkBase::Imm(kk) => {
-                            self.emit(format!("    MOVLW 0x{kk:02X}"));
-                            self.emit(format!("    MOVWF 0x{post:03X},A"));
-                        }
-                    }
-                }
-                WalkOp::Bridge {
-                    src_fsr,
-                    dst_fsr,
-                    loc,
-                } => {
-                    self.cur_loc = loc.clone();
-                    self.emit(format!("    MOVF 0x{:03X},W,A", postinc(*src_fsr)));
-                    self.emit(format!("    MOVWF 0x{:03X},A", postinc(*dst_fsr)));
-                }
-                WalkOp::StoreVal {
-                    base, n, fsr, loc, ..
-                } => {
-                    self.cur_loc = loc.clone();
-                    let (a, f) = self.operand(plan.count_slot);
-                    let abit = if a == 0 { "A" } else { "B" };
-                    self.emit(format!("    MOVF 0x{f:03X},W,{abit}"));
-                    match base {
-                        WalkBase::Imm(c) => {
-                            let lit = c.wrapping_add(*n as u8);
-                            self.emit(format!("    SUBLW 0x{lit:02X}"));
-                        }
-                        WalkBase::Addr(aa) => {
-                            self.emit(format!("    SUBLW 0x{n:02X}", n = *n as u8));
-                            let (ba, bf) = self.operand(*aa);
-                            let bbit = if ba == 0 { "A" } else { "B" };
-                            self.emit(format!("    ADDWF 0x{bf:03X},W,{bbit}"));
-                        }
-                    }
-                    self.emit(format!("    MOVWF 0x{:03X},A", postinc(*fsr)));
-                }
-            }
+            self.emit_walk_body_op(plan, b, op);
         }
+        self.emit_walk_latch(
+            plan,
+            head,
+            exit,
+            back_copies,
+            exit_copies,
+            back_dom,
+            exit_dom,
+        );
+    }
+    /// Emits a walk loop's latch: carried backedge copies, then the
+    /// down-counter latch with the exit copies on the `DECFSZ`
+    /// fall-through. The outer latch (epic-cc#1204) shares it; only its
+    /// body emits elsewhere.
+    fn emit_walk_latch(
+        &mut self,
+        plan: &WalkLoop,
+        head: &str,
+        exit: &str,
+        back_copies: &[(String, Ty, Val)],
+        exit_copies: &[(String, Ty, Val)],
+        back_dom: bool,
+        exit_dom: bool,
+    ) {
         // Body selects hit every exit equally, like a block prefix, so the
         // tracked bank below reflects only the latch region. Carried
         // reductions update in place where the backedge trampoline ran them.
@@ -3918,6 +4773,14 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVLW 0x{:02X}", plan.k as u8));
         self.emit_w_store(plan.count_slot);
     }
+    /// An outer header's seeds (epic-cc#1204) run on a label ahead of the
+    /// header: the entry edge targets it, the back edge skips it. The
+    /// seeds themselves share `emit_walk_seeds` with single-block walks.
+    fn emit_outer_seeds(&mut self, plan: &WalkLoop, head: &str) {
+        self.emit_label(&outer_seed_asm(head));
+        self.emit_walk_seeds(plan);
+    }
+
     /// Per-function NUL-walk pre-scan: headers shaped `while (base[i])`
     /// with a lone integer counter. Runs with the counted scan, over the
     /// same claim sets, so a loop both shapes accept stays counted (the
@@ -14612,6 +15475,33 @@ fn exit_bank(ends: &[Option<u8>]) -> Option<u8> {
 /// whenever its bodies multiply.
 const PHI_COPY_TEMP_LO: u16 = 0xFF3;
 
+/// An outer header's seeds label (epic-cc#1204): the entry edge targets
+/// it, the seeds run there, and control falls into the header. The
+/// back edge targets the header itself, skipping the seeds.
+fn outer_seed_asm(head: &str) -> String {
+    format!("{head}_oseed")
+}
+/// An outer-walk entry edge (epic-cc#1204): when `to` is an outer header
+/// entered from its preheader `from`, the edge targets the header's
+/// seeds label and the counter init copy is dead (the seeds reload the
+/// count). Returns the assembly target plus the filtered copies, or
+/// `None` when this edge carries no outer entry.
+fn outer_entry_edge(
+    outer: &HashMap<String, OuterWalk>,
+    labels: &HashMap<String, String>,
+    from: &str,
+    to: &str,
+    copies: &[(String, Ty, Val)],
+) -> Option<(String, Vec<(String, Ty, Val)>)> {
+    let o = outer.get(to).filter(|o| o.plan.preheader == from)?;
+    let kept = copies
+        .iter()
+        .filter(|(dst, _, _)| *dst != o.plan.idx)
+        .cloned()
+        .collect();
+    Some((outer_seed_asm(&labels[&o.header]), kept))
+}
+
 /// Emits dependency-ordered phi copies for one edge: no copy clobbers a
 /// slot a later copy still reads. Back edges run readers before writers
 /// (merge slots hold current values); forward edges run writers first.
@@ -16037,6 +16927,14 @@ pub fn select_with_opts(
         let nul_walks = Gen::find_nul_walks(&g, f);
         // Pointer walks (epic-cc#1151, strcmp): same position, same inputs.
         let ptr_walks = Gen::find_ptr_walks(&g, f);
+        // Outer walks (epic-cc#1204): two-block headers over nested
+        // counted walks. Runs after every other walk scan so the middle
+        // proof reads their plans.
+        let outer_walks = Gen::find_outer_walks(&g, f, &walk_loops, &nul_walks, &ptr_walks);
+        let mut outer_latch: HashMap<String, String> = HashMap::new();
+        for (header, o) in &outer_walks {
+            outer_latch.insert(o.latch.clone(), header.clone());
+        }
         // Sign-against-zero selects (epic-cc#1149): runs with the walks,
         // after every fold and claim set the shape checks read.
         g.select_fused = Gen::find_select_sign_zero(&g, f);
@@ -16127,6 +17025,12 @@ pub fn select_with_opts(
         let mut block_end: HashMap<String, Option<u8>> = HashMap::new();
         let mut ret_ends: Vec<Option<u8>> = Vec::new();
         for (bi, b) in f.blocks.iter().enumerate() {
+            // An outer header's seeds (epic-cc#1204) run on their own
+            // label ahead of it: the entry edge targets the seeds, the
+            // back edge targets the header and skips them.
+            if let Some(o) = outer_walks.get(&b.label) {
+                g.emit_outer_seeds(&o.plan, &labels[&b.label]);
+            }
             g.emit_label(&labels[&b.label]);
             // Join agreement: keep the tracked bank only when every
             // predecessor's recorded end state is present and equal.
@@ -16273,6 +17177,11 @@ pub fn select_with_opts(
                     Inst::Br(_) | Inst::BrCond(_) | Inst::Switch(_) | Inst::Ret(..) => {
                         terminator = Some(inst)
                     }
+                    // An outer header's body emits in its `Br` arm below
+                    // and its latch in the `BrCond` arm; an outer latch
+                    // emits only there. Only the terminators run here.
+                    _ if outer_walks.contains_key(&b.label) => {}
+                    _ if outer_latch.contains_key(&b.label) => {}
                     // A walk header's body emits whole in its latch arm
                     // below; only the terminator is captured here.
                     _ if walk_loops.contains_key(&b.label) => {}
@@ -16295,7 +17204,36 @@ pub fn select_with_opts(
                 Some(Inst::Br(br)) => {
                     g.cur_loc = br.loc.clone();
                     let merge = br.target.clone();
-                    if let Some(plan) = walk_loops.get(&merge).filter(|p| p.preheader == b.label) {
+                    // An outer header (epic-cc#1204): its body ops emit
+                    // here, ahead of the edge logic below that carries
+                    // the nested loop's seeds as usual.
+                    if let Some(o) = outer_walks.get(&b.label) {
+                        for op in &o.plan.body {
+                            g.emit_walk_body_op(&o.plan, b, op);
+                        }
+                    }
+                    // The outer-entry arm branches to the seeds label
+                    // itself, so the shared trailing branch below must
+                    // not run for it.
+                    let mut entered_outer = false;
+                    if let Some((tgt, copies)) = outer_entry_edge(
+                        &outer_walks,
+                        &labels,
+                        &b.label,
+                        &merge,
+                        &phi_copies
+                            .get(&(b.label.clone(), merge.clone()))
+                            .cloned()
+                            .unwrap_or_default(),
+                    ) {
+                        // Outer entry over an unconditional edge: filtered
+                        // copies, then the seeds label ahead of the header.
+                        emit_phi_copies(&mut g, &copies, doms[&b.label].contains(&merge));
+                        g.emit(format!("    BRA {tgt}"));
+                        entered_outer = true;
+                    } else if let Some(plan) =
+                        walk_loops.get(&merge).filter(|p| p.preheader == b.label)
+                    {
                         // Walk preheader: edge copies minus the counter
                         // init, then the pointer and count seeds.
                         let pre_copies: Vec<(String, Ty, Val)> = phi_copies
@@ -16336,33 +17274,106 @@ pub fn select_with_opts(
                     } else if let Some(c) = phi_copies.get(&(b.label.clone(), merge.clone())) {
                         emit_phi_copies(&mut g, c, doms[&b.label].contains(&merge));
                     }
-                    g.emit(format!("    BRA {}", labels[&merge]));
+                    if !entered_outer {
+                        g.emit(format!("    BRA {}", labels[&merge]));
+                    }
                 }
                 Some(Inst::BrCond(bc)) => {
                     g.cur_loc = bc.loc.clone();
-                    let lt = labels[&bc.t].clone();
-                    let lf = labels[&bc.f].clone();
-                    let t_copies = phi_copies.get(&(b.label.clone(), bc.t.clone())).cloned();
-                    let f_copies = phi_copies.get(&(b.label.clone(), bc.f.clone())).cloned();
+                    let mut lt = labels[&bc.t].clone();
+                    let mut lf = labels[&bc.f].clone();
+                    let mut t_copies = phi_copies.get(&(b.label.clone(), bc.t.clone())).cloned();
+                    let mut f_copies = phi_copies.get(&(b.label.clone(), bc.f.clone())).cloned();
+                    // Outer-walk entries (epic-cc#1204): an edge into an
+                    // outer header from its preheader targets the seeds
+                    // label ahead of the header, and the counter init
+                    // copy is dead. Every branch lowering below (fused,
+                    // plain, bit) routes through these targets, so one
+                    // hook covers them all.
+                    if let Some((tgt, copies)) = outer_entry_edge(
+                        &outer_walks,
+                        &labels,
+                        &b.label,
+                        &bc.t,
+                        t_copies.as_deref().unwrap_or(&[]),
+                    ) {
+                        lt = tgt;
+                        t_copies = Some(copies);
+                    }
+                    if let Some((tgt, copies)) = outer_entry_edge(
+                        &outer_walks,
+                        &labels,
+                        &b.label,
+                        &bc.f,
+                        f_copies.as_deref().unwrap_or(&[]),
+                    ) {
+                        lf = tgt;
+                        f_copies = Some(copies);
+                    }
                     // The absorbed compare, when this branch is its only
                     // consumer: lower it here so its exits are the branch
                     // edges, skipping the 0/1 slot entirely.
                     let fused_icmp = fused.as_ref().map(|fc| &fc.icmp);
-                    match (
-                        walk_loops.get(&b.label),
-                        nul_walks.get(&b.label),
-                        ptr_walks.get(&b.label),
-                        fused_icmp,
-                    ) {
-                        (Some(plan), _, _, _) => {
-                            // Walk latch: the counter's own edge copies are
-                            // home-managed, every other copy runs inline.
-                            let (back_copies, exit_copies) = if bc.t == b.label {
-                                (&t_copies, &f_copies)
-                            } else {
-                                (&f_copies, &t_copies)
+                    // An outer latch (epic-cc#1204): the counter's own
+                    // edge copies are home-managed, every other copy
+                    // runs inline, and the down-counter latch closes the
+                    // loop exactly like a single-block walk's.
+                    if let Some(header) = outer_latch.get(&b.label) {
+                        let o = &outer_walks[header];
+                        let (back_copies, exit_copies) = if bc.t == o.header {
+                            (&t_copies, &f_copies)
+                        } else {
+                            (&f_copies, &t_copies)
+                        };
+                        let no_idx =
+                            |cs: &Option<Vec<(String, Ty, Val)>>| -> Vec<(String, Ty, Val)> {
+                                cs.as_ref()
+                                    .map(|v| {
+                                        v.iter()
+                                            .filter(|(dst, _, _)| *dst != o.plan.idx)
+                                            .cloned()
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
                             };
-                            let no_idx =
+                        let head = labels[&o.header].clone();
+                        // A chained outer entry routes the exit through
+                        // that header's seeds label, minus its counter
+                        // init; otherwise the exit runs as lowered.
+                        let (exit_lbl, exit_vec) = outer_entry_edge(
+                            &outer_walks,
+                            &labels,
+                            &b.label,
+                            &o.plan.exit,
+                            &no_idx(exit_copies),
+                        )
+                        .map(|(t, c)| (t, c))
+                        .unwrap_or_else(|| (labels[&o.plan.exit].clone(), no_idx(exit_copies)));
+                        g.emit_walk_latch(
+                            &o.plan,
+                            &head,
+                            &exit_lbl,
+                            &no_idx(back_copies),
+                            &exit_vec,
+                            doms[&b.label].contains(&o.header),
+                            doms[&b.label].contains(&o.plan.exit),
+                        );
+                    } else {
+                        match (
+                            walk_loops.get(&b.label),
+                            nul_walks.get(&b.label),
+                            ptr_walks.get(&b.label),
+                            fused_icmp,
+                        ) {
+                            (Some(plan), _, _, _) => {
+                                // Walk latch: the counter's own edge copies are
+                                // home-managed, every other copy runs inline.
+                                let (back_copies, exit_copies) = if bc.t == b.label {
+                                    (&t_copies, &f_copies)
+                                } else {
+                                    (&f_copies, &t_copies)
+                                };
+                                let no_idx =
                                 |cs: &Option<Vec<(String, Ty, Val)>>| -> Vec<(String, Ty, Val)> {
                                     cs.as_ref()
                                         .map(|v| {
@@ -16373,28 +17384,42 @@ pub fn select_with_opts(
                                         })
                                         .unwrap_or_default()
                                 };
-                            let head = labels[&b.label].clone();
-                            let exit_lbl = labels[&plan.exit].clone();
-                            g.emit_walk_loop(
-                                plan,
-                                b,
-                                &head,
-                                &exit_lbl,
-                                &no_idx(back_copies),
-                                &no_idx(exit_copies),
-                                doms[&b.label].contains(&b.label),
-                                doms[&b.label].contains(&plan.exit),
-                            );
-                        }
-                        (_, Some(plan), _, _) => {
-                            // home-kept by the in-place increment, every
-                            // other copy runs inline on its edge.
-                            let (back_copies, exit_copies) = if bc.t == b.label {
-                                (&t_copies, &f_copies)
-                            } else {
-                                (&f_copies, &t_copies)
-                            };
-                            let no_idx =
+                                let head = labels[&b.label].clone();
+                                // A chained outer entry routes the exit
+                                // through that header's seeds label, minus
+                                // its counter init; otherwise the exit runs
+                                // as lowered.
+                                let (exit_lbl, exit_vec) = outer_entry_edge(
+                                    &outer_walks,
+                                    &labels,
+                                    &b.label,
+                                    &plan.exit,
+                                    &no_idx(exit_copies),
+                                )
+                                .map(|(t, c)| (t, c))
+                                .unwrap_or_else(|| {
+                                    (labels[&plan.exit].clone(), no_idx(exit_copies))
+                                });
+                                g.emit_walk_loop(
+                                    plan,
+                                    b,
+                                    &head,
+                                    &exit_lbl,
+                                    &no_idx(back_copies),
+                                    &exit_vec,
+                                    doms[&b.label].contains(&b.label),
+                                    doms[&b.label].contains(&plan.exit),
+                                );
+                            }
+                            (_, Some(plan), _, _) => {
+                                // home-kept by the in-place increment, every
+                                // other copy runs inline on its edge.
+                                let (back_copies, exit_copies) = if bc.t == b.label {
+                                    (&t_copies, &f_copies)
+                                } else {
+                                    (&f_copies, &t_copies)
+                                };
+                                let no_idx =
                                 |cs: &Option<Vec<(String, Ty, Val)>>| -> Vec<(String, Ty, Val)> {
                                     cs.as_ref()
                                         .map(|v| {
@@ -16405,23 +17430,23 @@ pub fn select_with_opts(
                                         })
                                         .unwrap_or_default()
                                 };
-                            let head = labels[&b.label].clone();
-                            let exit_lbl = labels[&plan.exit].clone();
-                            g.emit_nul_loop(
-                                plan,
-                                &head,
-                                &exit_lbl,
-                                &no_idx(back_copies),
-                                exit_copies.as_deref().unwrap_or(&[]),
-                                doms[&b.label].contains(&b.label),
-                                doms[&b.label].contains(&plan.exit),
-                            );
-                        }
-                        (_, _, Some(plan), _) => {
-                            // Pointer latch: both pointers ride their FSRs,
-                            // so their backedge copies filter out and the
-                            // exit runs whole on the shared stub.
-                            let no_ptr =
+                                let head = labels[&b.label].clone();
+                                let exit_lbl = labels[&plan.exit].clone();
+                                g.emit_nul_loop(
+                                    plan,
+                                    &head,
+                                    &exit_lbl,
+                                    &no_idx(back_copies),
+                                    exit_copies.as_deref().unwrap_or(&[]),
+                                    doms[&b.label].contains(&b.label),
+                                    doms[&b.label].contains(&plan.exit),
+                                );
+                            }
+                            (_, _, Some(plan), _) => {
+                                // Pointer latch: both pointers ride their FSRs,
+                                // so their backedge copies filter out and the
+                                // exit runs whole on the shared stub.
+                                let no_ptr =
                                 |cs: &Option<Vec<(String, Ty, Val)>>| -> Vec<(String, Ty, Val)> {
                                     cs.as_ref()
                                         .map(|v| {
@@ -16434,60 +17459,61 @@ pub fn select_with_opts(
                                         })
                                         .unwrap_or_default()
                                 };
-                            // The scan pins the back edge to `t`.
-                            let (back_copies, exit_copies) = (&t_copies, &f_copies);
-                            let head = labels[&b.label].clone();
-                            let exit_lbl = labels[&plan.exit].clone();
-                            g.emit_ptr_loop(
-                                plan,
-                                &head,
-                                &exit_lbl,
-                                &no_ptr(back_copies),
-                                &no_ptr(exit_copies),
-                                doms[&b.label].contains(&b.label),
-                                doms[&b.label].contains(&plan.exit),
-                            );
-                        }
-                        (None, None, None, Some(c)) => emit_fused_branch(
-                            &mut g,
-                            c,
-                            &lt,
-                            &lf,
-                            t_copies.as_deref(),
-                            f_copies.as_deref(),
-                            doms[&b.label].contains(&bc.t),
-                            doms[&b.label].contains(&bc.f),
-                        ),
-                        (None, None, None, None) => {
-                            // A packed flag load feeding this branch lowers
-                            // here: the bit test is the branch, so the
-                            // load's slot never materializes.
-                            if let Some((_, addr, bit)) = &fused_bit {
-                                emit_bit_cond_branches(
-                                    &mut g, *addr, *bit, &lt, &lf, &t_copies, &f_copies, b, &doms,
-                                    bc,
+                                // The scan pins the back edge to `t`.
+                                let (back_copies, exit_copies) = (&t_copies, &f_copies);
+                                let head = labels[&b.label].clone();
+                                let exit_lbl = labels[&plan.exit].clone();
+                                g.emit_ptr_loop(
+                                    plan,
+                                    &head,
+                                    &exit_lbl,
+                                    &no_ptr(back_copies),
+                                    &no_ptr(exit_copies),
+                                    doms[&b.label].contains(&b.label),
+                                    doms[&b.label].contains(&plan.exit),
                                 );
-                            } else {
-                                // Same hazard class as `Select`'s cond (the select guard, see
-                                // `emit_inst`'s `Inst::Select` arm): `emit_load_w`'s
-                                // `Val::Const` arm emits only `MOVLW`, which does not
-                                // set the Z flag (`crates/sim/src/lib.rs`), so a
-                                // literal cond here would make `BZ` test a stale flag
-                                // from whatever came before instead of `cond`'s real
-                                // value. Fail instead of silently miscompiling.
-                                assert!(
-                                    !matches!(bc.cond, Val::Const(_)),
-                                    "isel-pic18: const cond BrCond not yet supported"
-                                );
-                                // Same skip as the Select arm above: a reload
-                                // of a just-computed byte only feeds this
-                                // branch's `Z` test. (epic-cc#668)
-                                if !g.branch_reload_redundant(&bc.cond) {
-                                    g.emit_load_w(&bc.cond, 0, true);
+                            }
+                            (None, None, None, Some(c)) => emit_fused_branch(
+                                &mut g,
+                                c,
+                                &lt,
+                                &lf,
+                                t_copies.as_deref(),
+                                f_copies.as_deref(),
+                                doms[&b.label].contains(&bc.t),
+                                doms[&b.label].contains(&bc.f),
+                            ),
+                            (None, None, None, None) => {
+                                // A packed flag load feeding this branch lowers
+                                // here: the bit test is the branch, so the
+                                // load's slot never materializes.
+                                if let Some((_, addr, bit)) = &fused_bit {
+                                    emit_bit_cond_branches(
+                                        &mut g, *addr, *bit, &lt, &lf, &t_copies, &f_copies, b,
+                                        &doms, bc,
+                                    );
+                                } else {
+                                    // Same hazard class as `Select`'s cond (the select guard, see
+                                    // `emit_inst`'s `Inst::Select` arm): `emit_load_w`'s
+                                    // `Val::Const` arm emits only `MOVLW`, which does not
+                                    // set the Z flag (`crates/sim/src/lib.rs`), so a
+                                    // literal cond here would make `BZ` test a stale flag
+                                    // from whatever came before instead of `cond`'s real
+                                    // value. Fail instead of silently miscompiling.
+                                    assert!(
+                                        !matches!(bc.cond, Val::Const(_)),
+                                        "isel-pic18: const cond BrCond not yet supported"
+                                    );
+                                    // Same skip as the Select arm above: a reload
+                                    // of a just-computed byte only feeds this
+                                    // branch's `Z` test. (epic-cc#668)
+                                    if !g.branch_reload_redundant(&bc.cond) {
+                                        g.emit_load_w(&bc.cond, 0, true);
+                                    }
+                                    emit_cond_branches(
+                                        &mut g, &lt, &lf, &t_copies, &f_copies, b, &doms, bc,
+                                    );
                                 }
-                                emit_cond_branches(
-                                    &mut g, &lt, &lf, &t_copies, &f_copies, b, &doms, bc,
-                                );
                             }
                         }
                     }
