@@ -2998,8 +2998,10 @@ impl<'m> Gen<'m> {
     /// ADDLW; at 0xFF that literal wraps, so the byte instead adds the
     /// 1 only when there is no borrow (a_i - 0xFF - borrow is
     /// a_i + 1 - borrow), and a skipped ADDWF keeps C = 0 and Z from
-    /// the MOVF of the result. A register subtrahend keeps the scratch
-    /// INCFSZ fold, whose wrap keeps the true borrow-out.
+    /// the MOVF of the result. A register subtrahend rereads its own
+    /// file byte through INCFSZ when dst leaves it addressable in the
+    /// same bank, else it keeps the scratch fold. Either wrap keeps
+    /// C = borrow-in, the true borrow-out.
     fn emit_sub32(&mut self, a: &Val, b: &Val, dst: u16) {
         let aa = self.val_addr(a).direct();
         match b {
@@ -3029,17 +3031,40 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    SUBWF 0x{aa:02X}, W"));
                 self.emit(format!("    MOVWF 0x{dst:02X}"));
                 for i in 1..4u8 {
-                    // b_i is copied to scratch first (the dst preload may
-                    // overlay b), then W is reloaded from it after the
-                    // preload's MOVF clobbers W.
-                    self.emit(format!("    MOVF 0x{:02X}, W", bb + u16::from(i)));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                    self.emit(format!("    MOVF 0x{:02X}, W", aa + u16::from(i)));
-                    self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
-                    self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                    self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
-                    self.emit(format!("    SUBWF 0x{:02X}, F", dst + u16::from(i)));
+                    let sub = bb + u16::from(i);
+                    let min = aa + u16::from(i);
+                    let dd = dst + u16::from(i);
+                    // Park-free when the folded subtrahend rereads from its
+                    // own file byte: dst must not overlay it (the preload
+                    // would destroy it) and all three bytes share one bank
+                    // (a cross-bank reread costs the saved words back in
+                    // BANKSELs). INCFSZ's skip keeps C = borrow-in, the
+                    // true borrow-out, same as the scratch fold.
+                    if dd != sub
+                        && self.device.bank_of(sub) == self.device.bank_of(min)
+                        && self.device.bank_of(sub) == self.device.bank_of(dd)
+                    {
+                        if dd != min {
+                            self.emit(format!("    MOVF 0x{min:02X}, W"));
+                            self.emit(format!("    MOVWF 0x{dd:02X}"));
+                        }
+                        self.emit(format!("    MOVF 0x{sub:02X}, W"));
+                        self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                        self.emit(format!("    INCFSZ 0x{sub:02X}, W"));
+                        self.emit(format!("    SUBWF 0x{dd:02X}, F"));
+                    } else {
+                        // b_i is copied to scratch first (the dst preload may
+                        // overlay b), then W is reloaded from it after the
+                        // preload's MOVF clobbers W.
+                        self.emit(format!("    MOVF 0x{sub:02X}, W"));
+                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                        self.emit(format!("    MOVF 0x{min:02X}, W"));
+                        self.emit(format!("    MOVWF 0x{dd:02X}"));
+                        self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                        self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                        self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                        self.emit(format!("    SUBWF 0x{dd:02X}, F"));
+                    }
                 }
             }
             Val::Global(_) => panic!("isel: sub32 with a global operand"),

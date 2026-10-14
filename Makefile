@@ -62,6 +62,16 @@ EPIC_CC_GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null)
 # entry point shares the worktree target dir.
 TARGET_CACHE_MOUNT ?= $(TARGET_CACHE)
 
+# An override names a base, not a dir: the worktree key is suffixed unless
+# already present, so two worktrees given one shared base still build into
+# distinct dirs. A bare shared dir replays a sibling tree's artifacts as
+# this tree's own (cargo fingerprints key on /workspace, #1201).
+ifeq ($(filter %$(WT_KEY),$(TARGET_CACHE_MOUNT)),)
+EFFECTIVE_TARGET_CACHE := $(TARGET_CACHE_MOUNT)$(WT_KEY)
+else
+EFFECTIVE_TARGET_CACHE := $(TARGET_CACHE_MOUNT)
+endif
+
 # Recursively expanded (=), not immediate, so a TARGET_CACHE_MOUNT override
 # passed on the command line is still in effect when a recipe expands
 # DOCKER_RUN. With := the value is baked in at parse time and the override
@@ -80,13 +90,13 @@ DOCKER_ARGS = --rm \
 	--user $$(id -u):$$(id -g) \
 	-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
 	-v $(CARGO_HOME_CACHE):/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
-	-v $(TARGET_CACHE_MOUNT):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
+	-v $(EFFECTIVE_TARGET_CACHE):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
 	-e "EPIC_CC_GIT_SHA=$(EPIC_CC_GIT_SHA)" \
 	-e SIZE_BASELINE_ONLY -e CYCLE_BASELINE_ONLY \
 	-e UPDATE_SIZE_BASELINE -e UPDATE_CYCLE_BASELINE \
 	-v $(CURDIR):/workspace -w /workspace
 
-DOCKER_RUN = mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE_MOUNT) && $(WITH_TARGET_LOCK) $(TARGET_CACHE_MOUNT)/.build.lock docker run $(DOCKER_ARGS) $(LOCAL_IMAGE)
+DOCKER_RUN = mkdir -p $(CARGO_HOME_CACHE) $(EFFECTIVE_TARGET_CACHE) && $(WITH_TARGET_LOCK) $(EFFECTIVE_TARGET_CACHE)/.build.lock docker run $(DOCKER_ARGS) $(LOCAL_IMAGE)
 
 .PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check size-report guard-main-clone
 
@@ -116,8 +126,8 @@ image: ## Build the dev image (only image you need locally)
 	fi
 
 shell: guard-main-clone image ## Interactive dev shell inside the container
-	@mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE_MOUNT)
-	@$(WITH_TARGET_LOCK) $(TARGET_CACHE_MOUNT)/.build.lock docker run -it $(DOCKER_ARGS) $(LOCAL_IMAGE) bash
+	@mkdir -p $(CARGO_HOME_CACHE) $(EFFECTIVE_TARGET_CACHE)
+	@$(WITH_TARGET_LOCK) $(EFFECTIVE_TARGET_CACHE)/.build.lock docker run -it $(DOCKER_ARGS) $(LOCAL_IMAGE) bash
 
 exec: guard-main-clone image ## One-off command: make exec CMD='cargo test -p asm'
 	@$(DOCKER_RUN) bash -c '$(CMD)'

@@ -351,24 +351,269 @@ fn compare(dev: &Device, lkr: &LkrRam) -> Vec<String> {
     problems
 }
 
+/// Second oracle for parts gputils 1.5.x does not know (ADR-021): a record
+/// transcribed from the DFP `.ini` and attested against the datasheet,
+/// vendored under `crates/device/second_oracle/`. It runs only where
+/// gputils has no `.lkr` (RAM) or `gpasm -p` rejects the part (flash).
+struct SecondOracle {
+    flash_words: u32,
+    ram_banks: Vec<(u16, u16)>,
+    common_ram: Option<(u16, u16)>,
+    access_bank: Option<(u16, u16)>,
+    isr_w_shadow: Option<u16>,
+    isr_home_window: Option<(u16, u16)>,
+    pack: String,
+    ini: String,
+}
+
+fn oracle_field<'a>(v: &'a toml::Value, name: &str, key: &str) -> Result<&'a str, String> {
+    match v.get(key).and_then(|x| x.as_str()) {
+        Some(s) if !s.is_empty() => Ok(s),
+        _ => Err(format!("second oracle {name}: missing or empty `{key}`")),
+    }
+}
+
+/// One `[lo, hi]` pair; rejects negatives, overflow, and inverted ranges.
+fn oracle_pair(v: &toml::Value, name: &str, key: &str) -> Result<(u16, u16), String> {
+    let err = || format!("second oracle {name}: `{key}` must hold [lo, hi] with lo <= hi");
+    let pair = v.as_array().filter(|xs| xs.len() == 2).ok_or_else(err)?;
+    let mut out = [0u16; 2];
+    for (i, x) in pair.iter().enumerate() {
+        out[i] = u16::try_from(x.as_integer().ok_or_else(err)?).map_err(|_| err())?;
+    }
+    if out[0] > out[1] {
+        return Err(err());
+    }
+    Ok((out[0], out[1]))
+}
+
+fn oracle_opt_pair(v: &toml::Value, name: &str, key: &str) -> Result<Option<(u16, u16)>, String> {
+    match v.get(key) {
+        None => Ok(None),
+        Some(x) => Ok(Some(oracle_pair(x, name, key)?)),
+    }
+}
+
+fn oracle_opt_u16(v: &toml::Value, name: &str, key: &str) -> Result<Option<u16>, String> {
+    let err = || format!("second oracle {name}: `{key}` must hold a u16");
+    match v.get(key) {
+        None => Ok(None),
+        Some(x) => Ok(Some(
+            u16::try_from(x.as_integer().ok_or_else(err)?).map_err(|_| err())?,
+        )),
+    }
+}
+
+fn parse_second_oracle(name: &str, text: &str) -> Result<SecondOracle, String> {
+    let v: toml::Value = text
+        .parse()
+        .map_err(|e| format!("second oracle {name}: cannot parse: {e}"))?;
+    let got = oracle_field(&v, name, "name")?;
+    if got != name {
+        return Err(format!("second oracle {name}: record names `{got}`"));
+    }
+    let flash_words = match v.get("flash_words").and_then(|x| x.as_integer()) {
+        Some(n) if n > 0 => u32::try_from(n)
+            .map_err(|_| format!("second oracle {name}: flash_words out of range"))?,
+        _ => {
+            return Err(format!(
+                "second oracle {name}: missing or invalid `flash_words`"
+            ))
+        }
+    };
+    let banks = v
+        .get("ram_banks")
+        .and_then(|x| x.as_array())
+        .filter(|xs| !xs.is_empty())
+        .ok_or_else(|| format!("second oracle {name}: missing or empty `ram_banks`"))?;
+    let mut ram_banks = Vec::with_capacity(banks.len());
+    for b in banks {
+        ram_banks.push(oracle_pair(b, name, "ram_banks")?);
+    }
+    let common_ram = oracle_opt_pair(&v, name, "common_ram")?;
+    let access_bank = oracle_opt_pair(&v, name, "access_bank")?;
+    let isr_w_shadow = oracle_opt_u16(&v, name, "isr_w_shadow")?;
+    let isr_home_window = oracle_opt_pair(&v, name, "isr_home_window")?;
+    let prov = v
+        .get("provenance")
+        .ok_or_else(|| format!("second oracle {name}: missing [provenance]"))?;
+    let pack = oracle_field(prov, name, "pack")?.to_string();
+    let ini = oracle_field(prov, name, "ini")?.to_string();
+    let sha = oracle_field(prov, name, "ini_sha256")?;
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "second oracle {name}: ini_sha256 must be 64 hex chars"
+        ));
+    }
+    oracle_field(prov, name, "datasheet")?;
+    oracle_field(prov, name, "datasheet_section")?;
+    // A typo'd key would parse and then never compare, passing both halves
+    // while checking nothing: reject anything outside the schema.
+    const TOP: &[&str] = &[
+        "name",
+        "flash_words",
+        "ram_banks",
+        "common_ram",
+        "access_bank",
+        "isr_w_shadow",
+        "isr_home_window",
+        "provenance",
+    ];
+    if let Some(t) = v.as_table() {
+        for k in t.keys() {
+            if !TOP.contains(&k.as_str()) {
+                return Err(format!("second oracle {name}: unknown key `{k}`"));
+            }
+        }
+    }
+    const PROV: &[&str] = &[
+        "pack",
+        "ini",
+        "ini_sha256",
+        "datasheet",
+        "datasheet_section",
+    ];
+    if let Some(t) = prov.as_table() {
+        for k in t.keys() {
+            if !PROV.contains(&k.as_str()) {
+                return Err(format!(
+                    "second oracle {name}: unknown [provenance] key `{k}`"
+                ));
+            }
+        }
+    }
+    Ok(SecondOracle {
+        flash_words,
+        ram_banks,
+        common_ram,
+        access_bank,
+        isr_w_shadow,
+        isr_home_window,
+        pack,
+        ini,
+    })
+}
+
+fn second_oracle_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("second_oracle")
+        .join(format!("{name}.toml"))
+}
+
+/// The vendored record, or `None` when the part needs none because gputils
+/// covers it. `Some(Err)` is a malformed record, which fails the gate: a
+/// broken oracle is not an absent one.
+fn load_second_oracle(name: &str) -> Option<Result<SecondOracle, String>> {
+    let path = second_oracle_path(name);
+    if !path.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    Some(parse_second_oracle(name, &text))
+}
+
+/// Exact match on the expected TOML values: the record already passed human
+/// attestation, so a residual is a defect in one of the two files, never a
+/// disclosure. No divergence markers exist on this path by design.
+fn compare_second_oracle(dev: &Device, oracle: &SecondOracle) -> Vec<String> {
+    let show = |r: Option<(u16, u16)>| r.map_or("none".into(), |x| fmt(&[x]));
+    let mut problems = Vec::new();
+    if dev.flash_words != oracle.flash_words {
+        problems.push(format!(
+            "{}: flash_words is {} but the second oracle ({}, {}) states {}",
+            dev.name, dev.flash_words, oracle.pack, oracle.ini, oracle.flash_words
+        ));
+    }
+    let (ours, theirs) = (coalesce(dev.ram_banks), coalesce(&oracle.ram_banks));
+    if ours != theirs {
+        problems.push(format!(
+            "{}: ram_banks disagree\n  ours  : {}\n  oracle: {}",
+            dev.name,
+            fmt(&ours),
+            fmt(&theirs)
+        ));
+    }
+    if dev.common_ram != oracle.common_ram {
+        problems.push(format!(
+            "{}: common_ram is {} but the second oracle states {}",
+            dev.name,
+            show(dev.common_ram),
+            show(oracle.common_ram)
+        ));
+    }
+    if dev.access_bank != oracle.access_bank {
+        problems.push(format!(
+            "{}: access_bank is {} but the second oracle states {}",
+            dev.name,
+            show(dev.access_bank),
+            show(oracle.access_bank)
+        ));
+    }
+    let show_u16 = |r: Option<u16>| r.map_or("none".into(), |x| format!("0x{x:04X}"));
+    if dev.isr_w_shadow != oracle.isr_w_shadow {
+        problems.push(format!(
+            "{}: isr_w_shadow is {} but the second oracle states {}",
+            dev.name,
+            show_u16(dev.isr_w_shadow),
+            show_u16(oracle.isr_w_shadow)
+        ));
+    }
+    if dev.isr_home_window != oracle.isr_home_window {
+        problems.push(format!(
+            "{}: isr_home_window is {} but the second oracle states {}",
+            dev.name,
+            show(dev.isr_home_window),
+            show(oracle.isr_home_window)
+        ));
+    }
+    problems
+}
+
+/// gpasm names an unknown `-p` part and exits non-zero, which is how the
+/// flash gate tells "gputils never heard of this part" from a range verdict.
+fn is_unknown_processor(text: &str) -> bool {
+    text.contains("Didn't find any processor named")
+}
+
 #[test]
 fn ram_map_matches_gputils_for_every_device() {
     let Some(share) = gputils_share() else { return };
     let mut checked: Vec<&str> = Vec::new();
+    let mut oracle_checked: Vec<&str> = Vec::new();
     let mut uncovered: Vec<&str> = Vec::new();
     let mut problems: Vec<String> = Vec::new();
     for dev in device::ALL {
         match lkr_for(&share, dev.name) {
             Some(text) => {
                 problems.extend(compare(dev, &ram_from_lkr(&text)));
+                if second_oracle_path(dev.name).is_file() {
+                    problems.push(format!(
+                        "{}: gputils knows this part, so its second-oracle record is stale; \
+                         remove it",
+                        dev.name
+                    ));
+                }
                 checked.push(dev.name);
             }
-            None => uncovered.push(dev.name),
+            // No `.lkr`: gputils never heard of this part, so the vendored
+            // second oracle covers it when one exists.
+            None => match load_second_oracle(dev.name) {
+                Some(Ok(oracle)) => {
+                    problems.extend(compare_second_oracle(dev, &oracle));
+                    oracle_checked.push(dev.name);
+                }
+                Some(Err(e)) => problems.push(e),
+                None => uncovered.push(dev.name),
+            },
         }
     }
     // Coverage is reported by name, never inferred from a count: three covered
     // devices satisfy any `checked > 0` guard while a fourth goes unchecked.
-    eprintln!("gputils cross-check: verified {checked:?}, no .lkr for {uncovered:?}");
+    eprintln!(
+        "gputils cross-check: verified {checked:?}, second-oracle {oracle_checked:?}, \
+         no .lkr for {uncovered:?}"
+    );
     let unattested: Vec<&&str> = uncovered
         .iter()
         .filter(|n| provenance_tier(n) != "datasheet")
@@ -378,7 +623,10 @@ fn ram_map_matches_gputils_for_every_device() {
         "no gputils .lkr covers {unattested:?}, so nothing verifies their RAM map. \
          Only tier = \"datasheet\" may go uncovered."
     );
-    assert!(!checked.is_empty(), "no device was cross-checked");
+    assert!(
+        !checked.is_empty() || !oracle_checked.is_empty(),
+        "no device was cross-checked"
+    );
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
@@ -745,9 +993,10 @@ const OVERFLOW: &str = "Address exceeds maximum range";
 
 #[test]
 fn flash_words_matches_gputils_for_every_device() {
-    let Some(_share) = gputils_share() else {
+    let Some(share) = gputils_share() else {
         return;
     };
+    let mut oracle_checked: Vec<&str> = Vec::new();
     for dev in device::ALL {
         // org counts words on PIC14 and bytes on PIC18, so the last valid
         // address and the first bad one differ per core.
@@ -759,6 +1008,36 @@ fn flash_words_matches_gputils_for_every_device() {
         };
 
         let inside = probe_org(dev.name, last, "last");
+        // gpasm never heard of this part: neither probe can run, so the
+        // vendored second oracle states flash_words instead. A part with a
+        // `.lkr` but no `gpasm` entry is a broken install, not an oracle
+        // case: fail on the mix rather than split the halves across oracles.
+        if !inside.ran && is_unknown_processor(&inside.text) {
+            if lkr_for(&share, dev.name).is_some() {
+                panic!(
+                    "{}: mixed gputils state: a .lkr exists but gpasm rejects -p {}; \
+                     fix the install instead of adding a record (ADR-021)",
+                    dev.name, dev.name
+                );
+            }
+            match load_second_oracle(dev.name) {
+                Some(Ok(oracle)) => {
+                    assert_eq!(
+                        dev.flash_words, oracle.flash_words,
+                        "{}: flash_words is {} but the second oracle ({}, {}) states {}",
+                        dev.name, dev.flash_words, oracle.pack, oracle.ini, oracle.flash_words
+                    );
+                    oracle_checked.push(dev.name);
+                    continue;
+                }
+                Some(Err(e)) => panic!("{}: malformed second-oracle record: {e}", dev.name),
+                None => panic!(
+                    "{}: gpasm does not know this part and no second-oracle record covers it; \
+                     add crates/device/second_oracle/{}.toml (ADR-021)",
+                    dev.name, dev.name
+                ),
+            }
+        }
         assert!(
             inside.ran,
             "{}: gpasm could not run for this device, so 0x{last:X} was never \
@@ -789,6 +1068,7 @@ fn flash_words_matches_gputils_for_every_device() {
             outside.text
         );
     }
+    eprintln!("gputils flash cross-check: second-oracle {oracle_checked:?}");
 }
 
 /// The pack-derived SFR table against gputils' own headers: every register
@@ -841,4 +1121,144 @@ fn sfr_tables_match_gputils_headers() {
             }
         }
     }
+}
+
+/// Every vendored record names a shipped device and parses: a record for a
+/// removed part, or one that stopped parsing, must fail here rather than
+/// sit unverified until its part goes through the gate.
+#[test]
+fn second_oracle_records_match_known_devices() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("second_oracle");
+    let mut problems = Vec::new();
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        if !device::ALL.iter().any(|d| d.name == stem) {
+            problems.push(format!("second oracle {stem}: names no known device"));
+            continue;
+        }
+        if let Some(Err(e)) = load_second_oracle(&stem) {
+            problems.push(e);
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+fn oracle_fixture(name: &str) -> String {
+    format!(
+        "name = \"{name}\"\n\
+         flash_words = 8192\n\
+         ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF]]\n\
+         common_ram = [0x0070, 0x007F]\n\
+         [provenance]\n\
+         pack = \"Microchip.PIC16F1xxxx_DFP.1.29.444\"\n\
+         ini = \"xc8/pic/dat/ini/16f13145.ini\"\n\
+         ini_sha256 = \"af0c878c8b154a15a6fda72b216cb9642ddab13b4f36aeeb2f5340e6415de564\"\n\
+         datasheet = \"DS40002519D\"\n\
+         datasheet_section = \"9.1 Table 9-1 (flash), 9.2 Figure 9-4 (RAM)\"\n"
+    )
+}
+
+fn oracle_device() -> (Device, SecondOracle) {
+    let base = device::PIC16F887;
+    let dev = Device {
+        flash_words: 8192,
+        ram_banks: &[(0x20, 0x6F), (0xA0, 0xEF)],
+        common_ram: Some((0x70, 0x7F)),
+        access_bank: None,
+        ..base
+    };
+    let oracle = parse_second_oracle("p9z9", &oracle_fixture("p9z9")).unwrap();
+    (dev, oracle)
+}
+
+#[test]
+fn second_oracle_parse_accepts_a_full_record() {
+    let o = parse_second_oracle("p9z9", &oracle_fixture("p9z9")).unwrap();
+    assert_eq!(o.flash_words, 8192);
+    assert_eq!(o.ram_banks, vec![(0x20, 0x6F), (0xA0, 0xEF)]);
+    assert_eq!(o.common_ram, Some((0x70, 0x7F)));
+    assert_eq!(o.access_bank, None);
+}
+
+#[test]
+fn second_oracle_parse_rejects_a_nameless_or_shaless_record() {
+    assert!(parse_second_oracle("p9z9", "flash_words = 1\nram_banks = [[0, 1]]").is_err());
+    let no_sha = oracle_fixture("p9z9").replace("ini_sha256", "nope_sha");
+    assert!(parse_second_oracle("p9z9", &no_sha).is_err());
+    let short_sha = oracle_fixture("p9z9").replace("af0c878c", "zz");
+    assert!(parse_second_oracle("p9z9", &short_sha).is_err());
+    let renamed = oracle_fixture("p9z8");
+    assert!(parse_second_oracle("p9z9", &renamed).is_err());
+    let typo = oracle_fixture("p9z9").replace("common_ram", "common_rma");
+    assert!(parse_second_oracle("p9z9", &typo).is_err());
+}
+
+#[test]
+fn second_oracle_compare_passes_on_identical_values() {
+    let (dev, oracle) = oracle_device();
+    let problems = compare_second_oracle(&dev, &oracle);
+    assert!(
+        problems.is_empty(),
+        "identical values should pass: {problems:?}"
+    );
+}
+
+#[test]
+fn second_oracle_compare_names_each_mismatch() {
+    let (base_dev, base_oracle) = oracle_device();
+    let small_flash = Device {
+        flash_words: 4096,
+        ..base_dev
+    };
+    assert!(
+        compare_second_oracle(&small_flash, &base_oracle)
+            .iter()
+            .any(|p| p.contains("flash_words")),
+        "flash mismatch should name flash_words"
+    );
+    let mut short_oracle = parse_second_oracle("p9z9", &oracle_fixture("p9z9")).unwrap();
+    short_oracle.ram_banks.pop();
+    assert!(
+        compare_second_oracle(&base_dev, &short_oracle)
+            .iter()
+            .any(|p| p.contains("ram_banks")),
+        "bank mismatch should name ram_banks"
+    );
+    let mut moved_oracle = parse_second_oracle("p9z9", &oracle_fixture("p9z9")).unwrap();
+    moved_oracle.common_ram = Some((0x60, 0x6F));
+    assert!(
+        compare_second_oracle(&base_dev, &moved_oracle)
+            .iter()
+            .any(|p| p.contains("common_ram")),
+        "window mismatch should name common_ram"
+    );
+    let drifted_dev = Device {
+        isr_home_window: Some((0x60, 0x6F)),
+        ..base_dev
+    };
+    assert!(
+        compare_second_oracle(&drifted_dev, &base_oracle)
+            .iter()
+            .any(|p| p.contains("isr_home_window")),
+        "carve mismatch should name isr_home_window"
+    );
+}
+
+#[test]
+fn unknown_processor_matches_gpasm_verdict() {
+    assert!(is_unknown_processor(
+        "Didn't find any processor named: p16f13145\nHere are the supported processors:"
+    ));
+    assert!(!is_unknown_processor("Address exceeds maximum range"));
+    assert!(!is_unknown_processor(""));
 }
