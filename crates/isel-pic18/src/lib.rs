@@ -9430,15 +9430,22 @@ impl<'m> Gen<'m> {
                     }
                 } else if let Val::Reg(r) = &arg.val {
                     // A flash address bound for a RAM param slot would read back
-                    // through FSR: refuse. A flash-kind param takes the bytes
+                    // through FSR: refuse, and likewise a maybe-flash one
+                    // (epic-cc#1099). A flash-kind param takes the bytes
                     // whole; slot-based values copy as before, a static flash
                     // base materializes as LOW/HIGH, a dynamic one seeds
                     // TBLPTR first (epic-cc#1119).
                     let vflash = self.flash_val(self.cur_func, &arg.val);
+                    let vmixed = self.prov.mixed.contains(&ssa_key(self.cur_func, r));
                     let param_flash = self.slot_is_flash(func, &callee.params[i].name);
                     if vflash && !param_flash {
                         panic!(
                             "isel-pic18: cannot pass flash address %{r} to a RAM pointer param (epic-cc#1119)"
+                        );
+                    }
+                    if vmixed {
+                        panic!(
+                            "isel-pic18: cannot pass maybe-flash address %{r} to a pointer param (a pointer joins flash and RAM; epic-cc#1099, epic-cc#1119)"
                         );
                     }
                     let flash_base = if vflash {
@@ -10214,10 +10221,15 @@ impl<'m> Gen<'m> {
                 // A ROM address has no RAM form: a later load through the stored
                 // slot reads RAM at that address, silently wrong. A flash-kind
                 // slot takes it whole (epic-cc#1119); anything else still
-                // refuses (epic-cc#1101).
+                // refuses (epic-cc#1101). A maybe-flash address has no single
+                // space either: storing it anywhere is refused (epic-cc#1099).
                 let stores_rom = match &s.val {
                     Val::Global(g) => self.global_is_const(g),
                     Val::Reg(_) => self.flash_val(self.cur_func, &s.val),
+                    _ => false,
+                };
+                let stores_mixed = match &s.val {
+                    Val::Reg(r) => self.prov.mixed.contains(&ssa_key(self.cur_func, r)),
                     _ => false,
                 };
                 // A const destination is a ROM write: leave it to the const-base refusal below.
@@ -10225,13 +10237,24 @@ impl<'m> Gen<'m> {
                     .ptr
                     .strip_prefix('@')
                     .is_some_and(|g| self.global_is_const(g));
-                if stores_rom && !dst_is_const {
+                if (stores_rom || stores_mixed) && !dst_is_const {
                     if let Some(g) = s.ptr.strip_prefix('@') {
                         if self.global_slot_is_flash(g) {
-                            let dst = self.global_addr(g);
-                            self.emit_flash_addr_store(&s.val, s.ty, dst);
-                            return;
+                            if stores_rom {
+                                let dst = self.global_addr(g);
+                                self.emit_flash_addr_store(&s.val, s.ty, dst);
+                                return;
+                            }
+                            panic!(
+                                "isel-pic18: store of a maybe-flash address into a flash-kind slot is not supported (epic-cc#1099, epic-cc#1119)"
+                            );
                         }
+                    }
+                    if stores_mixed {
+                        panic!(
+                            "isel-pic18: store of a maybe-flash address {:?} is not supported (a pointer joins flash and RAM; epic-cc#1099, epic-cc#1119)",
+                            s.val
+                        );
                     }
                     panic!(
                         "isel-pic18: store of a ROM address into RAM is not supported: {:?} (epic-cc#1101)",
@@ -18106,13 +18129,21 @@ pub fn select_with_opts(
                 Some(Inst::Ret(Some((ty, v)), loc)) => {
                     g.cur_loc = loc.clone();
                     // A flash address has no RAM form for the caller: its
-                    // call-dst slot would read RAM at that address. Refuse
+                    // call-dst slot would read RAM at that address. Refuse,
+                    // and likewise a maybe-flash one (epic-cc#1099).
                     // (alloc copies returned consts to RAM, epic-cc#1119).
                     // A null constant is space-neutral and stays allowed.
                     if !matches!(v, Val::Const(_)) && g.flash_val(&f.name, v) {
                         panic!(
                             "isel-pic18: cannot return flash address {v:?} to a RAM caller (epic-cc#1119)"
                         );
+                    }
+                    if let Val::Reg(r) = v {
+                        if g.prov.mixed.contains(&ssa_key(&f.name, r)) {
+                            panic!(
+                                "isel-pic18: cannot return maybe-flash address %{r} to a caller (a pointer joins flash and RAM; epic-cc#1099, epic-cc#1119)"
+                            );
+                        }
                     }
                     let home = match v {
                         Val::Reg(r) => g.addrs.get(&ssa_key(&f.name, r)).copied(),

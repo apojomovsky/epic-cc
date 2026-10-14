@@ -334,3 +334,87 @@ fn flash_walk_reg_store_into_ram_is_refused() {
         None,
     );
 }
+
+#[test]
+#[should_panic(expected = "maybe-flash address")]
+fn mixed_select_forwarded_to_ram_param_is_refused() {
+    // A select joining flash and RAM forwarded to a callee would read
+    // data memory at a flash address on one arm: refuse (epic-cc#1099).
+    let m = with_bytes(
+        parse(
+            "const s i8\nglobal buf i8\nglobal flag i8\nglobal out i8\n\
+             fn use(void) (p=ptr)\n  block entry:\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n\
+             fn main(void) ()\n  block entry:\n    %c = load i8 @flag\n    %m = select i1 %c, ptr @s, ptr @buf\n    call void @use(ptr %m)\n    ret void\n",
+        ),
+        "s",
+        b"S",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("buf", 0x10),
+            ("flag", 0x11),
+            ("out", 0x12),
+            ("main::c", 0x13),
+            ("main::m", 0x14),
+            ("use::p", 0x16),
+            ("use::v", 0x18),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "maybe-flash address")]
+fn mixed_select_stored_to_ram_is_refused() {
+    // Storing a flash-or-RAM address into a RAM slot leaves no single
+    // space for later reads: refuse (epic-cc#1099).
+    let m = with_bytes(
+        parse(
+            "const s i8\nglobal buf i8\nglobal flag i8\nglobal g i16\n\
+             fn main(void) ()\n  block entry:\n    %c = load i8 @flag\n    %m = select i1 %c, ptr @s, ptr @buf\n    store ptr %m @g\n    ret void\n",
+        ),
+        "s",
+        b"S",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("buf", 0x10),
+            ("flag", 0x11),
+            ("g", 0x12),
+            ("main::c", 0x14),
+            ("main::m", 0x15),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "maybe-flash address")]
+fn mixed_select_returned_is_refused() {
+    // A returned flash-or-RAM address would read back through the
+    // caller's RAM slot: refuse (epic-cc#1099).
+    let m = with_bytes(
+        parse(
+            "const s i8\nglobal buf i8\nglobal flag i8\n\
+             fn get(ptr) ()\n  block entry:\n    %c = load i8 @flag\n    %m = select i1 %c, ptr @s, ptr @buf\n    ret ptr %m\n\
+             fn main(void) ()\n  block entry:\n    ret void\n",
+        ),
+        "s",
+        b"S",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("buf", 0x10),
+            ("flag", 0x11),
+            ("get::c", 0x12),
+            ("get::m", 0x13),
+        ]),
+        None,
+    );
+}

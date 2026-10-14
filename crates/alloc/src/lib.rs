@@ -2925,17 +2925,23 @@ enum Dip {
 /// proof (same predicate over the final map) lowers their walks through
 /// TBLPTR. Greatest fixpoint over the slot proof, dropping consts with a
 /// RAM-forcing use. Loads, derefs, and pure flash walks never force.
-fn flash_resident_consts(m: &Module, resolved: &PtrResolution) -> HashSet<String> {
+/// Returns the resident set plus the final slot spaces for the
+/// initializer-ref rule below.
+fn flash_resident_consts(
+    m: &Module,
+    resolved: &PtrResolution,
+) -> (HashSet<String>, HashSet<String>) {
     let mut live: HashSet<String> = m
         .globals
         .iter()
         .filter(|g| g.is_const && !g.name.starts_with("_ZTV"))
         .map(|g| g.name.clone())
         .collect();
+    let mut spaces: HashSet<String>;
     loop {
         let mut prov = flash_provenance(m);
         add_flash_walks(&mut prov, m, |n| live.contains(n));
-        let spaces = flash_slot_spaces(m, resolved, &prov, |n| live.contains(n));
+        spaces = flash_slot_spaces(m, resolved, &prov, |n| live.contains(n));
         let mut bad: HashSet<String> = HashSet::new();
         // Every const an offending value may carry leaves. Values are
         // followed through GEP chains and select/phi arms, so a pure
@@ -3001,7 +3007,13 @@ fn flash_resident_consts(m: &Module, resolved: &PtrResolution) -> HashSet<String
                                         force_val(&f.name, &s.val);
                                     }
                                 }
-                                None => {}
+                                // Spilling a const address through a pointer
+                                // (an alloca slot, a RAM global) reads back
+                                // through RAM: it keeps a copy like a direct
+                                // store (epic-cc#1119 review).
+                                None => {
+                                    force_val(&f.name, &s.val);
+                                }
                             }
                         }
                         ir::Inst::Asm(a) => {
@@ -3029,14 +3041,18 @@ fn flash_resident_consts(m: &Module, resolved: &PtrResolution) -> HashSet<String
                                 force_val(&f.name, v);
                             }
                         }
-                        ir::Inst::Memcpy(mc) => {
-                            force_val(&f.name, &mc.dst);
+                        ir::Inst::Memcpy(_) => {
+                            // A memcpy into flash-derived space is refused
+                            // in isel either way; no copy can serve it.
                         }
-                        ir::Inst::IntToPtr(p) => {
-                            force_val(&f.name, &p.val);
+                        ir::Inst::IntToPtr(_) => {
+                            // Integer-domain addresses are out of scope
+                            // (epic-cc#1119 follow-up).
                         }
-                        ir::Inst::Freeze(fr) => {
-                            force_val(&f.name, &fr.val);
+                        ir::Inst::Freeze(_) => {
+                            // Uses of the frozen value force through
+                            // fan-in following; the freeze itself needs
+                            // no copy.
                         }
                         _ => {}
                     }
@@ -3062,7 +3078,7 @@ fn flash_resident_consts(m: &Module, resolved: &PtrResolution) -> HashSet<String
             live.remove(&g);
         }
     }
-    live
+    (live, spaces)
 }
 
 /// Address allocation with a value-fold gate (epic-cc#863). `None`
@@ -3682,11 +3698,12 @@ fn allocate_inner(
     // a flash-proven position, so they keep no RAM copy and isel lowers
     // their walks through TBLPTR from the slot bytes. Other cores keep
     // every copy: their backends still address staged copies and pools.
-    let flash_resident: HashSet<String> = if device.core == Core::Pic18 {
-        flash_resident_consts(m, &resolved)
-    } else {
-        HashSet::new()
-    };
+    let (flash_resident, flash_spaces): (HashSet<String>, HashSet<String>) =
+        if device.core == Core::Pic18 {
+            flash_resident_consts(m, &resolved)
+        } else {
+            (HashSet::new(), HashSet::new())
+        };
     let stays_flash = |g: &str| device.core == Core::Pic18 && flash_resident.contains(g);
 
     let mut const_globals: HashSet<String> = HashSet::new();
@@ -4169,6 +4186,26 @@ fn allocate_inner(
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+    // Initializer refs into a RAM-kind global read back through RAM on
+    // PIC18: their consts keep the copies the fixpoint forced
+    // (epic-cc#1119 review). Flash-kind globals keep none.
+    if device.core == Core::Pic18 {
+        for g in &m.globals {
+            if g.is_const || flash_spaces.contains(&format!("@{}", g.name)) {
+                continue;
+            }
+            for (_, t, _) in &g.refs {
+                if t.starts_with("_ZTV") {
+                    continue;
+                }
+                if let Some(gl) = m.globals.iter().find(|x| x.name == *t && x.is_const) {
+                    if gl.size <= 255 {
+                        const_to_ram.insert(t.clone());
                     }
                 }
             }

@@ -456,6 +456,61 @@ fn a_single_const_select_arm_is_copied_to_ram() {
         "RAM arm @b keeps its address"
     );
 }
+#[test]
+fn const_spilled_through_pointer_keeps_copy_on_pic18() {
+    // Spilling a const address through a pointer (an alloca slot here)
+    // reads back through RAM: it keeps a RAM copy like a direct store
+    // (epic-cc#1119 review).
+    let m = parse(
+        "const c i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = alloca 2\n\
+             store ptr @c %a\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "spilled const @c must be copied to RAM"
+    );
+    assert!(
+        !out.const_globals.contains("c"),
+        "copied const @c must leave the flash set"
+    );
+}
+
+#[test]
+fn init_ref_into_mixed_global_keeps_copy_on_pic18() {
+    // A global initialized with a flash address but also written with
+    // RAM reads back through RAM: its const keeps a copy (epic-cc#1119
+    // review). Without the RAM store it would stay flash.
+    let mut m = parse(
+        "const c i8\n\
+         global g i16\n\
+         global buf i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %q = gep @buf +0\n\
+             store ptr %q @g\n\
+             ret void\n",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" {
+            g.bytes = vec![0, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "init-ref const @c into a mixed global must be copied to RAM"
+    );
+    assert!(
+        !out.const_globals.contains("c"),
+        "copied const @c must leave the flash set"
+    );
+}
 
 #[test]
 fn const_direct_ptr_call_arg_stays_in_flash_on_pic18() {
