@@ -3913,6 +3913,87 @@ fn byte_index_register_store_still_drops_the_zext_high_lane() {
 }
 
 #[test]
+fn xor_byte_shift_folds_into_the_carried_high_lane() {
+    // `c ^= (u16)byte << 8` over a phi-carried `c`: the zext, shift,
+    // and full-width xor never emit, the fold reads the staged byte
+    // and xors the carried high lane in place (epic-cc#1202).
+    // Hand trace: idx = 2, outer runs twice, out = 9.
+    let m = parse(
+        "global ram i64\n\
+         global idx i8\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i8 2 @idx\n\
+             br label head\n\
+           block head:\n\
+             %c = phi i16 7 entry %y latch\n\
+             %n = phi i8 0 entry %n2 latch\n\
+             %i = load i8 @idx\n\
+             %e = zext i8 %i to i16\n\
+             %s = shl i16 %e, 8\n\
+             %x = xor i16 %s, %c\n\
+             br label inner\n\
+           block inner:\n\
+             %d = phi i16 %x head %y inner\n\
+             %y = add i16 %d, 1\n\
+             %k = phi i8 0 head %k2 inner\n\
+             %k2 = add i8 %k, 1\n\
+             %t = icmp eq i8 %k2, 1\n\
+             br i1 %t latch inner\n\
+           block latch:\n\
+             %n2 = add i8 %n, 1\n\
+             %u = icmp eq i8 %n2, 2\n\
+             br i1 %u exit head\n\
+           block exit:\n\
+             store i16 %y @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x130),
+        ("out", 0x131),
+        ("main::i", 0x133),
+        ("main::e", 0x134),
+        ("main::s", 0x136),
+        ("main::x", 0x138),
+        ("main::c", 0x13A),
+        ("main::n", 0x13C),
+        ("main::n2", 0x13D),
+        ("main::d", 0x13E),
+        ("main::y", 0x140),
+        ("main::k", 0x142),
+        ("main::k2", 0x143),
+        ("main::t", 0x144),
+        ("main::u", 0x145),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        main_asm.lines().filter(|l| l.contains("XORWF")).count() == 1
+            && main_asm
+                .lines()
+                .any(|l| l.contains("XORWF") && l.contains(",F,")),
+        "the only xor is the in-place high-lane fold:\n{asm}"
+    );
+    for dead in [
+        "0x034", "0x035", "0x036", "0x037", "0x134", "0x135", "0x136", "0x137",
+    ] {
+        assert!(
+            !main_asm.contains(dead),
+            "zext/shift temp homes never emit ({dead}):\n{asm}"
+        );
+    }
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words.clone());
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(2000);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x131], 9, "out low byte:\n{asm}");
+    assert_eq!(p.ram()[0x132], 0, "out high byte:\n{asm}");
+}
+
+#[test]
 fn branch_on_computed_byte_skips_the_reload() {
     // `if (a & 3)`: the `ANDWF,W` already sets `Z` from the result
     // byte, and the `MOVWF` into the result slot preserves it, so the

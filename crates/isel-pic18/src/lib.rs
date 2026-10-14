@@ -186,6 +186,24 @@ struct BitLane {
     acc: String,
     loc: Option<SrcLoc>,
 }
+/// A high-byte xor fold (epic-cc#1202): `load i8` to `zext` to `shl 8`
+/// to `xor i16` against a phi-carried reg, the xor feeding one
+/// successor phi over an unconditional edge. The `xor` arm emits
+/// `MOVF byte,W; XORWF carried_hi,F` in place; the zext/shl arms
+/// skip (`mid`) and the phi incoming is rewritten to the carried reg.
+#[derive(Clone)]
+struct XorHiFold {
+    /// The loop-carried reg (`c`), updated in its own home.
+    carried: String,
+    /// Staged slot or global holding the loaded byte.
+    byte_addr: u16,
+    /// The carried reg's home; lane 1 is the xor target.
+    carried_home: u16,
+    /// Chain block (holds the load through the xor).
+    pred: String,
+    /// Block holding the successor phi.
+    succ: String,
+}
 /// A fused compare reading its lanes in place (epic-cc#721). `icmp`
 /// carries the chain's lane sources with each consumed single-use load
 /// replaced by its global; `consumed` names the load dsts the block
@@ -545,6 +563,13 @@ struct Gen<'m> {
     /// the eq arm drops its high-lane check (cmps).
     latch_narrow_adds: HashSet<String>,
     latch_narrow_cmps: HashSet<String>,
+    /// High-byte xor folds from the per-function pre-scan (epic-cc#1202).
+    /// Maps an `xor i16` dst to its fold: the `xor` arm emits the
+    /// in-place `MOVF`/`XORWF` pair, the phi-copy builder rewrites the
+    /// successor incoming to the carried reg, and `xor_hi_mid` holds
+    /// the skipped zext/shl dsts.
+    xor_hi_fold: HashMap<String, XorHiFold>,
+    xor_hi_mid: HashSet<String>,
     out: Vec<String>,
     /// One source location per emitted line, index-aligned with `out`.
     /// `None` marks a compiler-generated line (no source instruction).
@@ -2714,6 +2739,179 @@ impl<'m> Gen<'m> {
         (adds, cmps)
     }
 
+    /// High-byte xor pre-scan (epic-cc#1202): one header block holding
+    /// `load i8` to `zext` to `shl 8` to `xor i16` against a
+    /// phi-carried reg, the xor feeding one successor phi over an
+    /// unconditional edge. The fold emits `MOVF byte,W; XORWF
+    /// carried_hi,F` at the xor's slot with that phi incoming rewritten
+    /// to the carried reg; the zext/shl temps and the full-width xor
+    /// never emit. The load still stages the byte into its home (or the
+    /// fold reads the `Direct` global), so chain adjacency keeps that
+    /// home live at the fold. Runs last: every claim set below is
+    /// final, and no later scan reads the rewritten edge.
+    fn find_xor_hi_fold(g: &Gen, f: &Func) -> (HashMap<String, XorHiFold>, HashSet<String>) {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let claimed = |g: &Gen, r: &str| {
+            g.lane_consumed.contains(r)
+                || g.bit_lanes.contains_key(r)
+                || g.store_consumed.contains(r)
+                || g.store_fwd.contains_key(r)
+                || g.phi_fold.contains_key(r)
+                || g.phi_fold.values().any(|p| p == r)
+                || g.inplace_bins.contains(r)
+                || g.const_w_phis.contains(r)
+                || g.bin_w_srcs.contains(r)
+                || g.rmw_fwd.contains_key(r)
+                || g.rmw_fwd.values().any(|l| l == r)
+                || g.tablat_fwd.contains(r)
+                || g.trunc_fwd.contains_key(r)
+                || g.zext_ret.contains(r)
+        };
+        let single =
+            |uses: &HashMap<String, usize>, r: &str| uses.get(r).copied().unwrap_or(0) == 1;
+        let mut fold = HashMap::new();
+        let mut mid = HashSet::new();
+        for b in &f.blocks {
+            for (xi, inst) in b.insts.iter().enumerate() {
+                let Inst::Bin(q) = inst else { continue };
+                if q.op != ir::BinOp::Xor || q.ty.bytes() != 2 || !single(&uses, &q.dst) {
+                    continue;
+                }
+                let (ra, rb) = match (&q.a, &q.b) {
+                    (Val::Reg(x), Val::Reg(y)) => (x.clone(), y.clone()),
+                    _ => continue,
+                };
+                // The shl side defines the chain; the other side is the
+                // carried reg, whichever order clang left them in.
+                let mut chain: Option<(String, String)> = None;
+                for (shl, carried) in [(ra.clone(), rb.clone()), (rb, ra)] {
+                    if single(&uses, &carried)
+                        && b.insts[..xi].iter().any(
+                            |i| matches!(i, Inst::Bin(s) if s.dst == shl && s.op == ir::BinOp::Shl),
+                        )
+                    {
+                        chain = Some((shl, carried));
+                        break;
+                    }
+                }
+                let Some((shl_dst, carried)) = chain else {
+                    continue;
+                };
+                if !single(&uses, &shl_dst)
+                    || !b
+                        .insts
+                        .iter()
+                        .any(|i| matches!(i, Inst::Phi(p) if p.dst == carried))
+                {
+                    continue;
+                }
+                let Some(si) = b.insts[..xi]
+                    .iter()
+                    .rposition(|i| matches!(i, Inst::Bin(s) if s.dst == shl_dst))
+                else {
+                    continue;
+                };
+                let Inst::Bin(s) = &b.insts[si] else {
+                    continue;
+                };
+                if s.ty.bytes() != 2 || !matches!(&s.b, Val::Const(8)) {
+                    continue;
+                }
+                let Val::Reg(zext_dst) = &s.a else { continue };
+                if !single(&uses, zext_dst) {
+                    continue;
+                }
+                let Some(zi) = b.insts[..si]
+                    .iter()
+                    .rposition(|i| matches!(i, Inst::Zext(z) if z.dst == *zext_dst))
+                else {
+                    continue;
+                };
+                let Inst::Zext(z) = &b.insts[zi] else {
+                    continue;
+                };
+                if z.from.bytes() != 1 || z.to.bytes() != 2 {
+                    continue;
+                }
+                let Val::Reg(load_dst) = &z.val else { continue };
+                let Some(li) = b.insts[..zi].iter().rposition(
+                    |i| matches!(i, Inst::Load(l) if l.dst == *load_dst && l.ty.bytes() == 1),
+                ) else {
+                    continue;
+                };
+                // Chain adjacency: only virtual Geps may sit between the
+                // load and the xor, so no write can land on the byte's
+                // staged home mid-chain and no W threading can interleave.
+                let adjacent = b.insts[li + 1..xi].iter().all(|i| {
+                    matches!(i, Inst::Gep(_))
+                        || matches!(i, Inst::Load(l) if l.dst == *load_dst)
+                        || matches!(i, Inst::Zext(z) if z.dst == *zext_dst)
+                        || matches!(i, Inst::Bin(s) if s.dst == shl_dst)
+                });
+                if !adjacent {
+                    continue;
+                }
+                if [&carried, &shl_dst, zext_dst, load_dst]
+                    .iter()
+                    .any(|r| claimed(g, r))
+                {
+                    continue;
+                }
+                // The byte source: a `Direct`-folded global has no slot
+                // (that load never stages); any other fold skips staging
+                // too, so only the staged home is readable.
+                let byte_addr = match g.w_folds.loads.get(load_dst) {
+                    Some(iselcore::LoadFold::Direct(glob)) => g.global_addr(glob),
+                    Some(_) => continue,
+                    None => match g.addrs.get(&ssa_key(&f.name, load_dst)) {
+                        Some(a) => *a,
+                        None => continue,
+                    },
+                };
+                let Some(carried_home) = g.addrs.get(&ssa_key(&f.name, &carried)).copied() else {
+                    continue;
+                };
+                let Some(Inst::Br(br)) = b.insts.last() else {
+                    continue;
+                };
+                if br.target == b.label {
+                    continue;
+                }
+                let Some(succ) = f.blocks.iter().find(|s| s.label == br.target) else {
+                    continue;
+                };
+                let reads_xor = succ.insts.iter().any(|i| {
+                    matches!(i, Inst::Phi(p) if p.incoming.iter().any(|(v, from)| *from == b.label && *v == Val::Reg(q.dst.clone())))
+                });
+                if !reads_xor {
+                    continue;
+                }
+                mid.insert(zext_dst.clone());
+                mid.insert(shl_dst.clone());
+                fold.insert(
+                    q.dst.clone(),
+                    XorHiFold {
+                        carried,
+                        byte_addr,
+                        carried_home,
+                        pred: b.label.clone(),
+                        succ: br.target.clone(),
+                    },
+                );
+            }
+        }
+        (fold, mid)
+    }
     /// Walk-loop pre-scan (epic-cc#896): single-block counted loops whose
     /// index feeds only `PLUSW`-shaped accesses, closed by an increment
     /// compared against 1..=255. Runs after every fold so shape checks see
@@ -9012,6 +9210,16 @@ impl<'m> Gen<'m> {
                     self.emit_bit_lane(&lane);
                     return;
                 }
+                // High-byte xor fold (epic-cc#1202): the xor computes
+                // into its carried reg's home, a skipped shl never emits.
+                if let Some(fd) = self.xor_hi_fold.get(&b.dst).cloned() {
+                    self.emit_banked("MOVF", fd.byte_addr, ",W");
+                    self.emit_banked("XORWF", fd.carried_home + 1, ",F");
+                    return;
+                }
+                if self.xor_hi_mid.contains(&b.dst) {
+                    return;
+                }
                 let n = b.ty.bytes();
 
                 assert!(
@@ -9589,6 +9797,9 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Zext(z) => {
+                if self.xor_hi_mid.contains(&z.dst) {
+                    return;
+                }
                 if self.lane_consumed.contains(&z.dst) {
                     return;
                 }
@@ -15565,6 +15776,8 @@ pub fn select_with_opts(
                 select_fused: HashMap::new(),
                 latch_narrow_adds: HashSet::new(),
                 latch_narrow_cmps: HashSet::new(),
+                xor_hi_fold: HashMap::new(),
+                xor_hi_mid: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -15651,6 +15864,8 @@ pub fn select_with_opts(
             select_fused: HashMap::new(),
             latch_narrow_adds: HashSet::new(),
             latch_narrow_cmps: HashSet::new(),
+            xor_hi_fold: HashMap::new(),
+            xor_hi_mid: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -15745,6 +15960,11 @@ pub fn select_with_opts(
         let (latch_adds, latch_cmps) = Gen::find_latch_narrow(&g, f);
         g.latch_narrow_adds = latch_adds;
         g.latch_narrow_cmps = latch_cmps;
+        // High-byte xor folds (epic-cc#1202): run last, after every
+        // claim set the shape checks read.
+        let (xor_fold, xor_mid) = Gen::find_xor_hi_fold(&g, f);
+        g.xor_hi_fold = xor_fold;
+        g.xor_hi_mid = xor_mid;
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
         // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
@@ -15775,6 +15995,18 @@ pub fn select_with_opts(
                         // phi reg: same new value, and the backedge copy
                         // degrades to a skipped self-copy.
                         let val = g.fold_reg(val);
+                        // A folded high-byte xor already updated its
+                        // carried home in place, so the successor phi
+                        // reads the carried reg, not the dead xor temp.
+                        let val = match &val {
+                            Val::Reg(r) => match g.xor_hi_fold.get(r) {
+                                Some(fd) if fd.pred == *pred && fd.succ == b.label => {
+                                    Val::Reg(fd.carried.clone())
+                                }
+                                _ => val,
+                            },
+                            _ => val,
+                        };
                         phi_copies
                             .entry((pred.clone(), b.label.clone()))
                             .or_default()
@@ -16577,6 +16809,8 @@ pub fn select_with_opts(
             select_fused: HashMap::new(),
             latch_narrow_adds: HashSet::new(),
             latch_narrow_cmps: HashSet::new(),
+            xor_hi_fold: HashMap::new(),
+            xor_hi_mid: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
@@ -17008,6 +17242,8 @@ mod tests {
                 select_fused: HashMap::new(),
                 latch_narrow_adds: HashSet::new(),
                 latch_narrow_cmps: HashSet::new(),
+                xor_hi_fold: HashMap::new(),
+                xor_hi_mid: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -17058,6 +17294,8 @@ mod tests {
                 select_fused: HashMap::new(),
                 latch_narrow_adds: HashSet::new(),
                 latch_narrow_cmps: HashSet::new(),
+                xor_hi_fold: HashMap::new(),
+                xor_hi_mid: HashSet::new(),
                 w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 trunc_fwd: HashMap::new(),
@@ -17204,6 +17442,8 @@ mod p3_gen_tests {
             select_fused: HashMap::new(),
             latch_narrow_adds: HashSet::new(),
             latch_narrow_cmps: HashSet::new(),
+            xor_hi_fold: HashMap::new(),
+            xor_hi_mid: HashSet::new(),
             w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
