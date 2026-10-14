@@ -46,8 +46,8 @@
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    find_value_folds, flash_provenance, flash_walk_refusal, is_directive, resolve_pointers,
-    ssa_key, Base, FlashProvenance, PtrResolution, Slot,
+    chunk::word_size, find_value_folds, flash_provenance, flash_walk_refusal, is_directive,
+    resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -6530,42 +6530,6 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
     }
 }
 
-/// Counts one word per instruction line, ignoring labels, directives,
-/// symbol definitions, comments, and blanks. Mirrors the assembler pass-1
-/// count so page decisions match assigned addresses.
-fn word_size(lines: &[String]) -> usize {
-    lines
-        .iter()
-        .filter(|raw| {
-            let line = raw.split(';').next().unwrap_or("").trim();
-            if line.is_empty() {
-                return false;
-            }
-            if is_directive(line, "list") || is_directive(line, "radix") {
-                return false;
-            }
-            if line.starts_with("org ") {
-                return false;
-            }
-            if is_directive(line, "end") {
-                return false;
-            }
-            if line.ends_with(':') {
-                return false;
-            }
-            if line.contains(" equ ") {
-                return false;
-            }
-            if line.starts_with(".align ") {
-                return false;
-            }
-            if line.starts_with(".table ") {
-                return false;
-            }
-            true
-        })
-        .count()
-}
 /// Counts init words for RAM-resident const globals: two words per byte.
 /// The page-0 base includes this count (epic-cc#207).
 fn start_init_words(m: &Module, addrs: &HashMap<String, u16>) -> usize {

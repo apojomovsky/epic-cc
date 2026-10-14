@@ -13032,3 +13032,27 @@ fn mul_s16_wide_simulates_signed_products() {
         check(b, a);
     }
 }
+
+#[test]
+fn post_loop_load_through_counter_gep_reads_the_last_element() {
+    // PIC14 twin of the epic-cc#1274 shape: `isel` has no phi-fold map,
+    // so the increment stays staged with a backedge copy and the exit
+    // home keeps the last index. Pins the unaffected backend.
+    let ir = "global buf i64\nglobal out i8\nglobal sink i8\nfn main(void) ()\n  block entry:\n    br loop\n  block loop:\n    %i = phi i16 %r loop 0 entry\n    %p = gep @buf +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @sink\n    %r = add i16 %i, 1\n    %c = icmp eq i16 %r, 2\n    br i1 %c, exit, loop\n  block exit:\n    %w = load i8 %p\n    store i8 %w @out\n    ret void\n";
+    let map = [
+        ("buf", 0x40u16),
+        ("out", 0x21),
+        ("sink", 0x22),
+        ("main::i", 0x29),
+        ("main::r", 0x2B),
+        ("main::c", 0x2D),
+        ("main::v", 0x2E),
+        ("main::w", 0x2F),
+    ];
+    let seed = [(0x40u16, 0xA1u8), (0x41, 0xB2)];
+    assert_eq!(
+        sim_run(ir, &map, &seed, 0x21),
+        0xB2,
+        "post-loop load must read buf[1]"
+    );
+}

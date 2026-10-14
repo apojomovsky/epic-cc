@@ -12192,3 +12192,171 @@ fn phi_folded_counter_escape_materializes_the_last_index() {
     assert_eq!(pv, 0x121, "escaped address must be buf+1, not buf+2");
     assert_eq!(p.ram()[0x133], 2, "counter home keeps the bound residue");
 }
+
+#[test]
+fn post_loop_load_through_phi_folded_counter_reads_the_last_element() {
+    // A post-loop dereference through a counter-indexed `gep` must read
+    // the last index, but the phi-folded increment leaves the bound
+    // (last index plus step) in the shared home (epic-cc#1274). The fold
+    // stays staged instead, so the exit access reads the home holding
+    // the last index. The simulator run proves the exit value while the
+    // in-loop accumulation proves live uses are unaffected.
+    let m = parse(
+        "global buf i64\n\
+         global out i8\n\
+         global sink i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %p = gep @buf +0 +1*%i\n\
+             %v = load i8 %p\n\
+             store i8 %v @sink\n\
+             %r = add i16 %i, 1\n\
+             %c = icmp eq i16 %r, 2\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             %w = load i8 %p\n\
+             store i8 %w @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x120),
+        ("out", 0x128),
+        ("sink", 0x129),
+        ("main::i", 0x12A),
+        ("main::r", 0x12C),
+        ("main::c", 0x12E),
+        ("main::v", 0x12F),
+        ("main::w", 0x130),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(!lp.contains("INCF"), "increment must stay staged:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x120] = 0xA1;
+    p.ram_mut()[0x121] = 0xB2;
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[0x128],
+        0xB2,
+        "exit load must read buf[1], not buf[2]"
+    );
+    assert_eq!(p.ram()[0x129], 0xB2, "in-loop reads stay live");
+    assert_eq!(p.ram()[0x12A], 1, "counter home keeps the last index");
+}
+
+#[test]
+fn post_loop_store_through_phi_folded_counter_writes_the_last_element() {
+    // The store-address twin of the load case (epic-cc#1274): a post-loop
+    // store through the counter GEP must land the last index, so the
+    // fold stays staged the same way. A GEP in value position would keep
+    // folding (epic-cc#1271); only the address vetoes.
+    let m = parse(
+        "global buf i64\n\
+         global sink i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %p = gep @buf +0 +1*%i\n\
+             %v = load i8 %p\n\
+             store i8 %v @sink\n\
+             %r = add i16 %i, 1\n\
+             %c = icmp eq i16 %r, 2\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             store i8 90 %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x120),
+        ("sink", 0x128),
+        ("main::i", 0x129),
+        ("main::r", 0x12B),
+        ("main::c", 0x12D),
+        ("main::v", 0x12E),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(!lp.contains("INCF"), "increment must stay staged:\n{lp}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x120] = 0xA1;
+    p.ram_mut()[0x121] = 0xB2;
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[0x121],
+        90,
+        "exit store must land buf[1], not buf[2]"
+    );
+    assert_eq!(p.ram()[0x122], 0, "buf[2] stays untouched");
+    assert_eq!(p.ram()[0x120], 0xA1, "buf[0] stays untouched");
+    assert_eq!(p.ram()[0x128], 0xB2, "in-loop reads stay live");
+}
+
+#[test]
+fn post_loop_load_through_scaled_index_reads_the_last_element() {
+    // Same staleness through the `FSR0` seed (epic-cc#1274): a scale-2
+    // term defeats the `PLUSW` shape, so the exit access seeds `FSR0`
+    // from the counter home. The veto covers every `emit_ptr_setup`
+    // path, not just `PLUSW`, so the seed reads the last index.
+    let m = parse(
+        "global buf i64\n\
+         global out i8\n\
+         global sink i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %p = gep @buf +0 +2*%i\n\
+             %v = load i8 %p\n\
+             store i8 %v @sink\n\
+             %r = add i16 %i, 1\n\
+             %c = icmp eq i16 %r, 2\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             %w = load i8 %p\n\
+             store i8 %w @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x120),
+        ("out", 0x128),
+        ("sink", 0x129),
+        ("main::i", 0x12A),
+        ("main::r", 0x12C),
+        ("main::c", 0x12E),
+        ("main::v", 0x12F),
+        ("main::w", 0x130),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(!lp.contains("INCF"), "increment must stay staged:\n{lp}");
+    let exit = block_section(&asm, "main_Lexit");
+    assert!(
+        exit.contains("0xFEF"),
+        "scaled access reads via INDF0:\n{exit}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x120] = 0xA1;
+    p.ram_mut()[0x122] = 0xC3;
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[0x128],
+        0xC3,
+        "exit load must read buf[2], not buf[4]"
+    );
+    assert_eq!(p.ram()[0x129], 0xC3, "in-loop reads stay live");
+}
