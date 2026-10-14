@@ -3,7 +3,7 @@
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
 - Date (UTC): 2026-10-14
-- Commit: efb3d48
+- Commit: 62cac50
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
 - Menu-demo listing: 7562 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
