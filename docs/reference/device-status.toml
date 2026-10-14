@@ -1,0 +1,3 @@
+# Device support classification for docs/reference/devices.md (epic-cc#1280).
+# The 1.0 scope fills this in; any part not listed here renders as
+# "experimental". Status is one of: supported, experimental, planned.
