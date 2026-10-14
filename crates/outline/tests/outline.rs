@@ -399,6 +399,31 @@ fn repeated_tails_merge_into_one_copy() {
 }
 
 #[test]
+fn address_divergent_tails_never_share_a_body() {
+    // The epic-cc#1240 counterexample: two FSR0 setups for different
+    // slots differ only in addresses. Sharing one copy would load the
+    // wrong pointer at the second site, so both tails stay inline.
+    let mk = |n: &str, sep: &str, lo: &str, hi: &str| {
+        let b = vec![sep, lo, hi];
+        func(n, &b)
+    };
+    let src = program(
+        &[
+            mk("f", "NOP", "MOVFF 0x020, 0xFE9", "MOVFF 0x021, 0xFEA"),
+            mk("g", "NOP", "MOVFF 0x030, 0xFE9", "MOVFF 0x031, 0xFEA"),
+        ],
+        &["f", "g"],
+    );
+    let out = factor(&src, &Options::default());
+    assert!(
+        !out.contains("__pa"),
+        "divergent tails must stay inline:\n{out}"
+    );
+    assert_eq!(out.matches("MOVFF 0x020, 0xFE9").count(), 1, "{out}");
+    assert_eq!(out.matches("MOVFF 0x030, 0xFE9").count(), 1, "{out}");
+}
+
+#[test]
 fn bodies_never_land_before_an_org() {
     // f's end is followed by a vector org: a body there would collide.
     let mut body: Vec<&str> = Vec::new();
