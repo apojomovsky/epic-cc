@@ -204,8 +204,9 @@ Run `make pre-pr-check` before opening a PR. It is a thin wrapper around
 8. Hooks installed (`make setup-hooks`).
 9. `make pre-pr-check TEST=1` also runs the full suite (or `epic-tasks takeoff --test`).
 10. **Python lint.** `bash scripts/lint-python.sh` (ruff, pinned in the
-   Dockerfile) must pass: the pre-commit hook runs it on staged `.py`
-   files and CI runs it over `scripts/`. The baseline was swept in #375.
+  Dockerfile) must pass: the pre-commit hook runs it on staged `.py`
+  files and CI runs it over `scripts/`. The baseline was swept in #375.
+11. README freshness (canonical: epic-tasks AGENTS.md): a PR that changes user-visible surface (devices or cores, install or quickstart steps, CLI flags, release or packaging) updates README.md in the same PR or notes README: n/a in the PR body; takeoff check_readme warns (advisory, never blocking).
 
 The ritual exits 1 with the exact fix list while blocking items are
 outstanding. Don't skip it; the CI gate only covers the suite, not the
