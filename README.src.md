@@ -33,7 +33,7 @@ Compile it for a PIC16F877A:
 --8<-- "docs/snippets/build-add.sh"
 ```
 
-The program reads a value from an input pin register, adds 1, and writes the result to an output register. `volatile` tells the compiler that the hardware, not your code, can change `in`, so it must not optimize the read away.
+The program reads `in`, adds 1, and stores the result in `out`. `volatile` tells the compiler that something outside your code, such as hardware, can change these variables, so it must not optimize the accesses away.
 
 When the command finishes without errors, it has written `add.hex`. A hex file (Intel hex format) is the file a programmer writes to the chip's flash memory, and the format a simulator loads.
 
