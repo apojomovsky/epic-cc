@@ -1,5 +1,5 @@
 //! HAL PIC16 slice acceptance (epic-hal#105): the vendored
-//! `pic16f87xa-hal` slice compiled through the real `epic-cc` binary
+//! `hal/pic14/16f87xa` slice compiled through the real `epic-cc` binary
 //! (`--target 16F877A`) and run on the `Pic14` simulator. This is the
 //! crates/sim e2e epic-hal#67 item (1)/(3) acceptance: a peripheral
 //! callback fires end to end (stored by main through the inlined Init,

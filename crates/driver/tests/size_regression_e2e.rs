@@ -511,7 +511,7 @@ fn cases() -> Vec<Case> {
             .collect(),
         },
         Case {
-            // epic-cc#878: the `epic-encoder` sim slice, the same file set
+            // epic-cc#878: the `lib/encoder` sim slice, the same file set
             // `encoder_sim_const_pool_e2e` links (TU order included). It
             // links all profiles under the pooled default (epic-cc#1211);
             // the `--no-const-pool` build overflows flash.

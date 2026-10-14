@@ -1,4 +1,4 @@
-/* Vendored slice of the real epic-hal pic16f87xa-hal Timer0 driver
+/* Vendored slice of the real epic-hal hal/pic14/16f87xa Timer0 driver
  * (DS39582B §5.0), adapted to compile under epic-cc. Reduced to the
  * callback surface: internal Fosc/4, 1:256 prescaler, reload 0. The
  * callback slot is a 1-byte global the ISR reads and invokes; Init and

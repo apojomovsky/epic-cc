@@ -1,11 +1,11 @@
-//! epic-cc#931 (with epic-cc#923): the `epic-encoder` sim slice links
+//! epic-cc#931 (with epic-cc#923): the `lib/encoder` sim slice links
 //! under the pooled table, default since epic-cc#1211. `main` spans pages
 //! as a single planned chunk while the final banking grows it across a
 //! page boundary; isel now measures the real final-context sizes and
 //! repairs (re-split, re-place) instead of shipping the straddle. The
 //! fixture is the vendored `hal-pic16-encoder-full` tree plus the four
 //! sim-variant files from the same epic-hal pin (see its PROVENANCE.md),
-//! compiled like `epic_build.py --module epic-encoder --variant sim`.
+//! compiled like `epic_build.py --module lib/encoder --variant sim`.
 
 use iselcore::is_directive;
 use std::process::Command;

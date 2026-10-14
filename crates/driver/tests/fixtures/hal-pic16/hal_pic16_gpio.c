@@ -1,4 +1,4 @@
-/* Vendored slice of the real epic-hal pic16f87xa-hal GPIO driver
+/* Vendored slice of the real epic-hal hal/pic14/16f87xa GPIO driver
  * (DS39582B §4.2), adapted to compile under epic-cc. Reduced to the
  * blink surface: RB0 as output, toggle. The PORTB change callback
  * (RB_IRQHandler) is the 1-arg cross-context shape that exercises the

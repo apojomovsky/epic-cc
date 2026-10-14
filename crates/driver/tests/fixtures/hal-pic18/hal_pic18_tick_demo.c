@@ -1,8 +1,8 @@
-/* epic-tick on the 4550: the 1 ms Timer2 timebase. This is the epic-cc
- * build of the HAL's epic-tick module + its example program, adapted to
+/* `lib/tick` on the 4550: the 1 ms Timer2 timebase. This is the epic-cc
+ * build of the HAL's `lib/tick` module + its example program, adapted to
  * the slice. `main` starts the tick, delays 10 ms then 5 ms, and checks
  * the elapsed counts land within one tick of the requested value (the
- * same checks as epic-tick/tests/sim_tick.c). The sim drives the tick:
+ * same checks as lib/tick/tests/sim_tick.c). The sim drives the tick:
  * the e2e asserts PIR1<TMR2IF> each time it wants a millisecond to pass,
  * and `epic_tick_delay_ms` advances `g_tick_ms` when it sees the flag.
  * `g_tick_ms` is a volatile global the e2e reads from the address map.

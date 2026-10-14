@@ -314,7 +314,7 @@ jobs:
     # before epic-cc#107, the fix it needed, and both stayed green. epic-hal
     # has no epic-cc to run, so the gate lives here, where the compiler and its
     # pinned clang already do.
-    name: pic16f88x-hal 887 under epic-cc
+    name: hal/pic14/16f88x 887 under epic-cc
     needs: warm-toolchain-cache
     runs-on: ubuntu-latest
     steps:
@@ -373,15 +373,15 @@ jobs:
       - name: Emit the HAL build script
         if: steps.noncode.outputs.non_code != 'true'
         working-directory: hal
-        run: python3 scripts/epic_build.py build --module pic16f88x-hal --mcu 16F887 --toolchain epic-cc --epic-cc /cc/release/epic-cc --build-dir build-sim/pic16f88x-hal
+        run: python3 scripts/epic_build.py build --module hal/pic14/16f88x --mcu 16F887 --toolchain epic-cc --epic-cc /cc/release/epic-cc --build-dir build-sim/hal/pic14/16f88x
 
       - name: Compile the 887 firmware
         if: steps.noncode.outputs.non_code != 'true'
         run: |
           docker run --rm -v "$PWD/target:/cc:ro" -v "$PWD/hal:/hal" -w /hal \
             -e EPIC_REPO_ROOT=/hal epic-cc-ci:latest \
-            sh build-sim/pic16f88x-hal/16F887/build.sh
-          hex=hal/build-sim/pic16f88x-hal/16F887-blink.hex
+            sh build-sim/hal/pic14/16f88x/16F887/build.sh
+          hex=hal/build-sim/hal/pic14/16f88x/16F887-blink.hex
           test -s "$hex" || { echo "::error::no hex produced at $hex"; exit 1; }
           echo "built $hex"
 
