@@ -1514,6 +1514,22 @@ impl<'m> Gen<'m> {
         (lanes, consumed)
     }
 
+    /// Whether a load/store address reads a phi-folded counter home
+    /// (epic-cc#1274). The fold leaves the bound (last index plus step)
+    /// in the shared home past the loop, so a post-loop access through
+    /// a GEP naming the increment or its phi observes the bound, not
+    /// the last index. Only the fold target skews: every other term's
+    /// home still holds its last-iteration value.
+    fn folded_counter_deref(g: &Gen, func: &str, ptr: &str, r: &str, preg: &str) -> bool {
+        let Some(reg) = ptr.strip_prefix('%') else {
+            return false;
+        };
+        let Some((_, _, terms)) = g.resolved.get(&ssa_key(func, reg)) else {
+            return false;
+        };
+        terms.iter().any(|(_, t)| t == r || t == preg)
+    }
+
     /// Static RAM base for a load/store pointer: a mapped global, or a
     /// statically resolved object slot (alloca, byval). SFR literals,
     /// flash tables, address-holding sret slots and dynamic pointers
@@ -5885,6 +5901,12 @@ impl<'m> Gen<'m> {
                 }
                 match inst {
                     Inst::Load(l) => {
+                        // A post-loop dereference through a GEP over the
+                        // folded counter reads the bound residue, so the
+                        // increment stays staged (epic-cc#1274).
+                        if Self::folded_counter_deref(g, &f.name, &l.ptr, r, preg) {
+                            return false;
+                        }
                         // A load through a statically known base that
                         // overlaps the lanes would observe the folded
                         // home. Anything else cannot name the operand's
@@ -5896,6 +5918,14 @@ impl<'m> Gen<'m> {
                             if !disjoint(a, l.ty.bytes()) {
                                 return false;
                             }
+                        }
+                    }
+                    Inst::Store(s) => {
+                        // Same staleness through a post-loop store
+                        // address (epic-cc#1274). A GEP in value
+                        // position stays folded (epic-cc#1271).
+                        if Self::folded_counter_deref(g, &f.name, &s.ptr, r, preg) {
+                            return false;
                         }
                     }
                     Inst::Memcpy(_) | Inst::Asm(_) | Inst::VaStart(_) | Inst::VaArg(_) => {
