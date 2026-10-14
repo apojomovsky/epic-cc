@@ -75,8 +75,10 @@ diagnostic (see `crates/driver/src/clang_discovery.rs`).
 ## Environment variables the device data gate reads
 
 `crates/device/tests/gputils_crosscheck.rs` verifies every device TOML against
-gputils (ADR-021). It is the only oracle the device registry has, so running
-without it takes two variables, not one.
+gputils (ADR-021), or against a vendored second-oracle record
+(`crates/device/second_oracle/`, DFP `.ini` plus datasheet citation) for
+parts gputils does not know. Running without gputils takes two variables,
+not one.
 
 | Variable | Meaning |
 |---|---|
