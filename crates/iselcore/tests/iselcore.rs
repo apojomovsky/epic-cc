@@ -873,10 +873,10 @@ fn no_gate_folds_nothing() {
 }
 
 #[test]
-fn pic14_drops_direct_load_but_keeps_forwarded_bin() {
-    // The add shape on classic PIC14 (epic-cc#875): `%1` reads `@in`
-    // directly, while `%2` still stages: `isel` has no store-folded
-    // destination for `Bin` results there.
+fn pic14_drops_direct_load_and_slotless_bin() {
+    // The add shape on classic PIC14 (epic-cc#862): `%1` reads `@in`
+    // directly, and the single-byte `%2` computes into `@out`, so
+    // neither needs a slot.
     let m = parse(
         "global in i8\n\
          global out i8\n\
@@ -893,7 +893,44 @@ fn pic14_drops_direct_load_but_keeps_forwarded_bin() {
     let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
     assert_eq!(
         folds.unplaced_pic14(&m.funcs[0]),
-        std::collections::HashSet::from(["1".to_string()]),
+        std::collections::HashSet::from(["1".to_string(), "2".to_string()]),
+    );
+    assert_eq!(
+        iselcore::pic14_slotless_bins(&m.funcs[0], &folds),
+        std::collections::HashMap::from([("2".to_string(), "out".to_string())]),
+    );
+}
+
+#[test]
+fn pic14_keeps_wide_forwarded_bin_placed() {
+    // A two-byte `add` into a store stays staged (epic-cc#862): the
+    // wide lowering accumulates in place, which must not touch `@out`.
+    let m = parse(
+        "global in i16\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @in\n\
+             %2 = add i16 %1 1\n\
+             store i16 %2 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        folds.forwarded.contains_key("2"),
+        "wide bin still forwards: {:?}",
+        folds.forwarded
+    );
+    assert!(
+        iselcore::pic14_slotless_bins(&m.funcs[0], &folds).is_empty(),
+        "wide bin is not slotless"
+    );
+    assert!(
+        !folds.unplaced_pic14(&m.funcs[0]).contains("2"),
+        "wide bin keeps its slot"
     );
 }
 

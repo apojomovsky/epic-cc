@@ -676,18 +676,14 @@ fn icmp_ne_i16_folds_simulate() {
 #[test]
 fn direct_load_feeds_alu_from_the_source_global() {
     // `%1 = load @in` feeds one `add` operand: the op reads `@in`, so
-    // `%1` stages nowhere. `%2` keeps its slot: a forwarded `Bin` result
-    // still computes into the temp on this core.
+    // `%1` stages nowhere. The single-byte `%2` computes into `@out`
+    // (epic-cc#862), so it takes no address entry either.
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %2 = add i8 %1, 1\n    store i8 %2 @out\n    ret void\n");
-    let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::2", 0x26)]);
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21)]);
     let asm = select(&PIC16F1937, &m, &addrs);
     assert!(
-        asm.contains("MOVF 0x20, W\n    ADDLW 0x01"),
-        "the add reads the source global:\n{asm}"
-    );
-    assert!(
-        asm.contains("MOVWF 0x26"),
-        "the bin result stages into its slot:\n{asm}"
+        asm.contains("MOVF 0x20, W\n    ADDLW 0x01\n    MOVWF 0x21"),
+        "the add reads the source global into the store:\n{asm}"
     );
 }
 
@@ -724,16 +720,17 @@ fn forwarded_load_store_reads_the_source_global() {
 }
 
 #[test]
-fn forwarded_bin_result_keeps_its_slot() {
-    // `%2 = add` forwards into its store, but this backend has no
-    // store-folded destination: the bin computes into its temp as before,
-    // so `%2` keeps its entry and the slot stays live.
+fn forwarded_bin_result_computes_into_the_store() {
+    // `%2 = add` into `store %2 @out`: the single-byte bin computes
+    // straight into `@out` (epic-cc#862), so `%2` takes no address
+    // entry: a lookup would panic, so its absence proves the slot is
+    // gone.
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %2 = add i8 %1, 1\n    store i8 %2 @out\n    ret void\n");
-    let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::2", 0x26)]);
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21)]);
     let asm = select(&PIC16F1937, &m, &addrs);
     assert!(
-        asm.contains("MOVWF 0x26"),
-        "the bin result stages into its slot:\n{asm}"
+        asm.contains("MOVF 0x20, W\n    ADDLW 0x01\n    MOVWF 0x21"),
+        "the bin computes into the store destination:\n{asm}"
     );
 }
 

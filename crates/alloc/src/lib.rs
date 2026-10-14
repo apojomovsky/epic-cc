@@ -3003,10 +3003,10 @@ fn allocate_inner(
             }
         }
     }
-    // PIC14 and PIC14E drop only what their backends skip: folded loads
-    // plus load-forwarded stores. Forwarded `Bin` results keep their slot
-    // there, so they stay out of this set even though the shared
-    // predicate names them.
+    // PIC14 and PIC14E drop only what their backends skip: folded loads,
+    // load-forwarded stores, and single-byte `Bin`-into-store results,
+    // which both backends compute straight into the destination
+    // (epic-cc#862). Wider forwarded bins keep their slot.
     let unplaced: HashMap<String, HashSet<String>> = m
         .funcs
         .iter()
