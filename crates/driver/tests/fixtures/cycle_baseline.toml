@@ -307,7 +307,7 @@ ram_bytes = 43
 name = "speed-memcpy-32-18f4550"
 device = "18F4550"
 cycles = 723
-flash_words = 97
+flash_words = 103
 ram_bytes = 77
 
 [[entry]]
@@ -315,7 +315,7 @@ name = "speed-memcpy-32-18f4550"
 device = "18F4550"
 profile = "O2"
 cycles = 723
-flash_words = 97
+flash_words = 103
 ram_bytes = 77
 
 [[entry]]
@@ -591,9 +591,9 @@ ram_bytes = 131
 [[entry]]
 name = "scen-control-pass-18f4550"
 device = "18F4550"
-cycles = 778
-flash_words = 3561
-ram_bytes = 533
+cycles = 780
+flash_words = 3501
+ram_bytes = 532
 
 [[entry]]
 name = "scen-control-pass-18f4550"
