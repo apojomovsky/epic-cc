@@ -1823,6 +1823,29 @@ fn unknown_intrinsic_panics() {
     );
     let _ = legalize(m);
 }
+
+/// `llvm.assume` carries no dst and no codegen (epic-cc#1276): both the
+/// register form clang emits for `__builtin_assume(n != 0)` and the const
+/// form lower to nothing while surrounding code is untouched.
+#[test]
+fn drops_assume_without_dst() {
+    let m = parse(
+        "global n i16\n\
+         global tail i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v = load i16 @n\n\
+             %c = icmp ne i16 %v 0\n\
+             call void @llvm.assume(i1 %c)\n\
+             call void @llvm.assume(i1 1)\n\
+             store i8 0, @tail\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(!text.contains("llvm.assume"), "{text}");
+    assert!(text.contains("store i8 0 @tail"), "{text}");
+}
+
 /// A cross-context callback that calls a shared helper: the store-edge
 /// extension must close over callees, so the helper is `_isr`-duplicated
 /// and the callback's copy calls the helper's copy (ADR-013: the ISR must
