@@ -2006,6 +2006,391 @@ pub fn flash_walk_refusal(
     }
 }
 
+/// A writer into a pointer slot, classified for the flash-kind proof below.
+/// `Src` grounds flash: a flash const global or a walk reg already proven
+/// flash (itself grounded in consts). `Null` is compatible but grounds
+/// nothing, so a slot holding only null stays RAM. `Node` delegates to
+/// another candidate. Anything else (RAM values, unknown callers) is `Bad`
+/// and prunes the slot to RAM.
+#[derive(Clone, Debug)]
+enum SlotWriter {
+    Src,
+    Null,
+    Node(String),
+    Bad,
+}
+
+/// Static address space of every pointer slot (epic-cc#1119): params and
+/// phi/select/gep/load-ptr dsts keyed `{func}::{slot}`, globals as
+/// `@{global}`. A slot is flash-kind when every address it can hold is a
+/// flash table address or null, so loads through it must read program
+/// memory. Greatest fixpoint over writers, then an ungrounded prune: a
+/// cycle of slots passing each other addresses with no const source (two
+/// functions forwarding a RAM pointer back and forth) stays RAM.
+/// `is_flash_const` names the consts resident in flash, `prov` the
+/// already-proven flash walks, `resolved` the pointer chains for
+/// load-source slots. Const globals are never slots: their bytes are
+/// tables, read through the const paths instead.
+pub fn flash_slot_spaces(
+    m: &Module,
+    resolved: &PtrResolution,
+    prov: &FlashProvenance,
+    is_flash_const: impl Fn(&str) -> bool,
+) -> HashSet<String> {
+    let is_func = |n: &str| m.funcs.iter().any(|f| f.name == n);
+    // Candidate slots: plain ptr params plus every reg that can hold an
+    // address (ptr phis/selects, geps, ptr loads). byval/sret params hold
+    // caller copies, call results and inttoptr/va_arg/alloca slots hold
+    // RAM or runtime integers, so none of those are candidates.
+    let mut cands: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for p in &f.params {
+            if p.ptr && p.byval.is_none() && !p.sret {
+                cands.insert(ssa_key(&f.name, &p.name));
+            }
+        }
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Phi(p) if p.ptr => {
+                        cands.insert(ssa_key(&f.name, &p.dst));
+                    }
+                    Inst::Select(s) if s.ptr => {
+                        cands.insert(ssa_key(&f.name, &s.dst));
+                    }
+                    Inst::Gep(g) => {
+                        cands.insert(ssa_key(&f.name, &g.dst));
+                    }
+                    Inst::Load(l) if l.ptr_ty => {
+                        cands.insert(ssa_key(&f.name, &l.dst));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for g in &m.globals {
+        if !g.is_const {
+            cands.insert(format!("@{}", g.name));
+        }
+    }
+    // A value offered to a slot: flash consts and proven walks ground it,
+    // null is compatible, candidate regs delegate, everything else prunes.
+    // Function addresses are RAM-kind: calls through them copy bytes, but
+    // a dereference must never TBLRD code space (epic-cc#1119).
+    let val_writer = |v: &ir::Val, func: &str| -> SlotWriter {
+        match v {
+            ir::Val::Global(n) => {
+                if is_func(n) || !is_flash_const(n) {
+                    SlotWriter::Bad
+                } else {
+                    SlotWriter::Src
+                }
+            }
+            ir::Val::Reg(r) => {
+                let key = ssa_key(func, r);
+                if prov.flash.contains(&key) {
+                    SlotWriter::Src
+                } else if cands.contains(&key) {
+                    SlotWriter::Node(key)
+                } else {
+                    SlotWriter::Bad
+                }
+            }
+            ir::Val::Const(0) => SlotWriter::Null,
+            ir::Val::Const(_) => SlotWriter::Bad,
+        }
+    };
+    // Indirect-call targets gain an unknown caller: their params can
+    // receive any address, so they prune to RAM.
+    let mut indirect_targets: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Call(c) = i {
+                    if !c.callees.is_empty() {
+                        indirect_targets.extend(c.callees.iter().cloned());
+                    }
+                }
+            }
+        }
+    }
+    let mut writers: HashMap<String, Vec<SlotWriter>> = HashMap::new();
+    let mut push = |key: String, w: SlotWriter| {
+        writers.entry(key).or_default().push(w);
+    };
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Phi(p) if p.ptr => {
+                        let key = ssa_key(&f.name, &p.dst);
+                        for (v, _) in &p.incoming {
+                            push(key.clone(), val_writer(v, &f.name));
+                        }
+                    }
+                    Inst::Select(s) if s.ptr => {
+                        let key = ssa_key(&f.name, &s.dst);
+                        push(key.clone(), val_writer(&s.a, &f.name));
+                        push(key, val_writer(&s.b, &f.name));
+                    }
+                    Inst::Gep(g) => {
+                        let key = ssa_key(&f.name, &g.dst);
+                        match &g.base {
+                            GepBase::Global(n) => {
+                                if is_func(n) || !is_flash_const(n) {
+                                    push(key, SlotWriter::Bad);
+                                } else {
+                                    push(key, SlotWriter::Src);
+                                }
+                            }
+                            GepBase::Reg(r) => {
+                                push(key, val_writer(&ir::Val::Reg(r.clone()), &f.name));
+                            }
+                        }
+                    }
+                    Inst::Load(l) if l.ptr_ty => {
+                        let key = ssa_key(&f.name, &l.dst);
+                        if let Some(g) = l.ptr.strip_prefix('@') {
+                            if let Some(gl) = m.globals.iter().find(|x| x.name == g) {
+                                if gl.is_const {
+                                    // Bytes come from the flash table: every
+                                    // byte must be zero or covered by a ref
+                                    // to a flash const, else RAM-kind.
+                                    let mut covered = vec![false; gl.bytes.len()];
+                                    let mut ok = true;
+                                    for (pos, t, _) in &gl.refs {
+                                        if is_func(t) || !is_flash_const(t) {
+                                            ok = false;
+                                            break;
+                                        }
+                                        if *pos < covered.len() {
+                                            covered[*pos] = true;
+                                        }
+                                    }
+                                    if ok
+                                        && gl.bytes.iter().enumerate().all(|(n, b)| {
+                                            *b == 0 || covered.get(n).copied().unwrap_or(false)
+                                        })
+                                    {
+                                        push(key, SlotWriter::Src);
+                                    } else {
+                                        push(key, SlotWriter::Bad);
+                                    }
+                                } else {
+                                    push(key, SlotWriter::Node(format!("@{g}")));
+                                }
+                            } else {
+                                push(key, SlotWriter::Bad);
+                            }
+                        } else if let Some(r) = l.ptr.strip_prefix('%') {
+                            match resolved.get(&ssa_key(&f.name, r)) {
+                                Some((Base::Slot(sname, _), _, _)) => {
+                                    let skey = ssa_key(&f.name, sname);
+                                    if cands.contains(&skey) {
+                                        push(key, SlotWriter::Node(skey));
+                                    } else {
+                                        push(key, SlotWriter::Bad);
+                                    }
+                                }
+                                _ => push(key, SlotWriter::Bad),
+                            }
+                        } else {
+                            push(key, SlotWriter::Bad);
+                        }
+                    }
+                    Inst::Store(s) => {
+                        if let Some(g) = s.ptr.strip_prefix('@') {
+                            if m.globals.iter().any(|x| x.name == g && !x.is_const) {
+                                push(format!("@{g}"), val_writer(&s.val, &f.name));
+                            }
+                        }
+                    }
+                    Inst::Call(c) => {
+                        if c.callees.is_empty() {
+                            if let Some(callee) = m.funcs.iter().find(|x| x.name == c.func) {
+                                for (p, arg) in callee.params.iter().zip(c.args.iter()) {
+                                    if !(p.ptr && p.byval.is_none() && !p.sret) {
+                                        continue;
+                                    }
+                                    if arg.byval.is_some() || arg.sret {
+                                        push(ssa_key(&c.func, &p.name), SlotWriter::Bad);
+                                    } else {
+                                        push(
+                                            ssa_key(&c.func, &p.name),
+                                            val_writer(&arg.val, &f.name),
+                                        );
+                                    }
+                                }
+                                if c.args.len() < callee.params.len() {
+                                    for p in &callee.params[c.args.len()..] {
+                                        if p.ptr && p.byval.is_none() && !p.sret {
+                                            push(ssa_key(&c.func, &p.name), SlotWriter::Bad);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Globals start with their initializer as a writer: zero bytes are
+    // null, refs to flash consts are flash, anything else is RAM.
+    for g in &m.globals {
+        if g.is_const {
+            continue;
+        }
+        let key = format!("@{}", g.name);
+        let mut covered = vec![false; g.bytes.len()];
+        let mut ok = true;
+        for (pos, t, _) in &g.refs {
+            if is_func(t) || !is_flash_const(t) {
+                ok = false;
+                break;
+            }
+            if *pos < covered.len() {
+                covered[*pos] = true;
+            }
+        }
+        if ok
+            && g.bytes
+                .iter()
+                .enumerate()
+                .all(|(n, b)| *b == 0 || covered.get(n).copied().unwrap_or(false))
+        {
+            push(key, SlotWriter::Null);
+        } else {
+            push(key, SlotWriter::Bad);
+        }
+    }
+    // Params of indirectly-called functions gain the unknown caller.
+    for f in &m.funcs {
+        if !indirect_targets.contains(&f.name) {
+            continue;
+        }
+        for p in &f.params {
+            if p.ptr && p.byval.is_none() && !p.sret {
+                push(ssa_key(&f.name, &p.name), SlotWriter::Bad);
+            }
+        }
+    }
+    // Greatest fixpoint: drop candidates with a RAM writer, then drop
+    // cycles no const grounds.
+    let mut live: HashSet<String> = cands;
+    loop {
+        let dead: Vec<String> = writers
+            .iter()
+            .filter(|(k, ws)| {
+                live.contains(*k)
+                    && ws.iter().any(|w| match w {
+                        SlotWriter::Bad => true,
+                        SlotWriter::Node(n) => !live.contains(n),
+                        SlotWriter::Src | SlotWriter::Null => false,
+                    })
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        if dead.is_empty() {
+            break;
+        }
+        for d in dead {
+            live.remove(&d);
+        }
+    }
+    let mut grounded: HashSet<String> = HashSet::new();
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (k, ws) in &writers {
+            if !live.contains(k) || grounded.contains(k) {
+                continue;
+            }
+            let seeded = ws.iter().any(|w| match w {
+                SlotWriter::Src => true,
+                SlotWriter::Node(n) => grounded.contains(n),
+                SlotWriter::Null | SlotWriter::Bad => false,
+            });
+            if seeded {
+                grounded.insert(k.clone());
+                grew = true;
+            }
+        }
+    }
+    live.intersection(&grounded).cloned().collect()
+}
+
+/// Const globals whose addresses the value `v` in `func` may carry:
+/// direct globals, GEP chains, folded global bases, and select/phi arms
+/// followed transitively. Loads, params, and call results stop the walk:
+/// their consts are governed where they are written, not where they are
+/// read (epic-cc#1119).
+pub fn const_fan_in(
+    m: &Module,
+    resolved: &PtrResolution,
+    func: &str,
+    v: &ir::Val,
+) -> HashSet<String> {
+    let is_const = |n: &str| m.globals.iter().any(|g| g.name == n && g.is_const);
+    // Pointer derivations per reg: GEP bases plus select/phi arms.
+    let mut arms: HashMap<String, Vec<ir::Val>> = HashMap::new();
+    if let Some(f) = m.funcs.iter().find(|x| x.name == func) {
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Gep(g) => {
+                        arms.insert(
+                            g.dst.clone(),
+                            vec![match &g.base {
+                                GepBase::Global(n) => ir::Val::Global(n.clone()),
+                                GepBase::Reg(r) => ir::Val::Reg(r.clone()),
+                            }],
+                        );
+                    }
+                    Inst::Select(s) if s.ptr => {
+                        arms.insert(s.dst.clone(), vec![s.a.clone(), s.b.clone()]);
+                    }
+                    Inst::Phi(p) if p.ptr => {
+                        arms.insert(
+                            p.dst.clone(),
+                            p.incoming.iter().map(|(av, _)| av.clone()).collect(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut out: HashSet<String> = HashSet::new();
+    let mut stack = vec![v.clone()];
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(top) = stack.pop() {
+        match top {
+            ir::Val::Global(n) => {
+                if is_const(&n) {
+                    out.insert(n);
+                }
+            }
+            ir::Val::Reg(r) => {
+                if !seen.insert(ssa_key(func, &r)) {
+                    continue;
+                }
+                if let Some(conts) = arms.get(&r) {
+                    stack.extend(conts.iter().cloned());
+                } else if let Some((Base::Global(cg), _, _)) = resolved.get(&ssa_key(func, &r)) {
+                    if is_const(cg) {
+                        out.insert(cg.clone());
+                    }
+                }
+            }
+            ir::Val::Const(_) => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_directive, resolve_pointers, Base};
