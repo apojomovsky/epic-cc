@@ -10352,6 +10352,386 @@ fn walk_refuses_two_accesses_to_one_pointer() {
 }
 
 #[test]
+fn outer_walk_walks_nested_loop_with_branch_entry() {
+    // A two-block outer loop over a nested counted walk reads its array
+    // through one `POSTINC` pointer: the seeds run once on the entry
+    // label, the header walks, and the latch counts down (epic-cc#1204).
+    // The entry arrives over a compare-branch, so the seeds ride its
+    // edge like a trampoline's.
+    let m = parse(
+        "global buf i8\n\
+         global flag i8\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %f = load i8 @flag\n\
+             %e = icmp eq i8 %f 0\n\
+             br i1 %e head dead\n\
+           block dead:\n\
+             ret void\n\
+           block head:\n\
+             %i = phi i16 %in latch 0 entry\n\
+             %c = phi i16 %n latch -1 entry\n\
+             %g = gep @buf +0 +1*%i\n\
+             %v = load i8 %g\n\
+             %w = zext i8 %v to i16\n\
+             %s = shl i16 %w 8\n\
+             %x = xor i16 %s %c\n\
+             br mid\n\
+           block mid:\n\
+             %k = phi i8 %kn mid 3 head\n\
+             %d = phi i16 %n mid %x head\n\
+             %a = shl i16 %d 1\n\
+             %h = xor i16 %a 7\n\
+             %t = icmp slt i16 %d 0\n\
+             %n = select i1 %t i16 %h i16 %a\n\
+             %kn = add i8 %k -1\n\
+             %m = icmp eq i8 %kn 0\n\
+             br i1 %m latch mid\n\
+           block latch:\n\
+             %in = add i16 %i 1\n\
+             %lc = icmp eq i16 %in 4\n\
+             br i1 %lc exit head\n\
+           block exit:\n\
+             store volatile i16 %n @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("flag", 0x030),
+        ("out", 0x032),
+        ("main::f", 0x040),
+        ("main::e", 0x042),
+        ("main::i", 0x044),
+        ("main::c", 0x046),
+        ("main::v", 0x048),
+        ("main::w", 0x04A),
+        ("main::s", 0x04C),
+        ("main::x", 0x04E),
+        ("main::k", 0x050),
+        ("main::d", 0x052),
+        ("main::a", 0x054),
+        ("main::h", 0x056),
+        ("main::t", 0x058),
+        ("main::n", 0x05A),
+        ("main::kn", 0x05C),
+        ("main::m", 0x05D),
+        ("main::in", 0x05E),
+        ("main::lc", 0x060),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("main_Lhead_oseed:"),
+        "outer seeds label:\n{asm}"
+    );
+    let sd = block_section(&asm, "main_Lhead_oseed");
+    assert_eq!(
+        sd.matches("LFSR 0, 0x020").count(),
+        1,
+        "one array seed:\n{sd}"
+    );
+    let hd = block_section(&asm, "main_Lhead");
+    assert!(hd.contains("MOVFF 0xFEE,"), "header walks POSTINC0:\n{hd}");
+    assert!(!hd.contains("LFSR"), "no per-step seed:\n{hd}");
+    let lt = block_section(&asm, "main_Llatch");
+    assert!(lt.contains("DECFSZ 0x044,F,A"), "down-counter latch:\n{lt}");
+    assert!(!lt.contains("INCF 0x044"), "no up-counter:\n{lt}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let buf = [0x11u8, 0x22, 0x33, 0x44];
+    for (k, b) in buf.iter().enumerate() {
+        p.ram_mut()[0x20 + k] = *b;
+    }
+    p.run(20000);
+    assert!(p.halted(), "program must halt");
+    let mut c: u16 = 0xFFFF;
+    for b in buf {
+        let mut x = (u16::from(b) << 8) ^ c;
+        for _ in 0..3 {
+            x = if x & 0x8000 != 0 {
+                x.wrapping_shl(1) ^ 7
+            } else {
+                x.wrapping_shl(1)
+            };
+        }
+        c = x;
+    }
+    assert_eq!(p.ram()[0x32], (c & 0xFF) as u8, "result low");
+    assert_eq!(p.ram()[0x33], (c >> 8) as u8, "result high");
+    assert_eq!(p.ram()[0x44], 0, "counter must end at zero");
+}
+
+#[test]
+fn outer_walk_walks_nested_loop_with_plain_entry() {
+    // Same two-block nest with an unconditional entry edge: the seeds
+    // still run once ahead of the header, not per iteration.
+    let m = parse(
+        "global buf i8\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br pre\n\
+           block pre:\n\
+             br head\n\
+           block head:\n\
+             %i = phi i16 %in latch 0 pre\n\
+             %c = phi i16 %n latch -1 pre\n\
+             %g = gep @buf +0 +1*%i\n\
+             %v = load i8 %g\n\
+             %w = zext i8 %v to i16\n\
+             %s = shl i16 %w 8\n\
+             %x = xor i16 %s %c\n\
+             br mid\n\
+           block mid:\n\
+             %k = phi i8 %kn mid 3 head\n\
+             %d = phi i16 %n mid %x head\n\
+             %a = shl i16 %d 1\n\
+             %h = xor i16 %a 7\n\
+             %t = icmp slt i16 %d 0\n\
+             %n = select i1 %t i16 %h i16 %a\n\
+             %kn = add i8 %k -1\n\
+             %m = icmp eq i8 %kn 0\n\
+             br i1 %m latch mid\n\
+           block latch:\n\
+             %in = add i16 %i 1\n\
+             %lc = icmp eq i16 %in 4\n\
+             br i1 %lc exit head\n\
+           block exit:\n\
+             store volatile i16 %n @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("out", 0x032),
+        ("main::i", 0x044),
+        ("main::c", 0x046),
+        ("main::v", 0x048),
+        ("main::w", 0x04A),
+        ("main::s", 0x04C),
+        ("main::x", 0x04E),
+        ("main::k", 0x050),
+        ("main::d", 0x052),
+        ("main::a", 0x054),
+        ("main::h", 0x056),
+        ("main::t", 0x058),
+        ("main::n", 0x05A),
+        ("main::kn", 0x05C),
+        ("main::m", 0x05D),
+        ("main::in", 0x05E),
+        ("main::lc", 0x060),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("main_Lhead_oseed:"),
+        "outer seeds label:\n{asm}"
+    );
+    let lt = block_section(&asm, "main_Llatch");
+    assert!(lt.contains("DECFSZ 0x044,F,A"), "down-counter latch:\n{lt}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let buf = [0x11u8, 0x22, 0x33, 0x44];
+    for (k, b) in buf.iter().enumerate() {
+        p.ram_mut()[0x20 + k] = *b;
+    }
+    p.run(20000);
+    assert!(p.halted(), "program must halt");
+    let mut c: u16 = 0xFFFF;
+    for b in buf {
+        let mut x = (u16::from(b) << 8) ^ c;
+        for _ in 0..3 {
+            x = if x & 0x8000 != 0 {
+                x.wrapping_shl(1) ^ 7
+            } else {
+                x.wrapping_shl(1)
+            };
+        }
+        c = x;
+    }
+    assert_eq!(p.ram()[0x32], (c & 0xFF) as u8, "result low");
+    assert_eq!(p.ram()[0x33], (c >> 8) as u8, "result high");
+}
+
+#[test]
+fn outer_walk_refuses_inner_loop_with_pointer() {
+    // The middle reads a second array, so its walk owns an `FSR`: the
+    // outer loop keeps its per-iteration seed and latch instead of
+    // walking over a clobbered pointer (epic-cc#1204).
+    let m = parse(
+        "global buf i8\n\
+         global dst i8\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br pre\n\
+           block pre:\n\
+             br head\n\
+           block head:\n\
+             %i = phi i16 %in latch 0 pre\n\
+             %c = phi i16 %n latch -1 pre\n\
+             %g = gep @buf +0 +1*%i\n\
+             %v = load i8 %g\n\
+             %w = zext i8 %v to i16\n\
+             %s = shl i16 %w 8\n\
+             %x = xor i16 %s %c\n\
+             br mid\n\
+           block mid:\n\
+             %k = phi i8 %kn mid 0 head\n\
+             %d = phi i16 %n mid %x head\n\
+             %g2 = gep @dst +0 +1*%k\n\
+             %q = load i8 %g2\n\
+             %qq = zext i8 %q to i16\n\
+             %a = xor i16 %d %qq\n\
+             %n = shl i16 %a 1\n\
+             %kn = add i8 %k 1\n\
+             %m = icmp eq i8 %kn 3\n\
+             br i1 %m latch mid\n\
+           block latch:\n\
+             %in = add i16 %i 1\n\
+             %lc = icmp eq i16 %in 4\n\
+             br i1 %lc exit head\n\
+           block exit:\n\
+             store volatile i16 %n @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("dst", 0x028),
+        ("out", 0x032),
+        ("main::i", 0x044),
+        ("main::c", 0x046),
+        ("main::v", 0x048),
+        ("main::w", 0x04A),
+        ("main::s", 0x04C),
+        ("main::x", 0x04E),
+        ("main::k", 0x050),
+        ("main::d", 0x052),
+        ("main::q", 0x054),
+        ("main::qq", 0x056),
+        ("main::a", 0x058),
+        ("main::n", 0x05A),
+        ("main::kn", 0x05C),
+        ("main::m", 0x05D),
+        ("main::in", 0x05E),
+        ("main::lc", 0x060),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(!asm.contains("oseed"), "no outer seeds:\n{asm}");
+    let lt = block_section(&asm, "main_Llatch");
+    assert!(!lt.contains("DECFSZ"), "no outer walk latch:\n{lt}");
+    let mid = block_section(&asm, "main_Lmid");
+    assert!(
+        mid.contains("DECFSZ 0x050,F,A"),
+        "inner loop still walks:\n{mid}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let buf = [0x11u8, 0x22, 0x33, 0x44];
+    let dst = [1u8, 2, 3, 4];
+    for (k, b) in buf.iter().enumerate() {
+        p.ram_mut()[0x20 + k] = *b;
+        p.ram_mut()[0x28 + k] = dst[k];
+    }
+    p.run(20000);
+    assert!(p.halted(), "program must halt");
+    let mut c: u16 = 0xFFFF;
+    for b in buf {
+        let mut x = (u16::from(b) << 8) ^ c;
+        for q in &dst[..3] {
+            x = (x ^ u16::from(*q)).wrapping_shl(1);
+        }
+        c = x;
+    }
+    assert_eq!(p.ram()[0x32], (c & 0xFF) as u8, "result low");
+    assert_eq!(p.ram()[0x33], (c >> 8) as u8, "result high");
+}
+
+#[test]
+fn outer_walk_refuses_middle_reading_outer_counter() {
+    // The middle recomputes from the outer counter, so the counter
+    // escapes the pattern and the outer loop keeps its latch
+    // (epic-cc#1204).
+    let m = parse(
+        "global buf i8\n\
+         global out i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br pre\n\
+           block pre:\n\
+             br head\n\
+           block head:\n\
+             %i = phi i16 %in latch 0 pre\n\
+             %c = phi i16 %n latch -1 pre\n\
+             %g = gep @buf +0 +1*%i\n\
+             %v = load i8 %g\n\
+             %w = zext i8 %v to i16\n\
+             %s = shl i16 %w 8\n\
+             %x = xor i16 %s %c\n\
+             br mid\n\
+           block mid:\n\
+             %k = phi i8 %kn mid 3 head\n\
+             %d = phi i16 %n mid %x head\n\
+             %z = add i16 %i %d\n\
+             %a = shl i16 %z 1\n\
+             %n = xor i16 %a 7\n\
+             %kn = add i8 %k -1\n\
+             %m = icmp eq i8 %kn 0\n\
+             br i1 %m latch mid\n\
+           block latch:\n\
+             %in = add i16 %i 1\n\
+             %lc = icmp eq i16 %in 4\n\
+             br i1 %lc exit head\n\
+           block exit:\n\
+             store volatile i16 %n @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x020),
+        ("out", 0x032),
+        ("main::i", 0x044),
+        ("main::c", 0x046),
+        ("main::v", 0x048),
+        ("main::w", 0x04A),
+        ("main::s", 0x04C),
+        ("main::x", 0x04E),
+        ("main::k", 0x050),
+        ("main::d", 0x052),
+        ("main::z", 0x054),
+        ("main::a", 0x056),
+        ("main::n", 0x058),
+        ("main::kn", 0x05A),
+        ("main::m", 0x05B),
+        ("main::in", 0x05C),
+        ("main::lc", 0x05E),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(!asm.contains("oseed"), "no outer seeds:\n{asm}");
+    let lt = block_section(&asm, "main_Llatch");
+    assert!(!lt.contains("DECFSZ"), "no outer walk latch:\n{lt}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let buf = [0x11u8, 0x22, 0x33, 0x44];
+    for (k, b) in buf.iter().enumerate() {
+        p.ram_mut()[0x20 + k] = *b;
+    }
+    p.run(20000);
+    assert!(p.halted(), "program must halt");
+    let mut c: u16 = 0xFFFF;
+    for (i, b) in buf.iter().enumerate() {
+        let mut x = (u16::from(*b) << 8) ^ c;
+        for _ in 0..3 {
+            x = ((i as u16).wrapping_add(x)).wrapping_shl(1) ^ 7;
+        }
+        c = x;
+    }
+    assert_eq!(p.ram()[0x32], (c & 0xFF) as u8, "result low");
+    assert_eq!(p.ram()[0x33], (c >> 8) as u8, "result high");
+}
+
+#[test]
 fn nul_walk_scans_global_to_terminator_with_up_counter() {
     // A `while (buf[i])` loop walks `POSTINC0` instead of re-seeding
     // per byte: one `LFSR` up front, then a read plus the NUL test per
