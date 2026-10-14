@@ -1,6 +1,7 @@
 //! `iselcore` — shared instruction-selection primitives used by both the
 //! PIC14 (`isel`) and PIC18 (`isel-pic18`) backends.
 
+pub mod chunk;
 pub mod delay;
 
 use ir::{GepBase, Inst, Module};
