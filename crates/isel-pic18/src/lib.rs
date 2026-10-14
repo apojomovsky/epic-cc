@@ -4140,18 +4140,24 @@ impl<'m> Gen<'m> {
                     }
                 }
                 Inst::Select(s) => pairs += usize::from(s.ty.bytes()),
-                Inst::Load(l) if !l.ptr.starts_with('@') => return None,
-                Inst::Store(s) if !s.ptr.starts_with('@') => return None,
-                Inst::Call(_)
-                | Inst::Memcpy(_)
-                | Inst::Asm(_)
-                | Inst::FloatBin(_)
-                | Inst::Fcmp(_)
-                | Inst::FloatConv(_)
-                | Inst::VaArg(_)
-                | Inst::VaStart(_) => return None,
-                Inst::Ret(..) | Inst::Switch(_) => return None,
-                _ => {}
+                // Global memops stage like the single-block scan's own
+                // budget counts them; indexed ones seed an `FSR` per use.
+                Inst::Load(l) if l.ptr.starts_with('@') => {
+                    pairs += usize::from(l.ty.bytes());
+                }
+                Inst::Store(s) if s.ptr.starts_with('@') => {
+                    pairs += usize::from(s.ty.bytes());
+                }
+                // Pure ALU, virtual address math, and the terminators a
+                // region block may end with. Anything else (calls, table
+                // helpers, indexed accesses, new variants) stays out.
+                Inst::Bin(_)
+                | Inst::Gep(_)
+                | Inst::Freeze(_)
+                | Inst::IntToPtr(_)
+                | Inst::Br(_)
+                | Inst::BrCond(_) => {}
+                _ => return None,
             }
         }
         if pairs >= COPY_LOOP_MIN_PAIRS {
@@ -17176,6 +17182,10 @@ pub fn select_with_opts(
                             g.emit_walk_body_op(&o.plan, b, op);
                         }
                     }
+                    // The outer-entry arm branches to the seeds label
+                    // itself, so the shared trailing branch below must
+                    // not run for it.
+                    let mut entered_outer = false;
                     if let Some((tgt, copies)) = outer_entry_edge(
                         &outer_walks,
                         &labels,
@@ -17190,6 +17200,7 @@ pub fn select_with_opts(
                         // copies, then the seeds label ahead of the header.
                         emit_phi_copies(&mut g, &copies, doms[&b.label].contains(&merge));
                         g.emit(format!("    BRA {tgt}"));
+                        entered_outer = true;
                     } else if let Some(plan) =
                         walk_loops.get(&merge).filter(|p| p.preheader == b.label)
                     {
@@ -17233,7 +17244,9 @@ pub fn select_with_opts(
                     } else if let Some(c) = phi_copies.get(&(b.label.clone(), merge.clone())) {
                         emit_phi_copies(&mut g, c, doms[&b.label].contains(&merge));
                     }
-                    g.emit(format!("    BRA {}", labels[&merge]));
+                    if !entered_outer {
+                        g.emit(format!("    BRA {}", labels[&merge]));
+                    }
                 }
                 Some(Inst::BrCond(bc)) => {
                     g.cur_loc = bc.loc.clone();
