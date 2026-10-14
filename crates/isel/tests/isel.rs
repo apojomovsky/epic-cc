@@ -7022,17 +7022,23 @@ fn sub32_reg_reg_emits_four_byte_borrow_chain() {
     let m = parse(&i32_ab_module("sub"));
     let asm = select(&PIC16F877A, &m, &addrs(&i32_map()));
     // Byte 0 is a plain SUBWF (C = borrow out exact); bytes 1-3 fold the
-    // borrow into a scratch copy of b via INCFSZ's skip (the wrap b_i =
-    // 0xFF + borrow keeps C = borrow-in = 0, the true borrow-out).
+    // borrow onto b's own file byte via INCFSZ's skip (the wrap b_i =
+    // 0xFF + borrow keeps C = borrow-in = 0, the true borrow-out), so no
+    // scratch park is needed when dst leaves b addressable in the same
+    // bank (epic-cc#1224). All three bytes here are bank-0 with no
+    // overlay: x=0x20, y=0x24, r=0x38.
     // b=@y=0x24: `%b` folds and the sub reads `@y` directly (epic-cc#875).
     assert!(
         asm.contains("    MOVF 0x24, W\n    SUBWF 0x30, W\n    MOVWF 0x38"),
         "byte 0 sub:\n{asm}"
     );
-    assert_eq!(
-        asm.matches("    INCFSZ 0x70, W").count(),
-        3,
-        "one borrow fold per high byte:\n{asm}"
+    assert!(
+        !asm.contains("    INCFSZ 0x70, W"),
+        "no scratch borrow park remains:\n{asm}"
+    );
+    assert!(
+        !asm.contains("    MOVWF 0x70"),
+        "no scratch park store remains:\n{asm}"
     );
     assert_eq!(
         asm.matches("    SUBWF 0x39, F").count(),
@@ -7045,8 +7051,85 @@ fn sub32_reg_reg_emits_four_byte_borrow_chain() {
         "byte 3 subtract:\n{asm}"
     );
     assert!(
-        asm.contains("    MOVF 0x25, W\n    MOVWF 0x70\n    MOVF 0x31, W\n    MOVWF 0x39\n    MOVF 0x70, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x70, W\n    SUBWF 0x39, F"),
-        "byte 1 borrow chain:\n{asm}"
+        asm.contains("    MOVF 0x31, W\n    MOVWF 0x39\n    MOVF 0x25, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x25, W\n    SUBWF 0x39, F"),
+        "byte 1 park-free borrow fold:\n{asm}"
+    );
+}
+
+#[test]
+fn sub32_reg_reg_overlay_keeps_scratch_fold() {
+    // dst overlaying the subtrahend: the preload would destroy b_i before
+    // the fold rereads it, so the scratch park stays (epic-cc#1224).
+    let m = parse(&i32_ab_module("sub"));
+    let map = vec![
+        ("x", 0x20),
+        ("y", 0x24),
+        ("out", 0x28),
+        ("main::a", 0x30),
+        ("main::b", 0x34),
+        ("main::r", 0x24),
+    ];
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert_eq!(
+        asm.matches("    INCFSZ 0x70, W").count(),
+        3,
+        "overlayed bytes keep the scratch fold:\n{asm}"
+    );
+    assert!(
+        asm.contains("    MOVF 0x25, W\n    MOVWF 0x70\n    MOVF 0x31, W\n    MOVWF 0x25\n    MOVF 0x70, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x70, W\n    SUBWF 0x25, F"),
+        "byte 1 overlay borrow chain:\n{asm}"
+    );
+}
+
+#[test]
+fn sub32_reg_reg_cross_bank_keeps_scratch_fold() {
+    // Subtrahend in bank 1, minuend and dst in bank 0: rereading b_i
+    // after the preload costs the saved words back in BANKSELs, so the
+    // common-RAM park stays (epic-cc#1224).
+    let m = parse(&i32_ab_module("sub"));
+    let map = vec![
+        ("x", 0x20),
+        ("y", 0xA0),
+        ("out", 0x28),
+        ("main::a", 0x30),
+        ("main::b", 0x34),
+        ("main::r", 0x38),
+    ];
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert_eq!(
+        asm.matches("    INCFSZ 0x70, W").count(),
+        3,
+        "cross-bank bytes keep the scratch fold:\n{asm}"
+    );
+    assert!(
+        asm.contains("    MOVF 0xA1, W\n    MOVWF 0x70\n    MOVF 0x31, W\n    MOVWF 0x39\n    MOVF 0x70, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x70, W\n    SUBWF 0x39, F"),
+        "byte 1 cross-bank borrow chain:\n{asm}"
+    );
+}
+
+#[test]
+fn sub32_reg_reg_in_place_dst_skips_preload() {
+    // dst overlaying the minuend: no preload is needed, the fold reads
+    // b_i and subtracts in place (epic-cc#1224).
+    let m = parse(&i32_ab_module("sub"));
+    let map = vec![
+        ("x", 0x20),
+        ("y", 0x24),
+        ("out", 0x28),
+        ("main::a", 0x30),
+        ("main::b", 0x34),
+        ("main::r", 0x30),
+    ];
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
+    assert!(
+        !asm.contains("    INCFSZ 0x70, W"),
+        "no scratch borrow park remains:\n{asm}"
+    );
+    assert!(
+        asm.contains(
+            "    MOVF 0x25, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x25, W\n    SUBWF 0x31, F"
+        ),
+        "byte 1 in-place borrow fold:\n{asm}"
     );
 }
 
@@ -7755,6 +7838,88 @@ fn sub32_simulates_with_borrow_chain() {
         &got[..],
         &[0x01, 0xFF, 0xFF, 0xFF],
         "0x0000FF00 - 0x0000FFFF must be 0xFFFFFF01"
+    );
+
+    // Borrow-in at a 0xFF subtrahend byte with a borrow-out: 0x01050000
+    // - 0x0103FF01 = 0x000100FF. Byte 1's fold wraps (0xFF + borrow) and
+    // must pass the borrow to byte 2.
+    let got = sim_run_bytes(
+        &ir,
+        &sim32_map(),
+        &[
+            (0x20, 0x00),
+            (0x21, 0x00),
+            (0x22, 0x05),
+            (0x23, 0x01),
+            (0x24, 0x01),
+            (0x25, 0xFF),
+            (0x26, 0x03),
+            (0x27, 0x01),
+        ],
+        0x28,
+        4,
+    );
+    assert_eq!(
+        &got[..],
+        &[0xFF, 0x00, 0x01, 0x00],
+        "0x01050000 - 0x0103FF01 must be 0x000100FF"
+    );
+
+    // No-borrow bytes stay exact: 0x12345678 - 0x01010101 = 0x11335577.
+    let got = sim_run_bytes(
+        &ir,
+        &sim32_map(),
+        &[
+            (0x20, 0x78),
+            (0x21, 0x56),
+            (0x22, 0x34),
+            (0x23, 0x12),
+            (0x24, 0x01),
+            (0x25, 0x01),
+            (0x26, 0x01),
+            (0x27, 0x01),
+        ],
+        0x28,
+        4,
+    );
+    assert_eq!(
+        &got[..],
+        &[0x77, 0x55, 0x33, 0x11],
+        "0x12345678 - 0x01010101 must be 0x11335577"
+    );
+}
+
+#[test]
+fn sub32_overlay_dst_simulates() {
+    // dst overlaying the subtrahend keeps the scratch fold and must
+    // still subtract exactly (epic-cc#1224).
+    let ir = i32_ab_module("sub");
+    let map = [
+        ("x", 0x20),
+        ("y", 0x24),
+        ("out", 0x28),
+        ("main::a", 0x30),
+        ("main::b", 0x34),
+        ("main::r", 0x24),
+    ];
+    // 0x00010000 - 1 = 0x0000FFFF through the overlaid destination.
+    let got = sim_run_bytes(
+        &ir,
+        &str_map(&map),
+        &[
+            (0x20, 0x00),
+            (0x21, 0x00),
+            (0x22, 0x01),
+            (0x23, 0x00),
+            (0x24, 0x01),
+        ],
+        0x28,
+        4,
+    );
+    assert_eq!(
+        &got[..],
+        &[0xFF, 0xFF, 0x00, 0x00],
+        "overlayed dst must not corrupt the borrow chain"
     );
 }
 

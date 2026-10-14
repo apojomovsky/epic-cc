@@ -8,17 +8,23 @@
 use std::process::Command;
 
 /// Compile `src` with the driver and return the `--line-table` output.
-fn line_table(src: &str, device: &str) -> String {
+/// Outputs live in a per-test temp dir, never at a fixed `/tmp` path:
+/// the harness runs both tests in one binary on parallel threads, so a
+/// shared path lets one test read the table while the other overwrites
+/// it (epic-cc#1198). The pid keeps concurrent processes apart.
+fn line_table(src: &str, device: &str, test: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("lt_{test}_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let hex_path = dir.join("out.hex");
+    let table_path = dir.join("out.txt");
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args([
-            src,
-            "-o",
-            "/tmp/lt.hex",
-            "--device",
-            device,
-            "--line-table",
-            "/tmp/lt.txt",
-        ])
+        .arg(src)
+        .arg("-o")
+        .arg(&hex_path)
+        .arg("--device")
+        .arg(device)
+        .arg("--line-table")
+        .arg(&table_path)
         .output()
         .expect("run driver");
     assert!(
@@ -26,7 +32,9 @@ fn line_table(src: &str, device: &str) -> String {
         "driver: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    std::fs::read_to_string("/tmp/lt.txt").unwrap()
+    let table = std::fs::read_to_string(&table_path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    table
 }
 
 #[test]
@@ -34,7 +42,7 @@ fn line_table_maps_words_to_source_lines() {
     // A multi-line body: `a = 1;` on line 3, `b = a + 2;` on line 4,
     // `out = a + b;` on line 5. The table must carry each line's words.
     let src = "tests/fixtures/line_table.c";
-    let table = line_table(src, "p16f877a");
+    let table = line_table(src, "p16f877a", "maps_words");
     let lines: Vec<&str> = table.lines().filter(|l| !l.starts_with(';')).collect();
     assert!(!lines.is_empty(), "line table must have records:\n{table}");
     // Every record is `file:line:col 0xNNNN`.
@@ -64,7 +72,7 @@ fn line_table_maps_words_to_source_lines() {
 fn banksel_words_inherit_the_preceding_line() {
     // The banked fixture forces BANKSEL insertion (90 globals exceed bank 0).
     let src = "tests/fixtures/banked.c";
-    let table = line_table(src, "p16f877a");
+    let table = line_table(src, "p16f877a", "banksel_inherit");
     let records: Vec<(&str, &str)> = table
         .lines()
         .filter(|l| !l.starts_with(';'))
