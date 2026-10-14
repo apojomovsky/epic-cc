@@ -81,6 +81,184 @@ fn add32_const_ff_byte_folds_without_park() {
         "0x00 byte folds without a park:\n{asm}"
     );
 }
+fn add32_reg_reg_module() -> String {
+    "global x i32\nglobal y i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %r = add i32 %a, %b\n    store i32 %r @out\n    ret void".to_string()
+}
+
+#[test]
+fn add32_reg_reg_carry_folds_without_park() {
+    // epic-cc#1255: the carry folds onto b's own file byte via INCFSZ's
+    // skip, so no scratch park is needed when dst leaves b addressable
+    // in the same bank. All bytes here are bank-0 with no overlay.
+    let m = parse(&add32_reg_reg_module());
+    let asm = select(
+        &PIC16F1937,
+        &m,
+        &addrs(&[
+            ("x", 0x20),
+            ("y", 0x24),
+            ("out", 0x28),
+            ("main::a", 0x2C),
+            ("main::b", 0x30),
+            ("main::r", 0x34),
+        ]),
+    );
+    assert!(
+        asm.contains("    MOVF 0x2D, W\n    MOVWF 0x35\n    MOVF 0x25, W\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x25, W\n    ADDWF 0x35, F"),
+        "byte 1 park-free carry fold:\n{asm}"
+    );
+    assert!(
+        !asm.contains("INCFSZ 0x70, W"),
+        "no scratch carry park remains:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVWF 0x70"),
+        "no scratch park store remains:\n{asm}"
+    );
+}
+
+#[test]
+fn add32_reg_reg_overlay_and_cross_bank_keep_park() {
+    // dst overlaying the addend, or an addend in another bank:
+    // the fold cannot reread b_i, so the scratch park stays.
+    let m = parse(&add32_reg_reg_module());
+    let asm = select(
+        &PIC16F1937,
+        &m,
+        &addrs(&[
+            ("x", 0x20),
+            ("y", 0x24),
+            ("out", 0x28),
+            ("main::a", 0x2C),
+            ("main::b", 0x30),
+            ("main::r", 0x24),
+        ]),
+    );
+    assert_eq!(
+        asm.matches("    INCFSZ 0x70, W").count(),
+        3,
+        "overlayed bytes keep the scratch fold:\n{asm}"
+    );
+    let asm = select(
+        &PIC16F1937,
+        &m,
+        &addrs(&[
+            ("x", 0x20),
+            ("y", 0xA0),
+            ("out", 0x28),
+            ("main::a", 0x2C),
+            ("main::b", 0x30),
+            ("main::r", 0x34),
+        ]),
+    );
+    assert_eq!(
+        asm.matches("    INCFSZ 0x70, W").count(),
+        3,
+        "cross-bank bytes keep the scratch fold:\n{asm}"
+    );
+    assert!(
+        asm.contains("    MOVF 0xA1, W\n    MOVWF 0x70\n    MOVF 0x2D, W\n    MOVWF 0x35\n    MOVF 0x70, W\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x35, F"),
+        "byte 1 cross-bank carry chain:\n{asm}"
+    );
+}
+
+#[test]
+fn add32_reg_reg_in_place_dst_skips_preload() {
+    // dst overlaying the augend: no preload is needed, the fold reads
+    // b_i and accumulates in place.
+    let m = parse(&add32_reg_reg_module());
+    let asm = select(
+        &PIC16F1937,
+        &m,
+        &addrs(&[
+            ("x", 0x20),
+            ("y", 0x24),
+            ("out", 0x28),
+            ("main::a", 0x2C),
+            ("main::b", 0x30),
+            ("main::r", 0x2C),
+        ]),
+    );
+    assert!(
+        !asm.contains("INCFSZ 0x70, W"),
+        "no scratch carry park remains:\n{asm}"
+    );
+    assert!(
+        asm.contains(
+            "    MOVF 0x25, W\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x25, W\n    ADDWF 0x2D, F"
+        ),
+        "byte 1 in-place carry fold:\n{asm}"
+    );
+}
+
+#[test]
+fn add32_reg_reg_carry_simulates_boundaries() {
+    // The park-free fold keeps the carry across 0x00 and 0xFF
+    // addend bytes with carry in and out.
+    let ir = &add32_reg_reg_module();
+    let map = [
+        ("x", 0x20),
+        ("y", 0x24),
+        ("out", 0x28),
+        ("main::a", 0x2C),
+        ("main::b", 0x30),
+        ("main::r", 0x34),
+    ];
+    // 0x0000FFFF + 1 = 0x00010000 (carry through bytes 0-2).
+    let got = sim_run_bytes(
+        ir,
+        &map,
+        &[
+            (0x20, 0xFF),
+            (0x21, 0xFF),
+            (0x22, 0x00),
+            (0x23, 0x00),
+            (0x24, 0x01),
+        ],
+        0x28,
+        4,
+    );
+    assert_eq!(got, vec![0x00, 0x00, 0x01, 0x00], "carry through bytes 0-2");
+    // 0x0000FF80 + 0x00000080 = 0x00010000: byte 1's fold wraps
+    // (0xFF + carry) and must pass the carry to byte 2.
+    let got = sim_run_bytes(
+        ir,
+        &map,
+        &[
+            (0x20, 0x80),
+            (0x21, 0xFF),
+            (0x22, 0x00),
+            (0x23, 0x00),
+            (0x24, 0x80),
+        ],
+        0x28,
+        4,
+    );
+    assert_eq!(got, vec![0x00, 0x00, 0x01, 0x00], "carry through the wrap");
+    // 0x00050000 + 0x0003FF80 = 0x0008FF80: carry-in at the 0xFF byte
+    // with a carry-out to byte 2.
+    let got = sim_run_bytes(
+        ir,
+        &map,
+        &[
+            (0x20, 0x00),
+            (0x21, 0x00),
+            (0x22, 0x05),
+            (0x23, 0x00),
+            (0x24, 0x80),
+            (0x25, 0xFF),
+            (0x26, 0x03),
+            (0x27, 0x00),
+        ],
+        0x28,
+        4,
+    );
+    assert_eq!(
+        got,
+        vec![0x80, 0xFF, 0x08, 0x00],
+        "carry in and out at the 0xFF byte"
+    );
+}
 
 #[test]
 fn sub32_and_sub_const_lhs_folds_simulate() {

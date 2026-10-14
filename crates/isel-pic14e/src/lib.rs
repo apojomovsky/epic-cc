@@ -2254,8 +2254,10 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Adds i32 values with the carry folded per byte through scratch.
-    /// Uses the skip fold so the wrap keeps the true carry-out.
+    /// Adds i32 values with the carry folded per byte. A register addend
+    /// rereads its own file byte through INCFSZ when dst leaves it
+    /// addressable in the same bank, else it keeps the scratch fold.
+    /// Either wrap keeps C = carry-in, the true carry-out.
     fn emit_add32(&mut self, a: &Val, b: &Val, dst: u16) {
         let (reg, other) = match (a, b) {
             (Val::Reg(r), o) => (r.clone(), o),
@@ -2271,17 +2273,39 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    ADDWF 0x{ra:02X}, W"));
                 self.emit(format!("    MOVWF 0x{dst:02X}"));
                 for i in 1..4u8 {
-                    // b_i is copied to scratch first (the dst preload may
-                    // overlay b), then W is reloaded from it after the
-                    // preload's MOVF clobbers W.
-                    self.emit(format!("    MOVF 0x{:02X}, W", bb + u16::from(i)));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                    self.emit(format!("    MOVF 0x{:02X}, W", ra + u16::from(i)));
-                    self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
-                    self.emit("    BTFSC STATUS, 0 ; C".to_string());
-                    self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
-                    self.emit(format!("    ADDWF 0x{:02X}, F", dst + u16::from(i)));
+                    let add = bb + u16::from(i);
+                    let aug = ra + u16::from(i);
+                    let dd = dst + u16::from(i);
+                    // Park-free when the folded addend rereads from its
+                    // own file byte: dst must not overlay it (the preload
+                    // would destroy it) and all three bytes share one bank
+                    // (a cross-bank reread costs the saved words back in
+                    // MOVLBs). INCFSZ's skip keeps C = carry-in, the
+                    // true carry-out, same as the scratch fold.
+                    if dd != add
+                        && self.device.bank_of(add) == self.device.bank_of(aug)
+                        && self.device.bank_of(add) == self.device.bank_of(dd)
+                    {
+                        if dd != aug {
+                            self.emit(format!("    MOVF 0x{aug:02X}, W"));
+                            self.emit(format!("    MOVWF 0x{dd:02X}"));
+                        }
+                        self.emit(format!("    MOVF 0x{add:02X}, W"));
+                        self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                        self.emit(format!("    INCFSZ 0x{add:02X}, W"));
+                        self.emit(format!("    ADDWF 0x{dd:02X}, F"));
+                    } else {
+                        // Stages the addend in scratch before the preload
+                        // clobbers W.
+                        self.emit(format!("    MOVF 0x{add:02X}, W"));
+                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                        self.emit(format!("    MOVF 0x{aug:02X}, W"));
+                        self.emit(format!("    MOVWF 0x{dd:02X}"));
+                        self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                        self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                        self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                        self.emit(format!("    ADDWF 0x{dd:02X}, F"));
+                    }
                 }
             }
             Val::Const(k) => {
