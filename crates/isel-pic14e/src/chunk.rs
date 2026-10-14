@@ -1,48 +1,23 @@
 //! Cross-page placement for PIC14E functions past one 2048-word page
 //! (epic-cc#880). A split function is cut at its block labels; each
 //! non-final chunk ends in a three-word link to the next chunk's entry.
-//! The classic `isel` crate holds the same helpers; they move to
-//! `iselcore` once both backends share them.
+//! The leaf readers live in `iselcore::chunk`, shared with classic
+//! `isel`. The planners stay per backend: classic reserves link plus
+//! banking slack behind a repair loop, PIC14E plans exact links.
 
-use super::word_size;
 use banking::SKIP_OPS;
 use device::Device;
 use ir::SrcLoc;
+use iselcore::chunk::{code_of, label_of, word_size};
 use iselcore::is_directive;
 use std::collections::{HashMap, HashSet};
+
+pub(crate) use iselcore::chunk::{block_asm_labels, slice_banked_lines};
 
 /// Words a non-final chunk spends on its link: `MOVLW PAGE(next)`,
 /// `MOVWF PCLATH`, `GOTO next`. Reserved when planning, since no repair
 /// pass follows placement to absorb growth.
 pub(crate) const CHUNK_LINK_WORDS: usize = 3;
-
-/// The code part of an asm line: comment and surrounding space removed.
-fn code_of(line: &str) -> &str {
-    line.split(';').next().unwrap_or("").trim()
-}
-
-/// The name a label line defines, or `None` for any other line.
-fn label_of(code: &str) -> Option<&str> {
-    let name = code.strip_suffix(':')?;
-    (!name.contains(' ')).then_some(name)
-}
-
-/// Asm labels of a function's IR blocks in block order. The first is the
-/// function label; the rest are `{name}_L{label}`, as `emit_func_body`
-/// writes them.
-pub(crate) fn block_asm_labels(f: &ir::Func) -> Vec<String> {
-    f.blocks
-        .iter()
-        .enumerate()
-        .map(|(i, b)| {
-            if i == 0 {
-                f.name.clone()
-            } else {
-                format!("{}_L{}", f.name, b.label)
-            }
-        })
-        .collect()
-}
 
 /// Post-banking extent of each function and `__start`, label to label with
 /// assembler semantics. Block labels stay inside the enclosing function,
@@ -92,31 +67,6 @@ pub(crate) fn post_extents(banked: &str, func_names: &HashSet<&str>) -> HashMap<
     post
 }
 
-/// The banked lines of one function: from its label up to the next
-/// function label or `__start`. Banking has already run on these lines,
-/// so BANKSEL growth is counted in the plan.
-pub(crate) fn slice_banked_lines(
-    banked: &str,
-    func: &str,
-    func_names: &HashSet<&str>,
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut inside = false;
-    for raw in banked.lines() {
-        if let Some(label) = label_of(code_of(raw)) {
-            if label == func {
-                inside = true;
-            } else if inside && (func_names.contains(label) || label == "__start") {
-                break;
-            }
-        }
-        if inside {
-            out.push(raw.to_string());
-        }
-    }
-    out
-}
-
 /// The target of a `GOTO` to a label defined in the same lines.
 fn goto_target<'a>(code: &'a str, defined: &HashSet<&str>) -> Option<&'a str> {
     let target = code.strip_prefix("GOTO ")?;
@@ -137,11 +87,7 @@ pub(crate) fn insert_goto_sets(
     lines: &[String],
     locs: &[Option<SrcLoc>],
 ) -> (Vec<String>, Vec<Option<SrcLoc>>) {
-    let defined: HashSet<&str> = lines
-        .iter()
-        .filter_map(|l| label_of(code_of(l)))
-        .filter(|name| !name.starts_with('.'))
-        .collect();
+    let defined: HashSet<&str> = lines.iter().filter_map(|l| label_of(code_of(l))).collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut out_locs: Vec<Option<SrcLoc>> = Vec::with_capacity(lines.len());
     for (i, line) in lines.iter().enumerate() {
