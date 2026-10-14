@@ -98,7 +98,7 @@ DOCKER_ARGS = --rm \
 
 DOCKER_RUN = mkdir -p $(CARGO_HOME_CACHE) $(EFFECTIVE_TARGET_CACHE) && $(WITH_TARGET_LOCK) $(EFFECTIVE_TARGET_CACHE)/.build.lock docker run $(DOCKER_ARGS) $(LOCAL_IMAGE)
 
-.PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check size-report docs-gen guard-main-clone
+.PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check size-report docs-gen sync-shared-includes guard-main-clone
 
 bootstrap: ## First-time setup: host deps, git hooks, dev image
 	@bash scripts/bootstrap.sh
@@ -186,6 +186,9 @@ size-report: guard-main-clone image ## Regenerate crates/driver/tests/fixtures/S
 
 docs-gen: guard-main-clone image ## Regenerate docs/reference/{devices,cli}.md and README.md from the tree
 	@$(DOCKER_RUN) bash -c 'cargo build -q -p driver && python3 scripts/gen_docs_reference.py --binary /tmp/cargo-target/debug/epic-cc'
+
+sync-shared-includes: ## Refresh docs/snippets/ways-to-use-epic8.md from apojomovsky/epic-docs at REF (a commit sha); needs the network
+	@python3 scripts/shared_includes.py sync --ref "$(REF)"
 
 ci-local: guard-main-clone image ## EXACT CI, locally: docker epic-cc-ci bash scripts/ci-test.sh, run before git push (see #99)
 	@$(DOCKER_RUN) bash scripts/ci-test.sh
