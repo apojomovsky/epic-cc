@@ -3676,7 +3676,9 @@ fn allocate_inner(
         let top = overlay_end(device, base, &locals_widths, device.gpr_start());
         !m.globals
             .iter()
-            .any(|g| matches!(g.addr, Some(a) if a < top))
+            // Bit entities (epic-cc#707) live in SFR bits, not RAM, so a
+            // pinned SFR address must not force the globals-first layout.
+            .any(|g| matches!(g.addr, Some(p) if p.bit.is_none() && p.byte < top))
     });
     let global_start = match &placed_frames {
         Some((b, _, _, _)) => overlay_end(device, b, &locals_widths, device.gpr_start()),
@@ -4618,10 +4620,15 @@ fn allocate_inner(
     // other width. A global nothing fits still fails precisely at the
     // `no arrangement fits` panic below, never silently.
     for g in &m.globals {
+        // A bit entity (epic-cc#707) is served by bit ops at its SFR
+        // address: it reserves no RAM byte and takes no map entry.
+        if matches!(g.addr, Some(p) if p.bit.is_some()) {
+            continue;
+        }
         if g.is_const && !const_to_ram.contains(&g.name) {
             const_globals.insert(g.name.clone());
-        } else if let Some(a) = g.addr {
-            fixed.push((g.name.clone(), a, g.size));
+        } else if let Some(p) = g.addr {
+            fixed.push((g.name.clone(), p.byte, g.size));
         } else if packed_names.contains(&g.name) {
             // Its group's holder below reserves the shared byte.
         } else {

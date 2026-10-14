@@ -627,6 +627,15 @@ pub struct Func {
     pub variadic: bool,
 }
 
+/// An absolute placement: the byte address plus, for a bare-bit entity,
+/// the bit within it. `bit: Some` always rides beside a real `byte`;
+/// a bare `byte` with `bit: None` is an `EPIC_AT` byte global.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub byte: u16,
+    pub bit: Option<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Global {
     pub name: String,
@@ -644,7 +653,11 @@ pub struct Global {
     /// so the slot address (not the table base) is what the dispatch
     /// load reads (epic-cc#154, epic-cc#443, epic-cc#460).
     pub refs: Vec<(usize, String, u16)>,
-    pub addr: Option<u16>,
+    /// Absolute placement from a section the backend reads: `EPIC_AT` for
+    /// a byte, `.epic.bit.<addr>.<bit>` for a bare-bit entity (`GIE = 1`,
+    /// epic-cc#707). A bit entity takes no RAM byte and no map entry;
+    /// every load and store serves a bit op.
+    pub addr: Option<Placed>,
     /// LLVM `internal`/`private` linkage (a C `static`): no other module,
     /// debugger script, or harness poke can name this global, so
     /// whole-program passes may change its width or share its byte.
@@ -779,7 +792,10 @@ pub fn serialize(m: &Module) -> String {
     for g in &m.globals {
         let kind = if g.is_const { "const" } else { "global" };
         let mut line = match g.addr {
-            Some(a) => format!("{kind} {} {} @0x{a:02X}", g.name, ty_str(g.ty)),
+            Some(p) => match p.bit {
+                Some(b) => format!("{kind} {} {} @0x{:02X}.{b}", g.name, ty_str(g.ty), p.byte),
+                None => format!("{kind} {} {} @0x{:02X}", g.name, ty_str(g.ty), p.byte),
+            },
             None => format!("{kind} {} {}", g.name, ty_str(g.ty)),
         };
         if g.internal {
@@ -1214,16 +1230,23 @@ pub fn parse(text: &str) -> Module {
         {
             let is_const = line.starts_with("const ");
             let parts: Vec<&str> = rest.split_whitespace().collect();
-            // format: <name> <ty> [@addr] [internal]
+            // format: <name> <ty> [@addr[.bit]] [internal]
             let name = parts[0].to_string();
             let ty = parse_ty(parts[1]);
-            let mut addr = None;
+            let mut addr: Option<Placed> = None;
             let mut internal = false;
             for tok in &parts[2..] {
                 if *tok == "internal" {
                     internal = true;
+                } else if let Some((a, b)) = tok.split_once('.') {
+                    let bit: u8 = b.parse().unwrap_or_else(|_| panic!("bad bit {b:?}"));
+                    assert!(bit < 8, "bit number {bit} out of range, want 0-7");
+                    addr = Some(Placed {
+                        byte: parse_addr(a).unwrap_or_else(|| panic!("bad addr {a:?}")),
+                        bit: Some(bit),
+                    });
                 } else {
-                    addr = parse_addr(tok);
+                    addr = parse_addr(tok).map(|byte| Placed { byte, bit: None });
                 }
             }
             globals.push(Global {

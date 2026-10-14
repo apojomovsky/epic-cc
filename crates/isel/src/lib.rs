@@ -630,12 +630,7 @@ impl<'m> Gen<'m> {
                 Some(a) => Slot::Direct(a),
                 None => self.slot_addr(self.cur_func, r),
             },
-            Val::Global(g) => Slot::Direct(
-                *self
-                    .addrs
-                    .get(g)
-                    .unwrap_or_else(|| panic!("isel: no address for @{g}")),
-            ),
+            Val::Global(g) => Slot::Direct(self.global_addr(g)),
             Val::Const(k) => {
                 // Mask to the byte: clang prints i8 constants >= 128 as
                 // negative i8 (found by the fuzz corpus); the value is the
@@ -645,8 +640,29 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// The byte address of a RAM global (from the map).
+    /// The (register, bit) of a bare-bit entity (epic-cc#707), or `None`
+    /// for an ordinary global. Bit entities take no map entry: every load
+    /// and store serves a bit op, and any other use is an address escape.
+    fn bit_entity(&self, name: &str) -> Option<(u16, u8)> {
+        self.m
+            .globals
+            .iter()
+            .find(|g| g.name == name)
+            .and_then(|g| {
+                let p = g.addr?;
+                Some((p.byte, p.bit?))
+            })
+    }
+
+    /// The byte address of a RAM global (from the map). A bit entity has
+    /// no byte address: reaching here means its address escapes (stored,
+    /// passed, or computed), which a single bit cannot serve.
     fn global_addr(&self, name: &str) -> u16 {
+        if let Some((addr, bit)) = self.bit_entity(name) {
+            panic!(
+                "isel: cannot take the address of bit entity @{name} (register {addr:#X} bit {bit}): load its 0/1 value instead"
+            );
+        }
         *self
             .addrs
             .get(name)
@@ -1597,6 +1613,46 @@ impl<'m> Gen<'m> {
             _ => panic!(
                 "isel: multi-term index into large const table @{name} not supported: {terms:?}"
             ),
+        }
+    }
+
+    /// Materialize a bare-bit entity as a 0/1 byte in `dst` (epic-cc#707).
+    fn emit_bit_load(&mut self, addr: u16, bit: u8, dst: u16) {
+        assert!(
+            addr <= 0xFF,
+            "isel: bit entity register {addr:#X} is not a PIC14 file address"
+        );
+        self.emit("    MOVLW 0x00".to_string());
+        self.emit(format!("    BTFSC 0x{addr:02X}, {bit}"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit_w_store(dst);
+    }
+
+    /// Serve a store to a bare-bit entity (epic-cc#707). Constants set or
+    /// clear the bit directly; any other value rides W through a zero
+    /// test (`MOVF` sets Z exactly), with the set/clear on either side
+    /// of one bank-free GOTO so the skip stays exact.
+    fn emit_bit_store(&mut self, addr: u16, bit: u8, val: &Val) {
+        assert!(
+            addr <= 0xFF,
+            "isel: bit entity register {addr:#X} is not a PIC14 file address"
+        );
+        match val {
+            Val::Const(0) => self.emit(format!("    BCF 0x{addr:02X}, {bit}")),
+            Val::Const(_) => self.emit(format!("    BSF 0x{addr:02X}, {bit}")),
+            _ => {
+                let vsrc = self.val_addr(val).direct();
+                self.emit(format!("    MOVF 0x{vsrc:02X}, W"));
+                let clr = self.fresh_label();
+                let end = self.fresh_label();
+                self.emit("    BTFSC STATUS, 2".to_string());
+                self.emit(format!("    GOTO {clr}"));
+                self.emit(format!("    BSF 0x{addr:02X}, {bit}"));
+                self.emit(format!("    GOTO {end}"));
+                self.emit(format!("{clr}:"));
+                self.emit(format!("    BCF 0x{addr:02X}, {bit}"));
+                self.emit(format!("{end}:"));
+            }
         }
     }
 
@@ -3726,6 +3782,21 @@ impl<'m> Gen<'m> {
         self.cur_loc = i.loc().cloned();
         match i {
             Inst::Load(l) => {
+                // A bare-bit entity materializes its bit as a 0/1 byte
+                // (epic-cc#707). Skip-safe like the PIC18 sibling: the
+                // skipped MOVLW takes no bank select, so no BANKSEL lands
+                // between the test and its target.
+                if let Some(g) = l.ptr.strip_prefix('@') {
+                    if let Some((addr, bit)) = self.bit_entity(g) {
+                        assert!(
+                            l.ty.bytes() == 1 && !l.ptr_ty,
+                            "isel: bit entity @{g} serves only plain byte loads"
+                        );
+                        let dst = self.slot_addr(self.cur_func, &l.dst).direct();
+                        self.emit_bit_load(addr, bit, dst);
+                        return;
+                    }
+                }
                 // An i1 global is real: clang's own -O1 GlobalOpt narrows
                 // an internal flag only ever written 0/1 down to `global
                 // i1` (epic-cc#462). i1 is one byte in the byte model, so
@@ -3800,6 +3871,19 @@ impl<'m> Gen<'m> {
                         "isel: store of a ROM address into RAM is not supported: {:?} (PIC18-only, epic-cc#1101, epic-cc#1203)",
                         s.val
                     );
+                }
+                // A bare-bit entity serves the store as a bit op
+                // (epic-cc#707): constants set or clear directly, any other
+                // value is tested with the set/clear on either side.
+                if let Some(g) = s.ptr.strip_prefix('@') {
+                    if let Some((addr, bit)) = self.bit_entity(g) {
+                        assert!(
+                            s.ty.bytes() == 1,
+                            "isel: bit entity @{g} serves only plain byte stores"
+                        );
+                        self.emit_bit_store(addr, bit, &s.val);
+                        return;
+                    }
                 }
                 // Pool log variant (epic-cc#817): derived slots hold
                 // indices, so a store through one has no address.

@@ -98,7 +98,7 @@ DOCKER_ARGS = --rm \
 
 DOCKER_RUN = mkdir -p $(CARGO_HOME_CACHE) $(EFFECTIVE_TARGET_CACHE) && $(WITH_TARGET_LOCK) $(EFFECTIVE_TARGET_CACHE)/.build.lock docker run $(DOCKER_ARGS) $(LOCAL_IMAGE)
 
-.PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check size-report guard-main-clone
+.PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check size-report docs-gen guard-main-clone
 
 bootstrap: ## First-time setup: host deps, git hooks, dev image
 	@bash scripts/bootstrap.sh
@@ -183,6 +183,9 @@ size-report: guard-main-clone image ## Regenerate crates/driver/tests/fixtures/S
 	@$(DOCKER_RUN) bash -c 'set -o pipefail; SIZE_REPORT_JSON=1 cargo test -q -p driver --test size_regression_e2e -- --nocapture 2>/dev/null | sed -n /SIZE_REPORT_JSON_BEGIN/,/SIZE_REPORT_JSON_END/p | grep -v SIZE_REPORT_JSON > scratch/size-report/sizes.json'
 	@$(DOCKER_RUN) bash -c 'cargo run -q -p driver -- --target 18F4550 $(addprefix -I ,$(MENU_DEMO_INCLUDES)) $(addprefix -D ,$(MENU_DEMO_DEFINES)) --emit asm --save-temps scratch/size-report/temps -o scratch/size-report/menu-demo.asm $(MENU_DEMO_SRCS) && printf "%s\n" $(MENU_DEMO_SRCS) | sort > scratch/size-report/asm-inputs.txt && python3 scripts/inline-map.py scratch/size-report/temps/merged.ll scratch/size-report/temps/merged_opt.ll > scratch/size-report/inline.json 2>scratch/size-report/inline.err && python3 scripts/density-profile.py scratch/size-report/menu-demo.asm --inline-map scratch/size-report/inline.json --json > scratch/size-report/density.json'
 	@python3 scripts/size-report.py --sizes scratch/size-report/sizes.json --density scratch/size-report/density.json --baseline crates/driver/tests/fixtures/size_baseline.toml --sha $(EPIC_CC_GIT_SHA) --date $(REPORT_DATE) --asm-inputs scratch/size-report/asm-inputs.txt --out crates/driver/tests/fixtures/SIZE_REPORT.md && echo "wrote crates/driver/tests/fixtures/SIZE_REPORT.md"
+
+docs-gen: guard-main-clone image ## Regenerate docs/reference/{devices,cli}.md and README.md from the tree
+	@$(DOCKER_RUN) bash -c 'cargo build -q -p driver && python3 scripts/gen_docs_reference.py --binary /tmp/cargo-target/debug/epic-cc'
 
 ci-local: guard-main-clone image ## EXACT CI, locally: docker epic-cc-ci bash scripts/ci-test.sh, run before git push (see #99)
 	@$(DOCKER_RUN) bash scripts/ci-test.sh

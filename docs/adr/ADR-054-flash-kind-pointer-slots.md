@@ -1,4 +1,4 @@
-# ADR-053 -- PIC18 pointer slots carry a static flash or RAM address space
+# ADR-054 -- PIC18 pointer slots carry a static flash or RAM address space
 
 **Status:** Accepted 2026-10-14 (oracle decision on `epic-cc#1119`)<br>
 **Decides:** `epic-cc#1119`, `epic-cc#1092`<br>

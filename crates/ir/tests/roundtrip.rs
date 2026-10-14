@@ -16,7 +16,13 @@ fn global_type_and_addr_roundtrip() {
     assert_eq!(m.globals[0].ty, ir::Ty::I8);
     assert_eq!(m.globals[0].addr, None);
     assert_eq!(m.globals[1].ty, ir::Ty::I16);
-    assert_eq!(m.globals[1].addr, Some(0x20));
+    assert_eq!(
+        m.globals[1].addr,
+        Some(ir::Placed {
+            byte: 0x20,
+            bit: None
+        })
+    );
     let out = serialize(&m);
     assert!(out.contains("global in i8"));
     assert!(out.contains("const out i16 @0x20"));
@@ -30,13 +36,43 @@ fn explicit_global_addr_past_0xff_roundtrips() {
     // 0xFF (e.g. a bank-2 GPR address like 0x150) panicked in parse_addr
     // instead of round-tripping like any other explicit address.
     let m = parse("global g i16 @0x150\n");
-    assert_eq!(m.globals[0].addr, Some(0x150));
+    assert_eq!(
+        m.globals[0].addr,
+        Some(ir::Placed {
+            byte: 0x150,
+            bit: None
+        })
+    );
     let out = serialize(&m);
     assert!(
         out.contains("global g i16 @0x150"),
         "missing wide addr\n---\n{out}"
     );
     assert_eq!(serialize(&parse(&out)), out, "stable fixed point");
+}
+
+#[test]
+fn bit_placement_roundtrips() {
+    let m = parse("global GIE i8 @0x0B.7\nfn main(void) ()\n");
+    assert_eq!(
+        m.globals[0].addr,
+        Some(ir::Placed {
+            byte: 0x0B,
+            bit: Some(7)
+        })
+    );
+    let out = serialize(&m);
+    assert!(
+        out.contains("global GIE i8 @0x0B.7"),
+        "missing bit placement\n---\n{out}"
+    );
+    assert_eq!(serialize(&parse(&out)), out, "stable fixed point");
+}
+
+#[test]
+#[should_panic(expected = "out of range")]
+fn bit_number_past_7_is_rejected() {
+    parse("global G i8 @0x0B.9\n");
 }
 
 #[test]
@@ -75,7 +111,10 @@ fn gep_and_sized_globals_roundtrip() {
         name: "ram".into(),
         ty: ir::Ty::I8,
         is_const: false,
-        addr: Some(0x25),
+        addr: Some(ir::Placed {
+            byte: 0x25,
+            bit: None,
+        }),
         size: 8,
         bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
         refs: Vec::new(),
