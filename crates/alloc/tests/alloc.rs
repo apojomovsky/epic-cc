@@ -3668,10 +3668,11 @@ fn pic14_cross_bank_arg_keeps_its_copy() {
 }
 
 #[test]
-fn pic14_drops_direct_load_slot_but_keeps_bin_slot() {
-    // The add shape (epic-cc#875): `%1` reads `@in` in W, so its slot
-    // drops, while the `add` result still stages into `%2`'s slot.
-    // Globals stay exactly placed: the gated pass never moves them.
+fn pic14_drops_direct_load_slot_and_slotless_bin_slot() {
+    // The add shape (epic-cc#862): `%1` reads `@in` in W, so its slot
+    // drops, and the single-byte `add` computes into `@out`, so `%2`
+    // needs no slot either. Globals stay exactly placed: the gated
+    // pass never moves them.
     let m = parse(
         "global in i8\n\
          global out i8\n\
@@ -3691,8 +3692,8 @@ fn pic14_drops_direct_load_slot_but_keeps_bin_slot() {
         out.locals
     );
     assert!(
-        out.locals.contains_key("main::2"),
-        "forwarded bin result keeps its slot: {:?}",
+        !out.locals.contains_key("main::2"),
+        "slotless bin needs no slot: {:?}",
         out.locals
     );
 }
@@ -4056,10 +4057,11 @@ fn isr_region_shrink_wins_a_ram_tie_without_dipping_main() {
 }
 
 #[test]
-fn pic14e_drops_direct_load_slot_but_keeps_bin_slot() {
-    // The add shape (epic-cc#902): `%1` reads `@in` in W, so its slot
-    // drops, while the `add` result still stages into `%2`'s slot.
-    // Globals stay exactly placed: the gated pass never moves them.
+fn pic14e_drops_direct_load_slot_and_slotless_bin_slot() {
+    // The add shape (epic-cc#862): `%1` reads `@in` in W, so its slot
+    // drops, and the single-byte `add` computes into `@out`, so `%2`
+    // needs no slot either. Globals stay exactly placed: the gated
+    // pass never moves them.
     let m = parse(
         "global in i8\n\
          global out i8\n\
@@ -4079,8 +4081,8 @@ fn pic14e_drops_direct_load_slot_but_keeps_bin_slot() {
         out.locals
     );
     assert!(
-        out.locals.contains_key("main::2"),
-        "forwarded bin result keeps its slot: {:?}",
+        !out.locals.contains_key("main::2"),
+        "slotless bin needs no slot: {:?}",
         out.locals
     );
 }

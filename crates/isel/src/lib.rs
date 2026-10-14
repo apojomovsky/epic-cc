@@ -586,7 +586,8 @@ impl<'m> Gen<'m> {
     /// The source global a skipped load read, when `r` is one (epic-cc#875):
     /// a `Direct` fold names it, and a load forwarded into its store
     /// re-reads it from the load. Forwarded `Bin` results return `None`:
-    /// those still stage, so every reader resolves to the temp as before.
+    /// single-byte ones compute into the store destination with no
+    /// readers left, wider ones still stage into the temp as before.
     fn folded_load_source(&self, r: &str) -> Option<u16> {
         if let Some(iselcore::LoadFold::Direct(g)) = self.w_folds.loads.get(r) {
             return Some(self.global_addr(g));
@@ -605,6 +606,14 @@ impl<'m> Gen<'m> {
             }
         }
         None
+    }
+    /// The store global a slotless single-byte `Bin` computes into
+    /// (epic-cc#862), or `None` when the result keeps its temp slot.
+    fn slotless_bin_dst(&self, r: &str) -> Option<String> {
+        let f = self.m.funcs.iter().find(|f| f.name == self.cur_func)?;
+        iselcore::pic14_slotless_bins(f, &self.w_folds)
+            .get(r)
+            .cloned()
     }
 
     /// Resolve an operand value to its base byte address (lo for multi-byte).
@@ -2814,7 +2823,11 @@ impl<'m> Gen<'m> {
                 .get(&ssa_key(func, dst_name))
                 .copied()
                 .unwrap_or(0)
-                == 1;
+                == 1
+            // A slotless single-byte `Bin` writes through to its store
+            // destination at once (epic-cc#862): deferring would strand
+            // the value in W with no slot to flush it to.
+            && !(bytes == 1 && self.w_folds.forwarded.contains_key(dst_name));
         if single {
             self.flush_deferred();
             self.deferred_store = Some(dst);
@@ -3812,6 +3825,12 @@ impl<'m> Gen<'m> {
                             self.emit(format!("    MOVWF 0x{dst:02X}"));
                             return;
                         }
+                        // A slotless single-byte `Bin` computed straight
+                        // into this destination (epic-cc#862): the store
+                        // is already satisfied, so nothing emits.
+                        if self.slotless_bin_dst(r).as_deref() == Some(g) {
+                            return;
+                        }
                     }
                     self.emit_move_val_to_slot(&s.val, s.ty, dst);
                 } else if s.ptr.starts_with("0x") {
@@ -3866,7 +3885,13 @@ impl<'m> Gen<'m> {
             Inst::Bin(b) => {
                 assert!(b.ty != Ty::I1 || matches!(b.op, BinOp::And | BinOp::Or | BinOp::Xor), "isel: only i8/i16/i32 binops supported (and i1 And/Or/Xor)");
                 let b_ty = if b.ty == Ty::I1 { Ty::I8 } else { b.ty };
-                let da = self.slot_addr(self.cur_func, &b.dst).direct();
+                let da = match self.slotless_bin_dst(&b.dst) {
+                    // A single-byte `Bin` into its store computes straight
+                    // into the destination (epic-cc#862): the slot is gone,
+                    // and the store below is already satisfied.
+                    Some(g) => self.global_addr(&g),
+                    None => self.slot_addr(self.cur_func, &b.dst).direct(),
+                };
                 match (b.op, b_ty) {
                     (BinOp::Add, Ty::I16) => self.emit_add16(&b.a, &b.b, da),
                     (BinOp::Add, Ty::I32) => self.emit_add32(&b.a, &b.b, da),

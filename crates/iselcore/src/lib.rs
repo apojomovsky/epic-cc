@@ -708,10 +708,10 @@ impl ValueFolds {
         out
     }
     /// Regs needing no slot on classic PIC14 (epic-cc#875) and PIC14E
-    /// (epic-cc#902): folded loads plus forwarded regs produced by a
-    /// `Load`, whose store reads the source global. Forwarded `Bin`
-    /// results keep their slot: both backends compute those into the
-    /// temp as before, neither has a store-folded destination there.
+    /// (epic-cc#902): folded loads, forwarded regs produced by a `Load`
+    /// whose store reads the source global, and single-byte forwarded
+    /// `Bin` results, which both backends compute straight into the
+    /// store destination (epic-cc#862).
     pub fn unplaced_pic14(&self, f: &ir::Func) -> HashSet<String> {
         let mut out: HashSet<String> = self.loads.keys().cloned().collect();
         for r in self.forwarded.keys() {
@@ -724,8 +724,32 @@ impl ValueFolds {
                 out.insert(r.clone());
             }
         }
+        out.extend(pic14_slotless_bins(f, self).keys().cloned());
         out
     }
+}
+
+/// Regs a single-byte `Bin` computes straight into its store destination on
+/// PIC14/PIC14E (epic-cc#862): the `forwarded` producer is a one-byte
+/// Add/Sub/And/Xor whose only use is the direct-global store, and every
+/// one-byte lowering writes its destination once with no readback, so the
+/// backend addresses the store global instead of a temp slot. Wider bins
+/// stay placed: their lowerings accumulate in place, and those
+/// intermediate values must never touch a live global. So do all-const
+/// operands: the backend has no lowering for those (it panics), so the
+/// fold provably never applies to them.
+pub fn pic14_slotless_bins(f: &ir::Func, folds: &ValueFolds) -> HashMap<String, String> {
+    folds
+        .forwarded
+        .iter()
+        .filter(|(r, _)| {
+            f.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                matches!(i, Inst::Bin(q) if &q.dst == *r && q.ty.bytes() == 1
+                    && !matches!((&q.a, &q.b), (ir::Val::Const(_), ir::Val::Const(_))))
+            })
+        })
+        .map(|(r, g)| (r.clone(), g.clone()))
+        .collect()
 }
 
 /// A gap instruction the fold may move a global read past: a pure lane
