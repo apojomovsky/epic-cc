@@ -64,6 +64,10 @@ fn include_dir_path() -> std::path::PathBuf {
 fn main() {
     diag::install_panic_hook();
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", cli::USAGE);
+        return;
+    }
     if argv.iter().any(|a| a == "--version" || a == "-V") {
         println!("epic-cc {}", env!("EPIC_CC_STAMP"));
         return;

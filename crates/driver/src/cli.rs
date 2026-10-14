@@ -112,6 +112,7 @@ usage: epic-cc [options] <input.c|input.cpp>...
                        0xNN TYPE`, one flattened record per mapped var)
   --version, -V        print the compiler identity (e.g. epic-cc 0.3.0, or
                        epic-cc 0.1.0+<sha> for a build from a git checkout)
+  --help, -h           print this help and exit
   --resolve-device     resolve the next argument to a canonical device name
                        and print it, no input files needed (same resolution
                        --target uses, e.g. 16F877A and PIC16F877A -> p16f877a)
