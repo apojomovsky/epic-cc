@@ -15,19 +15,19 @@ A C compiler for 8-bit PIC microcontrollers, fully open source and MIT licensed,
 
 - **Fully open source, MIT licensed.** After the clang front end, every stage that turns your C into a hex file lives in this repository, so you can read and audit it.
 - **One command from C to hex file.** epic-cc compiles your whole program in one step, with no separate assembler or linker to install.
-- **Checked against independent tools.** The output is compared byte for byte with the gpasm assembler, and compared by behavior with host clang and SDCC.
+- **Checked against independent tools.** On a corpus of test programs, the output is compared byte for byte with the gpasm assembler, and by behavior with host clang and SDCC.
 
 **Status:** Each part is marked supported, experimental, or planned in the [device reference](docs/reference/devices.md). See [What's in 1.0](https://apojomovsky.github.io/epic-docs/status/).
 
 ## The shortest example
 
-Save this as `add.c`:
+Save this as `add.c` in the folder you get from the install step below:
 
 ```c
 --8<-- "crates/driver/tests/fixtures/add.c"
 ```
 
-Compile it for a PIC16F877A:
+Compile it for a PIC16F877A, a classic 8-bit PIC microcontroller:
 
 ```bash
 --8<-- "docs/snippets/build-add.sh"
@@ -41,7 +41,7 @@ If your code uses something the compiler does not support, it stops with an erro
 
 ## Install
 
-Download the release bundle for Linux. It carries its own copy of clang, so you install nothing else:
+Download the release bundle for Linux with the [GitHub CLI](https://cli.github.com/) (`gh`), or download the zip from the [releases page](https://github.com/apojomovsky/epic-cc/releases/latest) in a browser. The bundle carries its own copy of clang, so you install nothing else:
 
 ```bash
 --8<-- "docs/snippets/install.sh"
@@ -55,7 +55,7 @@ Check that it runs:
 ./epic-cc --help
 ```
 
-On Windows, download the zip from the [releases page](https://github.com/apojomovsky/epic-cc/releases/latest). To build epic-cc from source, see [Contributing](CONTRIBUTING.md).
+On Windows, download the Windows zip from the same releases page. To build epic-cc from source, see [Contributing](CONTRIBUTING.md).
 
 --8<-- "docs/snippets/ways-to-use-epic8.md"
 
