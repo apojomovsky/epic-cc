@@ -1,14 +1,17 @@
-# `second_oracle/` — device data for parts gputils does not know
+# `second_oracle/`: device data for parts gputils does not know
 
 gputils 1.5.x predates some parts (no `.lkr`, `gpasm -p` rejects the name),
 so the gputils cross-check cannot run for them. Each file here covers one
 such part: values transcribed from the DFP `.ini` (`ROMSIZE`, `RAMBANK`,
 `COMMON`) and attested against the datasheet memory map cited in
-`[provenance]`. The gate (`crates/device/tests/gputils_crosscheck.rs`) uses
-a record only when gputils has no `.lkr` for the part, and reports a record
-as stale once gputils learns it.
+`[provenance]`. The RAM gate uses a record only when gputils ships no
+`.lkr` for the part; the flash gate only when `gpasm -p` rejects its name.
+A part where the two halves disagree (`.lkr` without a `gpasm` entry)
+is a broken install and fails loudly instead of taking either path.
+The gate reports a record stale once gputils learns the part.
 
-Schema (all keys required except `common_ram` / `access_bank`):
+Schema (keys outside it are rejected; `common_ram`, `access_bank`,
+`isr_w_shadow` and `isr_home_window` are optional and default to absent):
 
 ```toml
 name = "p16f13145"

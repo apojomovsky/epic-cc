@@ -35,13 +35,16 @@
   `crates/device/second_oracle/`, transcribed from the DFP `.ini`
   (`ROMSIZE`, `RAMBANK`, `COMMON`) and attested against the datasheet memory
   map cited in its `[provenance]` (pack, ini path, ini sha256, datasheet
-  document and section). The gate uses a record only where gputils is
-  silent, compares `flash_words`, `ram_banks`, `common_ram` and
-  `access_bank` exactly, and reports the record stale once gputils learns
-  the part. A newer gputils was measured and rejected: upstream trunk has
-  no 16F13145 header, `.lkr` or `gpasm` entry, so rebuilding it gains
-  nothing; the `.ini` is a different DFP file in a different format from
-  the generator's EDC read, and the datasheet is the independent source.
+  document and section). The RAM half uses a record only when gputils ships
+  no `.lkr`, the flash half only when `gpasm -p` rejects the name; a part
+  where the halves disagree fails loudly as a broken install. The compared
+  fields are `flash_words`, `ram_banks`, `common_ram`, `access_bank` and
+  the ISR carves (`isr_w_shadow`, `isr_home_window`), all exactly, and the
+  gate reports the record stale once gputils learns the part. A newer
+  gputils was measured and rejected: upstream trunk has no 16F13145
+  header, `.lkr` or `gpasm` entry, so rebuilding it gains nothing; the
+  `.ini` is a different DFP file in a different format from the
+  generator's EDC read, and the datasheet is the independent source.
 
 ## Rationale
 

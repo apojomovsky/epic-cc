@@ -360,6 +360,8 @@ struct SecondOracle {
     ram_banks: Vec<(u16, u16)>,
     common_ram: Option<(u16, u16)>,
     access_bank: Option<(u16, u16)>,
+    isr_w_shadow: Option<u16>,
+    isr_home_window: Option<(u16, u16)>,
     pack: String,
     ini: String,
 }
@@ -392,6 +394,16 @@ fn oracle_opt_pair(v: &toml::Value, name: &str, key: &str) -> Result<Option<(u16
     }
 }
 
+fn oracle_opt_u16(v: &toml::Value, name: &str, key: &str) -> Result<Option<u16>, String> {
+    let err = || format!("second oracle {name}: `{key}` must hold a u16");
+    match v.get(key) {
+        None => Ok(None),
+        Some(x) => Ok(Some(
+            u16::try_from(x.as_integer().ok_or_else(err)?).map_err(|_| err())?,
+        )),
+    }
+}
+
 fn parse_second_oracle(name: &str, text: &str) -> Result<SecondOracle, String> {
     let v: toml::Value = text
         .parse()
@@ -420,6 +432,8 @@ fn parse_second_oracle(name: &str, text: &str) -> Result<SecondOracle, String> {
     }
     let common_ram = oracle_opt_pair(&v, name, "common_ram")?;
     let access_bank = oracle_opt_pair(&v, name, "access_bank")?;
+    let isr_w_shadow = oracle_opt_u16(&v, name, "isr_w_shadow")?;
+    let isr_home_window = oracle_opt_pair(&v, name, "isr_home_window")?;
     let prov = v
         .get("provenance")
         .ok_or_else(|| format!("second oracle {name}: missing [provenance]"))?;
@@ -433,11 +447,48 @@ fn parse_second_oracle(name: &str, text: &str) -> Result<SecondOracle, String> {
     }
     oracle_field(prov, name, "datasheet")?;
     oracle_field(prov, name, "datasheet_section")?;
+    // A typo'd key would parse and then never compare, passing both halves
+    // while checking nothing: reject anything outside the schema.
+    const TOP: &[&str] = &[
+        "name",
+        "flash_words",
+        "ram_banks",
+        "common_ram",
+        "access_bank",
+        "isr_w_shadow",
+        "isr_home_window",
+        "provenance",
+    ];
+    if let Some(t) = v.as_table() {
+        for k in t.keys() {
+            if !TOP.contains(&k.as_str()) {
+                return Err(format!("second oracle {name}: unknown key `{k}`"));
+            }
+        }
+    }
+    const PROV: &[&str] = &[
+        "pack",
+        "ini",
+        "ini_sha256",
+        "datasheet",
+        "datasheet_section",
+    ];
+    if let Some(t) = prov.as_table() {
+        for k in t.keys() {
+            if !PROV.contains(&k.as_str()) {
+                return Err(format!(
+                    "second oracle {name}: unknown [provenance] key `{k}`"
+                ));
+            }
+        }
+    }
     Ok(SecondOracle {
         flash_words,
         ram_banks,
         common_ram,
         access_bank,
+        isr_w_shadow,
+        isr_home_window,
         pack,
         ini,
     })
@@ -499,6 +550,23 @@ fn compare_second_oracle(dev: &Device, oracle: &SecondOracle) -> Vec<String> {
             show(oracle.access_bank)
         ));
     }
+    let show_u16 = |r: Option<u16>| r.map_or("none".into(), |x| format!("0x{x:04X}"));
+    if dev.isr_w_shadow != oracle.isr_w_shadow {
+        problems.push(format!(
+            "{}: isr_w_shadow is {} but the second oracle states {}",
+            dev.name,
+            show_u16(dev.isr_w_shadow),
+            show_u16(oracle.isr_w_shadow)
+        ));
+    }
+    if dev.isr_home_window != oracle.isr_home_window {
+        problems.push(format!(
+            "{}: isr_home_window is {} but the second oracle states {}",
+            dev.name,
+            show(dev.isr_home_window),
+            show(oracle.isr_home_window)
+        ));
+    }
     problems
 }
 
@@ -555,7 +623,10 @@ fn ram_map_matches_gputils_for_every_device() {
         "no gputils .lkr covers {unattested:?}, so nothing verifies their RAM map. \
          Only tier = \"datasheet\" may go uncovered."
     );
-    assert!(!checked.is_empty(), "no device was cross-checked");
+    assert!(
+        !checked.is_empty() || !oracle_checked.is_empty(),
+        "no device was cross-checked"
+    );
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
@@ -922,7 +993,7 @@ const OVERFLOW: &str = "Address exceeds maximum range";
 
 #[test]
 fn flash_words_matches_gputils_for_every_device() {
-    let Some(_share) = gputils_share() else {
+    let Some(share) = gputils_share() else {
         return;
     };
     let mut oracle_checked: Vec<&str> = Vec::new();
@@ -938,8 +1009,17 @@ fn flash_words_matches_gputils_for_every_device() {
 
         let inside = probe_org(dev.name, last, "last");
         // gpasm never heard of this part: neither probe can run, so the
-        // vendored second oracle states flash_words instead.
+        // vendored second oracle states flash_words instead. A part with a
+        // `.lkr` but no `gpasm` entry is a broken install, not an oracle
+        // case: fail on the mix rather than split the halves across oracles.
         if !inside.ran && is_unknown_processor(&inside.text) {
+            if lkr_for(&share, dev.name).is_some() {
+                panic!(
+                    "{}: mixed gputils state: a .lkr exists but gpasm rejects -p {}; \
+                     fix the install instead of adding a record (ADR-021)",
+                    dev.name, dev.name
+                );
+            }
             match load_second_oracle(dev.name) {
                 Some(Ok(oracle)) => {
                     assert_eq!(
@@ -1119,6 +1199,8 @@ fn second_oracle_parse_rejects_a_nameless_or_shaless_record() {
     assert!(parse_second_oracle("p9z9", &short_sha).is_err());
     let renamed = oracle_fixture("p9z8");
     assert!(parse_second_oracle("p9z9", &renamed).is_err());
+    let typo = oracle_fixture("p9z9").replace("common_ram", "common_rma");
+    assert!(parse_second_oracle("p9z9", &typo).is_err());
 }
 
 #[test]
@@ -1159,6 +1241,16 @@ fn second_oracle_compare_names_each_mismatch() {
             .iter()
             .any(|p| p.contains("common_ram")),
         "window mismatch should name common_ram"
+    );
+    let drifted_dev = Device {
+        isr_home_window: Some((0x60, 0x6F)),
+        ..base_dev
+    };
+    assert!(
+        compare_second_oracle(&drifted_dev, &base_oracle)
+            .iter()
+            .any(|p| p.contains("isr_home_window")),
+        "carve mismatch should name isr_home_window"
     );
 }
 
