@@ -2824,7 +2824,6 @@ pub fn allocate_with_pool(
             0
         }
     };
-    let score = |l: &AllocLayout| (ram(l), region(l));
     let select_impl = |dip: Dip, precise: bool| -> (AllocLayout, HashMap<String, u16>) {
         let (nofold, fit, nofold_base) =
             allocate_inner(device, m, edges_text, None, pool, dip, precise);
@@ -2863,20 +2862,28 @@ pub fn allocate_with_pool(
     };
     // Precise intervals shrink frames, and every shrink re-tiles the
     // downstream bases the outliner merges on (epic-cc#1145). The lever
-    // stays only where it pays: a strict RAM win keeps the precise map,
-    // a RAM-neutral shrink keeps it only when no base moved, and anything
-    // else keeps the lever-off map, so a layout churn that buys no RAM
-    // can never break outline merges.
+    // stays only where it pays RAM: a strict RAM win keeps the precise
+    // map, and a RAM-neutral map keeps it only when the layout is
+    // unchanged down to the last local (same bases but reshuffled slots
+    // still feed different addresses to codegen and the outliner). The
+    // score is RAM-only: the ISR-region tie-break serves the dip scopes,
+    // and a region-only win still re-tiles measured code. Anything else
+    // keeps the lever-off map, so churn that buys no RAM can never move
+    // a row.
     let select = |dip: Dip| -> AllocLayout {
         let (plain, plain_base) = select_impl(dip, true);
         if !lever_can_fire(m) {
             return plain;
         }
         let (off, off_base) = select_impl(dip, false);
-        if score(&off) < score(&plain) {
+        if ram(&off) < ram(&plain) {
             return off;
         }
-        if score(&off) == score(&plain) && off_base != plain_base {
+        if ram(&off) == ram(&plain)
+            && (off_base != plain_base
+                || off.locals != plain.locals
+                || off.globals != plain.globals)
+        {
             return off;
         }
         plain

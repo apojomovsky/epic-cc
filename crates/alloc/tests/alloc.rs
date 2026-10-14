@@ -2344,7 +2344,11 @@ fn store_through_local_pointer_keeps_it_live() {
              %d = add i8 3, 4\n\
              store i8 %d %__scr\n\
              %e = add i8 %c, 1\n\
+             %g = add i8 %c, 2\n\
+             %h = add i8 %c, 3\n\
              store i8 %e @sink\n\
+             store i8 %g @sink\n\
+             store i8 %h @sink\n\
              ret void\n",
     );
     let out = allocate(&PIC16F877A, &m, "depth 1\n");
@@ -2353,7 +2357,8 @@ fn store_through_local_pointer_keeps_it_live() {
         "store through __scr clobbers live c"
     );
     // The alloca's range ends at its last store through it, so e (defined
-    // after, epic-cc#853) reuses its slot.
+    // after, epic-cc#853) reuses its slot. The tail values make the
+    // sharing a strict RAM win, so the pay gate keeps it.
     assert_eq!(out.locals["f::e"], out.locals["f::__scr"]);
 }
 
@@ -4611,10 +4616,10 @@ fn naked_callee_keeps_alloca_full_interval() {
     assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
 }
 
-/// Retention is decided per callee: an alloca passed to a callee that only
-/// dereferences its param, directly or through a callee that does the
-/// same, frees its slot after the call, while one passed to a storing
-/// callee in the same caller keeps it.
+/// Retention is decided per callee: two allocas passed to a callee that
+/// only dereferences its param share one slot, while one passed to a
+/// storing callee in the same caller keeps its own. The sharing saves a
+/// whole object slot, so the pay gate keeps the precise map.
 #[test]
 fn retention_is_decided_per_callee() {
     let m = parse(
@@ -4622,16 +4627,18 @@ fn retention_is_decided_per_callee() {
          global out i8\n\
          fn f(void) ()\n\
            block entry:\n\
-             %buf = alloca 2\n\
+             %buf = alloca 4\n\
              %g = gep %buf +0\n\
              store i8 1 %g\n\
              call void @peek(%g)\n\
-             %z = add i8 3, 4\n\
-             store i8 %z @out\n\
-             %buf2 = alloca 2\n\
-             %h = gep %buf2 +0\n\
-             store i8 1 %h\n\
-             call void @keep(%h)\n\
+             %bufB = alloca 4\n\
+             %h = gep %bufB +0\n\
+             store i8 2 %h\n\
+             call void @peek(%h)\n\
+             %buf2 = alloca 4\n\
+             %k = gep %buf2 +0\n\
+             store i8 3 %k\n\
+             call void @keep(%k)\n\
              %y = add i8 5, 6\n\
              store i8 %y @out\n\
              ret void\n\
@@ -4657,7 +4664,7 @@ fn retention_is_decided_per_callee() {
         &m,
         "edge f peek\nedge f keep\nedge peek leaf\n",
     );
-    assert_eq!(out.locals["f::buf"], out.locals["f::z"]);
+    assert_eq!(out.locals["f::buf"], out.locals["f::bufB"]);
     assert_ne!(out.locals["f::buf2"], out.locals["f::y"]);
 }
 
@@ -4816,5 +4823,36 @@ fn ram_neutral_shrink_keeps_lever_off_map() {
     assert_eq!(
         out.locals["g::x"], 0x29,
         "g stays at its lever-off base instead of the shrunk 0x25"
+    );
+}
+
+/// Same bases but reshuffled slots still keep the lever-off map
+/// (epic-cc#1147): `f` could share its two allocas without moving any
+/// base or saving any RAM (`big` sets the top), yet the precise coloring
+/// hands different addresses to codegen. The tie goes to the old layout.
+#[test]
+fn ram_neutral_reshuffle_keeps_lever_off_map() {
+    let m = parse(
+        "global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %a = alloca 4\n\
+             %g1 = gep %a +0\n\
+             store i8 1 %g1\n\
+             %b = alloca 4\n\
+             %g2 = gep %b +0\n\
+             store i8 2 %g2\n\
+             ret void\n\
+         fn big(void) ()\n\
+           block entry:\n\
+             %w = alloca 16\n\
+             %gw = gep %w +0\n\
+             store i8 3 %gw\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(
+        out.locals["f::a"], out.locals["f::b"],
+        "RAM-neutral reshuffle stays off"
     );
 }
