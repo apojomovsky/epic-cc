@@ -1,6 +1,6 @@
 # ADR-021 -- Device data provenance and the gputils cross-check
 
-**Status:** Accepted 2026-08-23<br>
+**Status:** Accepted 2026-08-23, amended 2026-10-14 (`epic-cc#1037`: second oracle)<br>
 **Decides:** `epic-cc#104`<br>
 **Parent:** `docs/superpowers/specs/2026-08-23-device-provenance-design.md`
 
@@ -30,6 +30,18 @@
   not state, naming the field and exiting non-zero. It has no per-device
   fallback constants: a generated map that carries a real `sha256` reads as
   attested, so a guess there is worse than no generator.
+* Parts gputils 1.5.x does not know (no `.lkr`, `gpasm -p` rejects the name)
+  are covered by a second oracle instead: one vendored record per part under
+  `crates/device/second_oracle/`, transcribed from the DFP `.ini`
+  (`ROMSIZE`, `RAMBANK`, `COMMON`) and attested against the datasheet memory
+  map cited in its `[provenance]` (pack, ini path, ini sha256, datasheet
+  document and section). The gate uses a record only where gputils is
+  silent, compares `flash_words`, `ram_banks`, `common_ram` and
+  `access_bank` exactly, and reports the record stale once gputils learns
+  the part. A newer gputils was measured and rejected: upstream trunk has
+  no 16F13145 header, `.lkr` or `gpasm` entry, so rebuilding it gains
+  nothing; the `.ini` is a different DFP file in a different format from
+  the generator's EDC read, and the datasheet is the independent source.
 
 ## Rationale
 
@@ -54,10 +66,10 @@ cannot be skipped for want of a download.
 ## Revisit if
 
 * A supported part has no `.lkr` **and** gpasm does not know its `-p` name.
-  The RAM half then reports it uncovered and demands the datasheet tier, but
-  the flash half fails outright because the probe cannot run. That is the
-  right failure and not a silent pass, though it means such a part cannot be
-  added without a second oracle.
+  Resolved 2026-10-14 (`epic-cc#1037`): such a part ships a second-oracle
+  record (`crates/device/second_oracle/`, DFP `.ini` plus datasheet
+  citation) and both gate halves check it. The RAM half still names
+  record-less parts uncovered under the datasheet-tier rule.
 * The `.lkr` guard evaluation stops matching how we assemble. `ram_from_lkr`
   evaluates `#IFDEF`/`#ELSE`/`#FI` with no symbol defined, which is true of
   epic-cc (no gputils C runtime, no extended instruction mode) and selects the

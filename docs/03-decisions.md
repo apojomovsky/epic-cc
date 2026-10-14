@@ -19,7 +19,7 @@ one-line index entry here, e.g.:
 - ADR-018: CC-2 freestanding libc: stdint/stdbool/stddef headers + a linked-on-demand string.h, 2026-08-21
 - ADR-019: PIC variants -- file-per-device TOML + build.rs codegen + --target + canonical-per-core CI, 2026-08-22
 - ADR-020: DFP -> TOML generator (ATDF/EDC ingestion, deterministic output, --check gate), 2026-08-23
-- ADR-021: Device provenance and the gputils cross-check (required stanza, always-on RAM/flash gate), 2026-08-23
+- ADR-021: Device provenance and the gputils cross-check (required stanza, always-on RAM/flash gate), 2026-08-23, amended 2026-10-14 (second oracle for parts gputils does not know)
 - ADR-022: Indirect calls through function pointers (compare-and-call chain, whole-program address-taken set, ISR value rewrite), 2026-08-24
 - ADR-024: Cross-context stored callbacks (store in main, invoke in the ISR: global store/load visibility edges, `_isr` store rewrite, opaque-store trap), 2026-08-25
 - ADR-025: Size and map reporting (stderr size report, --map file, overlay RAM definition, --report JSON), 2026-08-26, amended 2026-09-25

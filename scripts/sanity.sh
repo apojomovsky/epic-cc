@@ -64,6 +64,19 @@ cat > "$TMP/minimal.asm" <<EOF
     end
 EOF
 if ! "$GPASM" -p "$DEVICE" -o "$TMP/gpasm.hex" "$TMP/minimal.asm" >/dev/null 2>&1; then
+  # gputils predates some parts: no .lkr and gpasm rejects the -p name. A
+  # vendored second oracle (ADR-021) covers the device data instead, checked
+  # by the device gate above; the add.c compile already proved our assembler
+  # accepts the flash map. Skip the gpasm drill only in that case.
+  SUFFIX="${DEVICE#p}"
+  SHARE="${PIC8_GPUTILS_SHARE:-/usr/local/share/gputils}"
+  if [ ! -f "$SHARE/lkr/${SUFFIX}_g.lkr" ] \
+      && [ -f "crates/device/second_oracle/$DEVICE.toml" ]; then
+    echo "sanity $DEVICE: gpasm does not know this part; second oracle covers it" >&2
+    echo "sanity $DEVICE: skipping gpasm assemble" >&2
+    echo "sanity $DEVICE: ok (HEX + second oracle)"
+    exit 0
+  fi
   echo "sanity $DEVICE: gpasm -p $DEVICE failed on minimal asm" >&2
   "$GPASM" -p "$DEVICE" -o "$TMP/gpasm.hex" "$TMP/minimal.asm" >&2 || true
   exit 1
