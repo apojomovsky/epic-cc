@@ -12,11 +12,11 @@ fn addrs(pairs: &[(&str, u16)]) -> HashMap<String, u16> {
 fn emits_add_for_in_plus_one() {
     // Milestone 3: locals come from the map too, keyed `{func}::{name}`.
     // alloc: globals in=0x20/out=0x21 -> end_of_globals 0x22 -> the root
-    // frame starts at 0x25, so main's remaining local lands at 0x26.
-    // `%1` needs no map entry: the single-use load folds and the add
-    // reads `@in` directly (epic-cc#875).
+    // frame starts at 0x25. `%1` needs no map entry: the single-use load
+    // folds and the add reads `@in` directly (epic-cc#875). `%2` needs
+    // none either: the single-byte bin computes into `@out` (epic-cc#862).
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %2 = add i8 %1, 1\n    store i8 %2 @out\n    ret void\n");
-    let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::2", 0x26)]);
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21)]);
     let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
         asm.contains("MOVF 0x20, W"),
@@ -25,10 +25,9 @@ fn emits_add_for_in_plus_one() {
     assert!(!asm.contains("MOVWF 0x25"), "no staged copy of %1:\n{asm}");
     assert!(asm.contains("ADDLW 0x01"));
     assert!(
-        asm.contains("MOVWF 0x26"),
-        "%2 must live at its map address 0x26:\n{asm}"
+        asm.contains("MOVWF 0x21"),
+        "the bin computes into @out:\n{asm}"
     );
-    assert!(asm.contains("MOVWF 0x21"));
 }
 
 #[test]
@@ -75,20 +74,17 @@ fn store_zero_const_emits_clrf() {
 #[test]
 fn add_const_lhs_uses_addlw() {
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %x = add i8 5, %1\n    store i8 %x @out\n    ret void\n");
-    let addrs = addrs(&[
-        ("in", 0x20),
-        ("out", 0x21),
-        ("main::1", 0x25),
-        ("main::x", 0x26),
-    ]);
+    // `%1` folds and `%x` computes into `@out` (epic-cc#862): neither
+    // needs a map entry.
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21)]);
     let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
         asm.contains("ADDLW 0x05"),
         "const-LHS add should use the ADDLW path:\n{asm}"
     );
     assert!(
-        asm.contains("MOVWF 0x26"),
-        "the result lands at its map address:\n{asm}"
+        asm.contains("MOVWF 0x21"),
+        "the result lands in the store destination:\n{asm}"
     );
     assert!(
         !asm.contains("ADDWF 0x05"),
@@ -1795,20 +1791,15 @@ fn sub_i8_reg_reg_emits_subwf() {
     let m = parse(
         "global x i8\nglobal y i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r = sub i8 %a, %b\n    store i8 %r @out\n    ret void\n",
     );
-    // alloc: globals end at 0x23 -> root frame at 0x26; %a=0x26, %r=0x28.
-    // `%b` folds and the sub reads `@y` directly (epic-cc#875).
-    let addrs = addrs(&[
-        ("x", 0x20),
-        ("y", 0x21),
-        ("out", 0x22),
-        ("main::a", 0x26),
-        ("main::r", 0x28),
-    ]);
+    // alloc: globals end at 0x23 -> root frame at 0x26; %a=0x26.
+    // `%b` folds and the sub reads `@y` directly (epic-cc#875); `%r`
+    // computes into `@out` (epic-cc#862).
+    let addrs = addrs(&[("x", 0x20), ("y", 0x21), ("out", 0x22), ("main::a", 0x26)]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // %a=0x26, %b=@y=0x21, %r=0x28.
+    // %a=0x26, %b=@y=0x21, %r=@out=0x22.
     assert!(asm.contains("MOVF 0x21, W"), "load b:\n{asm}");
     assert!(asm.contains("SUBWF 0x26, W"), "a - b:\n{asm}");
-    assert!(asm.contains("MOVWF 0x28"), "store d:\n{asm}");
+    assert!(asm.contains("MOVWF 0x22"), "store d:\n{asm}");
 }
 
 #[test]
@@ -1819,14 +1810,14 @@ fn sub_i8_reg_const_emits_subwf_in_correct_direction() {
     let m = parse(
         "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %r = sub i8 %a, 5\n    store i8 %r @out\n    ret void\n",
     );
-    // alloc: globals end at 0x22 -> root frame at 0x25; %r=0x26. `%a`
-    // folds and the sub reads `@x` directly (epic-cc#875).
-    let addrs = addrs(&[("x", 0x20), ("out", 0x21), ("main::r", 0x26)]);
+    // `%a` folds and the sub reads `@x` directly (epic-cc#875); `%r`
+    // computes into `@out` (epic-cc#862).
+    let addrs = addrs(&[("x", 0x20), ("out", 0x21)]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // %a=@x=0x20, %r=0x26.
+    // %a=@x=0x20, %r=@out=0x21.
     assert!(asm.contains("MOVLW 0x05"), "load k into W:\n{asm}");
     assert!(asm.contains("SUBWF 0x20, W"), "a - k via SUBWF a,W:\n{asm}");
-    assert!(asm.contains("MOVWF 0x26"), "store d:\n{asm}");
+    assert!(asm.contains("MOVWF 0x21"), "store d:\n{asm}");
     // Direction guard: SUBLW would compute k - a (wrong direction).
     assert!(
         !asm.contains("SUBLW"),
@@ -1845,28 +1836,22 @@ fn negative_i8_const_is_masked_to_byte() {
         "global x i8\nglobal o1 i8\nglobal o2 i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %s = sub i8 %a, -42\n    store i8 %s @o1\n    %t = add i8 %a, -42\n    store i8 %t @o2\n    ret void\n",
     );
     // alloc: x=0x20, o1=0x21, o2=0x22 -> end 0x23 -> root frame at 0x26;
-    // %a=0x26, %s=0x27, %t=0x28.
-    let addrs = addrs(&[
-        ("x", 0x20),
-        ("o1", 0x21),
-        ("o2", 0x22),
-        ("main::a", 0x26),
-        ("main::s", 0x27),
-        ("main::t", 0x28),
-    ]);
+    // %a=0x26 (two uses, so it stages). `%s` and `%t` compute into
+    // `@o1`/`@o2` (epic-cc#862).
+    let addrs = addrs(&[("x", 0x20), ("o1", 0x21), ("o2", 0x22), ("main::a", 0x26)]);
     let asm = select(&PIC16F877A, &m, &addrs);
     // sub: MOVLW 0xD6 (W = -42 & 0xFF); SUBWF a,W (W = a - 214); MOVWF s.
     assert!(
         asm.contains("MOVLW 0xD6\n    SUBWF 0x26, W"),
         "sub masks -42 to 0xD6:\n{asm}"
     );
-    assert!(asm.contains("MOVWF 0x27"), "sub dst:\n{asm}");
+    assert!(asm.contains("MOVWF 0x21"), "sub dst:\n{asm}");
     // add: MOVF a,W; ADDLW 0xD6; MOVWF t.
     assert!(
         asm.contains("MOVF 0x26, W\n    ADDLW 0xD6"),
         "add masks -42 to 0xD6:\n{asm}"
     );
-    assert!(asm.contains("MOVWF 0x28"), "add dst:\n{asm}");
+    assert!(asm.contains("MOVWF 0x22"), "add dst:\n{asm}");
     // No sign-extended high literal leaks in: an i8 -42 must not emit a
     // 0xFF fill (that would be a 16-bit constant, not a masked i8).
     assert!(
@@ -1948,16 +1933,17 @@ fn sub_const_lhs_emits_sublw_chain() {
     // the destination and adds k_i + 1 - borrow (epic-cc#1189): the sum
     // is k_i - a_i - borrow mod 256 with the true borrow-out.
     //
-    // i8: d = 5 - a. `%a` folds and the sub reads `@x` directly (epic-cc#875).
+    // i8: d = 5 - a. `%a` folds and the sub reads `@x` directly
+    // (epic-cc#875); `%r` computes into `@out` (epic-cc#862).
     let m = parse(
         "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %r = sub i8 5, %a\n    store i8 %r @out\n    ret void\n",
     );
-    let addrs8 = addrs(&[("x", 0x20), ("out", 0x21), ("main::r", 0x26)]);
+    let addrs8 = addrs(&[("x", 0x20), ("out", 0x21)]);
     let asm8 = select(&PIC16F877A, &m, &addrs8);
-    // %a=@x=0x20, %r=0x26.
+    // %a=@x=0x20, %r=@out=0x21.
     assert!(asm8.contains("MOVF 0x20, W"), "load a:\n{asm8}");
     assert!(asm8.contains("SUBLW 0x05"), "k - a via SUBLW k:\n{asm8}");
-    assert!(asm8.contains("MOVWF 0x26"), "store d:\n{asm8}");
+    assert!(asm8.contains("MOVWF 0x21"), "store d:\n{asm8}");
     assert!(
         !asm8.contains("SUBWF"),
         "const-LHS sub must not use SUBWF (a - k is the wrong direction):\n{asm8}"
@@ -6431,21 +6417,21 @@ fn banked_growth_packed_into_next_page() {
     // Issue #17 + #12: the bin packing measures POST-banking sizes, so a
     // function whose banking growth would straddle a page boundary is
     // packed into the next page with an anchor instead of straddling.
-    // main's body is 2042 words pre-banking (last word 0x7FE, page 0) and
-    // grows ~5 BANKSEL words to 2047 — past page 0's 2043-word tail — so
-    // it lands in page 1 with a `.org 0x800` anchor, and the post-banking
-    // page-fit check passes (no straddle).
+    // 679 pad chains: the whole program is 2046 words pre-banking and
+    // 2049 post (3 BANKSEL words of growth), past page 0's tail, so it
+    // lands in page 1 with a `.org 0x800` anchor, and the post-banking
+    // page-fit check passes (no straddle). 678 chains (2043/2046) still
+    // fit page 0: the slotless-bin word is what sank this calibration
+    // under the tail (epic-cc#862).
     let m = parse(&format!(
         "global in i8\nglobal out i8\n\
          fn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %b = add i8 %1, 0\n{}\
          \x20   store i8 %b @out\n    ret void\n",
-        pad_body(678)
+        pad_body(679)
     ));
     let addrs = addrs(&[
         ("in", 0x20),
         ("out", 0x21),
-        ("main::1", 0x25),
-        ("main::b", 0x26),
         ("main::a", 0xA0), // bank 1: every chain access needs a BANKSEL
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
@@ -11041,16 +11027,17 @@ fn forwarded_load_store_reads_the_source_global() {
 }
 
 #[test]
-fn forwarded_bin_result_keeps_its_slot() {
-    // `%2 = add` forwards into its store on PIC18, but `isel` has no
-    // store-folded destination: the bin computes into its temp as before
-    // (epic-cc#875), so `%2` keeps its entry and the slot stays live.
+fn forwarded_bin_result_computes_into_the_store() {
+    // `%2 = add` into `store %2 @out`: the single-byte bin computes
+    // straight into `@out` (epic-cc#862), so `%2` takes no address
+    // entry: a lookup would panic, so its absence proves the slot is
+    // gone.
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %2 = add i8 %1, 1\n    store i8 %2 @out\n    ret void\n");
-    let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::2", 0x26)]);
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21)]);
     let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
-        asm.contains("MOVWF 0x26"),
-        "the bin result stages into its slot:\n{asm}"
+        asm.contains("MOVF 0x20, W\n    ADDLW 0x01\n    MOVWF 0x21"),
+        "the bin computes into the store destination:\n{asm}"
     );
 }
 
@@ -11059,14 +11046,14 @@ fn two_loads_into_add_read_both_globals() {
     // Co-fold (epic-cc#876): `%1` feeds the b side and leads, so the
     // add reads `@a` into W first, then `@b` as the file operand.
     // Neither load needs an entry: a lookup would panic, so their
-    // absence proves both slots are gone. The bin result still keeps
-    // its temp on PIC14 (epic-cc#875).
+    // absence proves both slots are gone. The single-byte bin result
+    // likewise computes into `@c` (epic-cc#862).
     let m = parse("global a i8\nglobal b i8\nglobal c i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = add i8 %2 %1\n    store i8 %3 @c\n    ret void\n");
-    let addrs = addrs(&[("a", 0x20), ("b", 0x21), ("c", 0x22), ("main::3", 0x26)]);
+    let addrs = addrs(&[("a", 0x20), ("b", 0x21), ("c", 0x22)]);
     let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
-        asm.contains("MOVF 0x20, W\n    ADDWF 0x21, W\n    MOVWF 0x26"),
-        "add reads both globals into the temp:\n{asm}"
+        asm.contains("MOVF 0x20, W\n    ADDWF 0x21, W\n    MOVWF 0x22"),
+        "add reads both globals into the store:\n{asm}"
     );
 }
 #[test]
