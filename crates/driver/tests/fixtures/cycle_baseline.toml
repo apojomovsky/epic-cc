@@ -574,6 +574,21 @@ flash_words = 361
 ram_bytes = 48
 
 [[entry]]
+name = "speed-mul-u32-12f509"
+device = "12F509"
+cycles = 1501
+flash_words = 218
+ram_bytes = 36
+
+[[entry]]
+name = "speed-mul-u32-12f509"
+device = "12F509"
+profile = "O2"
+cycles = 1501
+flash_words = 218
+ram_bytes = 36
+
+[[entry]]
 name = "scen-pid-update-18f4550"
 device = "18F4550"
 cycles = 730
