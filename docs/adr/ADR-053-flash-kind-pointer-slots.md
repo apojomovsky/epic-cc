@@ -26,7 +26,11 @@ same question as storing a flash address into a RAM slot.
   flash-kind when every address it can hold is a flash table address
   (null alone does not qualify), computed as a greatest fixpoint over
   writers plus an ungrounded prune, so forwarding cycles with no const
-  source stay RAM.
+  source stay RAM. Indirect stores, memcpy destinations, and asm
+  outputs write their resolved global precisely; unknown-target writes
+  demote taken globals (globals taken as values, the only ones an
+  unknown pointer can alias). Globals initialized with a flash address
+  start flash-kind.
 - Loads through flash-kind slots seed `TBLPTR` from the slot bytes
   (`emit_flash_tblptr_seed` plus dynamic terms); stores of flash
   addresses into flash-kind globals materialize whole (`LOW`/`HIGH`,
@@ -42,6 +46,9 @@ same question as storing a flash address into a RAM slot.
 - The `isel` refusals stay as the safe fallback for anything unproven:
   flash values into RAM slots, through-ROM writes, flash returns, and
   flash arguments to RAM params (keeping the over-255 user error).
+  Maybe-flash values are refused on the same value paths (stores,
+  call args, returns). Integer-laundered addresses (loaded as data,
+  converted back) stay out of scope in `epic-cc#1284`.
 
 ## Rationale
 
