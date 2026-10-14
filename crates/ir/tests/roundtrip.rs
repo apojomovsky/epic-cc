@@ -70,6 +70,12 @@ fn bit_placement_roundtrips() {
 }
 
 #[test]
+#[should_panic(expected = "out of range")]
+fn bit_number_past_7_is_rejected() {
+    parse("global G i8 @0x0B.9\n");
+}
+
+#[test]
 fn gep_and_sized_globals_roundtrip() {
     let text = "global ram i8 @0x25\nconst table i8\nfn main(void) ()\n  block entry:\n    %p = gep @ram +0 +1*%3\n    ret void\n";
     let m = parse(text);

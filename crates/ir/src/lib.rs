@@ -1239,9 +1239,11 @@ pub fn parse(text: &str) -> Module {
                 if *tok == "internal" {
                     internal = true;
                 } else if let Some((a, b)) = tok.split_once('.') {
+                    let bit: u8 = b.parse().unwrap_or_else(|_| panic!("bad bit {b:?}"));
+                    assert!(bit < 8, "bit number {bit} out of range, want 0-7");
                     addr = Some(Placed {
                         byte: parse_addr(a).unwrap_or_else(|| panic!("bad addr {a:?}")),
-                        bit: Some(b.parse().unwrap_or_else(|_| panic!("bad bit {b:?}"))),
+                        bit: Some(bit),
                     });
                 } else {
                     addr = parse_addr(tok).map(|byte| Placed { byte, bit: None });
