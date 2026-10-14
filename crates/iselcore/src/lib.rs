@@ -1065,6 +1065,325 @@ pub fn find_value_folds(
     out
 }
 
+/// Whether `emit_load_w` of pointer reg `v` writes STATUS,C for any lane.
+///
+/// The one `emit_load_w` arm that writes `C` is the resolved-GEP address
+/// materialization of an indirect or pointer-param slot with a constant
+/// offset or dynamic terms. The shared-exit borrow chain holds `C` across
+/// lanes, so a compare whose rhs load writes it keeps the per-lane cascade.
+pub fn load_w_writes_carry(
+    fname: &str,
+    params: &[ir::Param],
+    resolved: &PtrResolution,
+    v: &ir::Val,
+) -> bool {
+    let ir::Val::Reg(r) = v else {
+        return false;
+    };
+    let Some((base, k, terms)) = resolved.get(&ssa_key(fname, r)) else {
+        return false;
+    };
+    let Base::Slot(sname, indirect) = base else {
+        return false;
+    };
+    let holds_addr = *indirect || params.iter().any(|pp| pp.name == *sname && pp.ptr);
+    holds_addr && (*k != 0 || !terms.is_empty())
+}
+
+/// The `icmp` a block's `BrCond` absorbs on PIC18 (epic-cc#862): the block
+/// tail is `[.., Icmp, BrCond]` on the compare's result, the compare is
+/// the result's only use in the function, its width and predicate have a
+/// fused lowering, and the unsigned carry-chain guard holds. A fused
+/// compare branches straight to the exits and never writes its 0/1 slot.
+///
+/// `signed_ok` decides the signed predicates, whose chain guard reads slot
+/// addresses: `isel-pic18` answers from the final map, `alloc` answers
+/// `false` so it keeps the slot whenever the answer depends on layout.
+pub fn fusable_icmp<'f>(
+    f: &'f ir::Func,
+    b: &'f ir::Block,
+    resolved: &PtrResolution,
+    signed_ok: impl Fn(&ir::Icmp) -> bool,
+) -> Option<&'f ir::Icmp> {
+    let [.., Inst::Icmp(c), Inst::BrCond(bc)] = b.insts.as_slice() else {
+        return None;
+    };
+    let ir::Val::Reg(cond) = &bc.cond else {
+        return None;
+    };
+    if c.dst != *cond {
+        return None;
+    }
+    if !matches!(c.ty.bytes(), 1 | 2 | 4) {
+        return None;
+    }
+    if !matches!(
+        c.pred.as_str(),
+        "eq" | "ne" | "ult" | "uge" | "ugt" | "ule" | "slt" | "sle" | "sgt" | "sge"
+    ) {
+        return None;
+    }
+    if matches!(c.pred.as_str(), "ult" | "uge" | "ugt" | "ule")
+        && load_w_writes_carry(&f.name, &f.params, resolved, &c.b)
+    {
+        return None;
+    }
+    if matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge") && !signed_ok(c) {
+        return None;
+    }
+    let bi_own = f.blocks.iter().position(|bb| std::ptr::eq(bb, b))?;
+    let branch_idx = b.insts.len() - 1;
+    for (bi, bb) in f.blocks.iter().enumerate() {
+        for (ii, inst) in bb.insts.iter().enumerate() {
+            if bi == bi_own && ii == branch_idx {
+                continue;
+            }
+            if ir::read_vals(inst).iter().any(|v| v == cond) {
+                return None;
+            }
+        }
+    }
+    Some(c)
+}
+
+/// The operand loads a fused compare reads in place (epic-cc#862): per
+/// side `0` (`a`) or `1` (`b`), a single-use same-block `Load` of the
+/// compare's width from a global `global_ok` accepts becomes that global,
+/// and the load emits nothing. A gap holding a call, an asm blob, or any
+/// memory write keeps the load staged: it may be volatile, and its
+/// position must not move past observable behavior. Returns
+/// `(side, load dst, global)` in side order.
+pub fn fused_chain_loads(
+    f: &ir::Func,
+    b: &ir::Block,
+    c: &ir::Icmp,
+    global_ok: impl Fn(&str, &ir::Icmp) -> bool,
+) -> Vec<(u8, String, String)> {
+    let mut out = Vec::new();
+    let ci = b
+        .insts
+        .iter()
+        .position(|i| matches!(i, Inst::Icmp(x) if x.dst == c.dst))
+        .unwrap_or(usize::MAX);
+    for (side, v) in [(0u8, &c.a), (1u8, &c.b)] {
+        let ir::Val::Reg(r) = v else { continue };
+        let Some(li) = b
+            .insts
+            .iter()
+            .position(|i| matches!(i, Inst::Load(l) if l.dst == *r))
+        else {
+            continue;
+        };
+        if li >= ci {
+            continue;
+        }
+        let Inst::Load(l) = &b.insts[li] else {
+            continue;
+        };
+        if l.ty.bytes() != c.ty.bytes() || l.ptr_ty {
+            continue;
+        }
+        let Some(name) = l.ptr.strip_prefix('@') else {
+            continue;
+        };
+        if !global_ok(name, c) {
+            continue;
+        }
+        let users = f
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insts.iter())
+            .filter(|inst| !matches!(inst, Inst::Icmp(x) if x.dst == c.dst))
+            .filter(|inst| ir::read_vals(inst).iter().any(|u| u == r))
+            .count();
+        if users != 0 {
+            continue;
+        }
+        let gap_clean = b.insts[li + 1..ci].iter().all(|inst| {
+            !matches!(
+                inst,
+                Inst::Call(_)
+                    | Inst::Asm(_)
+                    | Inst::Store(_)
+                    | Inst::Memcpy(_)
+                    | Inst::VaStart(_)
+                    | Inst::Br(_)
+                    | Inst::BrCond(_)
+                    | Inst::Switch(_)
+            )
+        });
+        if !gap_clean {
+            continue;
+        }
+        out.push((side, r.clone(), name.to_string()));
+    }
+    out
+}
+
+/// Regs `isel-pic18` never gives a slot because a fused compare absorbs
+/// them (epic-cc#862): each absorbed `icmp` result and the operand loads
+/// it reads in place. Every decision that depends on the final layout
+/// (signed chains, SFR-resident sources, flash or packed globals) answers
+/// "keep the slot" here, so this set is a subset of what the backend
+/// fuses and a dropped slot is never read.
+pub fn fused_compare_regs(
+    f: &ir::Func,
+    m: &Module,
+    resolved: &PtrResolution,
+    packed: &HashMap<String, u8>,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for b in &f.blocks {
+        let Some(c) = fusable_icmp(f, b, resolved, |_| false) else {
+            continue;
+        };
+        out.insert(c.dst.clone());
+        let ram_global = |name: &str, c: &ir::Icmp| {
+            !matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge")
+                && !packed.contains_key(name)
+                && m.globals.iter().any(|g| g.name == name && !g.is_const)
+        };
+        out.extend(
+            fused_chain_loads(f, b, c, ram_global)
+                .into_iter()
+                .map(|(_, reg, _)| reg),
+        );
+    }
+    out
+}
+/// Const producers `isel-pic18` threads through W instead of a slot
+/// (epic-cc#862): a single-phi block whose one-byte phi takes only
+/// constant incomings from every CFG predecessor and whose only use is
+/// the direct-global store right after the phis, or a one-byte
+/// two-constant `select` consumed by the next instruction, a
+/// direct-global store. Each edge/arm emits just `MOVLW` and the store
+/// one `MOVWF`, so no slot is addressed. The single-use pin is what
+/// makes the subset exact: every competing fold (boolean lanes, trunc
+/// and call-arg forwards) observes the value through a syntactic read
+/// or through the dst slot itself, so with the store as the only read
+/// no other path can claim it.
+pub fn const_w_phi_regs(
+    f: &ir::Func,
+    m: &Module,
+    resolved: &PtrResolution,
+    packed: &HashMap<String, u8>,
+) -> HashSet<String> {
+    let mut uses: HashMap<String, usize> = HashMap::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            for r in ir::read_vals(inst) {
+                if r.is_empty() {
+                    continue;
+                }
+                *uses.entry(r).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+    for b in &f.blocks {
+        let mut targets: Vec<&str> = Vec::new();
+        match b.insts.last() {
+            Some(Inst::Br(br)) => targets.push(&br.target),
+            Some(Inst::BrCond(bc)) => {
+                targets.push(&bc.t);
+                targets.push(&bc.f);
+            }
+            Some(Inst::Switch(sw)) => {
+                for (_, l) in &sw.cases {
+                    targets.push(l);
+                }
+                targets.push(&sw.default);
+            }
+            _ => {}
+        }
+        for t in targets {
+            preds.entry(t).or_default().push(b.label.as_str());
+        }
+    }
+    let mut out = HashSet::new();
+    let store_ok = |s: &ir::Store| {
+        if s.ty.bytes() != 1 {
+            return None;
+        }
+        let dst = s.ptr.strip_prefix('@')?;
+        let known = m.globals.iter().find(|x| x.name == dst)?;
+        if known.is_const || packed.contains_key(dst) {
+            return None;
+        }
+        Some(())
+    };
+    for b in &f.blocks {
+        let mut phis = b.insts.iter().filter_map(|i| match i {
+            Inst::Phi(p) => Some(p),
+            _ => None,
+        });
+        let Some(p) = phis.next() else { continue };
+        if phis.next().is_some() || p.ptr || p.ty.bytes() != 1 {
+            continue;
+        }
+        if p.incoming.is_empty()
+            || p.incoming
+                .iter()
+                .any(|(v, _)| !matches!(v, ir::Val::Const(_)))
+        {
+            continue;
+        }
+        if uses.get(&p.dst).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        if resolved.contains_key(&ssa_key(&f.name, &p.dst)) {
+            continue;
+        }
+        let mut froms: Vec<&str> = p.incoming.iter().map(|(_, fr)| fr.as_str()).collect();
+        froms.sort_unstable();
+        let mut ps: Vec<&str> = preds.get(b.label.as_str()).cloned().unwrap_or_default();
+        ps.sort_unstable();
+        ps.dedup();
+        if froms != ps {
+            continue;
+        }
+        let mut rest = b.insts.iter().filter(|i| !matches!(i, Inst::Phi(_)));
+        let Some(Inst::Store(s)) = rest.next() else {
+            continue;
+        };
+        if !matches!(&s.val, ir::Val::Reg(r) if r == &p.dst) {
+            continue;
+        }
+        if store_ok(s).is_none() {
+            continue;
+        }
+        out.insert(p.dst.clone());
+    }
+    for b in &f.blocks {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            let Inst::Select(s) = inst else { continue };
+            if s.ptr || s.ty.bytes() != 1 || matches!(s.cond, ir::Val::Const(_)) {
+                continue;
+            }
+            if !matches!((&s.a, &s.b), (ir::Val::Const(_), ir::Val::Const(_))) {
+                continue;
+            }
+            if uses.get(&s.dst).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            if resolved.contains_key(&ssa_key(&f.name, &s.dst)) {
+                continue;
+            }
+            let Some(Inst::Store(st)) = b.insts.get(ii + 1) else {
+                continue;
+            };
+            if !matches!(&st.val, ir::Val::Reg(r) if r == &s.dst) {
+                continue;
+            }
+            if store_ok(st).is_none() {
+                continue;
+            }
+            out.insert(s.dst.clone());
+        }
+    }
+    out
+}
+
 /// Drop `forwarded` entries whose producer is a load from a packed flag
 /// global (epic-cc#1162). The packed load still needs its slot: the
 /// backend materializes the bit there for its consumers, so a forwarded
@@ -1610,6 +1929,55 @@ pub fn add_flash_walks(
             prov.mixed.remove(&key);
             prov.flash.insert(key);
         }
+    }
+}
+
+/// Walk marks for the PIC14 family: `add_flash_walks` over the consts that
+/// keep no RAM copy (not in `addrs`, not `staged`) and are not C++ vtables.
+/// Those consts' addresses are flash labels, which a pointer slot hands to
+/// FSR/INDF as if RAM (epic-cc#1197, epic-cc#1203).
+pub fn pic14_flash_walks(
+    m: &Module,
+    addrs: &HashMap<String, u16>,
+    staged: &HashSet<String>,
+) -> FlashProvenance {
+    let flash_consts: HashSet<&str> = m
+        .globals
+        .iter()
+        .filter(|g| {
+            g.is_const
+                && !g.name.starts_with("_ZTV")
+                && !staged.contains(&g.name)
+                && !addrs.contains_key(&g.name)
+        })
+        .map(|g| g.name.as_str())
+        .collect();
+    let mut walks = FlashProvenance::default();
+    add_flash_walks(&mut walks, m, |n| flash_consts.contains(n));
+    walks
+}
+
+/// Refusal text when slot `slot` of `func` holds a flash-walk address (or a
+/// pointer joining flash and RAM): a load, store, or memcpy through it would
+/// read or write RAM at a flash address, and the PIC14 family has no
+/// variable-index flash reader. `issue` is the backend's tracking ticket.
+pub fn flash_walk_refusal(
+    walks: &FlashProvenance,
+    func: &str,
+    slot: &str,
+    issue: &str,
+) -> Option<String> {
+    let key = ssa_key(func, slot);
+    if walks.flash.contains(&key) {
+        Some(format!(
+            "pointer access through flash walk %{slot} (flash walks read program memory, PIC18-only, epic-cc#1091, epic-cc#{issue})"
+        ))
+    } else if walks.mixed.contains(&key) {
+        Some(format!(
+            "pointer access through maybe-flash %{slot} (a pointer joining flash and RAM, PIC18-only, epic-cc#1099, epic-cc#{issue})"
+        ))
+    } else {
+        None
     }
 }
 

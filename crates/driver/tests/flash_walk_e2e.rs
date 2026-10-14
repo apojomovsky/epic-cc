@@ -155,21 +155,40 @@ fn flash_walk_two_runtime_indices_chain_reads_program_memory_on_p18() {
     assert!(halted);
 }
 
-/// Storing a ROM address into RAM has no RAM form: a later load through the
-/// slot reads RAM at that address (epic-cc#1101). Covers a runtime index and a
-/// constant base, both refused rather than silently read as zero.
+/// Storing a small ROM address into RAM keeps a RAM copy of the const, so a
+/// later load through the slot reads the literal bytes (epic-cc#1223).
+/// Covers a runtime index, a constant base, and a walked pointer.
 #[test]
-fn flash_walk_store_of_rom_address_is_rejected_on_p18() {
-    expect_p18_rejection(
-        "tests/fixtures/flash_walk_store_address_runtime.c",
-        "store of a ROM address into RAM",
+fn flash_walk_store_of_rom_address_reads_ram_copy_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_store_address_runtime.c");
+    assert_eq!(
+        ram[map_addr(&map, "out")],
+        b'C',
+        "runtime offset into the RAM copy"
     );
-    expect_p18_rejection(
-        "tests/fixtures/flash_walk_store_address_const.c",
-        "store of a ROM address into RAM",
+    assert!(halted);
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_store_address_const.c");
+    assert_eq!(
+        ram[map_addr(&map, "out")],
+        b'P',
+        "constant offset into the RAM copy"
     );
+    assert!(halted);
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_store_address_walk.c");
+    assert_eq!(
+        ram[map_addr(&map, "out")],
+        b'C',
+        "walked pointer into the RAM copy"
+    );
+    assert!(halted);
+}
+
+/// A const over 255 bytes has no RAM copy: storing its address is still
+/// refused (epic-cc#1223 boundary).
+#[test]
+fn flash_walk_store_of_large_rom_address_is_rejected_on_p18() {
     expect_p18_rejection(
-        "tests/fixtures/flash_walk_store_address_walk.c",
+        "tests/fixtures/flash_walk_store_address_large.c",
         "store of a ROM address into RAM",
     );
 }

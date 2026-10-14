@@ -895,89 +895,15 @@ impl<'m> Gen<'m> {
     }
 
     /// The `icmp` a block's terminator can absorb, when that is the
-    /// compare's only use in the function.
-    ///
-    /// Requirements, each of which is load-bearing:
-    /// - the terminator is a `BrCond` on a `Reg`;
-    /// - the compare is in the *same* block, immediately before the
-    ///   terminator. Any instruction between them would be skipped by the
-    ///   fused exits, so adjacency is what makes the fusion sound rather
-    ///   than merely likely;
-    /// - any width the backends lower (`n == 1 || n == 2 || n == 4`).
-    ///   Single bytes fuse to the one-lane lowering (the same flags the
-    ///   materializing byte path reads, with the exits rebound), wider
-    ///   values to the borrow chain or sign check plus chain.
-    ///
-    /// A fused compare emits its exits as the branch's own targets and
-    /// never writes the result slot, so the 0/1 byte, its preclear, and
-    /// the reload (`MOVF`/`BZ`) all disappear.
+    /// compare's only use in the function (shape rules in
+    /// `iselcore::fusable_icmp`, shared with `alloc` so a dropped slot is
+    /// never read). A fused compare emits its exits as the branch's own
+    /// targets and never writes the result slot. The signed chain's guard
+    /// reads slot addresses, so this side answers it from the final map.
     fn fusable_icmp<'f>(g: &Gen, f: &'f Func, b: &'f Block) -> Option<&'f Icmp> {
-        let [.., Inst::Icmp(c), Inst::BrCond(bc)] = b.insts.as_slice() else {
-            return None;
-        };
-        let Val::Reg(cond) = &bc.cond else {
-            return None;
-        };
-        if c.dst != *cond {
-            return None;
-        }
-        // The same width guard `emit_inst`'s `Inst::Icmp` arm applies
-        // (`n == 1 || n == 2 || n == 4`). Fusing an i64 compare would
-        // route it to a lowering and compile, while the identical compare
-        // with any other use still panics; keep the two paths consistent
-        // and the unsupported width loud.
-        if !matches!(c.ty.bytes(), 1 | 2 | 4) {
-            return None;
-        }
-        // Only the predicates with a fused lowering (all ten: single
-        // bytes take the one-lane lowering, wider values the chain or
-        // sign check plus chain).
-        if !matches!(
-            c.pred.as_str(),
-            "eq" | "ne" | "ult" | "uge" | "ugt" | "ule" | "slt" | "sle" | "sgt" | "sge"
-        ) {
-            return None;
-        }
-        // The unsigned multi-byte compares lower to the borrow chain,
-        // which holds STATUS,C across lanes; a rhs lane load that writes
-        // C would corrupt it. The one-lane lowering consumes its flags
-        // immediately and needs no such guard, but the gate stays uniform
-        // across widths: the declined shapes keep the correct cascade.
-        if matches!(c.pred.as_str(), "ult" | "uge" | "ugt" | "ule") && g.load_w_writes_carry(&c.b) {
-            return None;
-        }
-        // The signed chain re-reads both high bytes in its sign check, so
-        // SFR operands and address-math rhs loads keep the cascade. The
-        // one-lane lowering reads each byte once and needs no such guard,
-        // but the gate stays uniform across widths for the same reason. A
-        // same-block single-use load feeding the compare is fine to fuse:
-        // the lanes then read a GPR global twice, and GPR reads have no side
-        // effects (only SFRs do, and those never fuse). The rewrite that
-        // could expose an SFR global directly keeps slot reads instead
-        // (see `fused_chain_sources`).
-        if matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge")
-            && !g.signed_chain_ok(&c.a, &c.b, c.ty.bytes() - 1)
-        {
-            return None;
-        }
-        // The compare's sole consumer must be this branch. Find `b`'s own
-        // index so the scan can skip exactly that terminator (the compare
-        // itself is a def, not a use, so `read_vals` never counts it).
-        let Some(bi_own) = f.blocks.iter().position(|bb| std::ptr::eq(bb, b)) else {
-            return None;
-        };
-        let branch_idx = b.insts.len() - 1;
-        for (bi, bb) in f.blocks.iter().enumerate() {
-            for (ii, inst) in bb.insts.iter().enumerate() {
-                if bi == bi_own && ii == branch_idx {
-                    continue;
-                }
-                if ir::read_vals(inst).iter().any(|v| v == cond) {
-                    return None;
-                }
-            }
-        }
-        Some(c)
+        iselcore::fusable_icmp(f, b, g.resolved, |c| {
+            g.signed_chain_ok(&c.a, &c.b, c.ty.bytes() - 1)
+        })
     }
     /// A packed flag load its `BrCond` absorbs (epic-cc#1162): the block
     /// tail is `[.., Load, BrCond]` with the load reading one packed bit
@@ -1030,44 +956,17 @@ impl<'m> Gen<'m> {
     /// side defined by a single-use same-block `Load` from a RAM global
     /// becomes that global, and the load joins `consumed`. The chain
     /// emitters already address any direct operand, so only the
-    /// producers forced the temp. A gap holding a call, an asm blob, or
-    /// any store keeps the slot path: the load may be volatile, and its
-    /// read count is preserved either way, but its position must not
-    /// move past observable behavior.
+    /// producers forced the temp. Shape rules live in
+    /// `iselcore::fused_chain_loads`, shared with `alloc`.
     fn fused_chain_sources(g: &Gen, f: &Func, b: &Block, c: &Icmp) -> FusedChain {
         let mut icmp = c.clone();
         let mut consumed = Vec::new();
-        let ci = b
-            .insts
-            .iter()
-            .position(|i| matches!(i, Inst::Icmp(x) if x.dst == c.dst))
-            .unwrap_or(usize::MAX);
-        for side in [&mut icmp.a, &mut icmp.b] {
-            let Val::Reg(r) = side.clone() else { continue };
-            let Some(li) = b
-                .insts
-                .iter()
-                .position(|i| matches!(i, Inst::Load(l) if l.dst == r))
-            else {
-                continue;
-            };
-            if li >= ci {
-                continue;
-            }
-            let Inst::Load(l) = &b.insts[li] else {
-                continue;
-            };
-            if l.ty.bytes() != c.ty.bytes() || l.ptr_ty {
-                continue;
-            }
-            let Some(name) = l.ptr.strip_prefix('@') else {
-                continue;
-            };
+        let readable = |name: &str, c: &Icmp| {
             if g.addrs.get(name).is_none()
                 || g.global_is_const(name)
                 || g.packed_bits.contains_key(name)
             {
-                continue;
+                return false;
             }
             // A signed ordering compare re-reads the high byte (sign check
             // plus chain), so a load from an SFR global must stay a slot
@@ -1075,44 +974,13 @@ impl<'m> Gen<'m> {
             // read into two machine reads of a side-effecting register.
             // GPR globals read twice are side-effect free (only torn reads,
             // the cascade's own class), so only the SFR floor declines.
-            if matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge")
-                && g.addrs.get(name).is_some_and(|a| *a >= PIC18_SFR_ACCESS_LO)
-            {
-                continue;
-            }
-            let users = f
-                .blocks
-                .iter()
-                .flat_map(|bb| bb.insts.iter())
-                .filter(|inst| !matches!(inst, Inst::Icmp(x) if x.dst == c.dst))
-                .filter(|inst| ir::read_vals(inst).iter().any(|v| v == &r))
-                .count();
-            if users != 0 {
-                continue;
-            }
-            // A gap holding a call, an asm blob, or any memory write
-            // keeps the slot path: the load may be volatile, and its
-            // read count is preserved either way, but its position must
-            // not move past observable behavior. `Memcpy` writes memory
-            // without being a `Store`, so it joins the reject set.
-            let gap_clean = b.insts[li + 1..ci].iter().all(|inst| {
-                !matches!(
-                    inst,
-                    Inst::Call(_)
-                        | Inst::Asm(_)
-                        | Inst::Store(_)
-                        | Inst::Memcpy(_)
-                        | Inst::VaStart(_)
-                        | Inst::Br(_)
-                        | Inst::BrCond(_)
-                        | Inst::Switch(_)
-                )
-            });
-            if !gap_clean {
-                continue;
-            }
-            *side = Val::Global(name.to_string());
-            consumed.push(r);
+            !(matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge")
+                && g.addrs.get(name).is_some_and(|a| *a >= PIC18_SFR_ACCESS_LO))
+        };
+        for (side, reg, name) in iselcore::fused_chain_loads(f, b, c, readable) {
+            let slot = if side == 0 { &mut icmp.a } else { &mut icmp.b };
+            *slot = Val::Global(name);
+            consumed.push(reg);
         }
         FusedChain { icmp, consumed }
     }
@@ -2222,130 +2090,14 @@ impl<'m> Gen<'m> {
     /// the ISR preserves it, so the single-phi block keeps the threaded
     /// copy last by construction.
     fn find_const_w_phis(g: &Gen, f: &Func) -> HashSet<String> {
-        let mut uses: HashMap<String, usize> = HashMap::new();
-        for b in &f.blocks {
-            for inst in &b.insts {
-                for r in ir::read_vals(inst) {
-                    if r.is_empty() {
-                        continue;
-                    }
-                    *uses.entry(r).or_insert(0) += 1;
-                }
-            }
-        }
-        let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
-        for b in &f.blocks {
-            let mut targets: Vec<&str> = Vec::new();
-            match b.insts.last() {
-                Some(Inst::Br(br)) => targets.push(&br.target),
-                Some(Inst::BrCond(bc)) => {
-                    targets.push(&bc.t);
-                    targets.push(&bc.f);
-                }
-                Some(Inst::Switch(sw)) => {
-                    for (_, l) in &sw.cases {
-                        targets.push(l);
-                    }
-                    targets.push(&sw.default);
-                }
-                _ => {}
-            }
-            for t in targets {
-                preds.entry(t).or_default().push(b.label.as_str());
-            }
-        }
-        let mut out = HashSet::new();
-        for b in &f.blocks {
-            let mut phis = b.insts.iter().filter_map(|i| match i {
-                Inst::Phi(p) => Some(p),
-                _ => None,
-            });
-            let Some(p) = phis.next() else { continue };
-            if phis.next().is_some() || p.ptr || p.ty.bytes() != 1 {
-                continue;
-            }
-            if p.incoming.is_empty() || p.incoming.iter().any(|(v, _)| !matches!(v, Val::Const(_)))
-            {
-                continue;
-            }
-            if uses.get(&p.dst).copied().unwrap_or(0) != 1 {
-                continue;
-            }
-            if g.lane_consumed.contains(&p.dst) || g.bit_lanes.contains_key(&p.dst) {
-                continue;
-            }
-            if g.resolved.contains_key(&ssa_key(&f.name, &p.dst)) {
-                continue;
-            }
-            // Every CFG predecessor must supply the constant, or W
-            // would be garbage on the uncovered edge.
-            let mut froms: Vec<&str> = p.incoming.iter().map(|(_, fr)| fr.as_str()).collect();
-            froms.sort_unstable();
-            let mut ps: Vec<&str> = preds.get(b.label.as_str()).cloned().unwrap_or_default();
-            ps.sort_unstable();
-            ps.dedup();
-            if froms != ps {
-                continue;
-            }
-            let mut rest = b.insts.iter().filter(|i| !matches!(i, Inst::Phi(_)));
-            let Some(Inst::Store(s)) = rest.next() else {
-                continue;
-            };
-            if !matches!(&s.val, Val::Reg(r) if r == &p.dst) || s.ty.bytes() != 1 {
-                continue;
-            }
-            let Some(dg) = s.ptr.strip_prefix('@') else {
-                continue;
-            };
-            let Some(known) = g.m.globals.iter().find(|x| x.name == dg) else {
-                continue;
-            };
-            if known.is_const || g.packed_bits.contains_key(dg) {
-                continue;
-            }
-            out.insert(p.dst.clone());
-        }
-        // A `select` over two constants feeding a direct-global store
-        // threads the same way: both arms `MOVLW`, the store `MOVWF`.
-        // Straight-line, so the store must be the next instruction;
-        // anything between could clobber W.
-        for b in &f.blocks {
-            for (ii, inst) in b.insts.iter().enumerate() {
-                let Inst::Select(s) = inst else { continue };
-                if s.ptr || s.ty.bytes() != 1 || matches!(s.cond, Val::Const(_)) {
-                    continue;
-                }
-                if !matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_))) {
-                    continue;
-                }
-                if uses.get(&s.dst).copied().unwrap_or(0) != 1 {
-                    continue;
-                }
-                if g.lane_consumed.contains(&s.dst) || g.bit_lanes.contains_key(&s.dst) {
-                    continue;
-                }
-                if g.resolved.contains_key(&ssa_key(&f.name, &s.dst)) {
-                    continue;
-                }
-                let Some(Inst::Store(st)) = b.insts.get(ii + 1) else {
-                    continue;
-                };
-                if !matches!(&st.val, Val::Reg(r) if r == &s.dst) || st.ty.bytes() != 1 {
-                    continue;
-                }
-                let Some(dg) = st.ptr.strip_prefix('@') else {
-                    continue;
-                };
-                let Some(known) = g.m.globals.iter().find(|x| x.name == dg) else {
-                    continue;
-                };
-                if known.is_const || g.packed_bits.contains_key(dg) {
-                    continue;
-                }
-                out.insert(s.dst.clone());
-            }
-        }
-        out
+        // Shape rules in `iselcore::const_w_phi_regs`, shared with
+        // `alloc` so a dropped slot is never read. The lane checks stay
+        // here: a lane member keeps its slot on this side, and the
+        // shared set never names one (its single read is the store).
+        iselcore::const_w_phi_regs(f, g.m, g.resolved, g.packed_bits)
+            .into_iter()
+            .filter(|r| !g.lane_consumed.contains(r) && !g.bit_lanes.contains_key(r))
+            .collect()
     }
     /// W-operand pre-scan (epic-cc#825): a single-use one-byte load from
     /// a RAM global immediately feeding a const-operand `Add`/`And`/`Or`
@@ -10087,8 +9839,16 @@ impl<'m> Gen<'m> {
                         !matches!(s.cond, Val::Const(_)),
                         "isel-pic18: const cond Select not yet supported"
                     );
-                    let dst = self.slot_addr(self.cur_func, &s.dst).direct();
                     let addr_value = seeded;
+                    // A dropped const-select slot (epic-cc#862) has no
+                    // address. The W path below emits `MOVLW` only and
+                    // never touches `dst`, so the sentinel is sound for
+                    // the same 12-bit-RAM reason as the phi-copy one.
+                    let dst = if !addr_value && self.const_w_phis.contains(&s.dst) {
+                        u16::MAX
+                    } else {
+                        self.slot_addr(self.cur_func, &s.dst).direct()
+                    };
                     // A W-threaded const select (epic-cc#825) leaves the
                     // arm in W for the following store: `MOVLW` only.
                     // Bytes resolve before any emission, so no closure
@@ -11318,32 +11078,13 @@ impl<'m> Gen<'m> {
     /// `C` from its own `SUBWF` immediately after each load and so is
     /// immune (epic-cc#519's `read_base` models the same arm).
     fn load_w_writes_carry(&self, v: &Val) -> bool {
-        let Val::Reg(r) = v else {
-            return false;
-        };
-        let Some((base, k, terms)) = self.resolved.get(&iselcore::ssa_key(self.cur_func, r)) else {
-            return false;
-        };
-        // A literal base panics inside `emit_load_w` rather than emitting
-        // anything, so it is not a clobber source.
-        let iselcore::Base::Slot(sname, indirect) = base else {
-            return false;
-        };
-        let holds_addr = *indirect
-            || self
-                .m
-                .funcs
-                .iter()
-                .find(|f| f.name == self.cur_func)
-                .map(|f| f.params.iter().any(|pp| pp.name == *sname && pp.ptr))
-                .unwrap_or(false);
-        if !holds_addr {
-            // `emit_load_w` asserts here; nothing is emitted.
-            return false;
-        }
-        // Constant offset only, or a dynamic term: both reach a carry-
-        // writing add.
-        *k != 0 || !terms.is_empty()
+        let params = self
+            .m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .map_or(&[][..], |f| &f.params[..]);
+        iselcore::load_w_writes_carry(self.cur_func, params, self.resolved, v)
     }
 
     /// Load byte `offset` of any `Val` into `W`: a constant via `MOVLW`
@@ -14593,7 +14334,19 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
     let mut pending: Vec<Pend> = copies
         .iter()
         .map(|(dst, ty, val)| {
-            let da = g.slot_addr(g.cur_func, dst).direct();
+            // A W-threaded const-phi incoming (epic-cc#825) leaves its
+            // byte in W for the merge block's store: only the `MOVLW`
+            // emits. Every other const copy keeps the slot write.
+            let w_only = matches!(val, Val::Const(_)) && g.const_w_phis.contains(dst);
+            // A dropped const-phi slot (epic-cc#862) has no address. The
+            // sentinel keeps the ordering checks below honest: `w_only`
+            // copies never block and emit no slot access, and no real
+            // slot address equals `u16::MAX` on PIC18 (12-bit RAM).
+            let da = if w_only {
+                u16::MAX
+            } else {
+                g.slot_addr(g.cur_func, dst).direct()
+            };
             let src = match val {
                 Val::Reg(r) => match g.resolved.get(&iselcore::ssa_key(g.cur_func, r)) {
                     // A resolved Slot arm reads its base slot's bytes (the
@@ -14610,10 +14363,6 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
                 },
                 _ => None,
             };
-            // A W-threaded const-phi incoming (epic-cc#825) leaves its
-            // byte in W for the merge block's store: only the `MOVLW`
-            // emits. Every other const copy keeps the slot write.
-            let w_only = matches!(val, Val::Const(_)) && g.const_w_phis.contains(dst);
             Pend {
                 da,
                 src,

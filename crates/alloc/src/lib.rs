@@ -2966,6 +2966,16 @@ fn allocate_inner(
             } else {
                 folds.unplaced()
             };
+            let mut dropped = dropped;
+            // isel-pic18's fused compares write no 0/1 byte and read their
+            // operand loads in place, and its W-threaded const producers
+            // leave the byte in W for the store (epic-cc#862). Both are
+            // gate-independent, so the bounding pass drops the same regs
+            // and the gated pass still only shrinks the overlay.
+            if device.core == Core::Pic18 {
+                dropped.extend(iselcore::fused_compare_regs(f, m, &resolved, &packed_bits));
+                dropped.extend(iselcore::const_w_phi_regs(f, m, &resolved, &packed_bits));
+            }
             (f.name.clone(), dropped)
         })
         .collect();
@@ -3581,6 +3591,30 @@ fn allocate_inner(
                             if let ir::Val::Global(g) = &s.val {
                                 addr_taken.insert(g.clone());
                             }
+                            // A const whose address is stored into memory is
+                            // read back through RAM pointers, which cannot name
+                            // flash: it keeps a RAM copy like a phi incoming
+                            // (epic-cc#1223).
+                            let stored = match &s.val {
+                                ir::Val::Global(g) => Some(g.clone()),
+                                ir::Val::Reg(r) => find_const_base(r).or_else(|| {
+                                    match resolved.get(&ssa_key(&f.name, r)) {
+                                        Some((Base::Global(cg), _, _)) => Some(cg.clone()),
+                                        _ => None,
+                                    }
+                                }),
+                                ir::Val::Const(_) => None,
+                            };
+                            if let Some(g) = stored {
+                                if let Some(gl) =
+                                    m.globals.iter().find(|gl| gl.name == g && gl.is_const)
+                                {
+                                    if gl.size <= 255 {
+                                        const_to_ram.insert(g.clone());
+                                        const_phi.insert(g);
+                                    }
+                                }
+                            }
                         }
                         ir::Inst::Asm(a) => {
                             for op in &a.operands {
@@ -3786,11 +3820,13 @@ fn allocate_inner(
                             }
                         }
                     }
-                    // A const reaching a pointer phi keeps its RAM copy:
-                    // iselcore seeds the phi as an indirect slot and every
-                    // read through it derefs RAM (the LSR chase shape whose
-                    // flash lowering is epic-cc#811). A gated address here
-                    // would deref flash as RAM.
+                    // A const reaching a pointer phi needs a RAM copy: iselcore
+                    // seeds the phi as an indirect slot, and every read through
+                    // it derefs RAM (the LSR chase shape, epic-cc#811). Without
+                    // a copy the slot holds a flash label and the walk reads RAM
+                    // there (epic-cc#1197, epic-cc#1203). The copy is never
+                    // staged (the buffer is clobbered mid-walk) or pool-gated.
+                    // Over 255 bytes no copy exists and isel refuses the walk.
                     if let ir::Inst::Phi(p) = inst {
                         if p.ptr {
                             for (v, _) in &p.incoming {
@@ -3806,6 +3842,12 @@ fn allocate_inner(
                                     ir::Val::Const(_) => None,
                                 };
                                 if let Some(g) = base {
+                                    let small =
+                                        m.globals.iter().any(|gl| gl.name == g && gl.size <= 255);
+                                    if small && matches!(device.core, Core::Pic14 | Core::Pic14e) {
+                                        const_to_ram.insert(g.clone());
+                                        const_derived.insert(g.clone());
+                                    }
                                     const_phi.insert(g);
                                 }
                             }
