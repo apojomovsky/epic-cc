@@ -560,7 +560,7 @@ _SHARED_BODY = re.compile(r"^__pa\d+$")
 
 def match_shared_code(items, i, cfg):
     """Code-factoring output: shared `__pa<N>` bodies and the calls or
-    branches that reach them (docs/44). Ranked ahead of runtime-routine,
+    branches that reach them (docs/internals/design/44). Ranked ahead of runtime-routine,
     whose `__` prefix rule would otherwise swallow the bodies."""
     del cfg
     if _SHARED_BODY.match(items[i].function):

@@ -1,4 +1,4 @@
-//! Lane B (docs/36, #286): coverage-guided fuzz target for `irparse`'s
+//! Lane B (docs/internals/design/36, #286): coverage-guided fuzz target for `irparse`'s
 //! parser over the canonical IR dialect. The parser sits directly behind
 //! the `.ll`-to-IR boundary the whole backend trusts, so a crash here is a
 //! front-end bug worth finding. The fuzzer mutates bytes under coverage

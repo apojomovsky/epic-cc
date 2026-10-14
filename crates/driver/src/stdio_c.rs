@@ -5,7 +5,7 @@
 //! the harness); the formatter never touches hardware. The sink contract
 //! is `void putchar(char)` (SDCC pic16's prototype, whose `__wparam`
 //! the driver predefines empty), not C's `int putchar(int)`, so one
-//! corpus source defines putchar for both compilers (docs/35 section 4).
+//! corpus source defines putchar for both compilers (docs/internals/design/35 section 4).
 //! Written per ADR-018's pointer rule: every string walk is an INDEX
 //! loop, the only pointer read is `va_arg` (now modelled directly), and
 //! the 32-bit conversion bodies are `noinline` helpers so every

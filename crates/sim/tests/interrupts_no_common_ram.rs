@@ -1,11 +1,11 @@
-//! SPIKE for epic-cc#393 D-2: does docs/39 section 3's shadow-slot ISR
+//! SPIKE for epic-cc#393 D-2: does docs/internals/design/39 section 3's shadow-slot ISR
 //! technique actually work for a device shaped like PIC16F74 (two real,
 //! non-aliased GPR regions, `common_ram = None`)? Not wired into isel; this
 //! hand-assembles the exact instruction sequence and drives it through the
 //! real simulator, the same way `gpr_window.rs` validates addressing with a
 //! synthetic `Device` and no codegen involved.
 //!
-//! Finding: docs/39 section 3 step 3's prose ("MOVWF STATUS directly from
+//! Finding: docs/internals/design/39 section 3 step 3's prose ("MOVWF STATUS directly from
 //! the saved (still-swapped) byte") is imprecise. Nibble-swapping STATUS
 //! once (to capture it bank-independently) and then writing that swapped
 //! byte straight back does NOT restore STATUS -- it scrambles every bit
@@ -55,7 +55,7 @@ fn goto(k: u16) -> u16 {
 const RETFIE: u16 = 0x0009;
 const SLEEP: u16 = 0x0063;
 
-/// PIC16F74's real shape (docs/39 section 1 bucket 2): two distinct,
+/// PIC16F74's real shape (docs/internals/design/39 section 1 bucket 2): two distinct,
 /// non-aliased 96-byte GPR regions, `common_ram = None`. Region A
 /// (0x20-0x7F) is bank 0 (RP1:RP0 = 00); region B (0xA0-0xFF) is bank 1
 /// (RP0 = 1, RP1 = 0) -- confirmed via `Pic14::bank_base`'s
@@ -89,14 +89,14 @@ const F74_SHAPE: Device = Device {
 };
 
 /// Offset 0x20 (W shadow) and 0x21 (STATUS shadow, region-A-only) are
-/// reserved out of both regions' normal allocation pool per docs/39
+/// reserved out of both regions' normal allocation pool per docs/internals/design/39
 /// section 3 step 1 -- the test's "main program" below deliberately uses
 /// 0x22/0x23 instead so a collision would be obvious as a wrong-value
 /// assertion, not a silent overlap.
 const W_SHADOW: u16 = 0x20;
 const STATUS_SHADOW: u16 = 0x21;
 
-/// The correct shadow-slot prologue/epilogue (docs/39 section 3, with the
+/// The correct shadow-slot prologue/epilogue (docs/internals/design/39 section 3, with the
 /// missing un-swap restored -- see module docs). Occupies words 4..=18;
 /// word 4 is the fixed PIC14 interrupt vector.
 fn isr_correct() -> Vec<u16> {
@@ -122,7 +122,7 @@ fn isr_correct() -> Vec<u16> {
     ]
 }
 
-/// docs/39 section 3 step 3 taken completely literally: skip the restore
+/// docs/internals/design/39 section 3 step 3 taken completely literally: skip the restore
 /// un-swap and `MOVWF STATUS` straight from the once-swapped byte. Same
 /// prologue, broken epilogue -- kept short since it only needs to prove
 /// the restore is wrong, not survive a full run.
@@ -231,7 +231,7 @@ fn shadow_slot_technique_restores_w_status_and_bank_across_a_region_switch() {
 
 #[test]
 fn skipping_the_restore_unswap_corrupts_status_as_docs_39_literally_describes_it() {
-    // Confirms the failure mode, not just its absence: docs/39's literal
+    // Confirms the failure mode, not just its absence: docs/internals/design/39's literal
     // "MOVWF STATUS directly from the saved (still-swapped) byte" text
     // scrambles STATUS's bits into the wrong nibble positions rather than
     // restoring them, because a nibble-swapped byte written straight back
@@ -261,7 +261,7 @@ fn skipping_the_restore_unswap_corrupts_status_as_docs_39_literally_describes_it
     assert_ne!(
         p.status(),
         status_before,
-        "the literal docs/39 restore step scrambles STATUS instead of restoring it \
+        "the literal docs/internals/design/39 restore step scrambles STATUS instead of restoring it \
          (swap-once-then-write-back is not the same as swap-capture then swap-restore)"
     );
     let _ = bank_before; // documented for readers comparing against the correct-path test

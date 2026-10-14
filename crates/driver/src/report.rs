@@ -606,7 +606,7 @@ pub fn fixed_bytes(device: &Device, has_isr: bool, uses: &FixedUses) -> u16 {
 pub fn fixed_total(device: &Device) -> u16 {
     match device.core {
         device::Core::Pic14 | device::Core::Pic14e => {
-            // docs/39 D-2 (epic-cc#393): a device with no common-RAM
+            // docs/internals/design/39 D-2 (epic-cc#393): a device with no common-RAM
             // region at all substitutes isr_home_window instead.
             let (lo, hi) = device
                 .common_ram
@@ -680,7 +680,7 @@ fn json_str(s: &str) -> String {
 }
 
 /// The `--report` file: the build's facts as JSON for tools that act on
-/// them (the PlatformIO size bar and pre-flash checks, docs/46 D-7, D-9).
+/// them (the PlatformIO size bar and pre-flash checks, docs/internals/design/46 D-7, D-9).
 /// The format is a contract; ADR-025 defines every key and null, and the
 /// optimization-profiles ADR adds `opt_level` (the `-O` profile that
 /// built this report, `"O0"`/`"O1"`/`"O2"`/`"Os"`).

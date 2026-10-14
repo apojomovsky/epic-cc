@@ -94,7 +94,7 @@ fn different_symbolic_operands_kept() {
     assert_eq!(optimize(asm), asm);
 }
 
-/// Lane D fixpoint idempotence (docs/36): a pass meant to reach a fixpoint
+/// Lane D fixpoint idempotence (docs/internals/design/36): a pass meant to reach a fixpoint
 /// must be a no-op the second time it runs on its own output. The peephole
 /// collapses redundant `MOVLW k; MOVWF PCLATH` pairs; running it again on
 /// its own output must not change anything (a pass that thinks it converged

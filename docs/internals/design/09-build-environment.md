@@ -1,0 +1,229 @@
+# 09 — Build environment
+
+**Isolated, reproducible builds via a docker multi-stage toolchain. Nothing is
+installed system-wide.** Decision recorded as [ADR-008](03-decisions.md)
+(supersedes ADR-007).
+
+## Getting in
+
+Build the dev image with `make image` (first build is slow, it compiles
+clang; see Caching). The tag is content-addressed
+(`epic-cc-dev:local-<hash>` from the Dockerfile plus uid/gid, printed by
+`scripts/dev-image-tag.sh`), so worktrees with different Dockerfiles hold
+distinct images. Then either an interactive shell:
+
+```bash
+make shell
+```
+
+or one-shot for automation:
+
+```bash
+make exec CMD='bash scripts/ci-test.sh'
+```
+
+## Push keepalive for the pre-push hook
+
+git opens the ssh connection to learn remote refs before running the
+pre-push hook, so the minutes-long `make ci-local` run idles it until
+the server kills it and the push dies after a green hook (#994).
+`scripts/bootstrap.sh` appends a managed `Host github.com` keepalive
+(`ServerAliveInterval 15`, `ServerAliveCountMax 40`) to `~/.ssh/config`
+once, and `make doctor` reports when it is missing. A config that
+already sets `ServerAliveInterval` is left alone. One-off escape hatch
+on a machine without the entry:
+
+```bash
+GIT_SSH_COMMAND='ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=40' git push
+```
+
+## What is pinned
+
+| Tool | Version | Role |
+|---|---|---|
+| **clang** | **20.1.8** (source tarball, sha256-pinned) | IR producer — **deliberately pinned, see below** |
+| rustc / cargo | 1.97.1 | via `rust-toolchain.toml` + rustup |
+| gputils (`gpasm`) | 1.5.2 (source, sha256-pinned) | assembler cross-check oracle |
+| ruff | 0.16.6 (binary, sha256-pinned) | python lint and format gate |
+| csmith / creduce | 2.3.0 / 2.10.0 (apt) | fuzzing and reduction |
+
+### Why clang is pinned, and built from source
+
+We parse **LLVM IR text**, so the clang version is part of our input format.
+Official LLVM stopped shipping Linux x86_64 binaries after 18.1.8, so the
+release clang is built from the digest-pinned 20.1.8 source tarball in the
+`clang-builder` stage. **Bumping this is a migration with a test pass, not
+housekeeping.**
+
+The build uses static LLVM libraries (the Linux default), so the produced
+`clang` links only platform runtimes — no `libLLVM.so`, no rpath patching.
+
+## Environment variables the images export
+
+| Variable | Meaning |
+|---|---|
+| `PIC8_CLANG_UNWRAPPED` | `/opt/clang/bin/clang` (unwrapped — no wrapper-injected host flags) |
+| `PIC8_CLANG_RESOURCE_DIR` | `/opt/clang/lib/clang/20` (builtin headers; **major version only**) |
+| `PIC8_GPASM` | `/usr/local/bin/gpasm` |
+| `PIC8_VENDOR_DIR` | `/workspace/vendor` |
+| `PIC8_XC8_ROOT` | `/opt/microchip/xc8/v4.00` (override to relocate) |
+
+The driver resolves clang from these env vars, or from the bundled `clang/`
+directory next to the executable in release bundles, or fails with a clean
+diagnostic (see `crates/driver/src/clang_discovery.rs`).
+
+## Environment variables the device data gate reads
+
+`crates/device/tests/gputils_crosscheck.rs` verifies every device TOML against
+gputils (ADR-021), or against a vendored second-oracle record
+(`crates/device/second_oracle/`, DFP `.ini` plus datasheet citation) for
+parts gputils does not know. Running without gputils takes two variables,
+not one.
+
+| Variable | Meaning |
+|---|---|
+| `PIC8_GPUTILS_SHARE` | gputils data root, default `/usr/local/share/gputils` |
+| `PIC8_ALLOW_NO_GPUTILS` | acknowledges the data root is absent. On its own the gate still **fails** |
+| `PIC8_UNVERIFIED_DEVICE_DATA` | set to `i-accept-unverified-device-data`, and only with the variable above, to run with no device verification at all |
+
+Both are read only when the data root is genuinely missing, so setting them
+cannot switch off a gate that could have run. With both set the tests print a
+`DEVICE DATA UNVERIFIED` banner and verify nothing; `scripts/ci-test.sh` also
+records the disabled gate in the CI step summary.
+
+## Caching
+
+The clang build is the only expensive layer (~1 h first build). `make image`
+and `make release-bundle` build it through a **dedicated buildx builder**
+(`epic-cc-builder`, docker-container driver, created lazily by the Makefile's
+`ENSURE_BUILDER`), not the default docker-driver builder. That is the load-
+bearing decision, not an optimization: the clang-builder layer cache and the
+LLVM ccache mount (`--mount=type=cache,target=/ccache`, used for
+`LLVM_CCACHE_BUILD`) live entirely inside that builder's own container and
+volume. `docker system prune` / `docker builder prune` — with or without
+`-a` — only ever touch the *default* builder's storage, so a generic disk
+cleanup, run by a person or an agent, cannot reach the clang cache at all
+unless it explicitly targets `epic-cc-builder` by name
+(`docker buildx prune --builder epic-cc-builder`, or removes the builder
+outright). This is deliberate: a plain `docker system prune` with no flags
+has previously wiped the (then-default-builder-backed) clang cache and
+forced a full ~1-2h recompile — see the Makefile's `BUILDER` comment.
+
+As a second line of defense — for a genuinely fresh machine, or if
+`epic-cc-builder` itself is ever deleted — `make image` / `make
+release-bundle` also pass `--cache-from` against the buildx registry cache
+CI warms on every push (`ghcr.io/<repo>-toolchain`,
+`.github/workflows/toolchain-cache.yml`). That ref is a public image, no
+login needed. In that scenario a cold local cache costs a pull of the
+already-built clang layer from GHCR, not a recompile. Because the base image
+and the LLVM tarball are digest-pinned, the clang layer only needs a real
+rebuild (locally or in CI) when the Dockerfile or a pin changes.
+
+Every CI and release image build runs through `scripts/warm-toolchain-cache.sh`,
+which retries when the build log reports a transient registry error: a 429 (Too
+Many Requests) from Docker Hub on the final log line, a 502/503/504 with a
+reason phrase on a line naming Docker Hub or GHCR, or a bare 502/503/504 at
+the end of the final log line naming the registry after a status keyword. It
+fails at once on any other error.
+GitHub-hosted runners share an
+egress IP, so the ubuntu base pull can exhaust the anonymous hourly budget in any
+job, not just the warm one.
+
+`make image` is idempotent: the tag itself carries the `Dockerfile` plus
+UID/GID hash, so a present tag means an up to date image and a missing
+tag means a build. The same hash rides as the `org.epic-cc.source-hash`
+label for inspectors comparing a checkout against its image. Since every
+make target (`exec`, `test`, `check-warnings`, `lint`, ...) depends on
+`image`, the guard is what stops the repeated `--load` re-export of an
+unchanged image that otherwise adds ~45s of "sending tarball" to every
+invocation. Old tags are never pruned automatically; drop them by hand
+(`docker images 'epic-cc-dev:local-*'`) when their Dockerfile is gone.
+
+## Cargo target cache is per worktree
+
+`CARGO_TARGET_DIR` points at `~/.cache/epic-cc/target-<worktree path with /
+replaced by ->`, so each worktree builds into its own cache. This is
+load-bearing: every docker invocation mounts its worktree at the identical
+in-container path (`/workspace`), and cargo fingerprints compilation units
+partly by absolute path, so a shared target dir lets cargo silently replay a
+different worktree's artifacts. `make check-warnings` and the pre-commit
+warnings gate build into this same dir: they run the identical command,
+flags and profile as every other build, so there is no separate cache to
+poison, and cargo replays cached warnings on a fresh build, so the gate
+still fires when the units are already compiled (#889). Under the default
+mount both serialize through the same `.build.lock` (an explicit
+`TARGET_CACHE_MOUNT` override names a base that the Makefile suffixes with
+the worktree key, so two worktrees sharing one base still land in distinct
+dirs with distinct locks; keep the hook on the default when overriding).
+Point an override base at `~/.cache/epic-cc/target` (it collapses onto the
+managed per-worktree names) or outside the cache dir: a custom `target-*`
+base under the cache dir falls outside diskd's recognized names and can be
+reaped while its worktree is live.
+A commit during `make test` queues instead of racing it. `make shell` holds
+the lock for its whole session, and the hook says so instead of waiting silently.
+
+Caches are never pruned automatically, and removing a worktree does not
+remove its cache (the caches live outside the repo). To reclaim the space of
+a removed worktree, delete the matching dirs under `~/.cache/epic-cc/`, whose
+names carry the worktree path with slashes replaced by dashes. The legacy
+`target-warncheck-*` dirs left over from before #889 are dead and safe to
+delete outright. Correctness
+first, disk second: a cold per-worktree build is the price of never replaying
+a sibling branch's bytes.
+
+## XC8 is not a build dependency
+
+XC8 is a **test oracle only** ([`05-verification.md`](05-verification.md)). It is
+proprietary and licence-gated, so it is kept out of the epic-cc dev image: that image
+merely *declares* `PIC8_XC8_ROOT=/opt/microchip/xc8/v4.00` without installing anything
+there. Its oracle image lives in the private epic-benchmarks repository
+(epic-cc#682), never on the host ([`06-environment.md`](06-environment.md)).
+
+**No test in this repo invokes XC8 yet.** The differential runner is deferred (`docs/internals/design/13`,
+phase 6), so nothing currently reads `$PIC8_XC8_ROOT` and there is no skip-when-absent path
+to exercise. An early revision of this doc described one; it was aspirational.
+
+## Device TOML authoring (DFP -> TOML)
+
+Per-device memory maps and config words live in `crates/device/devices/*.toml`
+and are generated from Microchip DFPs, not hand-transcribed at device #3+:
+
+```bash
+python3 scripts/gen-device.py p16f887 --out crates/device/devices/p16f887.toml
+python3 scripts/gen-device.py p16f887 --check   # CI gate: fails if TOML drifts
+```
+
+Source posture per `AGENTS.md` GPL boundary:
+
+* **Primary:** the DFP's `xc8/pic/dat/{ini,cfgdata}` and `edc/*.PIC` XML
+  (inside the `.atpack` zip). The pack itself is downloaded from
+  `https://packs.download.microchip.com/` (`Microchip.PIC16Fxxx_DFP` for
+  mid-range) and is never committed. The `.atpack`/`.atdf`/`.PIC` stays in
+  `vendor/microchip/device-data/` (gitignored) or under `$PIC8_XC8_ROOT`; only
+  the generated TOML is committed.
+* **Oracle:** `gputils` headers (`share/gputils/header/p16f887.inc`) are the
+  byte-for-byte oracle; XC8 headers are black-box oracle only.
+
+The generator (`scripts/gen-device.py`, stdlib only) normalises field/value
+names via a small alias table (`FOSC` -> `osc`, `WDTE` -> `wdt`, `INTRC` ->
+`intosc`, etc.) documented in its header, and emits deterministically
+formatted TOML (fields sorted by `byte_offset`/`shift`, values by `bits`).
+The provenance `pack` name is derived from the source file's nearest
+`*_DFP` ancestor directory; a file extracted outside its pack directory
+needs `--pack <name>` passed explicitly, otherwise the generator refuses to
+write the stanza rather than fabricate `pack = "unknown"` (ADR-021).
+See `docs/internals/adr/ADR-020-dfp-toml-generator.md` and `scripts/gen-device.py --help`.
+
+`crates/device/provenance.rs` reaches the crate only via `include!`, never a
+`mod` declaration, so `cargo fmt` (and `make fmt`) never visits it. The
+pre-commit hook still catches drift, since it runs `rustfmt --check` on staged
+files directly rather than through `cargo fmt`. Run `rustfmt` on that file by
+hand after editing it.
+
+## Release bundles
+
+Tag-triggered [`release.yml`](../../../.github/workflows/release.yml) builds the
+Linux bundle in the `release` stage and slices the official LLVM MSVC bundle
+for Windows, smoke-tests each shipped binary, and attaches both zips to the
+GitHub release. Layout and the driver's discovery contract are in
+[`30-distribution-design.md`](30-distribution-design.md).

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# One-command device onboarding (docs/38 D-1): collapse docs/32 §2-§6 into
+# One-command device onboarding (docs/internals/design/38 D-1): collapse docs/internals/design/32 §2-§6 into
 # a single wrapper. Generates the TOML, cross-checks it against gputils,
 # runs the per-device sanity, compiles a synthesized EPIC_CONFIG fixture,
 # and reports "ready to commit" with a field-diff vs the closest sibling,
 # or a failure list naming exactly which step failed. Run inside the dev
-# container (make exec / make shell); DFP sourcing stays manual (docs/38
+# container (make exec / make shell); DFP sourcing stays manual (docs/internals/design/38
 # D-1). Usage: bash scripts/add-device.sh <part> --atdf <path> [--pack <name>]
 set -euo pipefail
 
@@ -66,7 +66,7 @@ if ! python3 scripts/gen-device.py "$PART" "${GEN_ARGS[@]}" --out "$TOML" 2>"$TM
   step_fail "1 (gen-device.py)" "$(cat "$TMP/gen.err")"
 fi
 
-# --- step 2: gputils RAM correction (gputils wins, docs/32 §3) ---
+# --- step 2: gputils RAM correction (gputils wins, docs/internals/design/32 §3) ---
 LKR="/usr/local/share/gputils/lkr/${STEM#p}_g.lkr"
 if [ -f "$LKR" ]; then
   if python3 scripts/add_device.py correct-ram "$TOML" "$LKR"; then

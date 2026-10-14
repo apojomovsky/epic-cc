@@ -1,6 +1,6 @@
 //! A cheap, clang-free scan for `EPIC_CONFIG("...")`'s argument and for
 //! `#pragma config` settings, run before any clang invocation so
-//! EPIC_FOSC_HZ can be added to every `-D` list from the start (docs/31
+//! EPIC_FOSC_HZ can be added to every `-D` list from the start (docs/internals/design/31
 //! §10). Comment-, string- and char-literal-aware so a fuse string, a
 //! `'"'` initializer, or a stray comment cannot make it misfire.
 //! Preprocessor-blind by design: `#if` arms never taken still count,
@@ -59,14 +59,14 @@ pub fn find_epic_configs(sources: &[(String, String)]) -> Vec<FoundConfig> {
 /// plus `"..."` and `'...'` literals along the way. Returns the quoted
 /// argument, or `None` if no invocation was found anywhere.
 /// Panics if more than one invocation is found across all files: this
-/// supports exactly one, unconditional, per docs/31 §10.
+/// supports exactly one, unconditional, per docs/internals/design/31 §10.
 pub fn find_epic_config(sources: &[(String, String)]) -> Option<String> {
     single_epic(find_epic_configs(sources)).map(|f| f.spec)
 }
 
 /// The single `EPIC_CONFIG` hit, if any. Panics naming both sites when more
 /// than one is found across all files: exactly one unconditional
-/// invocation is supported, per docs/31 §10. `find_epic_config` delegates
+/// invocation is supported, per docs/internals/design/31 §10. `find_epic_config` delegates
 /// to this; the driver uses it directly to keep the site for mixing errors.
 pub fn single_epic(found: Vec<FoundConfig>) -> Option<FoundConfig> {
     if found.len() > 1 {

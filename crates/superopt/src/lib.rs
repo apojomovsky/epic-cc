@@ -9,7 +9,7 @@
 //! reproduces the expected output on every case in a fixed case set is
 //! "verified" here; this is exhaustive-input checking over a curated
 //! set of inputs, not a proof the way an SMT-based superoptimizer would
-//! give one. See `docs/41-superopt-spike-findings.md` for the fidelity
+//! give one. See `docs/internals/design/41-superopt-spike-findings.md` for the fidelity
 //! discussion (what makes the case set trustworthy per target).
 
 use pic14_sim::Pic18;
@@ -26,7 +26,7 @@ use pic14_sim::Pic18;
 /// `run_case` rejects any RAM byte outside `allowed_changes` that changed
 /// from its post-poke value, `STATUS_ADDR` and `W` excepted: both are
 /// treated as scratch, never part of the correctness contract these
-/// targets search for. See `docs/41-superopt-spike-findings.md` for the
+/// targets search for. See `docs/internals/design/41-superopt-spike-findings.md` for the
 /// design history (two review rounds found real soundness gaps here) and
 /// the caveat this scratch exception implies for a wider alphabet.
 pub struct Case {

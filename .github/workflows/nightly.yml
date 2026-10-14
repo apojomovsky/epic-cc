@@ -4,7 +4,7 @@ name: nightly
 # PR CI runs this only for TOMLs touched in the diff; nightly proves no TOML
 # drifted while no PR touched it. No fuzz, no per-device full fixtures, a
 # fuzz bug is core-wide and the canonical already covers it (see ADR-019
-# and docs/superpowers/specs/2026-08-22-pic-variants-design.md §8).
+# and docs/internals/specs/2026-08-22-pic-variants-design.md §8).
 
 on:
   schedule:

@@ -1,10 +1,10 @@
 //! `isel-pic18`: instruction selection for the PIC18 integer spine,
 //! extended by the pointer lowering (pointers, arrays, structs) and
-//! the flash const (`const` in flash via `TBLRD`). See docs/29 §4
+//! the flash const (`const` in flash via `TBLRD`). See docs/internals/design/29 §4
 //! for phasing, ADR-009, and ADR-010. `const` globals read via
 //! `TBLRD`: the 511-byte `RETLW` ceiling of PIC14 is gone, and
 //! stores through a `const` base panic: ROM is not writable.
-//! A separate crate from `isel` per docs/29 §2: the instruction sets
+//! A separate crate from `isel` per docs/internals/design/29 §2: the instruction sets
 //! differ enough that sharing leaks an abstraction and risks PIC14.
 
 use std::collections::{HashMap, HashSet};
@@ -10411,7 +10411,7 @@ impl<'m> Gen<'m> {
                     }
                     let active = n16 - m;
                     // Nibble-boundary shifts have shorter, sim-verified
-                    // forms than the per-bit unroll (crates/superopt, docs/41):
+                    // forms than the per-bit unroll (crates/superopt, docs/internals/design/41):
                     // one lane shifts by 4-7 as SWAPF+mask plus one seeded
                     // rotate per extra bit (epic-cc#573), an in-place 16-bit
                     // pair has a canned construction per amount 4-7 (left) or

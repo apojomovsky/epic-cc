@@ -1,5 +1,5 @@
 """Coverage for scripts/add_device.py, the data transforms behind
-scripts/add-device.sh (docs/38 D-1). No vendor file, no network, no cargo:
+scripts/add-device.sh (docs/internals/design/38 D-1). No vendor file, no network, no cargo:
 each helper is a pure function over a hand-authored TOML or .lkr.
 
 Run by scripts/ci-test.sh alongside the cargo suites.
@@ -83,7 +83,7 @@ values = [{ name = "lp", bits = 0 }, { name = "xt", bits = 1 }, { name = "hs", b
 """
 
 # A PIC18 .lkr with the DFP-understated shape: gpr0-gpr3 only, while the
-# real part has gpr0-gpr7 (the p18f2550 defect, docs/32 §3).
+# real part has gpr0-gpr7 (the p18f2550 defect, docs/internals/design/32 §3).
 PIC18_LKR = """\
 CODEPAGE   NAME=page       START=0x0               END=0x7FFF
 ACCESSBANK NAME=accessram  START=0x0               END=0x5F
@@ -126,7 +126,7 @@ SHAREBANK  NAME=gprnobank  START=0xA0              END=0xDF           PROTECTED
 # PIC10F320/322's shape: a true single bank, no aliasing at all, so
 # gputils calls the whole thing a plain DATABANK, never a SHAREBANK
 # (there is no second bank to protect against). gen-device.py's D-1 carve
-# still splits it into ram_banks + common_ram (docs/39).
+# still splits it into ram_banks + common_ram (docs/internals/design/39).
 PIC14_LKR_SINGLE_BANK = """\
 DATABANK   NAME=sfr0       START=0x0               END=0x3F           PROTECTED
 DATABANK   NAME=gpr0       START=0x40              END=0x7F
@@ -168,7 +168,7 @@ class SynthesizeConfigTest(unittest.TestCase):
             self.assertIn(f"{name}=", spec)
 
     def test_locked_without_default_does_not_false_fail(self):
-        # A locked field with no default must still synthesize (docs/38
+        # A locked field with no default must still synthesize (docs/internals/design/38
         # D-1 step 4: handle locked explicitly, not assume a default).
         toml = PIC18_TOML.replace('default = "off"\nlocked = "off"', 'locked = "off"')
         with tempfile.TemporaryDirectory() as d:
@@ -231,7 +231,7 @@ class CorrectRamTest(unittest.TestCase):
 
     def test_pic14_widens_understated_ram(self):
         # The DFP understates a PIC14 part's banked GPR; gputils wins and
-        # the TOML's ram_banks must widen to the lkr's banks (docs/32 §3).
+        # the TOML's ram_banks must widen to the lkr's banks (docs/internals/design/32 §3).
         with tempfile.TemporaryDirectory() as d:
             toml = write(
                 pathlib.Path(d) / "p14syn01.toml",
@@ -273,7 +273,7 @@ class CorrectRamTest(unittest.TestCase):
         # the union of an already-carved ram_banks (0x40-0x6F) and
         # common_ram (0x70-0x7F). Widening to the full DATABANK span would
         # overlap common_ram; confirmed this used to happen before the
-        # common_ram-aware clip (docs/39 D-1, the p10f320 add-device.sh
+        # common_ram-aware clip (docs/internals/design/39 D-1, the p10f320 add-device.sh
         # failure that found this).
         with tempfile.TemporaryDirectory() as d:
             toml = write(pathlib.Path(d) / "p14syn01.toml", PIC14_SINGLE_BANK_TOML)
@@ -414,7 +414,7 @@ class SiblingTest(unittest.TestCase):
         # p16f84a's real sibling is p16f84 (a shared name prefix, the same
         # silicon family), not p10f320: an unrelated same-core device that
         # merely happens to have an equal-length stem. Confirmed on the
-        # real registry (docs/32 §2 diff produced only noise against
+        # real registry (docs/internals/design/32 §2 diff produced only noise against
         # p10f320 and an empty, correct diff against p16f84).
         with tempfile.TemporaryDirectory() as d:
             d = pathlib.Path(d)

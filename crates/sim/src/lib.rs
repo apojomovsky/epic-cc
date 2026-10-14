@@ -887,7 +887,7 @@ pub struct Pic14e {
 impl Pic14e {
     /// A simulator on `device`'s memory map. The bank map, the linear
     /// region and the flash window are per-core constants on this core
-    /// (docs/33 §D-2), so only the `Core::Pic14e` contract is checked, not
+    /// (docs/internals/design/33 §D-2), so only the `Core::Pic14e` contract is checked, not
     /// per-device fields.
     pub fn with_device(device: &Device, prog: Vec<u16>) -> Self {
         assert_eq!(
@@ -1534,7 +1534,7 @@ impl Pic14e {
 /// The baseline register file (DS41236E Figure 4-4): the SFR block
 /// 0x00-0x06 and the shared GPR 0x07-0x0F are bank-independent, bank 0 GPR
 /// is 0x10-0x1F and bank 1 GPR 0x30-0x3F. `FSR<5>` selects the bank for
-/// *both* direct and indirect addressing (D-2, docs/37): a direct operand
+/// *both* direct and indirect addressing (D-2, docs/internals/design/37): a direct operand
 /// `f` resolves to `(FSR<5> << 5) | f`, and `INDF` reads/writes
 /// `RAM[FSR & 0x3F]` (the full flat address). The 2-level hardware
 /// call/return stack (D-4) is a shift register: CALL pushes PC+1 (level 1

@@ -63,7 +63,7 @@ make image && make shell    # first build is slow: compiles clang from source
 cargo test --workspace
 ```
 
-See [`docs/09-build-environment.md`](docs/09-build-environment.md) for the
+See [`docs/internals/design/09-build-environment.md`](docs/internals/design/09-build-environment.md) for the
 pinned versions and build-cache notes.
 
 Prefer PlatformIO? The
@@ -129,7 +129,7 @@ packs) and the registry, already over a hundred profiles, grows
 continuously. See the [device
 directory](crates/device/devices/) for the current list. Adding a same-core
 part is a file, not a feature; see
-[ADR-019](docs/adr/ADR-019-pic-variants-device-registry.md).
+[ADR-019](docs/internals/adr/ADR-019-pic-variants-device-registry.md).
 
 <a id="under-the-hood"></a>
 <details>
@@ -151,7 +151,7 @@ breaks nearly every assumption a conventional backend relies on:
 | Harvard architecture | `const` lives in program memory, reachable only through `RETLW` jump tables. |
 | 368 B RAM / 8K words flash | Code size and RAM pressure are correctness concerns, not just quality ones. |
 
-Full detail with datasheet cross-references: [`docs/01-target-pic14.md`](docs/01-target-pic14.md).
+Full detail with datasheet cross-references: [`docs/internals/design/01-target-pic14.md`](docs/internals/design/01-target-pic14.md).
 
 ### Architecture: one pipeline, one backend per core
 
@@ -180,7 +180,7 @@ straight to `asm`.
 Optimization profiles pick the tradeoff: `-Os` (the default) is the
 size-first pipeline above, `-O2` trades flash for speed (no factoring,
 single-use helpers folded even into `main`), `-O0` keeps the IR closest
-to source for debugging, `-O1` sits between. ([ADR-045](docs/adr/ADR-045-optimization-profiles.md))
+to source for debugging, `-O1` sits between. ([ADR-045](docs/internals/adr/ADR-045-optimization-profiles.md))
 
 On PIC14, address-taken const bytes (string literals and friends) pool
 into one flash table by default instead of staging a RAM copy per const;
@@ -191,10 +191,10 @@ Three decisions shape everything:
 - **clang out-of-process, not an LLVM backend.** We parse clang's `.ll` text
   output and go our own way: no libLLVM, no SelectionDAG, no TableGen. A prior
   attempt at this exact target with LLVM upstream (`llvm-pic`) was archived
-  after 18 months without working `CALL`/`GOTO`. ([ADR-001](docs/03-decisions.md))
+  after 18 months without working `CALL`/`GOTO`. ([ADR-001](docs/internals/design/03-decisions.md))
 - **Whole-program compilation, down to HEX.** Locals can't live on a stack, so
   frames are statically overlaid using the *whole* call graph, which requires
-  whole-program visibility by construction. ([ADR-002](docs/03-decisions.md))
+  whole-program visibility by construction. ([ADR-002](docs/internals/design/03-decisions.md))
 - **`-target msp430` as a datalayout proxy**, for clang's ABI-independent type
   decisions (8-bit `char`, 16-bit `int`/pointers) without generating MSP430 code.
 
@@ -245,16 +245,16 @@ suite.
 
 Full design conversation, ADRs, and per-milestone plans live in
 [`docs/`](docs/); start with
-[`docs/08-status-and-next-steps.md`](docs/08-status-and-next-steps.md).
+[`docs/internals/design/08-status-and-next-steps.md`](docs/internals/design/08-status-and-next-steps.md).
 
 </details>
 
 ## Documentation
 
-- [`docs/00-charter.md`](docs/00-charter.md): goal, scope, non-goals
-- [`docs/03-decisions.md`](docs/03-decisions.md): ADRs, with rejected alternatives
-- [`docs/12-backend-design.md`](docs/12-backend-design.md): the approved backend spec
-- [`docs/34-debugger-design.md`](docs/34-debugger-design.md): the GDB/simulator debugger design
+- [`docs/internals/design/00-charter.md`](docs/internals/design/00-charter.md): goal, scope, non-goals
+- [`docs/internals/design/03-decisions.md`](docs/internals/design/03-decisions.md): ADRs, with rejected alternatives
+- [`docs/internals/design/12-backend-design.md`](docs/internals/design/12-backend-design.md): the approved backend spec
+- [`docs/internals/design/34-debugger-design.md`](docs/internals/design/34-debugger-design.md): the GDB/simulator debugger design
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`AGENTS.md`](AGENTS.md): conventions for contributors and agents
 
 ## Non-goals

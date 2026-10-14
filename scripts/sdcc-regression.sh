@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# SDCC regression-suite pass rate (docs/35 section 4, Tier 3): runs SDCC's
+# SDCC regression-suite pass rate (docs/internals/design/35 section 4, Tier 3): runs SDCC's
 # own vendored regression suite for the pic14 and pic16 ports under gpsim
 # and reports the pass rate as context next to the parity table. The suite
 # is GPL and lives in the image only (PIC8_SDCC_REGRESSION); nothing here
 # is committed or shipped. Informational, never a gate: SDCC's pic ports
-# have acknowledged bugs (docs/35 section 1). Run inside the image from the
+# have acknowledged bugs (docs/internals/design/35 section 1). Run inside the image from the
 # mounted /workspace: bash scripts/sdcc-regression.sh
 
 set -euo pipefail
@@ -29,7 +29,7 @@ for port in pic14 pic16; do
   # The port excludes are the suite's own (pic14/pic16 are excluded from
   # the suite's default ALL_PORTS, so we run them explicitly). A non-zero
   # make under the suite's `-` error semantics means individual cases
-  # failed, which is expected for SDCC's pic ports (docs/35 section 1);
+  # failed, which is expected for SDCC's pic ports (docs/internals/design/35 section 1);
   # the report below is the point, not the make status.
   make "test-$port" SDCC_BIN_PATH=/usr/local/bin || true
 done
@@ -47,7 +47,7 @@ for port in pic14 pic16; do
 done
 
 # Write a pass-rate line next to the parity table, stamped with the SDCC
-# version (provenance, docs/35 section 7). GITHUB_STEP_SUMMARY is a
+# version (provenance, docs/internals/design/35 section 7). GITHUB_STEP_SUMMARY is a
 # runner-host path not mounted into the container, so we write to a file
 # in the bind-mounted /workspace and let the host step append it.
 if [ -n "${SUMMARY_FILE:-}" ]; then

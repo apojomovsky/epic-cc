@@ -3,7 +3,7 @@
 //! `active` lanes as `r` steps of `BCF STATUS,C` + one `RRCF` per lane,
 //! 3 words/step, i.e. `3*r` words for a single lane.
 //!
-//! The left-shift work (docs/41) landed a single-lane 4-bit form as
+//! The left-shift work (docs/internals/design/41) landed a single-lane 4-bit form as
 //! `SWAPF lane,W ; ANDLW 0xF0 ; MOVWF lane`, 3 words, replacing the 12-word
 //! unroll at r == 4. The mirror claim for right shifts is
 //! `SWAPF lane,W ; ANDLW 0x0F ; MOVWF lane`: a right shift by 4 moves the
@@ -12,7 +12,7 @@
 //! produces.
 //!
 //! The ticket's own history is the reason this is verified rather than
-//! asserted: docs/41 records an unsound `CLRF`-first candidate caught only
+//! asserted: docs/internals/design/41 records an unsound `CLRF`-first candidate caught only
 //! by review (epic-cc#501). So the construction is checked before any
 //! `isel-pic18` change, over the full 8-bit input domain.
 

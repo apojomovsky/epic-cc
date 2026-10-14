@@ -14,8 +14,8 @@ statically allocated and overlaid across the whole-program call graph,
 which forces whole-program compilation by construction. Every stage is
 a separate crate with a **diffable text boundary** (`.ll` in, `.asm`/HEX
 out), so a miscompile bisects to a stage before anyone reads code.
-Read `docs/30-distribution-design.md` (the docker toolchain) and
-`docs/01-target-pic14.md` (why the target is hard) before touching
+Read `docs/internals/design/30-distribution-design.md` (the docker toolchain) and
+`docs/internals/design/01-target-pic14.md` (why the target is hard) before touching
 code.
 
 The front end is a **pinned clang 20.1.8**: its version is part of our
@@ -170,8 +170,8 @@ Run `make pre-pr-check` before opening a PR. It is a thin wrapper around
 2. **You are in a `.worktrees/` worktree**, not on `master`.
 3. **No plan files in the PR's final diff.** Plans live through
    development; the final commit distills load-bearing decisions into
-   an ADR (`docs/adr/ADR-00N-<topic>.md` + an index line in
-   `docs/03`) and `git rm`s the plan. Squash merging then keeps master
+   an ADR (`docs/internals/adr/ADR-00N-<topic>.md` + an index line in
+   `docs/internals/design/03`) and `git rm`s the plan. Squash merging then keeps master
    plan-free. The plan stays visible in the PR's commit history.
 4. Commit hygiene: conventional single-line subjects, no trailers,
    no em-dashes, no whitespace errors.
@@ -259,7 +259,7 @@ mechanical rules fails the ritual and blocks the push.
   them as external processes in tests is fine; linking them into the
   compiler is not.
 - **Never commit the reference PDFs.** They are copyrighted and live
-  outside the repo (`docs/06-environment.md`).
+  outside the repo (`docs/internals/design/06-environment.md`).
 - **Don't copy the Microchip datasheets into docs either**: link them.
 - **Panics are the error surface today.** Unsupported input aborts with
   a precise message; that is deliberate (correct over silent
@@ -329,10 +329,10 @@ Rust's documentation comments are `///` (item docs, rendered by
 
 ### Docs lifecycle
 
-1. `docs/NN-*.md` = the numbered design/decision series; `docs/03` is
+1. `docs/internals/design/NN-*.md` = the numbered design/decision series; `docs/internals/design/03` is
    the ADR log (ADR-001..008) and the index for newer ADRs. Living
    documents.
-2. **Implementation plans** (`docs/superpowers/plans/`) are ephemeral:
+2. **Implementation plans** (`docs/internals/plans/`) are ephemeral:
    they live through development and are deleted in the final commit
    before merging (the takeoff ritual enforces this). The PR's commit
    history keeps them for archaeology; master never carries them.
@@ -340,12 +340,12 @@ Rust's documentation comments are `///` (item docs, rendered by
 3. **Decisions distill into ADRs when worth it** (pragmatism): a bug
    fix usually does not earn an ADR, a feature or an architectural
    change does. Distillation happens in the same final commit that
-   deletes the plan. New ADRs go to `docs/adr/ADR-00N-<topic>.md`
+   deletes the plan. New ADRs go to `docs/internals/adr/ADR-00N-<topic>.md`
    (Status line, decision, rationale, rejected alternatives) with a
-   one-line index entry added to `docs/03-decisions.md`.
+   one-line index entry added to `docs/internals/design/03-decisions.md`.
 4. No bitacores: findings narratives and session logs describing
    completed work are deleted. Live gotchas live in
-   `docs/09-build-environment.md` (toolchain) or the ADRs (decisions).
+   `docs/internals/design/09-build-environment.md` (toolchain) or the ADRs (decisions).
 5. **Write for a reader who wasn't there.** Clear, easy to follow,
    sized to the point being made: a doc that overwhelms with detail is
    as broken as one that omits the load-bearing fact.
@@ -396,7 +396,7 @@ cache is an optimization, never a gate.
 
 `make image`/`make release-bundle` build through a dedicated buildx
 builder (`epic-cc-builder`), not the default docker driver
-(`docs/09-build-environment.md` Caching). The clang-builder layer cache
+(`docs/internals/design/09-build-environment.md` Caching). The clang-builder layer cache
 and the LLVM ccache mount live entirely inside that builder's own
 container/volume, so `docker system prune` / `docker builder prune`
 (with or without `-a`) only ever touch the *default* builder and cannot

@@ -26,7 +26,7 @@ set -uo pipefail
 export BASELINE_ARTIFACT_DIR="$PWD/scratch/baseline-artifacts"
 
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "::error::cargo not on PATH; run inside the dev container (see docs/09-build-environment.md)" >&2
+  echo "::error::cargo not on PATH; run inside the dev container (see docs/internals/design/09-build-environment.md)" >&2
   exit 2
 fi
 

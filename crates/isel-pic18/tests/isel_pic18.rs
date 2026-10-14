@@ -328,7 +328,7 @@ fn const_shl_i16_by_7_becomes_a_right_shift_and_byte_move() {
 #[test]
 fn const_shl_i16_by_2_keeps_the_unrolled_form() {
     // Amounts 2 and 3 have no verified shortcut: superopt found nothing
-    // within a tractable search bound (docs/41). Pin that no special case
+    // within a tractable search bound (docs/internals/design/41). Pin that no special case
     // silently fires for them.
     let m = parse(
         "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
@@ -352,7 +352,7 @@ fn const_shl_i16_by_2_keeps_the_unrolled_form() {
 #[test]
 fn const_shl_i32_by_4_keeps_the_unrolled_form() {
     // The 16-bit constructions do not extend to 4 lanes without their own
-    // superopt verification (docs/41 defers this); the unroll must stay.
+    // superopt verification (docs/internals/design/41 defers this); the unroll must stay.
     let m = parse(
         "global a i32\nglobal out i32\nfn main(void) ()\n  block entry:\n\
          %1 = load i32 @a\n    %2 = shl i32 %1, 4\n    store i32 %2 @out\n    ret void\n",

@@ -34,7 +34,7 @@ make test        # the full suite, exactly what CI runs
 The first build is slow (it compiles clang from source), later runs reuse a
 cache. Your files stay owned by you, and nothing lands system-wide, so there
 is never a reason to install rustup, clang, or gpasm on the host. `make help`
-lists the rest, and `docs/09-build-environment.md` documents the pinned
+lists the rest, and `docs/internals/design/09-build-environment.md` documents the pinned
 versions. To run a single command without opening a shell:
 
 ```bash
@@ -92,14 +92,14 @@ The full rules live in `AGENTS.md`. The ones every human contributor meets:
 
 ## Where the docs live
 
-- `docs/08-status-and-next-steps.md`: the current-state map. Start here.
-- `docs/00-charter.md`: what the project is and is not.
-- `docs/03-decisions.md` plus `docs/adr/`: decisions with rejected
+- `docs/internals/design/08-status-and-next-steps.md`: the current-state map. Start here.
+- `docs/internals/design/00-charter.md`: what the project is and is not.
+- `docs/internals/design/03-decisions.md` plus `docs/internals/adr/`: decisions with rejected
   alternatives. Architectural changes add an ADR.
-- `docs/04-pipeline-design.md`, `docs/12-backend-design.md`: how the
+- `docs/internals/design/04-pipeline-design.md`, `docs/internals/design/12-backend-design.md`: how the
   compiler fits together.
-- `docs/05-verification.md`: the simulator, oracle, and fuzzing story.
-- `docs/32-adding-a-device.md`: the runbook for supporting a new part.
+- `docs/internals/design/05-verification.md`: the simulator, oracle, and fuzzing story.
+- `docs/internals/design/32-adding-a-device.md`: the runbook for supporting a new part.
 
 ## Asking questions
 

@@ -1,4 +1,4 @@
-// D-2 end-to-end acceptance (docs/37 section 3 P2): globals in both
+// D-2 end-to-end acceptance (docs/internals/design/37 section 3 P2): globals in both
 // banks plus a genuinely runtime pointer (FSR/INDF) deref, exercising the
 // `BCF`/`BSF FSR,5` reassertion sequence through real codegen. The 509's
 // bank 0 GPR is 0x10-0x1F (16 bytes) and bank 1 is 0x30-0x3F (16 bytes),

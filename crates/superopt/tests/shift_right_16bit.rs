@@ -9,7 +9,7 @@
 //! against a 12-word baseline) and the search bound cannot reach it, so
 //! each candidate is constructed and `verify()`d over the full 65536
 //! (`lo, hi`) domain plus a `W` sample. Nothing here is wired into
-//! `isel-pic18` from a hand derivation; docs/41's unsound `CLRF`-first
+//! `isel-pic18` from a hand derivation; docs/internals/design/41's unsound `CLRF`-first
 //! candidate (epic-cc#501) is the reason.
 
 use pic14_sim::Pic18;

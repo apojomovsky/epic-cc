@@ -1,4 +1,4 @@
-//! Lane D determinism check (docs/36): compiling the same input twice must
+//! Lane D determinism check (docs/internals/design/36): compiling the same input twice must
 //! produce byte-identical output. This catches a real bug class (hash-map
 //! or hash-set iteration order, an unstable sort) that a single-run
 //! correctness check cannot see, and matters because the differential-fuzz

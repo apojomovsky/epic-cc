@@ -14,7 +14,7 @@
 //! clang stays pinned at `-O1` under every profile.
 //!
 //! Multiple `.c` inputs are each run through clang separately, then merged
-//! with `llvm-link` before `irparse` ever sees them (docs/31 §7): the
+//! with `llvm-link` before `irparse` ever sees them (docs/internals/design/31 §7): the
 //! merge, not this driver, resolves cross-unit symbols and renames
 //! collisions, so `wholeprog` onward sees exactly the single-module shape it
 //! always has.
@@ -44,7 +44,7 @@ fn resolve_or_exit(name: &str) -> &'static device::Device {
 }
 
 /// The effective header dir: the `include/` shipped beside the executable
-/// when present, else a materialized per-run fallback (docs/46 D-6). The
+/// when present, else a materialized per-run fallback (docs/internals/design/46 D-6). The
 /// fallback parent is a per-pid temp dir, the same shape the compile path
 /// uses for its stage artifacts.
 fn include_dir_path() -> std::path::PathBuf {
@@ -151,7 +151,7 @@ fn main() {
         None => std::env::temp_dir().join(format!("epic-cc-{}", std::process::id())),
     };
     std::fs::create_dir_all(&tmp).expect("create temp dir");
-    // Shipped `include/` beside the binary when present (docs/46 D-6);
+    // Shipped `include/` beside the binary when present (docs/internals/design/46 D-6);
     // otherwise the same headers materialized under the temp dir.
     let header_dir = match driver::include_dir::bundled(&exe_dir) {
         Some(dir) => dir,
@@ -631,7 +631,7 @@ fn main() {
             // (ADR-027, epic-cc#210) runs before banking so it sees
             // isel's raw instruction order before banking turns bank
             // demand into BANKSEL/MOVLB text. The banking pass is core-aware
-            // (docs/33 §1): it emits the classic RP-bit `BCF/BSF STATUS, 5/6`
+            // (docs/internals/design/33 §1): it emits the classic RP-bit `BCF/BSF STATUS, 5/6`
             // BANKSEL on PIC14 and the single `MOVLB k` on PIC14E, tracking
             // BSR there.
             let (asm, l) = schedule::schedule_with_locs(device, &asm, &locs);
@@ -666,7 +666,7 @@ fn main() {
         }
         // Code factoring shares repeated runs as leaf bodies; its own
         // budget check adds one return level to the IR depth, so it backs
-        // off rather than overflow the stack (docs/44, epic-cc#662).
+        // off rather than overflow the stack (docs/internals/design/44, epic-cc#662).
         // Factoring trades calls for flash, so the speed profiles skip
         // it: `-O0` keeps the listing closest to source for stepping,
         // `-O2` keeps it inline for speed. `--no-outline` forces it off

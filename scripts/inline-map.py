@@ -7,7 +7,7 @@ with exactly one direct caller::
     python3 scripts/inline-map.py merged.ll merged_opt.ll [tu.ll ...] > inline.json
 
 `density-profile.py --inline-map inline.json` rolls those callees back
-into their caller when ranking, so the triage in docs/43 does not have
+into their caller when ranking, so the triage in docs/internals/design/43 does not have
 to be redone by hand for every listing. Functions with zero or several
 callers are skipped with a stderr note: nothing here guesses.
 

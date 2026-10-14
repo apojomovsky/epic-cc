@@ -525,7 +525,7 @@ impl<'m> Gen<'m> {
     /// Substitute `$0`/`%0` placeholders in an inline asm template with the
     /// allocated address of each `*m` operand. Each operand's `ptr` is either
     /// `@global` or `%local`; globals are looked up directly, locals via
-    /// `ssa_key(func, name)`. GEP-derived pointers panic (docs/31 §3).
+    /// `ssa_key(func, name)`. GEP-derived pointers panic (docs/internals/design/31 §3).
     fn substitute_asm(&self, template: &str, operands: &[ir::AsmOperand]) -> String {
         // Detect GEP-derived operand pointers: any `%reg` that resolves to a
         // GEP with non-zero offset or dynamic terms is not a direct local.
@@ -7761,11 +7761,11 @@ fn block_dominators(f: &ir::Func) -> HashMap<String, HashSet<String>> {
 /// preempted main's in-flight retval/scratch (live across the interrupt in
 /// the compare/shift/multiply/call-return paths) into the shadow bytes.
 /// Two address shapes share this one emitter:
-/// - `common_ram`-backed devices (every device but PIC16F74, docs/39
+/// - `common_ram`-backed devices (every device but PIC16F74, docs/internals/design/39
 ///   bucket 1): `w_save` is the fixed ISR-save area's own first byte,
 ///   bank-independent like the rest of common RAM, so this is the exact
 ///   assembly every one of those devices has always generated.
-/// - docs/39 D-2 devices (`common_ram: None`, `isr_w_shadow: Some`):
+/// - docs/internals/design/39 D-2 devices (`common_ram: None`, `isr_w_shadow: Some`):
 ///   `w_save` is the cross-region shadow slot instead, the one byte that
 ///   must be touched before the bank is known; every other address here
 ///   is an ordinary `ram_banks` byte inside `isr_home_window`, and
@@ -11032,7 +11032,7 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
         }
         if i == 0 && f.isr {
             // The scratch/retval addresses are fixed, device-derived
-            // constants (docs/39): bank-independent common RAM on every
+            // constants (docs/internals/design/39): bank-independent common RAM on every
             // device but PIC16F74 (`common_ram: Some`), an ordinary,
             // banked home-region window there instead (`isr_w_shadow:
             // Some`, epic-cc#393 D-2) -- either way the ISR save area sits
@@ -13390,7 +13390,7 @@ const PLACEMENT_SLACK: usize = 2;
 
 /// First-fit placement of one unit (function or chunk): the lowest page
 /// whose tail fits it, else a new page under the device flash bound
-/// (docs/39 D-1, epic-cc#398). Returns `(page, start)`.
+/// (docs/internals/design/39 D-1, epic-cc#398). Returns `(page, start)`.
 fn place_unit(
     device: &Device,
     page_next: &mut Vec<usize>,
@@ -13476,7 +13476,7 @@ pub fn select_with_opts(
     // The icmp scratch byte and the four retval bytes are fixed constants,
     // carved from common RAM (bank-independent, never used by locals) on
     // every device but PIC16F74, or from `isr_home_window` there instead
-    // (docs/39 D-2, epic-cc#393: an ordinary window `banking`'s BANKSEL
+    // (docs/internals/design/39 D-2, epic-cc#393: an ordinary window `banking`'s BANKSEL
     // insertion already reaches correctly). Either way the ISR save area
     // (W or STATUS, PCLATH, FSR, retval x4, scratch) sits right after the
     // retval region, disjoint from it and from scratch.

@@ -147,7 +147,7 @@ class GenDeviceTest(unittest.TestCase):
         # A merged ram_banks or a fabricated common_ram here would mean the
         # generator mistook a full-bank duplicate for extra or shared RAM.
         # Two real, non-aliased regions survive (PIC16F74's own shape) with
-        # no common_ram fabricated -- docs/39 D-2 (epic-cc#393) then carves
+        # no common_ram fabricated -- docs/internals/design/39 D-2 (epic-cc#393) then carves
         # isr_w_shadow/isr_home_window out of them instead, asserted below.
         xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN02" edc:arch="16xxxx">
   <edc:ArchDef edc:name="16xxxx">
@@ -218,7 +218,7 @@ class GenDeviceTest(unittest.TestCase):
         self.assertNotIn("common_ram", text)
 
     def test_misaligned_multi_region_isr_w_shadow_fails_loudly(self):
-        # docs/39 D-2 only knows how to carve isr_w_shadow when every real
+        # docs/internals/design/39 D-2 only knows how to carve isr_w_shadow when every real
         # region shares the same low 7 bits at its own start address
         # (PIC16F74: both regions start at low7 0x20). A region starting at
         # a different low7 (0x90 here, low7 0x10) has no single offset this
@@ -253,11 +253,11 @@ class GenDeviceTest(unittest.TestCase):
         self.assertIn("isr_w_shadow", r.stderr)
 
     def test_single_region_from_a_full_bank_shadow_gets_a_carved_common_ram(self):
-        # docs/39 D-1 / ADR-034: PIC16F84's shape (bank0 real GPR, bank1
+        # docs/internals/design/39 D-1 / ADR-034: PIC16F84's shape (bank0 real GPR, bank1
         # 100% shadow, no primary of its own) -- unlike the PIC16F74-style
         # test above, only ONE physical region exists, so the generator
         # should carve COMMON_RAM_CARVE_SIZE bytes off the top rather than
-        # leave common_ram unset. Addresses match docs/39's real prediction
+        # leave common_ram unset. Addresses match docs/internals/design/39's real prediction
         # (0x0C-0x4F -> common_ram 0x40-0x4F, ram_banks 0x0C-0x3F).
         xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN03" edc:arch="16xxxx">
   <edc:ArchDef edc:name="16xxxx">
@@ -287,7 +287,7 @@ class GenDeviceTest(unittest.TestCase):
         self.assertIn("common_ram = [0x0040, 0x004F]", text)
 
     def test_single_declared_bank_with_no_shadow_at_all_gets_a_carved_common_ram(self):
-        # docs/39 D-1: PIC10F320/322's shape -- no bank1 GPRDataSector
+        # docs/internals/design/39 D-1: PIC10F320/322's shape -- no bank1 GPRDataSector
         # exists at all, not even a shadow. Same carve rule applies: one
         # physical region is trivially bank-independent when there is no
         # other bank to distinguish it from.
@@ -990,7 +990,7 @@ class GenDeviceBaselineArchTest(unittest.TestCase):
 
 
 class GenDeviceSweepTest(unittest.TestCase):
-    """`--sweep` breadth proofing (docs/38 D-2): generate for every part in
+    """`--sweep` breadth proofing (docs/internals/design/38 D-2): generate for every part in
     an unpacked DFP directory, triage failures instead of stopping at the
     first one. The fixture pack mirrors a real .atpack layout: a
     `*_DFP`-suffixed directory holding `edc/*.PIC` files, so the pack name

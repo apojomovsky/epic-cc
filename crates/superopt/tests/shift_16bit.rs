@@ -304,7 +304,7 @@ fn shift_left_7() {
     assert_eq!(constructed.len(), 7);
 }
 
-/// epic-cc#528: the deep run docs/41's table left unanswered. Lengths 4 and
+/// epic-cc#528: the deep run docs/internals/design/41's table left unanswered. Lengths 4 and
 /// 5 over the 28-symbol alphabet, curated case sample, timing recorded.
 /// Length 3 is the previous bound and already covered by the unit tests
 /// above, so this starts at 4.
