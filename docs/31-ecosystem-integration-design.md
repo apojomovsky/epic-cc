@@ -47,10 +47,10 @@ Established by inspection on 2026-08-20, with the locations that prove each clai
 
 | Claim | Evidence |
 |---|---|
-| **The SFR layer is already compiler-neutral.** Every SFR access is a volatile dereference of a literal address, which is the same `inttoptr` shape epic-cc's fixtures already compile. | `pic18fxx5x-hal/include/target/pic18_platform.h`; compare `crates/driver/tests/fixtures/interrupt.c` |
-| **The environment split already anticipates a fourth toolchain.** `src/core|peripherals` are shared; `src/target|sim|mdb` are selected at build time, never by `#ifdef`. | `pic18fxx5x-hal/src/`, `AGENTS.md` |
-| **Two of four XC8-isms are already behind macros.** `EPIC_PLACE` wraps `__at` (36 sites), `EPIC_WEAK` is a no-op. | `pic18fxx5x-hal/include/target/pic18_platform.h:19,16` |
-| **Two are not.** `#pragma config` (117 lines) and `__interrupt(high_priority|low_priority)` (6 sites) are written raw. | `pic18fxx5x-hal/src/target/pic18_isr_vector.c` and family equivalents |
+| **The SFR layer is already compiler-neutral.** Every SFR access is a volatile dereference of a literal address, which is the same `inttoptr` shape epic-cc's fixtures already compile. | `hal/pic18/18fxx5x/include/target/pic18_platform.h`; compare `crates/driver/tests/fixtures/interrupt.c` |
+| **The environment split already anticipates a fourth toolchain.** `src/core|peripherals` are shared; `src/target|sim|mdb` are selected at build time, never by `#ifdef`. | `hal/pic18/18fxx5x/src/`, `AGENTS.md` |
+| **Two of four XC8-isms are already behind macros.** `EPIC_PLACE` wraps `__at` (36 sites), `EPIC_WEAK` is a no-op. | `hal/pic18/18fxx5x/include/target/pic18_platform.h:19,16` |
+| **Two are not.** `#pragma config` (117 lines) and `__interrupt(high_priority|low_priority)` (6 sites) are written raw. | `hal/pic18/18fxx5x/src/target/pic18_isr_vector.c` and family equivalents |
 | **`epic-math` is the dialect problem.** Roughly 400 XC8-dialect `asm()` statements across `src/pic16/` and `src/pic18/`, operating on `__at`-pinned scratch globals. | `epic-math/src/pic16/epic_math_mul.c` (83), `src/pic16/epic_math_div.c` (75), and six more |
 | **`epic-math` already has a portable C path.** `src/host/` implements the same four modules in C for the host-simulation build. | `epic-math/src/host/` |
 | **The hand asm loses to an optimizing compiler.** On the 4550 it is beaten on every operation at `-O2`/`-O3`; on the 877A it is beaten on mul and div at `-O3`. It exists to beat XC8's licence-gated optimizer. | `docs/experiments/math-cycle-benchmark/README.md` |
@@ -101,7 +101,7 @@ epic-cc ships a header, `epic-cc.h`, defining its spellings. epic-hal's platform
 seam maps its `EPIC_*` macros onto them, one line per item:
 
 ```c
-/* pic18fxx5x-hal/include/epiccc/pic18_platform.h  (new, alongside target/ and host/) */
+/* hal/pic18/18fxx5x/include/epiccc/pic18_platform.h  (new, alongside target/ and host/) */
 #define EPIC_PLACE(a)   EPIC_AT(a)
 ```
 

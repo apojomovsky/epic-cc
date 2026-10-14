@@ -3,7 +3,7 @@
  * the HAL's SFR/GPIO/Timer0/Timer2/IRQ/WDT layer (the same sources that
  * live in epic-hal's include/epiccc and src/epiccc), reduced to the slice
  * the PIC18 smoke needs: GPIO on RB0, Timer0, Timer2, the IRQ controller,
- * the watchdog refresh, and the 1 ms epic-tick timebase.
+ * the watchdog refresh, and the 1 ms `lib/tick` timebase.
  *
  * Adapted around three open backend gaps, exactly as the 887 HAL's
  * epic-cc variants are:

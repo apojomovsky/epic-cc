@@ -5,7 +5,7 @@
 //! backend emitted `SUBFWB` for every lane above the first, which computes
 //! `W - f - borrow`: the operands reversed. The simulator decoded both
 //! opcodes with the same formula, so every sim gate agreed with the wrong
-//! asm; MPLAB SIM and real silicon do not. `epic-menu-demo` was the visible
+//! asm; MPLAB SIM and real silicon do not. `demos/menu` was the visible
 //! casualty, its UART baud crawling to 183 and the capture truncating.
 //!
 //! The fixture forwards runtime `fosc_hz`/`baud` through an inner call, the
