@@ -1262,3 +1262,27 @@ fn a_const_initialized_aggregate_copies_by_loop_and_reads_back_its_bytes() {
     );
     assert!(p.halted());
 }
+
+#[test]
+fn escaped_loop_address_lands_on_the_last_element() {
+    // Post-loop read of an escaped counter-indexed address (epic-cc#1271):
+    // two trips over `buf` sum 1+2 while `last` must hold `&buf[1]`. The
+    // pipeline carries clang's exit-phi bound arithmetic through, and the
+    // backend folds any residual fold step into the literal, so both the
+    // accumulation and the escaped address stay exact.
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/escape_last_addr.c"
+    );
+    let (mut p, globals, _asm) = compile_with_asm(fixture);
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["sum"] as usize],
+        3,
+        "loop must sum buf[0]+buf[1]"
+    );
+    let last = globals["last"];
+    let got = (p.ram()[last as usize] as u16) | ((p.ram()[last as usize + 1] as u16) << 8);
+    assert_eq!(got, globals["buf"] + 1, "last must be &buf[1]");
+}
