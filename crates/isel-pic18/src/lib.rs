@@ -2587,6 +2587,46 @@ impl<'m> Gen<'m> {
             _ => None,
         }
     }
+    /// Post-loop residue of a phi-folded counter (epic-cc#1271). The fold
+    /// computes the increment into the phi's own slot, so past the loop
+    /// the home holds the bound (last index plus step), not the last index
+    /// an escaping GEP was derived with. Returns the signed step, 0 when
+    /// `reg` is no fold target. Only the phi-side reg skews: a term naming
+    /// the increment reads the new value, which is what the home holds.
+    fn escape_skew(&self, reg: &str) -> i64 {
+        let mut skew = 0i64;
+        for (inc, phi) in &self.phi_fold {
+            if phi != reg {
+                continue;
+            }
+            let bin = self
+                .m
+                .funcs
+                .iter()
+                .find(|f| f.name == self.cur_func)
+                .and_then(|f| {
+                    f.blocks
+                        .iter()
+                        .flat_map(|b| &b.insts)
+                        .find_map(|i| match i {
+                            Inst::Bin(q) if q.dst == *inc => Some(q.clone()),
+                            _ => None,
+                        })
+                });
+            let Some(q) = bin else { continue };
+            let Some((qreg, k)) = Self::const_bin_reg(&q.op, &q.a, &q.b) else {
+                continue;
+            };
+            if qreg != reg {
+                continue;
+            }
+            skew += match q.op {
+                ir::BinOp::Add => k,
+                _ => -k,
+            };
+        }
+        skew
+    }
 
     /// Sign-against-zero select pre-scan (epic-cc#1149): a value `Select`
     /// whose cond is a single-use `icmp slt/sge Reg, 0` in the previous
@@ -6554,20 +6594,40 @@ impl<'m> Gen<'m> {
                     }
                     if self.global_is_const(name) {
                         // A link-time label cannot carry a constant offset in its
-                        // `LOW()/HIGH()` literal, so only k == 0 with one unscaled
-                        // term has a flash form.
-                        let (true, [(1, reg)]) = (k == 0, terms.as_slice()) else {
+                        // `LOW()/HIGH()` literal, so only one unscaled term with
+                        // no other offset has a flash form. A phi-folded counter
+                        // leaves bound in its home (epic-cc#1271): its step folds
+                        // into that offset, costing an `ADDLW` per nonzero byte.
+                        let (true, [(1, reg)]) = (true, terms.as_slice()) else {
                             panic!(
                                 "isel-pic18: flash-const `{name}` with a scaled, multi-term, or offset runtime index has no RAM address (epic-cc#1101)"
                             );
                         };
+                        let skew = self.escape_skew(reg);
+                        let k = k.wrapping_sub(skew as u16);
+                        assert!(
+                            skew != 0 || k == 0,
+                            "isel-pic18: flash-const `{name}` with a scaled, multi-term, or offset runtime index has no RAM address (epic-cc#1101)"
+                        );
                         let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                         for i in 0..ty.bytes() {
                             let lit = if i == 0 { "LOW" } else { "HIGH" };
                             self.emit(format!("    MOVLW {lit}({name})"));
-                            if i != 0 {
+                            if i == 0 {
+                                let lo = (k & 0xFF) as u8;
+                                if lo != 0 {
+                                    self.emit(format!("    ADDLW 0x{lo:02X}"));
+                                }
+                            } else {
+                                // Carry-FIRST: byte 0's `ADDLW` sets C while
+                                // `MOVLW` leaves it alone, so the low carry is
+                                // consumed before the high byte's own `ADDLW`.
                                 self.emit("    BTFSC 0xFD8,0,A".to_string());
                                 self.emit("    ADDLW 0x01".to_string());
+                                let hi = (k >> 8) as u8;
+                                if hi != 0 {
+                                    self.emit(format!("    ADDLW 0x{hi:02X}"));
+                                }
                             }
                             let (ra_a, ra_f) = self.operand(ra + u16::from(i));
                             let ra_bank = if ra_a == 0 { "A" } else { "B" };
@@ -6586,6 +6646,12 @@ impl<'m> Gen<'m> {
                                 self.emit(format!("    MOVLW 0x{byte:02X}"));
                             }
                             [(1, reg)] => {
+                                // A phi-folded counter leaves its bound in
+                                // the shared home (epic-cc#1271): fold the
+                                // step into the literal, the sequence stays.
+                                let byte = ((addr.wrapping_sub(self.escape_skew(reg) as u16)
+                                    >> (i as u32 * 8))
+                                    & 0xFF) as u8;
                                 let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                                 let ra_i = ra + u16::from(i);
                                 let (ra_a, ra_f) = self.operand(ra_i);
@@ -6608,7 +6674,20 @@ impl<'m> Gen<'m> {
                                 // copy_bytes: FSR0 only holds this address
                                 // right here. (epic-cc#468)
                                 if i == 0 {
-                                    self.emit_fsr0_dynamic(self.global_addr(name), k, &terms, 0);
+                                    // Folded counters leave bound in their
+                                    // homes (epic-cc#1271): each scale times
+                                    // step rejoins the static literal, exact
+                                    // 16-bit math, so the seed stays sound.
+                                    let mut held = 0i64;
+                                    for (s, r) in &terms {
+                                        held += *s as i64 * self.escape_skew(r);
+                                    }
+                                    self.emit_fsr0_dynamic(
+                                        self.global_addr(name),
+                                        k.wrapping_sub(held as u16),
+                                        &terms,
+                                        0,
+                                    );
                                 }
                                 let sfr = if i == 0 { 0xFE9 } else { 0xFEA };
                                 let (sa, sf) = self.operand(sfr);
@@ -6712,6 +6791,13 @@ impl<'m> Gen<'m> {
                             // times. Each ADDWF updates the carry, so the
                             // final carry out of byte 0 is exactly the
                             // carry into byte 1, like the scale-1 shape.
+                            // A phi-folded counter leaves bound, not last
+                            // index, in the home (epic-cc#1271); a runtime
+                            // base cannot absorb the step, so refuse loudly.
+                            assert!(
+                                self.escape_skew(reg) == 0,
+                                "isel-pic18: GEP value over a slot base indexed by phi-folded counter %{reg} reads the post-increment home (epic-cc#1271)"
+                            );
                             let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                             let (ra_a, ra_f) = self.operand(ra);
                             let ra_bank = if ra_a == 0 { "A" } else { "B" };
@@ -11442,6 +11528,13 @@ impl<'m> Gen<'m> {
                             return;
                         }
                         [(1, reg)] => {
+                            // A phi-folded counter leaves bound, not last
+                            // index, in the home (epic-cc#1271); a runtime
+                            // base cannot absorb the step, so refuse loudly.
+                            assert!(
+                                self.escape_skew(reg) == 0,
+                                "isel-pic18: GEP value over a slot base indexed by phi-folded counter %{reg} reads the post-increment home (epic-cc#1271)"
+                            );
                             let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                             let (ra_a, ra_f) = self.operand(ra);
                             let ra_bank = if ra_a == 0 { "A" } else { "B" };

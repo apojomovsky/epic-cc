@@ -12137,3 +12137,58 @@ fn live_call_to_unreachable_placeholder_is_rejected() {
     );
     let _ = select(&PIC18F4550, &m, &addrs(&[]), None);
 }
+
+#[test]
+fn phi_folded_counter_escape_materializes_the_last_index() {
+    // A counter-indexed `gep` read as a value past the loop must land the
+    // last index, but the phi-folded increment leaves the bound (last index
+    // plus step) in the shared home (epic-cc#1271). The exit materialization
+    // folds the step into the literal base: `buf - 1` plus the
+    // twice-incremented home is `buf + 1`, not `buf + 2`. The simulator run
+    // proves the stored address; the counter home keeps the bound residue,
+    // proving the fold fired rather than degrading to a staged increment.
+    let m = parse(
+        "global buf i64\n\
+         global pv i16\n\
+         global sink i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %p = gep @buf +0 +1*%i\n\
+             %v = load i8 %p\n\
+             store i8 %v @sink\n\
+             %r = add i16 %i, 1\n\
+             %c = icmp eq i16 %r, 2\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             store ptr %p @pv\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("buf", 0x120),
+        ("pv", 0x130),
+        ("sink", 0x132),
+        ("main::i", 0x133),
+        ("main::r", 0x135),
+        ("main::c", 0x137),
+        ("main::v", 0x138),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let lp = block_section(&asm, "main_Lloop");
+    assert!(lp.contains("INCF"), "increment must fold in place:\n{lp}");
+    let exit = block_section(&asm, "main_Lexit");
+    assert!(
+        exit.contains("MOVLW 0x1F"),
+        "exit must add buf-1 against the bound home:\n{exit}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    let pv = (p.ram()[0x130] as u16) | ((p.ram()[0x131] as u16) << 8);
+    assert_eq!(pv, 0x121, "escaped address must be buf+1, not buf+2");
+    assert_eq!(p.ram()[0x133], 2, "counter home keeps the bound residue");
+}
