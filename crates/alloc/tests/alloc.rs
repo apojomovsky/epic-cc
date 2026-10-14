@@ -2344,7 +2344,11 @@ fn store_through_local_pointer_keeps_it_live() {
              %d = add i8 3, 4\n\
              store i8 %d %__scr\n\
              %e = add i8 %c, 1\n\
+             %g = add i8 %c, 2\n\
+             %h = add i8 %c, 3\n\
              store i8 %e @sink\n\
+             store i8 %g @sink\n\
+             store i8 %h @sink\n\
              ret void\n",
     );
     let out = allocate(&PIC16F877A, &m, "depth 1\n");
@@ -2352,9 +2356,10 @@ fn store_through_local_pointer_keeps_it_live() {
         out.locals["f::__scr"], out.locals["f::c"],
         "store through __scr clobbers live c"
     );
-    // The alloca is a memory object: its slot is reserved for the whole
-    // function, so e (dead after its store) still cannot reuse it.
-    assert_ne!(out.locals["f::e"], out.locals["f::__scr"]);
+    // The alloca's range ends at its last store through it, so e (defined
+    // after, epic-cc#853) reuses its slot. The tail values make the
+    // sharing a strict RAM win, so the pay gate keeps it.
+    assert_eq!(out.locals["f::e"], out.locals["f::__scr"]);
 }
 
 /// An asm operand reading a local keeps it live: the prefixed operand form
@@ -4361,6 +4366,372 @@ fn packed_holders_stay_out_of_the_address_map() {
     );
 }
 
+/// Two allocas with disjoint spans share one slot: the first is dead after
+/// its last store through it, so the second reuses the bytes (epic-cc#853).
+#[test]
+fn disjoint_allocas_share_one_slot() {
+    let m = parse(
+        "fn f(void) ()\n\
+           block entry:\n\
+             %a = alloca 2\n\
+             %g1 = gep %a +0\n\
+             store i8 1 %g1\n\
+             %b = alloca 2\n\
+             %g2 = gep %b +0\n\
+             store i8 2 %g2\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::a"], out.locals["f::b"]);
+}
+
+/// A returned alloca address outlives the function: the caller may read the
+/// bytes after return, so the alloca keeps its full-function interval and a
+/// value used mid-body cannot share its slot.
+#[test]
+fn returned_alloca_address_keeps_full_interval() {
+    let m = parse(
+        "global tab i8\n\
+         fn f(ptr) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @tab\n\
+             ret ptr %g\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// A stored alloca address can be reloaded and dereferenced later: the
+/// reload resolves to a fresh slot, so the store escapes the alloca and it
+/// keeps its full-function interval.
+#[test]
+fn stored_alloca_address_keeps_full_interval() {
+    let m = parse(
+        "global tab i8\n\
+         global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             store ptr %g @tab\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// A pointer phi over an alloca reseeds as a fresh slot: uses past the
+/// merge resolve elsewhere, so the alloca arm escapes and keeps its
+/// full-function interval, or the store through the phi would clobber a
+/// value sharing the slot.
+#[test]
+fn phi_reseeded_alloca_keeps_full_interval() {
+    let m = parse(
+        "global tab i8\n\
+         global out i8\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             br i1 %c, label %l, label %r\n\
+           block l:\n\
+             br label %m\n\
+           block r:\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi ptr %buf l @tab r\n\
+             store i8 1 %p\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// A callee that stores its pointer param keeps reading the bytes after the
+/// call returns: the alloca must keep its full-function interval, or a
+/// value defined after the call reuses the slot a later load through the
+/// stored pointer reads.
+#[test]
+fn storing_callee_keeps_alloca_full_interval() {
+    let m = parse(
+        "global tab i8\n\
+         global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             call void @keep(%g)\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             ret void\n\
+         fn keep(void) (p=ptr)\n\
+           block entry:\n\
+             store ptr %p @tab\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge f keep\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// A callee that returns its pointer param hands the address back to the
+/// caller, which dereferences it after later values were defined.
+#[test]
+fn returning_callee_keeps_alloca_full_interval() {
+    let m = parse(
+        "global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             %r = call ptr @id(%g)\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             store i8 5 %r\n\
+             ret void\n\
+         fn id(ptr) (p=ptr)\n\
+           block entry:\n\
+             ret ptr %p\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge f id\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// Retention is transitive: a callee that only forwards the pointer to a
+/// retaining callee retains it too, and so does one that stores a pointer
+/// derived from it.
+#[test]
+fn forwarding_and_derived_pointers_propagate_retention() {
+    let m = parse(
+        "global tab i8\n\
+         global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 4\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             call void @fwd(%g)\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             %buf2 = alloca 4\n\
+             %h = gep %buf2 +0\n\
+             store i8 1 %h\n\
+             call void @fwd_derived(%h)\n\
+             %y = add i8 5, 6\n\
+             store i8 %y @out\n\
+             ret void\n\
+         fn fwd(void) (p=ptr)\n\
+           block entry:\n\
+             call void @keep(%p)\n\
+             ret void\n\
+         fn fwd_derived(void) (p=ptr)\n\
+           block entry:\n\
+             %q = gep %p +2\n\
+             call void @keep(%q)\n\
+             ret void\n\
+         fn keep(void) (p=ptr)\n\
+           block entry:\n\
+             store ptr %p @tab\n\
+             ret void\n",
+    );
+    let out = allocate(
+        &PIC16F877A,
+        &m,
+        "edge f fwd\nedge f fwd_derived\nedge fwd keep\nedge fwd_derived keep\n",
+    );
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+    assert_ne!(out.locals["f::buf2"], out.locals["f::y"]);
+}
+
+/// An indirect call has no visible callee, and a variadic tail lands in the
+/// callee's `va_arg` reads: both retain when any candidate or read does.
+#[test]
+fn indirect_and_variadic_calls_keep_alloca_full_interval() {
+    let m = parse(
+        "global tab i8\n\
+         global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             %fp = add i16 1, 2\n\
+             call void %fp(%g) callees keep\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             %buf2 = alloca 2\n\
+             %h = gep %buf2 +0\n\
+             store i8 1 %h\n\
+             call void @vkeep(i8 1, %h)\n\
+             %y = add i8 5, 6\n\
+             store i8 %y @out\n\
+             ret void\n\
+         fn keep(void) (p=ptr)\n\
+           block entry:\n\
+             store ptr %p @tab\n\
+             ret void\n\
+         fn vkeep(void) (n, ...)\n\
+           block entry:\n\
+             %ap = alloca 1\n\
+             va_start ap\n\
+             %q = va_arg ptr ap ptr\n\
+             store ptr %q @tab\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge f keep\nedge f vkeep\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+    assert_ne!(out.locals["f::buf2"], out.locals["f::y"]);
+}
+
+/// A naked callee is opaque asm: the walk cannot see what it does with a
+/// param, so an alloca handed to it keeps its full-function interval.
+#[test]
+fn naked_callee_keeps_alloca_full_interval() {
+    let m = parse(
+        "global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             call void @opaque(%g)\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             ret void\n\
+         fn opaque(void) [naked] (p=ptr)\n\
+           block entry:\n\
+             asm \"nop\"\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge f opaque\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// Retention is decided per callee: two allocas passed to a callee that
+/// only dereferences its param share one slot, while one passed to a
+/// storing callee in the same caller keeps its own. The sharing saves a
+/// whole object slot, so the pay gate keeps the precise map.
+#[test]
+fn retention_is_decided_per_callee() {
+    let m = parse(
+        "global tab i8\n\
+         global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 4\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             call void @peek(%g)\n\
+             %bufB = alloca 4\n\
+             %h = gep %bufB +0\n\
+             store i8 2 %h\n\
+             call void @peek(%h)\n\
+             %buf2 = alloca 4\n\
+             %k = gep %buf2 +0\n\
+             store i8 3 %k\n\
+             call void @keep(%k)\n\
+             %y = add i8 5, 6\n\
+             store i8 %y @out\n\
+             ret void\n\
+         fn peek(void) (p=ptr)\n\
+           block entry:\n\
+             %q = gep %p +1\n\
+             %v = load i8 %q\n\
+             store i8 %v %p\n\
+             call void @leaf(%q)\n\
+             ret void\n\
+         fn leaf(void) (r=ptr)\n\
+           block entry:\n\
+             %w = load i8 %r\n\
+             store i8 %w @out\n\
+             ret void\n\
+         fn keep(void) (p=ptr)\n\
+           block entry:\n\
+             store ptr %p @tab\n\
+             ret void\n",
+    );
+    let out = allocate(
+        &PIC16F877A,
+        &m,
+        "edge f peek\nedge f keep\nedge peek leaf\n",
+    );
+    assert_eq!(out.locals["f::buf"], out.locals["f::bufB"]);
+    assert_ne!(out.locals["f::buf2"], out.locals["f::y"]);
+}
+
+/// The va region ends at its last va_arg: a value defined after shares the
+/// region's slot (epic-cc#853).
+#[test]
+fn va_region_dead_after_last_va_arg_shares_its_slot() {
+    let m = parse(
+        "global out i8\n\
+         fn vprintf(i16) (fmt, ...)\n\
+           block entry:\n\
+             %ap = alloca 1\n\
+             va_start ap\n\
+             %9 = va_arg ptr ap i16\n\
+             %x = add i8 1, 2\n\
+             store i8 %x @out\n\
+             ret i16 %9\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["vprintf::__va"], out.locals["vprintf::x"]);
+}
+
+/// A value live across the va span cannot share the region's slot: the
+/// va_arg reads would clobber it.
+#[test]
+fn value_live_across_va_span_keeps_its_slot() {
+    let m = parse(
+        "global out i8\n\
+         fn vprintf(i16) (fmt, ...)\n\
+           block entry:\n\
+             %ap = alloca 1\n\
+             va_start ap\n\
+             %v = add i8 1, 2\n\
+             %9 = va_arg ptr ap i16\n\
+             %w = add i8 %v, 1\n\
+             store i8 %w @out\n\
+             ret i16 %9\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["vprintf::__va"], out.locals["vprintf::v"]);
+}
+
+/// printf reads its va_list slot and passes the address on to a callee that
+/// walks the region during the call: the region must keep its slot against
+/// a value defined after `va_start`, or the callee's frame lands on it.
+#[test]
+fn va_list_handed_to_a_callee_keeps_the_region_slot() {
+    let m = parse(
+        "global out i8\n\
+         fn printf(i16) (fmt, ...)\n\
+           block entry:\n\
+             %ap = alloca 2\n\
+             va_start ap\n\
+             %l = load ptr %ap\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             %r = call i16 @walk(%l)\n\
+             ret i16 %r\n\
+         fn walk(i16) (p=ptr)\n\
+           block entry:\n\
+             %v = load i16 %p\n\
+             ret i16 %v\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge printf walk\n");
+    assert_ne!(out.locals["printf::__va"], out.locals["printf::z"]);
+}
+
 /// A branch-absorbed compare and its operand load reserve no overlay
 /// slot on PIC18 (epic-cc#862): isel lowers the fused branch without
 /// writing the 0/1 byte or staging the sources.
@@ -4412,5 +4783,76 @@ fn const_phi_into_store_takes_no_pic18_slot() {
         !out.locals.keys().any(|k| k == "main::p"),
         "const phi must be slotless: {:?}",
         out.locals
+    );
+}
+/// A RAM-neutral shrink that re-tiles bases keeps the lever-off map
+/// (epic-cc#1145): `f` could share its two allocas, but `big` sets the
+/// top in both maps, so sharing buys no RAM while moving `g`. The tie
+/// goes to the old layout: no sharing, no moved base, no broken merges.
+#[test]
+fn ram_neutral_shrink_keeps_lever_off_map() {
+    let m = parse(
+        "global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %a = alloca 4\n\
+             %g1 = gep %a +0\n\
+             store i8 1 %g1\n\
+             call void @g()\n\
+             %b = alloca 4\n\
+             %g2 = gep %b +0\n\
+             store i8 2 %g2\n\
+             ret void\n\
+         fn g(void) ()\n\
+           block entry:\n\
+             %x = add i8 1, 2\n\
+             store i8 %x @out\n\
+             ret void\n\
+         fn big(void) ()\n\
+           block entry:\n\
+             %w = alloca 16\n\
+             %gw = gep %w +0\n\
+             store i8 3 %gw\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge f g\n");
+    assert_ne!(
+        out.locals["f::a"], out.locals["f::b"],
+        "RAM-neutral sharing stays off"
+    );
+    assert_eq!(
+        out.locals["g::x"], 0x29,
+        "g stays at its lever-off base instead of the shrunk 0x25"
+    );
+}
+
+/// Same bases but reshuffled slots still keep the lever-off map
+/// (epic-cc#1147): `f` could share its two allocas without moving any
+/// base or saving any RAM (`big` sets the top), yet the precise coloring
+/// hands different addresses to codegen. The tie goes to the old layout.
+#[test]
+fn ram_neutral_reshuffle_keeps_lever_off_map() {
+    let m = parse(
+        "global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %a = alloca 4\n\
+             %g1 = gep %a +0\n\
+             store i8 1 %g1\n\
+             %b = alloca 4\n\
+             %g2 = gep %b +0\n\
+             store i8 2 %g2\n\
+             ret void\n\
+         fn big(void) ()\n\
+           block entry:\n\
+             %w = alloca 16\n\
+             %gw = gep %w +0\n\
+             store i8 3 %gw\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(
+        out.locals["f::a"], out.locals["f::b"],
+        "RAM-neutral reshuffle stays off"
     );
 }

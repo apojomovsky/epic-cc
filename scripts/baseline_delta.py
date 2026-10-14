@@ -12,6 +12,10 @@ Rules (epic-tasks#306, epic-cc#1135):
 - net win: no metric total grows and at least one shrinks;
 - per row: flash grows at most 8 words, cycles at most 1%, RAM never grows;
 - a row that regresses within those limits must be named in the PR body;
+- an `-O2` speed trade is the one exception to the flash cap (epic-cc#1096):
+  on a cycle-ladder `-O2` binary whose cycles shrink at least 1%, flash may
+  grow up to 64 words per row, must still be named in the PR body, and is left
+  out of the flash total because the cycle win is what makes it a net win;
 - a net loss, a row over its limit, RAM growth, or a removed row holds;
 - a new row has no base to regress against, so it is reported and never holds.
 """
@@ -38,6 +42,8 @@ METRICS = {
 }
 FLASH_WORDS_LIMIT = 8
 CYCLE_PERCENT_LIMIT = 1
+# Above this an O2 lever is a design decision, not a tuning trade.
+O2_SPEED_FLASH_WORDS_LIMIT = 64
 ISR_ROW = re.compile(r"^(speed-isr-.+)-(latency|roundtrip)((?:@O2)?)$")
 
 
@@ -61,6 +67,19 @@ def index_entries(entries):
     return out
 
 
+def speed_binaries(b_idx, h_idx):
+    """Binaries on the cycle ladder at -O2 whose cycles shrank by at least 1%."""
+    out = set()
+    for key, h in h_idx.items():
+        b = b_idx.get(key)
+        if b is None or h.get("profile") != "O2":
+            continue
+        saved = b["cycles"] - h["cycles"]
+        if saved > 0 and saved * 100 >= b["cycles"] * CYCLE_PERCENT_LIMIT:
+            out.add(binary_of(key))
+    return out
+
+
 def judge(base, head, pr_body):
     """Compare base and head ladders; return the verdict.
 
@@ -75,10 +94,12 @@ def judge(base, head, pr_body):
     counted = set()
     regressions = []
     over_limit = []
+    speed_trades = []
 
     for ladder in METRICS:
         b_idx = index_entries(base.get(ladder, []))
         h_idx = index_entries(head.get(ladder, []))
+        speedy = speed_binaries(b_idx, h_idx) if ladder == "cycle" else set()
         for key in sorted(set(b_idx) | set(h_idx)):
             if key not in b_idx:
                 new_rows.append(f"{ladder} {key}")
@@ -92,7 +113,15 @@ def judge(base, head, pr_body):
                 delta = hv - bv
                 # ISR latency and roundtrip rows are two readings of one binary.
                 binary = (ladder, binary_of(key), metric)
-                if metric == "cycles" or binary not in counted:
+                trade = (
+                    metric == "flash_words"
+                    and delta > 0
+                    and h.get("profile") == "O2"
+                    and binary_of(key) in speedy
+                )
+                if trade:
+                    counted.add(binary)
+                elif metric == "cycles" or binary not in counted:
                     counted.add(binary)
                     totals[metric] += delta
                 if delta == 0:
@@ -112,6 +141,15 @@ def judge(base, head, pr_body):
                     continue
                 if metric == "ram_bytes":
                     over_limit.append(f"{ladder} {key}: RAM grew {bv} -> {hv}")
+                elif trade:
+                    if delta > O2_SPEED_FLASH_WORDS_LIMIT:
+                        over_limit.append(
+                            f"{ladder} {key}: flash +{delta} words exceeds "
+                            f"{O2_SPEED_FLASH_WORDS_LIMIT} even as an O2 speed trade"
+                        )
+                    else:
+                        speed_trades.append(key)
+                        regressions.append(key)
                 elif metric == "flash_words":
                     if delta > FLASH_WORDS_LIMIT:
                         over_limit.append(
@@ -134,7 +172,7 @@ def judge(base, head, pr_body):
     )
     unexplained = sorted(k for k in set(regressions) if not names_row(pr_body, k))
     reasons.extend(over_limit)
-    if regressions and not net_win:
+    if set(regressions) - set(speed_trades) and not net_win:
         reasons.append("regressions without a net win across all rows")
     if unexplained:
         reasons.append(
@@ -147,6 +185,7 @@ def judge(base, head, pr_body):
         "net_win": net_win,
         "totals": totals,
         "regressions": sorted(set(regressions)),
+        "speed_trades": sorted(set(speed_trades)),
         "rows": rows,
         "new_rows": sorted(new_rows),
     }
@@ -169,6 +208,10 @@ def render_markdown(result, base_desc="base"):
     for new in result.get("new_rows", []):
         lines.append(f"- {new}: new row (informational, nothing to regress against)")
     if result.get("new_rows"):
+        lines.append("")
+    for key in result.get("speed_trades", []):
+        lines.append(f"- {key}: -O2 speed trade (flash grew, cycles shrank)")
+    if result.get("speed_trades"):
         lines.append("")
     t = result["totals"]
     lines.append(

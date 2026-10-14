@@ -1229,6 +1229,59 @@ fn offset_pointer_into_ram_global_is_ram() {
     assert!(prov.mixed.is_empty(), "got {:?}", prov.mixed);
 }
 
+fn walk_over(name: &str) -> ir::Module {
+    parse(&format!(
+        "const {name} i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             br loop\n\
+           block loop:\n\
+             %p = phi ptr @{name} entry %n loop\n\
+             %n = gep %p +1\n\
+             %v = load i8 %p\n\
+             br loop\n"
+    ))
+}
+
+// epic-cc#1197, epic-cc#1203: a walk over a const with no RAM copy holds a
+// flash label, so it is marked; every const that has an address in RAM
+// (copied, or staged through the shared buffer) or is a C++ vtable is not.
+#[test]
+fn pic14_walk_marks_follow_the_consts_with_no_ram_copy() {
+    use std::collections::{HashMap, HashSet};
+    let none = HashMap::new();
+    let nostage = HashSet::new();
+
+    let m = walk_over("str");
+    let w = iselcore::pic14_flash_walks(&m, &none, &nostage);
+    assert!(w.flash.contains("main::p"), "got {:?}", w.flash);
+
+    let copied = HashMap::from([("str".to_string(), 0x40u16)]);
+    let w = iselcore::pic14_flash_walks(&m, &copied, &nostage);
+    assert!(w.flash.is_empty() && w.mixed.is_empty(), "RAM copy: {w:?}");
+
+    let staged = HashSet::from(["str".to_string()]);
+    let w = iselcore::pic14_flash_walks(&m, &none, &staged);
+    assert!(w.flash.is_empty() && w.mixed.is_empty(), "staged: {w:?}");
+
+    let vt = walk_over("_ZTV4Base");
+    let w = iselcore::pic14_flash_walks(&vt, &none, &nostage);
+    assert!(w.flash.is_empty() && w.mixed.is_empty(), "vtable: {w:?}");
+}
+
+#[test]
+fn flash_walk_refusal_names_the_slot_and_the_kind() {
+    let mut walks = iselcore::FlashProvenance::default();
+    walks.flash.insert("main::p".to_string());
+    walks.mixed.insert("main::q".to_string());
+    let flash = iselcore::flash_walk_refusal(&walks, "main", "p", "1203").expect("flash walk");
+    assert!(flash.contains("flash walk %p") && flash.contains("epic-cc#1203"));
+    let mixed = iselcore::flash_walk_refusal(&walks, "main", "q", "1197").expect("mixed walk");
+    assert!(mixed.contains("maybe-flash %q") && mixed.contains("epic-cc#1197"));
+    assert!(iselcore::flash_walk_refusal(&walks, "main", "r", "1203").is_none());
+    assert!(iselcore::flash_walk_refusal(&walks, "other", "p", "1203").is_none());
+}
+
 /// A branch-absorbed compare and the loads feeding it need no slot
 /// (epic-cc#862): the lowering branches straight to the exits and reads
 /// the sources in place.

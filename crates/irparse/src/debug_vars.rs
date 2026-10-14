@@ -20,6 +20,7 @@ pub enum DiTypeNode {
     },
     Pointer {
         base: Option<u32>,
+        size: Option<u32>,
     },
     Typedef {
         name: Option<String>,
@@ -55,9 +56,23 @@ pub enum DiTypeNode {
     Other,
 }
 
+/// One located byte range of a local that SROA split into separate
+/// allocas, from a `#dbg_*` record whose expression is a bare
+/// `DW_OP_LLVM_fragment`. `ssa` names the piece's storage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiPiece {
+    /// Byte offset within the variable.
+    pub offset: u32,
+    pub size: u32,
+    pub ssa: String,
+}
+
 /// One variable of the typed table: a C name, its type-graph root, and,
-/// for locals, the SSA value operand its `#dbg_*` record named. `func`
-/// is the defining function's name for locals, `None` for globals.
+/// for locals, the storage its `#dbg_*` records named: `ssa` for a
+/// whole-variable record, `pieces` (sorted, non-overlapping) for fragment
+/// records. A split variable has no one address: its pieces are not
+/// ordered or adjacent in RAM, and the allocator colors each separately.
+/// `func` is the defining function's name for locals, `None` for globals.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiVar {
     pub name: String,
@@ -66,6 +81,7 @@ pub struct DiVar {
     pub func: Option<String>,
     pub arg: Option<u32>,
     pub ssa: Option<String>,
+    pub pieces: Vec<DiPiece>,
 }
 
 /// The parsed typed variable table. No addresses here: the join to
@@ -96,7 +112,7 @@ impl DebugVars {
         };
         match self.types.get(&id) {
             Some(DiTypeNode::Basic { name, .. }) => name.clone(),
-            Some(DiTypeNode::Pointer { base }) => format!("{}*", next(base)),
+            Some(DiTypeNode::Pointer { base, .. }) => format!("{}*", next(base)),
             Some(DiTypeNode::Typedef { base, .. }) | Some(DiTypeNode::Qualifier { base }) => {
                 next(base)
             }
@@ -113,6 +129,29 @@ impl DebugVars {
                 format!("{}[{}]", next(element), count.unwrap_or(0))
             }
             _ => "?".to_string(),
+        }
+    }
+
+    /// Byte size of a type-graph root, `None` when the graph does not
+    /// say.
+    pub fn type_size(&self, id: u32) -> Option<u32> {
+        self.type_size_at(id, 0)
+    }
+
+    fn type_size_at(&self, id: u32, depth: u32) -> Option<u32> {
+        if depth > 32 {
+            return None;
+        }
+        let next = |b: &Option<u32>| b.and_then(|b| self.type_size_at(b, depth + 1));
+        match self.types.get(&id)? {
+            DiTypeNode::Basic { size, .. }
+            | DiTypeNode::Struct { size, .. }
+            | DiTypeNode::Union { size, .. }
+            | DiTypeNode::Enum { size, .. } => size.map(|bits| bits / 8),
+            DiTypeNode::Pointer { size, .. } => size.map(|bits| bits / 8),
+            DiTypeNode::Typedef { base, .. } | DiTypeNode::Qualifier { base } => next(base),
+            DiTypeNode::Array { element, count } => Some(next(element)? * (*count)?),
+            DiTypeNode::Member { .. } | DiTypeNode::Other => None,
         }
     }
 }
@@ -144,17 +183,16 @@ pub fn parse_debug_vars(src: &str) -> DebugVars {
     let mut sub_names: HashMap<u32, String> = HashMap::new();
     // Lexical block id -> parent scope id.
     let mut scope_parent: HashMap<u32, u32> = HashMap::new();
-    // Local var id -> SSA operand its body record named.
-    let mut recorded: HashMap<u32, String> = HashMap::new();
+    // Local var id -> the storage its body records named.
+    let mut storage = Storage::default();
 
     for raw in src.lines() {
         let line = raw.trim();
-        if line.starts_with("#dbg_value(") || line.starts_with("#dbg_declare(") {
-            record_dbg_ssa(line, &mut recorded);
-            continue;
-        }
-        if line.starts_with("#dbg_assign(") {
-            record_dbg_assign_ssa(line, &mut recorded);
+        if line.starts_with("#dbg_value(")
+            || line.starts_with("#dbg_declare(")
+            || line.starts_with("#dbg_assign(")
+        {
+            storage.record(line);
             continue;
         }
         if !line.starts_with('!') {
@@ -193,6 +231,7 @@ pub fn parse_debug_vars(src: &str) -> DebugVars {
             let node = match tag.as_str() {
                 "DW_TAG_pointer_type" => DiTypeNode::Pointer {
                     base: node_field(body, "baseType"),
+                    size: num_field(body, "size"),
                 },
                 "DW_TAG_member" => DiTypeNode::Member {
                     name: string_field(body, "name"),
@@ -307,17 +346,23 @@ pub fn parse_debug_vars(src: &str) -> DebugVars {
                 .flatten(),
             arg: None,
             ssa: None,
+            pieces: Vec::new(),
         })
         .collect();
     let mut locals: Vec<DiVar> = local_meta
         .into_iter()
-        .map(|(id, name, line, ty, arg, scope)| DiVar {
-            name,
-            line,
-            ty,
-            func: scope_func(Some(scope), &scope_parent, &sub_names),
-            arg,
-            ssa: recorded.get(&id).cloned(),
+        .map(|(id, name, line, ty, arg, scope)| {
+            let mut pieces = storage.pieces.remove(&id).unwrap_or_default();
+            pieces.sort_by_key(|p| p.offset);
+            DiVar {
+                name,
+                line,
+                ty,
+                func: scope_func(Some(scope), &scope_parent, &sub_names),
+                arg,
+                ssa: storage.whole.get(&id).cloned(),
+                pieces,
+            }
         })
         .collect();
     globals.sort_by(|a, b| a.name.cmp(&b.name));
@@ -349,36 +394,82 @@ fn scope_func(
     None
 }
 
-/// Capture `#dbg_value(VALUE, !VAR, ...)` / `#dbg_declare(...)`'s SSA
-/// operand. Constants, `undef`, `null` and `poison` map nothing.
-fn record_dbg_ssa(line: &str, recorded: &mut HashMap<u32, String>) {
-    let Some(args) = dbg_args(line) else {
-        return;
-    };
-    if args.len() < 2 {
-        return;
-    }
-    if let (Some(var), Some(ssa)) = (dbg_var_id(&args[1]), ssa_of(&args[0])) {
-        recorded.entry(var).or_insert(ssa);
+/// Storage the `#dbg_*` body records named, keyed by DILocalVariable id.
+/// The first record for a variable (or for a byte range of it) wins.
+#[derive(Default)]
+struct Storage {
+    whole: HashMap<u32, String>,
+    pieces: HashMap<u32, Vec<DiPiece>>,
+}
+
+impl Storage {
+    /// Record one `#dbg_value`/`#dbg_declare`/`#dbg_assign` line. For
+    /// `#dbg_assign(VALUE, !VAR, !EXPR, !ID, ADDR, !EXPR, !LOC)` the address
+    /// operand is the storage and the value is only what a store wrote, so
+    /// the address wins and `undef` falls back to the value. Constants,
+    /// `undef`, `null` and `poison` map nothing. A fragment expression
+    /// counts as a piece only when it is a bare `DW_OP_LLVM_fragment`
+    /// on a whole-byte range: any other op makes the operand a computed
+    /// value, not the piece's storage.
+    fn record(&mut self, line: &str) {
+        let Some(args) = dbg_args(line) else {
+            return;
+        };
+        let assign = line.starts_with("#dbg_assign(");
+        if args.len() < if assign { 6 } else { 3 } {
+            return;
+        }
+        let Some(var) = dbg_var_id(&args[1]) else {
+            return;
+        };
+        let ssa = if assign && expr_ops(&args[5]).is_empty() {
+            ssa_of(&args[4]).or_else(|| ssa_of(&args[0]))
+        } else {
+            ssa_of(&args[0])
+        };
+        let Some(ssa) = ssa else {
+            return;
+        };
+        let ops = expr_ops(&args[2]);
+        if !ops.contains(&"DW_OP_LLVM_fragment") {
+            self.whole.entry(var).or_insert(ssa);
+            return;
+        }
+        let [_, bit_offset, bit_size] = ops[..] else {
+            return;
+        };
+        let (Ok(bit_offset), Ok(bit_size)) = (bit_offset.parse::<u32>(), bit_size.parse::<u32>())
+        else {
+            return;
+        };
+        if bit_size == 0 || bit_offset % 8 != 0 || bit_size % 8 != 0 {
+            return;
+        }
+        let piece = DiPiece {
+            offset: bit_offset / 8,
+            size: bit_size / 8,
+            ssa,
+        };
+        let taken = self.pieces.entry(var).or_default();
+        if taken
+            .iter()
+            .all(|p| piece.offset >= p.offset + p.size || p.offset >= piece.offset + piece.size)
+        {
+            taken.push(piece);
+        }
     }
 }
 
-/// `#dbg_assign(VALUE, !VAR, !EXPR, !ID, ADDR, !EXPR, !LOC)`: the value
-/// is often `undef` for aggregates, the address operand (arg 4) then
-/// names the storage.
-fn record_dbg_assign_ssa(line: &str, recorded: &mut HashMap<u32, String>) {
-    let Some(args) = dbg_args(line) else {
-        return;
-    };
-    if args.len() < 5 {
-        return;
-    }
-    let Some(var) = dbg_var_id(&args[1]) else {
-        return;
-    };
-    if let Some(ssa) = ssa_of(&args[0]).or_else(|| ssa_of(&args[4])) {
-        recorded.entry(var).or_insert(ssa);
-    }
+/// The ops of a `!DIExpression(...)` operand; empty for no ops.
+fn expr_ops(arg: &str) -> Vec<&str> {
+    arg.trim()
+        .strip_prefix("!DIExpression(")
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 /// The top-level comma args between a record's outer parens.

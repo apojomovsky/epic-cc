@@ -47,10 +47,16 @@ fn sim_case() -> (Vec<String>, Vec<String>, Vec<String>) {
     (includes, inputs, defines)
 }
 
-fn build_sim() -> Vec<u16> {
+// Scratch outputs carry the calling test's tag: the binary runs its
+// tests on parallel threads under one pid, so a pid-only name lets one
+// test delete the file another just wrote (epic-cc#1227).
+fn scratch_path(tag: &str, ext: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("encoder_sim_{tag}_{}.{ext}", std::process::id()))
+}
+
+fn build_sim(tag: &str) -> Vec<u16> {
     let (includes, inputs, defines) = sim_case();
-    let hex_path =
-        std::env::temp_dir().join(format!("encoder_sim_pool_{}.hex", std::process::id()));
+    let hex_path = scratch_path(tag, "hex");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_epic-cc"));
     cmd.args(["--target", "16F877A", "--const-pool"]);
     for dir in &includes {
@@ -77,7 +83,7 @@ fn encoder_sim_links_under_const_pool() {
     // pages 0x1000-0x1805 as a single extent while cross-page chunking did
     // not apply. Passing-after: the repaired layout links (the driver gates
     // flash fit in its own report, so a successful build fits the device).
-    let words = build_sim();
+    let words = build_sim("pool");
     assert!(!words.is_empty(), "the sim build must produce flash words");
 }
 
@@ -88,7 +94,7 @@ fn encoder_sim_constant_irq_calls_have_no_out_of_line_bodies() {
     // inlines each body at its sites and the table lookup collapses.
     // No runtime-indexed reader of irq_table survives in this firmware
     // (EPIC_IRQ_GetFlag has no live caller), so the table drops too.
-    let asm = asm_text();
+    let asm = asm_text("fold");
     for body in [
         "EPIC_IRQ_Enable:",
         "EPIC_IRQ_DisableSrc:",
@@ -110,10 +116,9 @@ fn encoder_sim_constant_irq_calls_have_no_out_of_line_bodies() {
 /// pads, labels and directives emit none). epic-cc#923 failed here with a
 /// backward `.org` when a page's content outgrew its pad; the walk pins
 /// that exact failure without assembling.
-fn asm_text() -> String {
+fn asm_text(tag: &str) -> String {
     let (includes, inputs, defines) = sim_case();
-    let asm_path =
-        std::env::temp_dir().join(format!("encoder_sim_plain_{}.asm", std::process::id()));
+    let asm_path = scratch_path(tag, "asm");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_epic-cc"));
     cmd.args(["--target", "16F877A", "--emit", "asm"]);
     for dir in &includes {
@@ -139,7 +144,7 @@ fn encoder_sim_default_flags_layout_fits_pages() {
     // Failing-before: `asm: backward .org to 0x17A2 from 0x17B2`, a page's
     // content outgrowing its pad. Passing-after: every `.org` jumps
     // forward and no page holds more than 2048 words.
-    let asm = asm_text();
+    let asm = asm_text("pages");
     assert!(
         asm.contains("__const_pool"),
         "default flags must emit the pooled table (epic-cc#1211):\n{asm}"

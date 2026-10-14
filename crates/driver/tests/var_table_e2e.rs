@@ -73,8 +73,10 @@ fn address_taken_local_joins_through_ssa_key() {
     );
     // `arr` has its address taken, so it survives -O1 in RAM; the join
     // must land it in the overlay locals through its #dbg_assign record.
+    // Only `arr[0]` is used, so SROA keeps one 2-byte fragment: the
+    // table reports exactly that piece, not the whole array.
     let slot = record(&t, "main::arr");
-    assert_eq!(slot.1, "int[4]");
+    assert_eq!(slot.1, "int[4] ; bytes 0+2");
     // Plain locals (`slot`, `p`) were promoted and constant-folded at
     // -O1: they must be omitted, not invented.
     assert!(

@@ -25,11 +25,14 @@
 //! progression jumps past it); common RAM holds the fixed scratch and
 //! retval bytes instead (see `isel`).
 
+mod retain;
+
 use std::collections::{HashMap, HashSet};
 
 use device::{Core, Device};
 use ir::{Inst, Module};
 use iselcore::{find_value_folds, resolve_pointers, ssa_key, Base, PtrResolution, ValueFolds};
+use retain::Retention;
 
 /// One shared flag byte (epic-cc#1162): the synthetic holder placed in
 /// the floating list, plus member globals with bit positions. isel-pic18
@@ -626,9 +629,13 @@ fn first_fit(
 /// immediately reusable. Greedy first-fit coloring reuses the lowest slot
 /// whose interval is disjoint; the slot's width grows to the widest
 /// occupant.
+/// `precise` bounds memory objects by their use ranges (epic-cc#853); off
+/// keeps every object full-function, the pre-lever layout bit for bit.
 fn frame_layout(
     f: &ir::Func,
     resolved: &PtrResolution,
+    retention: &Retention,
+    precise: bool,
     va_size: u16,
     unplaced: &HashSet<String>,
     retval_homed: &HashSet<String>,
@@ -647,8 +654,8 @@ fn frame_layout(
     // breaks ties in the coloring, so same-start values keep the documented
     // params-first, instruction-order layout. A memory object (an alloca or
     // a byval/sret param) is a RAM region the code reads and writes through
-    // derived pointers, not a value with a def-use range: its slot must stay
-    // reserved for the whole function, so it gets a full-function interval.
+    // derived pointers, not a plain value: the escape scan below decides
+    // whether it keeps a full-function interval or colors from its uses.
     let mut defs: HashMap<String, (usize, u16, u8, usize, bool)> = HashMap::new();
     let mut order_idx = 0usize;
     for p in &f.params {
@@ -660,9 +667,7 @@ fn frame_layout(
     }
     // The va region: the contiguous frame bytes a variadic callee's extra
     // args land in, one region per variadic function, sized to the widest
-    // call site. Full-function interval like any memory object: the
-    // callee's `va_arg` reads are live across the whole body and the
-    // caller's arg copies happen at each call point.
+    // call site. It colors from entry through its last va_arg/va_start.
     if va_size > 0 {
         defs.insert("__va".to_string(), (0, 0, va_size as u8, order_idx, true));
         order_idx += 1;
@@ -743,6 +748,143 @@ fn frame_layout(
             }
         }
     }
+    // Precise object ranges (epic-cc#853): an alloca's bytes are touched
+    // only through pointers derived from it. Every folded chain resolves
+    // to its object, so each use of a resolving value is a use of the
+    // object; the va region's uses are its va_arg/va_start points.
+    let mut alloca_set: HashSet<String> = HashSet::new();
+    for b in &order {
+        for inst in &b.insts {
+            if let ir::Inst::Alloca(a) = inst {
+                alloca_set.insert(a.dst.clone());
+            }
+        }
+    }
+    let base_obj = |r: &str| -> Option<String> {
+        match resolved.get(&ssa_key(&f.name, r)) {
+            Some((Base::Slot(obj, _), _, _)) if alloca_set.contains(obj) => Some(obj.clone()),
+            _ => None,
+        }
+    };
+    // An object whose address escapes (stored to RAM, returned, merged
+    // into a reseeded select/phi whose uses resolve elsewhere, or passed
+    // to a callee that retains it) keeps the full-function interval below.
+    // A call arg no callee retains is a plain use at the call point.
+    let mut escaped: HashSet<String> = HashSet::new();
+    for b in &order {
+        for inst in &b.insts {
+            match inst {
+                ir::Inst::Store(s) => {
+                    if let ir::Val::Reg(r) = &s.val {
+                        if let Some(o) = base_obj(r) {
+                            escaped.insert(o);
+                        }
+                    }
+                }
+                ir::Inst::Ret(Some((_, v)), _) => {
+                    if let ir::Val::Reg(r) = v {
+                        if let Some(o) = base_obj(r) {
+                            escaped.insert(o);
+                        }
+                    }
+                }
+                ir::Inst::Call(c) => {
+                    for (i, a) in c.args.iter().enumerate() {
+                        if let ir::Val::Reg(r) = &a.val {
+                            if let Some(o) = base_obj(r) {
+                                if !escaped.contains(&o) && retention.call_retains(c, i) {
+                                    escaped.insert(o);
+                                }
+                            }
+                        }
+                    }
+                }
+                ir::Inst::Phi(p) => {
+                    let dst_base = match resolved.get(&ssa_key(&f.name, &p.dst)) {
+                        Some((Base::Slot(o, _), _, _)) => Some(o.clone()),
+                        _ => None,
+                    };
+                    for (v, _) in &p.incoming {
+                        if let ir::Val::Reg(r) = v {
+                            if let Some(o) = base_obj(r) {
+                                if dst_base.as_ref() != Some(&o) {
+                                    escaped.insert(o);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Folded chains the GEP propagation cannot see (pointer selects, call
+    // args) still resolve to the object, so sweep their uses onto it. A
+    // select that does not fold never resolves: iselcore panics on the
+    // unresolvable chain before layout runs, so no escape check is needed.
+    let mut extra: Vec<(String, (usize, u16))> = Vec::new();
+    for (v, us) in &uses {
+        if v.is_empty() {
+            continue;
+        }
+        if let Some(o) = base_obj(v) {
+            if *v != o {
+                extra.extend(us.iter().map(|&u| (o.clone(), u)));
+            }
+        }
+    }
+    for (o, u) in extra {
+        uses.entry(o).or_default().insert(u);
+    }
+    // va_start stores an address into the region in the list slot, so any
+    // other read of that slot (printf loads it and hands it to vprintf)
+    // passes the address to code the intervals cannot see: the region
+    // then keeps its whole-function interval.
+    let mut va_pinned = false;
+    if va_size > 0 {
+        let mut va_lists: HashSet<String> = HashSet::new();
+        for b in &order {
+            for inst in &b.insts {
+                let list = match inst {
+                    ir::Inst::VaStart(v) => &v.list,
+                    ir::Inst::VaArg(v) => &v.ptr,
+                    _ => continue,
+                };
+                va_lists.insert(base_obj(list).unwrap_or_else(|| list.clone()));
+            }
+        }
+        for (i, b) in order.iter().enumerate() {
+            for (pos, inst) in b.insts.iter().enumerate() {
+                if matches!(inst, ir::Inst::VaArg(_) | ir::Inst::VaStart(_)) {
+                    uses.entry("__va".to_string())
+                        .or_default()
+                        .insert((i, pos as u16));
+                } else if ir::read_vals(inst)
+                    .iter()
+                    .any(|r| va_lists.contains(&base_obj(r).unwrap_or_else(|| r.clone())))
+                {
+                    va_pinned = true;
+                }
+            }
+        }
+    }
+    // Full-function holdouts: byval/sret params plus escaped allocas, and
+    // the va region when its address leaves the function. Every other
+    // memory object colors from its bounded range. With the lever off
+    // every object holds out, the pre-lever layout bit for bit.
+    let mut fixed: HashSet<String> = HashSet::new();
+    for p in &f.params {
+        if p.byval.is_some() || p.sret {
+            fixed.insert(p.name.clone());
+        }
+    }
+    fixed.extend(escaped.into_iter());
+    if va_pinned {
+        fixed.insert("__va".to_string());
+    }
+    if !precise {
+        fixed.extend(defs.iter().filter(|(_, d)| d.4).map(|(k, _)| k.clone()));
+    }
 
     // Loop-aware liveness: a value used in a loop body is live across the
     // back-edge, so its slot is occupied at the body's end and the header's
@@ -799,7 +941,9 @@ fn frame_layout(
     }
     let mut def_set: Vec<HashSet<String>> = vec![HashSet::new(); order.len()];
     for (v, &(d, _, _, _, mem)) in &defs {
-        if !mem {
+        // A bounded object kills like a value, so liveness above its def
+        // never drags its range back to the entry.
+        if !mem || !fixed.contains(v) {
             def_set[d].insert(v.clone());
         }
     }
@@ -857,9 +1001,9 @@ fn frame_layout(
     // Live interval per value: [min(def, uses, pred ends), max(...)] in
     // linear order. A loop-carried value (use before def in linear order)
     // spans the loop, so it cannot alias a co-live value; a dead def is a
-    // point interval, immediately reusable. A memory object spans the whole
+    // point interval, immediately reusable. A fixed object spans the whole
     // function (its slot is a RAM region, live from entry to exit), so it
-    // never aliases anything.
+    // never aliases anything. A bounded object colors like a value.
 
     // Dead defs reaching alloc in the driver e2e suite are effectful only
     // (calls, volatile loads, va_arg, memory objects). isel does not DCE, so
@@ -868,12 +1012,14 @@ fn frame_layout(
     // A folded or forwarded producer (epic-cc#863) needs no slot: isel
     // reads the source or computes into the store destination, so no
     // interval enters coloring and no address leaves placement.
-    let mut vals: Vec<(&String, (usize, u16), (usize, u16), u8, usize)> = Vec::new();
+    // The sort key keeps a bounded object at its old full-interval start:
+    // coloring order is unchanged, so only real sharing moves addresses.
+    let mut vals: Vec<(&String, (usize, u16), (usize, u16), u8, usize, (usize, u16))> = Vec::new();
     for (v, &(d, p_d, w, o, mem)) in &defs {
         if unplaced.contains(v) {
             continue;
         }
-        let (lo, hi) = if mem {
+        let (lo, hi) = if mem && fixed.contains(v) {
             (
                 (0usize, 0u16),
                 (
@@ -920,9 +1066,14 @@ fn frame_layout(
             }
             (lo, hi)
         };
-        vals.push((v, lo, hi, w, o));
+        let srt = if mem && !fixed.contains(v) {
+            (0usize, 0u16)
+        } else {
+            lo
+        };
+        vals.push((v, lo, hi, w, o, srt));
     }
-    vals.sort_by(|a, b| a.1.cmp(&b.1).then(a.4.cmp(&b.4)));
+    vals.sort_by(|a, b| a.5.cmp(&b.5).then(a.4.cmp(&b.4)));
     // A block reachable from itself runs more than once, so linear
     // dead-after cannot see dynamic-after uses across the back edge.
     let on_cycle = |mi: usize| -> bool {
@@ -1368,7 +1519,7 @@ fn frame_layout(
     // occupant.
     let interval_of: HashMap<&str, ((usize, u16), (usize, u16))> = vals
         .iter()
-        .map(|(v, lo, hi, _, _)| (v.as_str(), (*lo, *hi)))
+        .map(|(v, lo, hi, _, _, _)| (v.as_str(), (*lo, *hi)))
         .collect();
     // Diamond pins color behind a per-frame width-sum gate: the pinned
     // layout wins only on a strictly smaller slot-width sum, ties keep the
@@ -1381,7 +1532,7 @@ fn frame_layout(
         // opens at the earliest pred end), so arms with no slot yet wait
         // for a second sweep. Base pins keep the single sweep bit for bit.
         let mut deferred: Vec<(String, Vec<String>, (usize, u16), (usize, u16), u8)> = Vec::new();
-        for (v, lo, hi, w, _) in &vals {
+        for (v, lo, hi, w, _, _) in &vals {
             let mut stuck = false;
             if let Some(s) = pins.get(v.as_str()) {
                 if let Some(&si) = slot_of.get(s.as_str()) {
@@ -1487,7 +1638,7 @@ fn frame_layout(
     }
     let size: u16 = widths.iter().map(|&w| u16::from(w)).sum();
     let mut live: HashMap<String, (usize, (usize, u16), (usize, u16))> = HashMap::new();
-    for (v, lo, hi, _, _) in &vals {
+    for (v, lo, hi, _, _, _) in &vals {
         if let Some(&s) = slot_of.get(*v) {
             live.insert((*v).clone(), (s, *lo, *hi));
         }
@@ -2622,6 +2773,17 @@ fn home_args(
     sel
 }
 
+/// Whether precise intervals can shrink a frame: some alloca or va region
+/// exists. Modules without either skip the lever-off comparison outright.
+fn lever_can_fire(m: &Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.variadic
+            || f.blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|i| matches!(i, ir::Inst::Alloca(_))))
+    })
+}
+
 /// Whole-program overlay address allocation (entry point used by the
 /// driver, the `alloc` binary, and tests). On PIC18 with fitting frames
 /// it pairs two passes (epic-cc#863): a bounding pass with every slot
@@ -2654,8 +2816,17 @@ pub fn allocate_with_pool(
     // the same bank reaches past the ISR end. Other cores keep the RAM
     // rule alone: the region tie flipped a large PIC16 program's layout
     // for flash with no RAM saved. Full ties keep the earlier candidate.
-    let select = |dip: Dip| -> AllocLayout {
-        let (nofold, fit) = allocate_inner(device, m, edges_text, None, pool, dip);
+    let ram = |l: &AllocLayout| l.bank_used.iter().sum::<u16>();
+    let region = |l: &AllocLayout| {
+        if device.core == Core::Pic18 {
+            l.isr_bytes
+        } else {
+            0
+        }
+    };
+    let select_impl = |dip: Dip, precise: bool| -> (AllocLayout, HashMap<String, u16>) {
+        let (nofold, fit, nofold_base) =
+            allocate_inner(device, m, edges_text, None, pool, dip, precise);
         if matches!(device.core, Core::Pic14 | Core::Pic14e) {
             // Globals-first is exact, not monotone: global placement reads
             // only the module's globals, never the frame widths the gated
@@ -2667,13 +2838,15 @@ pub fn allocate_with_pool(
                 .filter(|g| !g.is_const && nofold.globals.contains_key(&g.name))
                 .map(|g| g.name.clone())
                 .collect();
-            return allocate_inner(device, m, edges_text, Some(&safe), pool, dip).0;
+            let (layout, _, base) =
+                allocate_inner(device, m, edges_text, Some(&safe), pool, dip, precise);
+            return (layout, base);
         }
         if device.core != Core::Pic18 || !fit {
-            return nofold;
+            return (nofold, nofold_base);
         }
         let Some((_, hi)) = device.access_bank else {
-            return nofold;
+            return (nofold, nofold_base);
         };
         // Same bank test `isel-pic18` applies to the final map, so its
         // folds agree with these drops on every placed slot.
@@ -2683,15 +2856,34 @@ pub fn allocate_with_pool(
             .filter(|g| !g.is_const && nofold.globals.get(&g.name).is_some_and(|a| *a <= hi))
             .map(|g| g.name.clone())
             .collect();
-        allocate_inner(device, m, edges_text, Some(&safe), pool, dip).0
+        let (layout, _, base) =
+            allocate_inner(device, m, edges_text, Some(&safe), pool, dip, precise);
+        (layout, base)
     };
-    let ram = |l: &AllocLayout| l.bank_used.iter().sum::<u16>();
-    let region = |l: &AllocLayout| {
-        if device.core == Core::Pic18 {
-            l.isr_bytes
-        } else {
-            0
+    // Precise intervals shrink frames, and every shrink re-tiles the
+    // downstream bases the outliner merges on (epic-cc#1145). The lever
+    // stays only where it pays RAM: a strict win keeps the precise map,
+    // and a tie keeps it only on a byte-identical layout (reshuffled
+    // slots still feed different addresses to codegen). The score is
+    // RAM-only: a region-only win still re-tiles measured code. Churn
+    // that buys no RAM can never move a row.
+    let select = |dip: Dip| -> AllocLayout {
+        let (plain, plain_base) = select_impl(dip, true);
+        if !lever_can_fire(m) {
+            return plain;
         }
+        let (off, off_base) = select_impl(dip, false);
+        if ram(&off) < ram(&plain) {
+            return off;
+        }
+        if ram(&off) == ram(&plain)
+            && (off_base != plain_base
+                || off.locals != plain.locals
+                || off.globals != plain.globals)
+        {
+            return off;
+        }
+        plain
     };
     let mut best = select(Dip::Off);
     // Without an ISR the ISR-scoped layout is the plain one bit for bit;
@@ -2732,7 +2924,10 @@ enum Dip {
 /// do not, the globals-first fallback owns the layout instead. `pool`
 /// gates pooled-const RAM copies on PIC14 (epic-cc#816). `dip` scopes
 /// the per-site live-high dip; `Dip::Off` follows the caller-end rule
-/// everywhere, the pre-dip layout bit for bit.
+/// everywhere, the pre-dip layout bit for bit. `precise` bounds memory
+/// objects by their use ranges (epic-cc#853); off keeps the pre-lever
+/// layout bit for bit. Returns the layout, the fit flag, and the frame
+/// bases (the tie-break in `allocate_with_pool` compares them).
 fn allocate_inner(
     device: &Device,
     m: &Module,
@@ -2740,7 +2935,8 @@ fn allocate_inner(
     gate: Option<&HashSet<String>>,
     pool: bool,
     dip: Dip,
-) -> (AllocLayout, bool) {
+    precise: bool,
+) -> (AllocLayout, bool, HashMap<String, u16>) {
     // The va region size frame_layout reserves: the widest call site, with
     // a one-byte floor so a variadic function whose call sites pass no
     // extra args still has a base address for its va_start (epic-cc#391).
@@ -2775,6 +2971,7 @@ fn allocate_inner(
     // slot materializes its two address bytes into the dst slot, so the
     // dst needs a RAM slot; a folded select is virtual and defines none.
     let resolved = resolve_pointers(m);
+    let retention = Retention::new(m);
     // Value folds (epic-cc#863, epic-cc#875, epic-cc#902): producers needing
     // no slot, computed by the predicate the PIC18, PIC14, and PIC14E
     // backends share, so a dropped slot is never read. Other cores keep
@@ -2934,6 +3131,8 @@ fn allocate_inner(
         let fl = frame_layout(
             f,
             &resolved,
+            &retention,
+            precise,
             floored_va_size(f, &va_sizes),
             unplaced_in(&f.name),
             &retval_in(&f.name),
@@ -3445,6 +3644,30 @@ fn allocate_inner(
                             if let ir::Val::Global(g) = &s.val {
                                 addr_taken.insert(g.clone());
                             }
+                            // A const whose address is stored into memory is
+                            // read back through RAM pointers, which cannot name
+                            // flash: it keeps a RAM copy like a phi incoming
+                            // (epic-cc#1223).
+                            let stored = match &s.val {
+                                ir::Val::Global(g) => Some(g.clone()),
+                                ir::Val::Reg(r) => find_const_base(r).or_else(|| {
+                                    match resolved.get(&ssa_key(&f.name, r)) {
+                                        Some((Base::Global(cg), _, _)) => Some(cg.clone()),
+                                        _ => None,
+                                    }
+                                }),
+                                ir::Val::Const(_) => None,
+                            };
+                            if let Some(g) = stored {
+                                if let Some(gl) =
+                                    m.globals.iter().find(|gl| gl.name == g && gl.is_const)
+                                {
+                                    if gl.size <= 255 {
+                                        const_to_ram.insert(g.clone());
+                                        const_phi.insert(g);
+                                    }
+                                }
+                            }
                         }
                         ir::Inst::Asm(a) => {
                             for op in &a.operands {
@@ -3650,11 +3873,13 @@ fn allocate_inner(
                             }
                         }
                     }
-                    // A const reaching a pointer phi keeps its RAM copy:
-                    // iselcore seeds the phi as an indirect slot and every
-                    // read through it derefs RAM (the LSR chase shape whose
-                    // flash lowering is epic-cc#811). A gated address here
-                    // would deref flash as RAM.
+                    // A const reaching a pointer phi needs a RAM copy: iselcore
+                    // seeds the phi as an indirect slot, and every read through
+                    // it derefs RAM (the LSR chase shape, epic-cc#811). Without
+                    // a copy the slot holds a flash label and the walk reads RAM
+                    // there (epic-cc#1197, epic-cc#1203). The copy is never
+                    // staged (the buffer is clobbered mid-walk) or pool-gated.
+                    // Over 255 bytes no copy exists and isel refuses the walk.
                     if let ir::Inst::Phi(p) = inst {
                         if p.ptr {
                             for (v, _) in &p.incoming {
@@ -3670,6 +3895,12 @@ fn allocate_inner(
                                     ir::Val::Const(_) => None,
                                 };
                                 if let Some(g) = base {
+                                    let small =
+                                        m.globals.iter().any(|gl| gl.name == g && gl.size <= 255);
+                                    if small && matches!(device.core, Core::Pic14 | Core::Pic14e) {
+                                        const_to_ram.insert(g.clone());
+                                        const_derived.insert(g.clone());
+                                    }
                                     const_phi.insert(g);
                                 }
                             }
@@ -4392,6 +4623,8 @@ fn allocate_inner(
         let fl = frame_layout(
             f,
             &resolved,
+            &retention,
+            precise,
             floored_va_size(f, &va_sizes),
             unplaced_in(&f.name),
             &retval_in(&f.name),
@@ -4563,6 +4796,7 @@ fn allocate_inner(
             isr_hi_save,
         },
         frames_fit,
+        base,
     )
 }
 
