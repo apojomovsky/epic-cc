@@ -2862,14 +2862,11 @@ pub fn allocate_with_pool(
     };
     // Precise intervals shrink frames, and every shrink re-tiles the
     // downstream bases the outliner merges on (epic-cc#1145). The lever
-    // stays only where it pays RAM: a strict RAM win keeps the precise
-    // map, and a RAM-neutral map keeps it only when the layout is
-    // unchanged down to the last local (same bases but reshuffled slots
-    // still feed different addresses to codegen and the outliner). The
-    // score is RAM-only: the ISR-region tie-break serves the dip scopes,
-    // and a region-only win still re-tiles measured code. Anything else
-    // keeps the lever-off map, so churn that buys no RAM can never move
-    // a row.
+    // stays only where it pays RAM: a strict win keeps the precise map,
+    // and a tie keeps it only on a byte-identical layout (reshuffled
+    // slots still feed different addresses to codegen). The score is
+    // RAM-only: a region-only win still re-tiles measured code. Churn
+    // that buys no RAM can never move a row.
     let select = |dip: Dip| -> AllocLayout {
         let (plain, plain_base) = select_impl(dip, true);
         if !lever_can_fire(m) {
