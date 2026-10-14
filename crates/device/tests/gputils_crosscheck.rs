@@ -1075,6 +1075,8 @@ fn flash_words_matches_gputils_for_every_device() {
 /// gputils names must be in the table, by name or pack alias, at the same
 /// address, and every single-bit field both name must sit at the same bit.
 /// Bits only one side names are MPASM spellings (`R_NOT_W`), not errors.
+/// Parts gputils predates ship no header; a vendored second oracle stands
+/// in for the check there.
 #[test]
 fn sfr_tables_match_gputils_headers() {
     let Some(share) = gputils_share() else {
@@ -1083,8 +1085,15 @@ fn sfr_tables_match_gputils_headers() {
     for dev in device::ALL.iter().filter(|d| !d.sfrs.is_empty()) {
         let stem = dev.name.strip_prefix('p').unwrap_or(dev.name);
         let path = share.join("header").join(format!("p{stem}.inc"));
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{}: cannot read {}: {e}", dev.name, path.display()));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            // gputils predates some parts, so no header ships for them. A
+            // vendored second oracle covers the device data instead; without
+            // one the missing header is a coverage hole, never a pass.
+            if second_oracle_path(dev.name).is_file() {
+                continue;
+            }
+            panic!("{}: gputils ships no header {}", dev.name, path.display());
+        };
         let inc = device::gputils::names_from_inc(&text);
         let find = |name: &str| {
             dev.sfrs

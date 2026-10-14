@@ -1,0 +1,2121 @@
+name = "p16f13145"
+core = "pic14e"
+flash_words = 8192
+ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF], [0x0120, 0x016F], [0x01A0, 0x01EF], [0x0220, 0x026F], [0x02A0, 0x02EF], [0x0320, 0x036F], [0x03A0, 0x03EF], [0x0420, 0x046F], [0x04A0, 0x04EF], [0x0520, 0x056F], [0x05A0, 0x05EF], [0x0620, 0x064F]]
+common_ram = [0x0070, 0x007F]
+stack_depth = 16
+interrupt_vectors = [0x0004]
+
+[provenance]
+tier = "atdf"
+source = "PIC16F13145.PIC"
+pack = "Microchip.PIC16F1xxxx_DFP.1.32.471"
+sha256 = "2149c21c81cdd4832629d4701b14d6b4d3a7a7e7517fe17b9cdfedfa5bc63773"
+
+[config]
+base_byte_addr = 0x1000E
+num_bytes = 10
+erased_baseline = [0xFF, 0x3F, 0xFF, 0x3F, 0xFF, 0x3F, 0xFF, 0x3F, 0xFF, 0x3F]
+
+[[config.fields]]
+name = "osc"
+aliases = ["FEXTOSC"]
+byte_offset = 0
+mask = 0x07
+shift = 0
+values = [{ name = "lp", bits = 0 }, { name = "xt", bits = 1 }, { name = "hs", bits = 2 }, { name = "off", bits = 4 }, { name = "ecl", bits = 5 }, { name = "ech", bits = 7 }]
+
+[[config.fields]]
+name = "rstosc"
+byte_offset = 0
+mask = 0x70
+shift = 4
+values = [{ name = "hfintosc_32mhz", bits = 0 }, { name = "hfintosc_16mhz", bits = 1 }, { name = "extosc_4pll", bits = 2 }, { name = "lfintosc", bits = 5 }, { name = "hfintosc_1mhz", bits = 6 }, { name = "extosc", bits = 7 }]
+
+[[config.fields]]
+name = "clkouten"
+byte_offset = 1
+mask = 0x01
+shift = 0
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "cswen"
+byte_offset = 1
+mask = 0x08
+shift = 3
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "vddar"
+byte_offset = 1
+mask = 0x10
+shift = 4
+values = [{ name = "lo", bits = 0 }, { name = "hi", bits = 1 }]
+
+[[config.fields]]
+name = "fcmen"
+byte_offset = 1
+mask = 0x20
+shift = 5
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "mclre"
+byte_offset = 2
+mask = 0x01
+shift = 0
+values = [{ name = "intmclr", bits = 0 }, { name = "extmclr", bits = 1 }]
+
+[[config.fields]]
+name = "pwrts"
+byte_offset = 2
+mask = 0x06
+shift = 1
+values = [{ name = "pwrt_1", bits = 0 }, { name = "pwrt_16", bits = 1 }, { name = "pwrt_64", bits = 2 }, { name = "pwrt_off", bits = 3 }]
+
+[[config.fields]]
+name = "lpboren"
+byte_offset = 2
+mask = 0x20
+shift = 5
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "boren"
+byte_offset = 2
+mask = 0xC0
+shift = 6
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "sboren", bits = 1 }, { name = "nsleep", bits = 2 }, { name = "on", bits = 3 }]
+
+[[config.fields]]
+name = "dacautoen"
+byte_offset = 3
+mask = 0x01
+shift = 0
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "borv"
+byte_offset = 3
+mask = 0x02
+shift = 1
+values = [{ name = "hi", bits = 0 }, { name = "lo", bits = 1 }]
+
+[[config.fields]]
+name = "pps1way"
+byte_offset = 3
+mask = 0x08
+shift = 3
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "stvren"
+byte_offset = 3
+mask = 0x10
+shift = 4
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "debug"
+byte_offset = 3
+mask = 0x20
+shift = 5
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wdtcps"
+byte_offset = 4
+mask = 0x1F
+shift = 0
+values = [{ name = "wdtcps_0", bits = 0 }, { name = "wdtcps_1", bits = 1 }, { name = "wdtcps_2", bits = 2 }, { name = "wdtcps_3", bits = 3 }, { name = "wdtcps_4", bits = 4 }, { name = "wdtcps_5", bits = 5 }, { name = "wdtcps_6", bits = 6 }, { name = "wdtcps_7", bits = 7 }, { name = "wdtcps_8", bits = 8 }, { name = "wdtcps_9", bits = 9 }, { name = "wdtcps_10", bits = 10 }, { name = "wdtcps_11", bits = 11 }, { name = "wdtcps_12", bits = 12 }, { name = "wdtcps_13", bits = 13 }, { name = "wdtcps_14", bits = 14 }, { name = "wdtcps_15", bits = 15 }, { name = "wdtcps_16", bits = 16 }, { name = "wdtcps_17", bits = 17 }, { name = "wdtcps_18", bits = 18 }, { name = "wdtcps_19", bits = 19 }, { name = "wdtcps_20", bits = 20 }, { name = "wdtcps_21", bits = 21 }, { name = "wdtcps_22", bits = 22 }, { name = "wdtcps_23", bits = 23 }, { name = "wdtcps_24", bits = 24 }, { name = "wdtcps_25", bits = 25 }, { name = "wdtcps_26", bits = 26 }, { name = "wdtcps_27", bits = 27 }, { name = "wdtcps_28", bits = 28 }, { name = "wdtcps_29", bits = 29 }, { name = "wdtcps_30", bits = 30 }, { name = "wdtcps_31", bits = 31 }]
+
+[[config.fields]]
+name = "wdt"
+aliases = ["WDTE"]
+byte_offset = 4
+mask = 0x60
+shift = 5
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "swdten", bits = 1 }, { name = "nsleep", bits = 2 }, { name = "on", bits = 3 }]
+
+[[config.fields]]
+name = "wdtcws"
+byte_offset = 5
+mask = 0x07
+shift = 0
+values = [{ name = "wdtcws_0", bits = 0 }, { name = "wdtcws_1", bits = 1 }, { name = "wdtcws_2", bits = 2 }, { name = "wdtcws_3", bits = 3 }, { name = "wdtcws_4", bits = 4 }, { name = "wdtcws_5", bits = 5 }, { name = "wdtcws_6", bits = 6 }, { name = "wdtcws_7", bits = 7 }]
+
+[[config.fields]]
+name = "wdtccs"
+byte_offset = 5
+mask = 0x38
+shift = 3
+values = [{ name = "lfintosc", bits = 0 }, { name = "mfintosc", bits = 1 }, { name = "sc", bits = 7 }]
+
+[[config.fields]]
+name = "bbsize"
+byte_offset = 6
+mask = 0x07
+shift = 0
+values = [{ name = "bb64k", bits = 0 }, { name = "bb32k", bits = 1 }, { name = "bb16k", bits = 2 }, { name = "bb8k", bits = 3 }, { name = "bb4k", bits = 4 }, { name = "bb2k", bits = 5 }, { name = "bb1k", bits = 6 }, { name = "bb512", bits = 7 }]
+
+[[config.fields]]
+name = "bben"
+byte_offset = 6
+mask = 0x08
+shift = 3
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "safen"
+byte_offset = 6
+mask = 0x10
+shift = 4
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wrtapp"
+byte_offset = 6
+mask = 0x80
+shift = 7
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wrtb"
+byte_offset = 7
+mask = 0x01
+shift = 0
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wrtc"
+byte_offset = 7
+mask = 0x02
+shift = 1
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wrtsaf"
+byte_offset = 7
+mask = 0x08
+shift = 3
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "lvp"
+byte_offset = 7
+mask = 0x20
+shift = 5
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "cp"
+byte_offset = 8
+mask = 0x01
+shift = 0
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[sfrs]]
+name = "INDF0"
+addr = 0x0000
+width = 1
+fields = []
+
+[[sfrs]]
+name = "INDF1"
+addr = 0x0001
+width = 1
+fields = []
+
+[[sfrs]]
+name = "PCL"
+addr = 0x0002
+width = 1
+fields = []
+
+[[sfrs]]
+name = "STATUS"
+addr = 0x0003
+width = 1
+fields = [{ name = "C", mask = 0x01, shift = 0 }, { name = "DC", mask = 0x02, shift = 1 }, { name = "Z", mask = 0x04, shift = 2 }, { name = "nPD", mask = 0x08, shift = 3 }, { name = "nTO", mask = 0x10, shift = 4 }, { name = "CARRY", mask = 0x01, shift = 0, mode = 1 }, { name = "ZERO", mask = 0x04, shift = 2, mode = 1 }]
+
+[[sfrs]]
+name = "FSR0"
+addr = 0x0004
+width = 2
+fields = []
+
+[[sfrs]]
+name = "FSR0L"
+addr = 0x0004
+width = 1
+fields = []
+
+[[sfrs]]
+name = "FSR0H"
+addr = 0x0005
+width = 1
+fields = []
+
+[[sfrs]]
+name = "FSR1"
+addr = 0x0006
+width = 2
+fields = []
+
+[[sfrs]]
+name = "FSR1L"
+addr = 0x0006
+width = 1
+fields = []
+
+[[sfrs]]
+name = "FSR1H"
+addr = 0x0007
+width = 1
+fields = []
+
+[[sfrs]]
+name = "BSR"
+addr = 0x0008
+width = 1
+fields = [{ name = "BSR", mask = 0x3F, shift = 0 }, { name = "BSR0", mask = 0x01, shift = 0, mode = 1 }, { name = "BSR1", mask = 0x02, shift = 1, mode = 1 }, { name = "BSR2", mask = 0x04, shift = 2, mode = 1 }, { name = "BSR3", mask = 0x08, shift = 3, mode = 1 }, { name = "BSR4", mask = 0x10, shift = 4, mode = 1 }, { name = "BSR5", mask = 0x20, shift = 5, mode = 1 }]
+
+[[sfrs]]
+name = "WREG"
+addr = 0x0009
+width = 1
+fields = []
+
+[[sfrs]]
+name = "PCLATH"
+addr = 0x000A
+width = 1
+fields = [{ name = "PCLATH", mask = 0x7F, shift = 0 }]
+
+[[sfrs]]
+name = "INTCON"
+addr = 0x000B
+width = 1
+fields = [{ name = "INTEDG", mask = 0x01, shift = 0 }, { name = "PEIE", mask = 0x40, shift = 6 }, { name = "GIE", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PORTA"
+addr = 0x000C
+width = 1
+fields = [{ name = "RA0", mask = 0x01, shift = 0 }, { name = "RA1", mask = 0x02, shift = 1 }, { name = "RA2", mask = 0x04, shift = 2 }, { name = "RA3", mask = 0x08, shift = 3 }, { name = "RA4", mask = 0x10, shift = 4 }, { name = "RA5", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "PORTB"
+addr = 0x000D
+width = 1
+fields = [{ name = "RB4", mask = 0x10, shift = 4 }, { name = "RB5", mask = 0x20, shift = 5 }, { name = "RB6", mask = 0x40, shift = 6 }, { name = "RB7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PORTC"
+addr = 0x000E
+width = 1
+fields = [{ name = "RC0", mask = 0x01, shift = 0 }, { name = "RC1", mask = 0x02, shift = 1 }, { name = "RC2", mask = 0x04, shift = 2 }, { name = "RC3", mask = 0x08, shift = 3 }, { name = "RC4", mask = 0x10, shift = 4 }, { name = "RC5", mask = 0x20, shift = 5 }, { name = "RC6", mask = 0x40, shift = 6 }, { name = "RC7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "TRISA"
+addr = 0x0012
+width = 1
+fields = [{ name = "TRISA0", mask = 0x01, shift = 0 }, { name = "TRISA1", mask = 0x02, shift = 1 }, { name = "TRISA2", mask = 0x04, shift = 2 }, { name = "TRISA4", mask = 0x10, shift = 4 }, { name = "TRISA5", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "TRISB"
+addr = 0x0013
+width = 1
+fields = [{ name = "TRISB4", mask = 0x10, shift = 4 }, { name = "TRISB5", mask = 0x20, shift = 5 }, { name = "TRISB6", mask = 0x40, shift = 6 }, { name = "TRISB7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "TRISC"
+addr = 0x0014
+width = 1
+fields = [{ name = "TRISC0", mask = 0x01, shift = 0 }, { name = "TRISC1", mask = 0x02, shift = 1 }, { name = "TRISC2", mask = 0x04, shift = 2 }, { name = "TRISC3", mask = 0x08, shift = 3 }, { name = "TRISC4", mask = 0x10, shift = 4 }, { name = "TRISC5", mask = 0x20, shift = 5 }, { name = "TRISC6", mask = 0x40, shift = 6 }, { name = "TRISC7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "LATA"
+addr = 0x0018
+width = 1
+fields = [{ name = "LATA0", mask = 0x01, shift = 0 }, { name = "LATA1", mask = 0x02, shift = 1 }, { name = "LATA2", mask = 0x04, shift = 2 }, { name = "LATA4", mask = 0x10, shift = 4 }, { name = "LATA5", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "LATB"
+addr = 0x0019
+width = 1
+fields = [{ name = "LATB4", mask = 0x10, shift = 4 }, { name = "LATB5", mask = 0x20, shift = 5 }, { name = "LATB6", mask = 0x40, shift = 6 }, { name = "LATB7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "LATC"
+addr = 0x001A
+width = 1
+fields = [{ name = "LATC0", mask = 0x01, shift = 0 }, { name = "LATC1", mask = 0x02, shift = 1 }, { name = "LATC2", mask = 0x04, shift = 2 }, { name = "LATC3", mask = 0x08, shift = 3 }, { name = "LATC4", mask = 0x10, shift = 4 }, { name = "LATC5", mask = 0x20, shift = 5 }, { name = "LATC6", mask = 0x40, shift = 6 }, { name = "LATC7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PIR0"
+addr = 0x008C
+width = 1
+fields = [{ name = "INTF", mask = 0x01, shift = 0 }, { name = "IOCIF", mask = 0x10, shift = 4 }, { name = "TMR0IF", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "PIR1"
+addr = 0x008D
+width = 1
+fields = [{ name = "NVMIF", mask = 0x01, shift = 0 }, { name = "CRCIF", mask = 0x02, shift = 1 }, { name = "SCANIF", mask = 0x04, shift = 2 }, { name = "CSWIF", mask = 0x10, shift = 4 }, { name = "OSFIF", mask = 0x20, shift = 5 }, { name = "TMR1IF", mask = 0x40, shift = 6 }, { name = "TMR1GIF", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PIR2"
+addr = 0x008E
+width = 1
+fields = [{ name = "TMR2IF", mask = 0x04, shift = 2 }, { name = "CCP1IF", mask = 0x20, shift = 5 }, { name = "CCP2IF", mask = 0x40, shift = 6 }]
+
+[[sfrs]]
+name = "PIR3"
+addr = 0x008F
+width = 1
+fields = []
+
+[[sfrs]]
+name = "PIR4"
+addr = 0x0090
+width = 1
+fields = [{ name = "CLC1IF", mask = 0x04, shift = 2 }, { name = "CLC2IF", mask = 0x08, shift = 3 }, { name = "CLC3IF", mask = 0x10, shift = 4 }, { name = "CLC4IF", mask = 0x20, shift = 5 }, { name = "TX1IF", mask = 0x40, shift = 6 }, { name = "RC1IF", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PIR5"
+addr = 0x0091
+width = 1
+fields = [{ name = "SSP1IF", mask = 0x04, shift = 2 }, { name = "BCL1IF", mask = 0x08, shift = 3 }, { name = "CM1IF", mask = 0x40, shift = 6 }, { name = "CM2IF", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PIR6"
+addr = 0x0092
+width = 1
+fields = [{ name = "ADIF", mask = 0x01, shift = 0 }, { name = "ADTIF", mask = 0x02, shift = 1 }]
+
+[[sfrs]]
+name = "PIR7"
+addr = 0x0093
+width = 1
+fields = [{ name = "CLB1IF0", mask = 0x01, shift = 0 }, { name = "CLB1IF1", mask = 0x02, shift = 1 }, { name = "CLB1IF2", mask = 0x04, shift = 2 }, { name = "CLB1IF3", mask = 0x08, shift = 3 }]
+
+[[sfrs]]
+name = "PIE0"
+addr = 0x0096
+width = 1
+fields = [{ name = "INTE", mask = 0x01, shift = 0 }, { name = "IOCIE", mask = 0x10, shift = 4 }, { name = "TMR0IE", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "PIE1"
+addr = 0x0097
+width = 1
+fields = [{ name = "NVMIE", mask = 0x01, shift = 0 }, { name = "CRCIE", mask = 0x02, shift = 1 }, { name = "SCANIE", mask = 0x04, shift = 2 }, { name = "CSWIE", mask = 0x10, shift = 4 }, { name = "OSFIE", mask = 0x20, shift = 5 }, { name = "TMR1IE", mask = 0x40, shift = 6 }, { name = "TMR1GIE", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PIE2"
+addr = 0x0098
+width = 1
+fields = [{ name = "TMR2IE", mask = 0x04, shift = 2 }, { name = "CCP1IE", mask = 0x20, shift = 5 }, { name = "CCP2IE", mask = 0x40, shift = 6 }]
+
+[[sfrs]]
+name = "PIE3"
+addr = 0x0099
+width = 1
+fields = []
+
+[[sfrs]]
+name = "PIE4"
+addr = 0x009A
+width = 1
+fields = [{ name = "CLC1IE", mask = 0x04, shift = 2 }, { name = "CLC2IE", mask = 0x08, shift = 3 }, { name = "CLC3IE", mask = 0x10, shift = 4 }, { name = "CLC4IE", mask = 0x20, shift = 5 }, { name = "TX1IE", mask = 0x40, shift = 6 }, { name = "RC1IE", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PIE5"
+addr = 0x009B
+width = 1
+fields = [{ name = "SSP1IE", mask = 0x04, shift = 2 }, { name = "BCL1IE", mask = 0x08, shift = 3 }, { name = "CM1IE", mask = 0x40, shift = 6 }, { name = "CM2IE", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PIE6"
+addr = 0x009C
+width = 1
+fields = [{ name = "ADIE", mask = 0x01, shift = 0 }, { name = "ADTIE", mask = 0x02, shift = 1 }]
+
+[[sfrs]]
+name = "PIE7"
+addr = 0x009D
+width = 1
+fields = [{ name = "CLB1IE0", mask = 0x01, shift = 0 }, { name = "CLB1IE1", mask = 0x02, shift = 1 }, { name = "CLB1IE2", mask = 0x04, shift = 2 }, { name = "CLB1IE3", mask = 0x08, shift = 3 }]
+
+[[sfrs]]
+name = "PMD0"
+addr = 0x010C
+width = 1
+fields = [{ name = "NVMMD", mask = 0x01, shift = 0 }, { name = "CRCMD", mask = 0x02, shift = 1 }, { name = "SCANMD", mask = 0x04, shift = 2 }, { name = "SYSCMD", mask = 0x08, shift = 3 }, { name = "IOCMD", mask = 0x20, shift = 5 }, { name = "TMR0MD", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PMD1"
+addr = 0x010D
+width = 1
+fields = [{ name = "TMR1MD", mask = 0x01, shift = 0 }, { name = "TMR2MD", mask = 0x04, shift = 2 }, { name = "CCP1MD", mask = 0x20, shift = 5 }, { name = "CCP2MD", mask = 0x40, shift = 6 }]
+
+[[sfrs]]
+name = "PMD2"
+addr = 0x010E
+width = 1
+fields = [{ name = "CLC1MD", mask = 0x20, shift = 5 }, { name = "CLC2MD", mask = 0x40, shift = 6 }, { name = "CLC3MD", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PMD3"
+addr = 0x010F
+width = 1
+fields = [{ name = "CLC4MD", mask = 0x01, shift = 0 }, { name = "UART1MD", mask = 0x02, shift = 1 }, { name = "MSSP1MD", mask = 0x08, shift = 3 }, { name = "FVRMD", mask = 0x20, shift = 5 }, { name = "CM1MD", mask = 0x40, shift = 6 }, { name = "CM2MD", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PMD4"
+addr = 0x0110
+width = 1
+fields = [{ name = "ADCMD", mask = 0x01, shift = 0 }, { name = "DAC1MD", mask = 0x02, shift = 1 }, { name = "CLBMD", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PMD5"
+addr = 0x0111
+width = 1
+fields = [{ name = "PWM1MD", mask = 0x01, shift = 0 }, { name = "PWM2MD", mask = 0x02, shift = 1 }]
+
+[[sfrs]]
+name = "WDTCON0"
+addr = 0x018C
+width = 1
+fields = [{ name = "SEN", mask = 0x01, shift = 0 }, { name = "PS", mask = 0x3E, shift = 1 }, { name = "SWDTEN", mask = 0x01, shift = 0, mode = 1 }, { name = "WDTPS", mask = 0x3E, shift = 1, mode = 1 }, { name = "WDTSEN", mask = 0x01, shift = 0, mode = 2 }, { name = "PS0", mask = 0x02, shift = 1, mode = 2 }, { name = "PS1", mask = 0x04, shift = 2, mode = 2 }, { name = "PS2", mask = 0x08, shift = 3, mode = 2 }, { name = "PS3", mask = 0x10, shift = 4, mode = 2 }, { name = "PS4", mask = 0x20, shift = 5, mode = 2 }, { name = "WDTPS0", mask = 0x02, shift = 1, mode = 3 }, { name = "WDTPS1", mask = 0x04, shift = 2, mode = 3 }, { name = "WDTPS2", mask = 0x08, shift = 3, mode = 3 }, { name = "WDTPS3", mask = 0x10, shift = 4, mode = 3 }, { name = "WDTPS4", mask = 0x20, shift = 5, mode = 3 }]
+
+[[sfrs]]
+name = "WDTCON1"
+addr = 0x018D
+width = 1
+fields = [{ name = "WINDOW", mask = 0x07, shift = 0 }, { name = "CS", mask = 0x70, shift = 4 }, { name = "WINDOW0", mask = 0x01, shift = 0, mode = 1 }, { name = "WINDOW1", mask = 0x02, shift = 1, mode = 1 }, { name = "WINDOW2", mask = 0x04, shift = 2, mode = 1 }, { name = "WDTCS", mask = 0x70, shift = 4, mode = 1 }, { name = "WDTWINDOW", mask = 0x07, shift = 0, mode = 2 }, { name = "CS0", mask = 0x10, shift = 4, mode = 2 }, { name = "CS1", mask = 0x20, shift = 5, mode = 2 }, { name = "CS2", mask = 0x40, shift = 6, mode = 2 }, { name = "WDTWINDOW0", mask = 0x01, shift = 0, mode = 3 }, { name = "WDTWINDOW1", mask = 0x02, shift = 1, mode = 3 }, { name = "WDTWINDOW2", mask = 0x04, shift = 2, mode = 3 }, { name = "WDTCS0", mask = 0x10, shift = 4, mode = 3 }, { name = "WDTCS1", mask = 0x20, shift = 5, mode = 3 }, { name = "WDTCS2", mask = 0x40, shift = 6, mode = 3 }]
+
+[[sfrs]]
+name = "WDTPS"
+addr = 0x018E
+width = 2
+fields = []
+
+[[sfrs]]
+name = "WDTPSL"
+addr = 0x018E
+width = 1
+fields = [{ name = "PSCNT0", mask = 0x01, shift = 0 }, { name = "PSCNT1", mask = 0x02, shift = 1 }, { name = "PSCNT2", mask = 0x04, shift = 2 }, { name = "PSCNT3", mask = 0x08, shift = 3 }, { name = "PSCNT4", mask = 0x10, shift = 4 }, { name = "PSCNT5", mask = 0x20, shift = 5 }, { name = "PSCNT6", mask = 0x40, shift = 6 }, { name = "PSCNT7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "WDTPSH"
+addr = 0x018F
+width = 1
+fields = [{ name = "PSCNT8", mask = 0x01, shift = 0 }, { name = "PSCNT9", mask = 0x02, shift = 1 }, { name = "PSCNT10", mask = 0x04, shift = 2 }, { name = "PSCNT11", mask = 0x08, shift = 3 }, { name = "PSCNT12", mask = 0x10, shift = 4 }, { name = "PSCNT13", mask = 0x20, shift = 5 }, { name = "PSCNT14", mask = 0x40, shift = 6 }, { name = "PSCNT15", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "WDTTMR"
+addr = 0x0190
+width = 1
+fields = [{ name = "PSCNT16", mask = 0x01, shift = 0 }, { name = "PSCNT17", mask = 0x02, shift = 1 }, { name = "STATE", mask = 0x04, shift = 2 }, { name = "TMR", mask = 0xF8, shift = 3 }, { name = "WDTPSCNT16", mask = 0x01, shift = 0, mode = 1 }, { name = "WDTPSCNT17", mask = 0x02, shift = 1, mode = 1 }, { name = "WDTSTATE", mask = 0x04, shift = 2, mode = 1 }, { name = "WDTTMR0", mask = 0x08, shift = 3, mode = 1 }, { name = "WDTTMR1", mask = 0x10, shift = 4, mode = 1 }, { name = "WDTTMR2", mask = 0x20, shift = 5, mode = 1 }, { name = "WDTTMR3", mask = 0x40, shift = 6, mode = 1 }, { name = "WDTTMR4", mask = 0x80, shift = 7, mode = 1 }, { name = "WDTTMR", mask = 0xF8, shift = 3, mode = 2 }]
+
+[[sfrs]]
+name = "BORCON"
+addr = 0x0191
+width = 1
+fields = [{ name = "BORRDY", mask = 0x01, shift = 0 }, { name = "SBOREN", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PCON0"
+addr = 0x0192
+width = 1
+fields = [{ name = "nBOR", mask = 0x01, shift = 0 }, { name = "nPOR", mask = 0x02, shift = 1 }, { name = "nRI", mask = 0x04, shift = 2 }, { name = "nRMCLR", mask = 0x08, shift = 3 }, { name = "nRWDT", mask = 0x10, shift = 4 }, { name = "nWDTWV", mask = 0x20, shift = 5 }, { name = "STKUNF", mask = 0x40, shift = 6 }, { name = "STKOVF", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "PCON1"
+addr = 0x0193
+width = 1
+fields = [{ name = "nMEMV", mask = 0x02, shift = 1 }]
+
+[[sfrs]]
+name = "TMR0L"
+addr = 0x019C
+width = 1
+aliases = ["TMR0"]
+fields = [{ name = "TMR0L0", mask = 0x01, shift = 0 }, { name = "TMR0L1", mask = 0x02, shift = 1 }, { name = "TMR0L2", mask = 0x04, shift = 2 }, { name = "TMR0L3", mask = 0x08, shift = 3 }, { name = "TMR0L4", mask = 0x10, shift = 4 }, { name = "TMR0L5", mask = 0x20, shift = 5 }, { name = "TMR0L6", mask = 0x40, shift = 6 }, { name = "TMR0L7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "TMR0H"
+addr = 0x019D
+width = 1
+aliases = ["PR0"]
+fields = [{ name = "TMR0H0", mask = 0x01, shift = 0 }, { name = "TMR0H1", mask = 0x02, shift = 1 }, { name = "TMR0H2", mask = 0x04, shift = 2 }, { name = "TMR0H3", mask = 0x08, shift = 3 }, { name = "TMR0H4", mask = 0x10, shift = 4 }, { name = "TMR0H5", mask = 0x20, shift = 5 }, { name = "TMR0H6", mask = 0x40, shift = 6 }, { name = "TMR0H7", mask = 0x80, shift = 7 }, { name = "T0PR0", mask = 0x01, shift = 0, mode = 1 }, { name = "T0PR1", mask = 0x02, shift = 1, mode = 1 }, { name = "T0PR2", mask = 0x04, shift = 2, mode = 1 }, { name = "T0PR3", mask = 0x08, shift = 3, mode = 1 }, { name = "T0PR4", mask = 0x10, shift = 4, mode = 1 }, { name = "T0PR5", mask = 0x20, shift = 5, mode = 1 }, { name = "T0PR6", mask = 0x40, shift = 6, mode = 1 }, { name = "T0PR7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "T0CON0"
+addr = 0x019E
+width = 1
+fields = [{ name = "OUTPS", mask = 0x0F, shift = 0 }, { name = "MD16", mask = 0x10, shift = 4 }, { name = "OUT", mask = 0x20, shift = 5 }, { name = "EN", mask = 0x80, shift = 7 }, { name = "T0OUTPS", mask = 0x0F, shift = 0, mode = 1 }, { name = "T0MD16", mask = 0x10, shift = 4, mode = 1 }, { name = "T0OUT", mask = 0x20, shift = 5, mode = 1 }, { name = "T0EN", mask = 0x80, shift = 7, mode = 1 }, { name = "OUTPS0", mask = 0x01, shift = 0, mode = 2 }, { name = "OUTPS1", mask = 0x02, shift = 1, mode = 2 }, { name = "OUTPS2", mask = 0x04, shift = 2, mode = 2 }, { name = "OUTPS3", mask = 0x08, shift = 3, mode = 2 }, { name = "T016BIT", mask = 0x10, shift = 4, mode = 2 }, { name = "T0OUTPS0", mask = 0x01, shift = 0, mode = 3 }, { name = "T0OUTPS1", mask = 0x02, shift = 1, mode = 3 }, { name = "T0OUTPS2", mask = 0x04, shift = 2, mode = 3 }, { name = "T0OUTPS3", mask = 0x08, shift = 3, mode = 3 }]
+
+[[sfrs]]
+name = "T0CON1"
+addr = 0x019F
+width = 1
+fields = [{ name = "CKPS", mask = 0x0F, shift = 0 }, { name = "ASYNC", mask = 0x10, shift = 4 }, { name = "CS", mask = 0xE0, shift = 5 }, { name = "CKPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "CKPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "CKPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "CKPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "T0ASYNC", mask = 0x10, shift = 4, mode = 1 }, { name = "CS0", mask = 0x20, shift = 5, mode = 1 }, { name = "CS1", mask = 0x40, shift = 6, mode = 1 }, { name = "CS2", mask = 0x80, shift = 7, mode = 1 }, { name = "T0CKPS", mask = 0x0F, shift = 0, mode = 2 }, { name = "T0CS", mask = 0xE0, shift = 5, mode = 2 }, { name = "T0CKPS0", mask = 0x01, shift = 0, mode = 3 }, { name = "T0CKPS1", mask = 0x02, shift = 1, mode = 3 }, { name = "T0CKPS2", mask = 0x04, shift = 2, mode = 3 }, { name = "T0CKPS3", mask = 0x08, shift = 3, mode = 3 }, { name = "T0CS0", mask = 0x20, shift = 5, mode = 3 }, { name = "T0CS1", mask = 0x40, shift = 6, mode = 3 }, { name = "T0CS2", mask = 0x80, shift = 7, mode = 3 }]
+
+[[sfrs]]
+name = "FVRCON"
+addr = 0x020C
+width = 1
+fields = [{ name = "ADFVR", mask = 0x03, shift = 0 }, { name = "CDAFVR", mask = 0x0C, shift = 2 }, { name = "TSRNG", mask = 0x10, shift = 4 }, { name = "TSEN", mask = 0x20, shift = 5 }, { name = "RDY", mask = 0x40, shift = 6 }, { name = "EN", mask = 0x80, shift = 7 }, { name = "ADFVR0", mask = 0x01, shift = 0, mode = 1 }, { name = "ADFVR1", mask = 0x02, shift = 1, mode = 1 }, { name = "CDAFVR0", mask = 0x04, shift = 2, mode = 1 }, { name = "CDAFVR1", mask = 0x08, shift = 3, mode = 1 }, { name = "FVRRDY", mask = 0x40, shift = 6, mode = 1 }, { name = "FVREN", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "CPCON"
+addr = 0x020D
+width = 1
+fields = [{ name = "CPRDY", mask = 0x01, shift = 0 }, { name = "CPT", mask = 0x02, shift = 1 }, { name = "CPREQ", mask = 0x04, shift = 2 }, { name = "CPOS", mask = 0x20, shift = 5 }, { name = "CPON", mask = 0xC0, shift = 6 }]
+
+[[sfrs]]
+name = "CPUDOZE"
+addr = 0x028C
+width = 1
+fields = [{ name = "DOZE", mask = 0x07, shift = 0 }, { name = "DOE", mask = 0x10, shift = 4 }, { name = "ROI", mask = 0x20, shift = 5 }, { name = "DOZEN", mask = 0x40, shift = 6 }, { name = "IDLEN", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "OSCCON1"
+addr = 0x028D
+width = 1
+fields = [{ name = "NDIV", mask = 0x0F, shift = 0 }, { name = "NOSC", mask = 0x70, shift = 4 }, { name = "NDIV0", mask = 0x01, shift = 0, mode = 1 }, { name = "NDIV1", mask = 0x02, shift = 1, mode = 1 }, { name = "NDIV2", mask = 0x04, shift = 2, mode = 1 }, { name = "NDIV3", mask = 0x08, shift = 3, mode = 1 }, { name = "NOSC0", mask = 0x10, shift = 4, mode = 1 }, { name = "NOSC1", mask = 0x20, shift = 5, mode = 1 }, { name = "NOSC2", mask = 0x40, shift = 6, mode = 1 }]
+
+[[sfrs]]
+name = "OSCCON2"
+addr = 0x028E
+width = 1
+fields = [{ name = "CDIV", mask = 0x0F, shift = 0 }, { name = "COSC", mask = 0x70, shift = 4 }, { name = "CDIV0", mask = 0x01, shift = 0, mode = 1 }, { name = "CDIV1", mask = 0x02, shift = 1, mode = 1 }, { name = "CDIV2", mask = 0x04, shift = 2, mode = 1 }, { name = "CDIV3", mask = 0x08, shift = 3, mode = 1 }, { name = "COSC0", mask = 0x10, shift = 4, mode = 1 }, { name = "COSC1", mask = 0x20, shift = 5, mode = 1 }, { name = "COSC2", mask = 0x40, shift = 6, mode = 1 }]
+
+[[sfrs]]
+name = "OSCCON3"
+addr = 0x028F
+width = 1
+fields = [{ name = "NOSCR", mask = 0x08, shift = 3 }, { name = "ORDY", mask = 0x10, shift = 4 }, { name = "CSWHOLD", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "OSCSTAT"
+addr = 0x0290
+width = 1
+fields = [{ name = "PLLR", mask = 0x01, shift = 0 }, { name = "SFOR", mask = 0x02, shift = 1 }, { name = "ADOR", mask = 0x04, shift = 2 }, { name = "LFOR", mask = 0x10, shift = 4 }, { name = "MFOR", mask = 0x20, shift = 5 }, { name = "HFOR", mask = 0x40, shift = 6 }, { name = "EXTOR", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "OSCEN"
+addr = 0x0291
+width = 1
+fields = [{ name = "PLLEN", mask = 0x01, shift = 0 }, { name = "ADOEN", mask = 0x04, shift = 2 }, { name = "LFOEN", mask = 0x10, shift = 4 }, { name = "MFOEN", mask = 0x20, shift = 5 }, { name = "HFOEN", mask = 0x40, shift = 6 }, { name = "EXTOEN", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "OSCTUNE"
+addr = 0x0292
+width = 1
+fields = [{ name = "TUN", mask = 0x3F, shift = 0 }, { name = "TUN0", mask = 0x01, shift = 0, mode = 1 }, { name = "TUN1", mask = 0x02, shift = 1, mode = 1 }, { name = "TUN2", mask = 0x04, shift = 2, mode = 1 }, { name = "TUN3", mask = 0x08, shift = 3, mode = 1 }, { name = "TUN4", mask = 0x10, shift = 4, mode = 1 }, { name = "TUN5", mask = 0x20, shift = 5, mode = 1 }]
+
+[[sfrs]]
+name = "OSCFRQ"
+addr = 0x0293
+width = 1
+fields = [{ name = "FRQ", mask = 0x07, shift = 0 }, { name = "FRQ0", mask = 0x01, shift = 0, mode = 1 }, { name = "FRQ1", mask = 0x02, shift = 1, mode = 1 }, { name = "FRQ2", mask = 0x04, shift = 2, mode = 1 }]
+
+[[sfrs]]
+name = "TMR1"
+addr = 0x030C
+width = 2
+fields = []
+
+[[sfrs]]
+name = "TMR1L"
+addr = 0x030C
+width = 1
+fields = [{ name = "TMR1L0", mask = 0x01, shift = 0 }, { name = "TMR1L1", mask = 0x02, shift = 1 }, { name = "TMR1L2", mask = 0x04, shift = 2 }, { name = "TMR1L3", mask = 0x08, shift = 3 }, { name = "TMR1L4", mask = 0x10, shift = 4 }, { name = "TMR1L5", mask = 0x20, shift = 5 }, { name = "TMR1L6", mask = 0x40, shift = 6 }, { name = "TMR1L7", mask = 0x80, shift = 7 }, { name = "TMR10", mask = 0x01, shift = 0, mode = 1 }, { name = "TMR11", mask = 0x02, shift = 1, mode = 1 }, { name = "TMR12", mask = 0x04, shift = 2, mode = 1 }, { name = "TMR13", mask = 0x08, shift = 3, mode = 1 }, { name = "TMR14", mask = 0x10, shift = 4, mode = 1 }, { name = "TMR15", mask = 0x20, shift = 5, mode = 1 }, { name = "TMR16", mask = 0x40, shift = 6, mode = 1 }, { name = "TMR17", mask = 0x80, shift = 7, mode = 1 }, { name = "CAL01", mask = 0x01, shift = 0, mode = 2 }, { name = "CAL11", mask = 0x02, shift = 1, mode = 2 }, { name = "CAL21", mask = 0x04, shift = 2, mode = 2 }, { name = "CAL31", mask = 0x08, shift = 3, mode = 2 }, { name = "CAL41", mask = 0x10, shift = 4, mode = 2 }, { name = "CAL51", mask = 0x20, shift = 5, mode = 2 }, { name = "CAL61", mask = 0x40, shift = 6, mode = 2 }, { name = "CAL71", mask = 0x80, shift = 7, mode = 2 }]
+
+[[sfrs]]
+name = "TMR1H"
+addr = 0x030D
+width = 1
+fields = [{ name = "TMR1H0", mask = 0x01, shift = 0 }, { name = "TMR1H1", mask = 0x02, shift = 1 }, { name = "TMR1H2", mask = 0x04, shift = 2 }, { name = "TMR1H3", mask = 0x08, shift = 3 }, { name = "TMR1H4", mask = 0x10, shift = 4 }, { name = "TMR1H5", mask = 0x20, shift = 5 }, { name = "TMR1H6", mask = 0x40, shift = 6 }, { name = "TMR1H7", mask = 0x80, shift = 7 }, { name = "TMR18", mask = 0x01, shift = 0, mode = 1 }, { name = "TMR19", mask = 0x02, shift = 1, mode = 1 }, { name = "TMR110", mask = 0x04, shift = 2, mode = 1 }, { name = "TMR111", mask = 0x08, shift = 3, mode = 1 }, { name = "TMR112", mask = 0x10, shift = 4, mode = 1 }, { name = "TMR113", mask = 0x20, shift = 5, mode = 1 }, { name = "TMR114", mask = 0x40, shift = 6, mode = 1 }, { name = "TMR115", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "T1CON"
+addr = 0x030E
+width = 1
+fields = [{ name = "ON", mask = 0x01, shift = 0 }, { name = "RD16", mask = 0x02, shift = 1 }, { name = "nSYNC", mask = 0x04, shift = 2 }, { name = "CKPS", mask = 0x30, shift = 4 }, { name = "TMR1ON", mask = 0x01, shift = 0, mode = 1 }, { name = "T1RD16", mask = 0x02, shift = 1, mode = 1 }, { name = "nT1SYNC", mask = 0x04, shift = 2, mode = 1 }, { name = "T1CKPS0", mask = 0x10, shift = 4, mode = 1 }, { name = "T1CKPS1", mask = 0x20, shift = 5, mode = 1 }, { name = "CKPS0", mask = 0x10, shift = 4, mode = 2 }, { name = "CKPS1", mask = 0x20, shift = 5, mode = 2 }, { name = "RD161", mask = 0x02, shift = 1, mode = 3 }]
+
+[[sfrs]]
+name = "T1GCON"
+addr = 0x030F
+width = 1
+aliases = ["PR1"]
+fields = [{ name = "GVAL", mask = 0x04, shift = 2 }, { name = "GGO_nDONE", mask = 0x08, shift = 3 }, { name = "GSPM", mask = 0x10, shift = 4 }, { name = "GTM", mask = 0x20, shift = 5 }, { name = "GPOL", mask = 0x40, shift = 6 }, { name = "GE", mask = 0x80, shift = 7 }, { name = "T1GVAL", mask = 0x04, shift = 2, mode = 1 }, { name = "T1GGO_nDONE", mask = 0x08, shift = 3, mode = 1 }, { name = "T1GSPM", mask = 0x10, shift = 4, mode = 1 }, { name = "T1GTM", mask = 0x20, shift = 5, mode = 1 }, { name = "T1GPOL", mask = 0x40, shift = 6, mode = 1 }, { name = "T1GE", mask = 0x80, shift = 7, mode = 1 }, { name = "T1GGO", mask = 0x08, shift = 3, mode = 2 }]
+
+[[sfrs]]
+name = "T1GATE"
+addr = 0x0310
+width = 1
+aliases = ["TMR1GATE"]
+fields = [{ name = "GSS", mask = 0x1F, shift = 0 }, { name = "GSS0", mask = 0x01, shift = 0, mode = 1 }, { name = "GSS1", mask = 0x02, shift = 1, mode = 1 }, { name = "GSS2", mask = 0x04, shift = 2, mode = 1 }, { name = "GSS3", mask = 0x08, shift = 3, mode = 1 }, { name = "GSS4", mask = 0x10, shift = 4, mode = 1 }, { name = "T1GSS0", mask = 0x01, shift = 0, mode = 2 }, { name = "T1GSS1", mask = 0x02, shift = 1, mode = 2 }, { name = "T1GSS2", mask = 0x04, shift = 2, mode = 2 }, { name = "T1GSS3", mask = 0x08, shift = 3, mode = 2 }, { name = "T1GSS4", mask = 0x10, shift = 4, mode = 2 }]
+
+[[sfrs]]
+name = "T1CLK"
+addr = 0x0311
+width = 1
+aliases = ["TMR1CLK"]
+fields = [{ name = "T1CS0", mask = 0x01, shift = 0 }, { name = "T1CS1", mask = 0x02, shift = 1 }, { name = "T1CS2", mask = 0x04, shift = 2 }, { name = "T1CS3", mask = 0x08, shift = 3 }, { name = "T1CS4", mask = 0x10, shift = 4 }, { name = "CS0", mask = 0x01, shift = 0, mode = 1 }, { name = "CS1", mask = 0x02, shift = 1, mode = 1 }, { name = "CS2", mask = 0x04, shift = 2, mode = 1 }, { name = "CS3", mask = 0x08, shift = 3, mode = 1 }, { name = "CS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "T2TMR"
+addr = 0x038C
+width = 1
+aliases = ["TMR2"]
+fields = []
+
+[[sfrs]]
+name = "T2PR"
+addr = 0x038D
+width = 1
+aliases = ["PR2"]
+fields = []
+
+[[sfrs]]
+name = "T2CON"
+addr = 0x038E
+width = 1
+fields = [{ name = "OUTPS", mask = 0x0F, shift = 0 }, { name = "CKPS", mask = 0x70, shift = 4 }, { name = "ON", mask = 0x80, shift = 7 }, { name = "T2OUTPS", mask = 0x0F, shift = 0, mode = 1 }, { name = "T2CKPS", mask = 0x70, shift = 4, mode = 1 }, { name = "T2ON", mask = 0x80, shift = 7, mode = 1 }, { name = "T2OUTPS0", mask = 0x01, shift = 0, mode = 2 }, { name = "T2OUTPS1", mask = 0x02, shift = 1, mode = 2 }, { name = "T2OUTPS2", mask = 0x04, shift = 2, mode = 2 }, { name = "T2OUTPS3", mask = 0x08, shift = 3, mode = 2 }, { name = "T2CKPS0", mask = 0x10, shift = 4, mode = 2 }, { name = "T2CKPS1", mask = 0x20, shift = 5, mode = 2 }, { name = "T2CKPS2", mask = 0x40, shift = 6, mode = 2 }, { name = "OUTPS0", mask = 0x01, shift = 0, mode = 3 }, { name = "OUTPS1", mask = 0x02, shift = 1, mode = 3 }, { name = "OUTPS2", mask = 0x04, shift = 2, mode = 3 }, { name = "OUTPS3", mask = 0x08, shift = 3, mode = 3 }, { name = "CKPS0", mask = 0x10, shift = 4, mode = 3 }, { name = "CKPS1", mask = 0x20, shift = 5, mode = 3 }, { name = "CKPS2", mask = 0x40, shift = 6, mode = 3 }, { name = "TMR2ON", mask = 0x80, shift = 7, mode = 3 }]
+
+[[sfrs]]
+name = "T2HLT"
+addr = 0x038F
+width = 1
+fields = [{ name = "MODE", mask = 0x1F, shift = 0 }, { name = "CSYNC", mask = 0x20, shift = 5 }, { name = "CPOL", mask = 0x40, shift = 6 }, { name = "PSYNC", mask = 0x80, shift = 7 }, { name = "MODE0", mask = 0x01, shift = 0, mode = 1 }, { name = "MODE1", mask = 0x02, shift = 1, mode = 1 }, { name = "MODE2", mask = 0x04, shift = 2, mode = 1 }, { name = "MODE3", mask = 0x08, shift = 3, mode = 1 }, { name = "MODE4", mask = 0x10, shift = 4, mode = 1 }, { name = "CKSYNC", mask = 0x20, shift = 5, mode = 1 }, { name = "CKPOL", mask = 0x40, shift = 6, mode = 1 }, { name = "T2MODE", mask = 0x1F, shift = 0, mode = 2 }, { name = "T2CSYNC", mask = 0x20, shift = 5, mode = 2 }, { name = "T2CPOL", mask = 0x40, shift = 6, mode = 2 }, { name = "T2PSYNC", mask = 0x80, shift = 7, mode = 2 }, { name = "T2MODE0", mask = 0x01, shift = 0, mode = 3 }, { name = "T2MODE1", mask = 0x02, shift = 1, mode = 3 }, { name = "T2MODE2", mask = 0x04, shift = 2, mode = 3 }, { name = "T2MODE3", mask = 0x08, shift = 3, mode = 3 }, { name = "T2MODE4", mask = 0x10, shift = 4, mode = 3 }]
+
+[[sfrs]]
+name = "T2CLKCON"
+addr = 0x0390
+width = 1
+aliases = ["T2CLK"]
+fields = [{ name = "CS0", mask = 0x01, shift = 0 }, { name = "CS1", mask = 0x02, shift = 1 }, { name = "CS2", mask = 0x04, shift = 2 }, { name = "CS3", mask = 0x08, shift = 3 }, { name = "CS4", mask = 0x10, shift = 4 }, { name = "T2CS0", mask = 0x01, shift = 0, mode = 1 }, { name = "T2CS1", mask = 0x02, shift = 1, mode = 1 }, { name = "T2CS2", mask = 0x04, shift = 2, mode = 1 }, { name = "T2CS3", mask = 0x08, shift = 3, mode = 1 }, { name = "T2CS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "T2RST"
+addr = 0x0391
+width = 1
+fields = [{ name = "RSEL0", mask = 0x01, shift = 0 }, { name = "RSEL1", mask = 0x02, shift = 1 }, { name = "RSEL2", mask = 0x04, shift = 2 }, { name = "RSEL3", mask = 0x08, shift = 3 }, { name = "RSEL4", mask = 0x10, shift = 4 }, { name = "T2RSEL0", mask = 0x01, shift = 0, mode = 1 }, { name = "T2RSEL1", mask = 0x02, shift = 1, mode = 1 }, { name = "T2RSEL2", mask = 0x04, shift = 2, mode = 1 }, { name = "T2RSEL3", mask = 0x08, shift = 3, mode = 1 }, { name = "T2RSEL4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "CCPR1"
+addr = 0x040C
+width = 2
+fields = []
+
+[[sfrs]]
+name = "CCPR1L"
+addr = 0x040C
+width = 1
+fields = []
+
+[[sfrs]]
+name = "CCPR1H"
+addr = 0x040D
+width = 1
+fields = []
+
+[[sfrs]]
+name = "CCP1CON"
+addr = 0x040E
+width = 1
+fields = [{ name = "MODE", mask = 0x0F, shift = 0 }, { name = "FMT", mask = 0x10, shift = 4 }, { name = "OUT", mask = 0x20, shift = 5 }, { name = "EN", mask = 0x80, shift = 7 }, { name = "MODE0", mask = 0x01, shift = 0, mode = 1 }, { name = "MODE1", mask = 0x02, shift = 1, mode = 1 }, { name = "MODE2", mask = 0x04, shift = 2, mode = 1 }, { name = "MODE3", mask = 0x08, shift = 3, mode = 1 }, { name = "CCP1MODE", mask = 0x0F, shift = 0, mode = 2 }, { name = "CCP1FMT", mask = 0x10, shift = 4, mode = 2 }, { name = "CCP1OUT", mask = 0x20, shift = 5, mode = 2 }, { name = "CCP1EN", mask = 0x80, shift = 7, mode = 2 }, { name = "CCP1MODE0", mask = 0x01, shift = 0, mode = 3 }, { name = "CCP1MODE1", mask = 0x02, shift = 1, mode = 3 }, { name = "CCP1MODE2", mask = 0x04, shift = 2, mode = 3 }, { name = "CCP1MODE3", mask = 0x08, shift = 3, mode = 3 }, { name = "P1M1", mask = 0x80, shift = 7, mode = 4 }]
+
+[[sfrs]]
+name = "CCP1CAP"
+addr = 0x040F
+width = 1
+fields = [{ name = "CTS", mask = 0x0F, shift = 0 }, { name = "CTS0", mask = 0x01, shift = 0, mode = 1 }, { name = "CTS1", mask = 0x02, shift = 1, mode = 1 }, { name = "CTS2", mask = 0x04, shift = 2, mode = 1 }, { name = "CTS3", mask = 0x08, shift = 3, mode = 1 }, { name = "CCP1CTS", mask = 0x0F, shift = 0, mode = 2 }, { name = "CCP1CTS0", mask = 0x01, shift = 0, mode = 3 }, { name = "CCP1CTS1", mask = 0x02, shift = 1, mode = 3 }, { name = "CCP1CTS2", mask = 0x04, shift = 2, mode = 3 }, { name = "CCP1CTS3", mask = 0x08, shift = 3, mode = 3 }]
+
+[[sfrs]]
+name = "CCPR2"
+addr = 0x0410
+width = 2
+fields = []
+
+[[sfrs]]
+name = "CCPR2L"
+addr = 0x0410
+width = 1
+fields = []
+
+[[sfrs]]
+name = "CCPR2H"
+addr = 0x0411
+width = 1
+fields = []
+
+[[sfrs]]
+name = "CCP2CON"
+addr = 0x0412
+width = 1
+fields = [{ name = "MODE", mask = 0x0F, shift = 0 }, { name = "FMT", mask = 0x10, shift = 4 }, { name = "OUT", mask = 0x20, shift = 5 }, { name = "EN", mask = 0x80, shift = 7 }, { name = "MODE0", mask = 0x01, shift = 0, mode = 1 }, { name = "MODE1", mask = 0x02, shift = 1, mode = 1 }, { name = "MODE2", mask = 0x04, shift = 2, mode = 1 }, { name = "MODE3", mask = 0x08, shift = 3, mode = 1 }, { name = "CCP2MODE", mask = 0x0F, shift = 0, mode = 2 }, { name = "CCP2FMT", mask = 0x10, shift = 4, mode = 2 }, { name = "CCP2OUT", mask = 0x20, shift = 5, mode = 2 }, { name = "CCP2EN", mask = 0x80, shift = 7, mode = 2 }, { name = "CCP2MODE0", mask = 0x01, shift = 0, mode = 3 }, { name = "CCP2MODE1", mask = 0x02, shift = 1, mode = 3 }, { name = "CCP2MODE2", mask = 0x04, shift = 2, mode = 3 }, { name = "CCP2MODE3", mask = 0x08, shift = 3, mode = 3 }, { name = "P2M1", mask = 0x80, shift = 7, mode = 4 }]
+
+[[sfrs]]
+name = "CCP2CAP"
+addr = 0x0413
+width = 1
+fields = [{ name = "CTS", mask = 0x0F, shift = 0 }, { name = "CTS0", mask = 0x01, shift = 0, mode = 1 }, { name = "CTS1", mask = 0x02, shift = 1, mode = 1 }, { name = "CTS2", mask = 0x04, shift = 2, mode = 1 }, { name = "CTS3", mask = 0x08, shift = 3, mode = 1 }, { name = "CCP2CTS", mask = 0x0F, shift = 0, mode = 2 }, { name = "CCP2CTS0", mask = 0x01, shift = 0, mode = 3 }, { name = "CCP2CTS1", mask = 0x02, shift = 1, mode = 3 }, { name = "CCP2CTS2", mask = 0x04, shift = 2, mode = 3 }, { name = "CCP2CTS3", mask = 0x08, shift = 3, mode = 3 }]
+
+[[sfrs]]
+name = "CCPTMRS0"
+addr = 0x041F
+width = 1
+fields = [{ name = "C1TSEL", mask = 0x03, shift = 0 }, { name = "C2TSEL", mask = 0x0C, shift = 2 }]
+
+[[sfrs]]
+name = "CLBCON"
+addr = 0x050C
+width = 1
+fields = [{ name = "BUSY", mask = 0x01, shift = 0 }, { name = "EN", mask = 0x80, shift = 7 }, { name = "CLBEN", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "CLBSWINU"
+addr = 0x050D
+width = 1
+fields = [{ name = "CLBSWIN24", mask = 0x01, shift = 0 }, { name = "CLBSWIN25", mask = 0x02, shift = 1 }, { name = "CLBSWIN26", mask = 0x04, shift = 2 }, { name = "CLBSWIN27", mask = 0x08, shift = 3 }, { name = "CLBSWIN28", mask = 0x10, shift = 4 }, { name = "CLBSWIN29", mask = 0x20, shift = 5 }, { name = "CLBSWIN30", mask = 0x40, shift = 6 }, { name = "CLBSWIN31", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CLBSWINH"
+addr = 0x050E
+width = 1
+fields = [{ name = "CLBSWIN16", mask = 0x01, shift = 0 }, { name = "CLBSWIN17", mask = 0x02, shift = 1 }, { name = "CLBSWIN18", mask = 0x04, shift = 2 }, { name = "CLBSWIN19", mask = 0x08, shift = 3 }, { name = "CLBSWIN20", mask = 0x10, shift = 4 }, { name = "CLBSWIN21", mask = 0x20, shift = 5 }, { name = "CLBSWIN22", mask = 0x40, shift = 6 }, { name = "CLBSWIN23", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CLBSWINM"
+addr = 0x050F
+width = 1
+fields = [{ name = "CLBSWIN8", mask = 0x01, shift = 0 }, { name = "CLBSWIN9", mask = 0x02, shift = 1 }, { name = "CLBSWIN10", mask = 0x04, shift = 2 }, { name = "CLBSWIN11", mask = 0x08, shift = 3 }, { name = "CLBSWIN12", mask = 0x10, shift = 4 }, { name = "CLBSWIN13", mask = 0x20, shift = 5 }, { name = "CLBSWIN14", mask = 0x40, shift = 6 }, { name = "CLBSWIN15", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CLBSWINL"
+addr = 0x0510
+width = 1
+fields = [{ name = "CLBSWIN0", mask = 0x01, shift = 0 }, { name = "CLBSWIN1", mask = 0x02, shift = 1 }, { name = "CLBSWIN2", mask = 0x04, shift = 2 }, { name = "CLBSWIN3", mask = 0x08, shift = 3 }, { name = "CLBSWIN4", mask = 0x10, shift = 4 }, { name = "CLBSWIN5", mask = 0x20, shift = 5 }, { name = "CLBSWIN6", mask = 0x40, shift = 6 }, { name = "CLBSWIN7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CLBCLK"
+addr = 0x0515
+width = 1
+fields = [{ name = "CLK", mask = 0x0F, shift = 0 }, { name = "CLK0", mask = 0x01, shift = 0, mode = 1 }, { name = "CLK1", mask = 0x02, shift = 1, mode = 1 }, { name = "CLK2", mask = 0x04, shift = 2, mode = 1 }, { name = "CLK3", mask = 0x08, shift = 3, mode = 1 }]
+
+[[sfrs]]
+name = "CLBPPSCON4"
+addr = 0x0516
+width = 1
+fields = [{ name = "OESEL6", mask = 0x0F, shift = 0 }, { name = "OESEL7", mask = 0xF0, shift = 4 }]
+
+[[sfrs]]
+name = "CLBPPSCON3"
+addr = 0x0517
+width = 1
+fields = [{ name = "OESEL4", mask = 0x0F, shift = 0 }, { name = "OESEL5", mask = 0xF0, shift = 4 }]
+
+[[sfrs]]
+name = "CLBPPSCON2"
+addr = 0x0518
+width = 1
+fields = [{ name = "OESEL2", mask = 0x0F, shift = 0 }, { name = "OESEL3", mask = 0xF0, shift = 4 }]
+
+[[sfrs]]
+name = "CLBPPSCON1"
+addr = 0x0519
+width = 1
+fields = [{ name = "OESEL0", mask = 0x0F, shift = 0 }, { name = "OESEL1", mask = 0xF0, shift = 4 }]
+
+[[sfrs]]
+name = "CLCnCON"
+addr = 0x068C
+width = 1
+fields = [{ name = "MODE", mask = 0x07, shift = 0 }, { name = "INTN", mask = 0x08, shift = 3 }, { name = "INTP", mask = 0x10, shift = 4 }, { name = "OUT", mask = 0x20, shift = 5 }, { name = "EN", mask = 0x80, shift = 7 }, { name = "MODE0", mask = 0x01, shift = 0, mode = 1 }, { name = "MODE1", mask = 0x02, shift = 1, mode = 1 }, { name = "MODE2", mask = 0x04, shift = 2, mode = 1 }]
+
+[[sfrs]]
+name = "CLCnPOL"
+addr = 0x068D
+width = 1
+fields = [{ name = "G1POL", mask = 0x01, shift = 0 }, { name = "G2POL", mask = 0x02, shift = 1 }, { name = "G3POL", mask = 0x04, shift = 2 }, { name = "G4POL", mask = 0x08, shift = 3 }, { name = "POL", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CLCnSEL0"
+addr = 0x068E
+width = 1
+fields = [{ name = "D1S0", mask = 0x01, shift = 0 }, { name = "D1S1", mask = 0x02, shift = 1 }, { name = "D1S2", mask = 0x04, shift = 2 }, { name = "D1S3", mask = 0x08, shift = 3 }, { name = "D1S4", mask = 0x10, shift = 4 }, { name = "D1S5", mask = 0x20, shift = 5 }, { name = "D1S6", mask = 0x40, shift = 6 }]
+
+[[sfrs]]
+name = "CLCnSEL1"
+addr = 0x068F
+width = 1
+fields = [{ name = "D2S0", mask = 0x01, shift = 0 }, { name = "D2S1", mask = 0x02, shift = 1 }, { name = "D2S2", mask = 0x04, shift = 2 }, { name = "D2S3", mask = 0x08, shift = 3 }, { name = "D2S4", mask = 0x10, shift = 4 }, { name = "D2S5", mask = 0x20, shift = 5 }, { name = "D2S6", mask = 0x40, shift = 6 }]
+
+[[sfrs]]
+name = "CLCnSEL2"
+addr = 0x0690
+width = 1
+fields = [{ name = "D3S0", mask = 0x01, shift = 0 }, { name = "D3S1", mask = 0x02, shift = 1 }, { name = "D3S2", mask = 0x04, shift = 2 }, { name = "D3S3", mask = 0x08, shift = 3 }, { name = "D3S4", mask = 0x10, shift = 4 }, { name = "D3S5", mask = 0x20, shift = 5 }, { name = "D3S6", mask = 0x40, shift = 6 }]
+
+[[sfrs]]
+name = "CLCnSEL3"
+addr = 0x0691
+width = 1
+fields = [{ name = "D4S0", mask = 0x01, shift = 0 }, { name = "D4S1", mask = 0x02, shift = 1 }, { name = "D4S2", mask = 0x04, shift = 2 }, { name = "D4S3", mask = 0x08, shift = 3 }, { name = "D4S4", mask = 0x10, shift = 4 }, { name = "D4S5", mask = 0x20, shift = 5 }, { name = "D4S6", mask = 0x40, shift = 6 }]
+
+[[sfrs]]
+name = "CLCnGLS0"
+addr = 0x0692
+width = 1
+fields = [{ name = "G1D1N", mask = 0x01, shift = 0 }, { name = "G1D1T", mask = 0x02, shift = 1 }, { name = "G1D2N", mask = 0x04, shift = 2 }, { name = "G1D2T", mask = 0x08, shift = 3 }, { name = "G1D3N", mask = 0x10, shift = 4 }, { name = "G1D3T", mask = 0x20, shift = 5 }, { name = "G1D4N", mask = 0x40, shift = 6 }, { name = "G1D4T", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CLCnGLS1"
+addr = 0x0693
+width = 1
+fields = [{ name = "G2D1N", mask = 0x01, shift = 0 }, { name = "G2D1T", mask = 0x02, shift = 1 }, { name = "G2D2N", mask = 0x04, shift = 2 }, { name = "G2D2T", mask = 0x08, shift = 3 }, { name = "G2D3N", mask = 0x10, shift = 4 }, { name = "G2D3T", mask = 0x20, shift = 5 }, { name = "G2D4N", mask = 0x40, shift = 6 }, { name = "G2D4T", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CLCnGLS2"
+addr = 0x0694
+width = 1
+fields = [{ name = "G3D1N", mask = 0x01, shift = 0 }, { name = "G3D1T", mask = 0x02, shift = 1 }, { name = "G3D2N", mask = 0x04, shift = 2 }, { name = "G3D2T", mask = 0x08, shift = 3 }, { name = "G3D3N", mask = 0x10, shift = 4 }, { name = "G3D3T", mask = 0x20, shift = 5 }, { name = "G3D4N", mask = 0x40, shift = 6 }, { name = "G3D4T", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CLCnGLS3"
+addr = 0x0695
+width = 1
+fields = [{ name = "G4D1N", mask = 0x01, shift = 0 }, { name = "G4D1T", mask = 0x02, shift = 1 }, { name = "G4D2N", mask = 0x04, shift = 2 }, { name = "G4D2T", mask = 0x08, shift = 3 }, { name = "G4D3N", mask = 0x10, shift = 4 }, { name = "G4D3T", mask = 0x20, shift = 5 }, { name = "G4D4N", mask = 0x40, shift = 6 }, { name = "G4D4T", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CLCSELECT"
+addr = 0x0696
+width = 1
+fields = [{ name = "SLCT0", mask = 0x01, shift = 0 }, { name = "SLCT1", mask = 0x02, shift = 1 }]
+
+[[sfrs]]
+name = "CLCDATA"
+addr = 0x0697
+width = 1
+fields = [{ name = "CLC1OUT", mask = 0x01, shift = 0 }, { name = "CLC2OUT", mask = 0x02, shift = 1 }, { name = "CLC3OUT", mask = 0x04, shift = 2 }, { name = "CLC4OUT", mask = 0x08, shift = 3 }]
+
+[[sfrs]]
+name = "RC1REG"
+addr = 0x070C
+width = 1
+fields = []
+
+[[sfrs]]
+name = "TX1REG"
+addr = 0x070D
+width = 1
+fields = []
+
+[[sfrs]]
+name = "SP1BRG"
+addr = 0x070E
+width = 2
+fields = []
+
+[[sfrs]]
+name = "SP1BRGL"
+addr = 0x070E
+width = 1
+fields = []
+
+[[sfrs]]
+name = "SP1BRGH"
+addr = 0x070F
+width = 1
+fields = []
+
+[[sfrs]]
+name = "RC1STA"
+addr = 0x0710
+width = 1
+fields = [{ name = "RX9D", mask = 0x01, shift = 0 }, { name = "OERR", mask = 0x02, shift = 1 }, { name = "FERR", mask = 0x04, shift = 2 }, { name = "ADDEN", mask = 0x08, shift = 3 }, { name = "CREN", mask = 0x10, shift = 4 }, { name = "SREN", mask = 0x20, shift = 5 }, { name = "RX9", mask = 0x40, shift = 6 }, { name = "SPEN", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "TX1STA"
+addr = 0x0711
+width = 1
+fields = [{ name = "TX9D", mask = 0x01, shift = 0 }, { name = "TRMT", mask = 0x02, shift = 1 }, { name = "BRGH", mask = 0x04, shift = 2 }, { name = "SENDB", mask = 0x08, shift = 3 }, { name = "SYNC", mask = 0x10, shift = 4 }, { name = "TXEN", mask = 0x20, shift = 5 }, { name = "TX9", mask = 0x40, shift = 6 }, { name = "CSRC", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "BAUD1CON"
+addr = 0x0712
+width = 1
+fields = [{ name = "ABDEN", mask = 0x01, shift = 0 }, { name = "WUE", mask = 0x02, shift = 1 }, { name = "BRG16", mask = 0x08, shift = 3 }, { name = "SCKP", mask = 0x10, shift = 4 }, { name = "RCIDL", mask = 0x40, shift = 6 }, { name = "ABDOVF", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "SSP1BUF"
+addr = 0x078C
+width = 1
+fields = []
+
+[[sfrs]]
+name = "SSP1ADD"
+addr = 0x078D
+width = 1
+fields = [{ name = "MSK0", mask = 0x01, shift = 0 }, { name = "MSK1", mask = 0x02, shift = 1 }, { name = "MSK2", mask = 0x04, shift = 2 }, { name = "MSK3", mask = 0x08, shift = 3 }, { name = "MSK4", mask = 0x10, shift = 4 }, { name = "MSK5", mask = 0x20, shift = 5 }, { name = "MSK6", mask = 0x40, shift = 6 }, { name = "MSK7", mask = 0x80, shift = 7 }, { name = "MSK01", mask = 0x01, shift = 0, mode = 1 }, { name = "MSK11", mask = 0x02, shift = 1, mode = 1 }, { name = "MSK21", mask = 0x04, shift = 2, mode = 1 }, { name = "MSK31", mask = 0x08, shift = 3, mode = 1 }, { name = "MSK41", mask = 0x10, shift = 4, mode = 1 }, { name = "MSK51", mask = 0x20, shift = 5, mode = 1 }, { name = "MSK61", mask = 0x40, shift = 6, mode = 1 }, { name = "MSK71", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "SSP1MSK"
+addr = 0x078E
+width = 1
+fields = [{ name = "MSK0", mask = 0x01, shift = 0 }, { name = "MSK1", mask = 0x02, shift = 1 }, { name = "MSK2", mask = 0x04, shift = 2 }, { name = "MSK3", mask = 0x08, shift = 3 }, { name = "MSK4", mask = 0x10, shift = 4 }, { name = "MSK5", mask = 0x20, shift = 5 }, { name = "MSK6", mask = 0x40, shift = 6 }, { name = "MSK7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "SSP1STAT"
+addr = 0x078F
+width = 1
+fields = [{ name = "BF", mask = 0x01, shift = 0 }, { name = "UA", mask = 0x02, shift = 1 }, { name = "R_nW", mask = 0x04, shift = 2 }, { name = "S", mask = 0x08, shift = 3 }, { name = "P", mask = 0x10, shift = 4 }, { name = "D_nA", mask = 0x20, shift = 5 }, { name = "CKE", mask = 0x40, shift = 6 }, { name = "SMP", mask = 0x80, shift = 7 }, { name = "R_W", mask = 0x04, shift = 2, mode = 1 }, { name = "D_A", mask = 0x20, shift = 5, mode = 1 }, { name = "nW", mask = 0x04, shift = 2, mode = 2 }, { name = "nA", mask = 0x20, shift = 5, mode = 2 }, { name = "nWRITE", mask = 0x04, shift = 2, mode = 3 }, { name = "nADDRESS", mask = 0x20, shift = 5, mode = 3 }, { name = "READ_WRITE", mask = 0x04, shift = 2, mode = 4 }, { name = "DATA_ADDRESS", mask = 0x20, shift = 5, mode = 4 }, { name = "I2C_READ", mask = 0x04, shift = 2, mode = 5 }, { name = "I2C_START", mask = 0x08, shift = 3, mode = 5 }, { name = "I2C_STOP", mask = 0x10, shift = 4, mode = 5 }, { name = "I2C_DAT", mask = 0x20, shift = 5, mode = 5 }, { name = "BF1", mask = 0x01, shift = 0, mode = 6 }, { name = "UA1", mask = 0x02, shift = 1, mode = 6 }, { name = "R", mask = 0x04, shift = 2, mode = 6 }, { name = "START", mask = 0x08, shift = 3, mode = 6 }, { name = "STOP", mask = 0x10, shift = 4, mode = 6 }, { name = "D", mask = 0x20, shift = 5, mode = 6 }, { name = "CKE1", mask = 0x40, shift = 6, mode = 6 }, { name = "SMP1", mask = 0x80, shift = 7, mode = 6 }, { name = "RW", mask = 0x04, shift = 2, mode = 7 }, { name = "START1", mask = 0x08, shift = 3, mode = 7 }, { name = "STOP1", mask = 0x10, shift = 4, mode = 7 }, { name = "DA", mask = 0x20, shift = 5, mode = 7 }, { name = "RW1", mask = 0x04, shift = 2, mode = 8 }, { name = "I2C_START1", mask = 0x08, shift = 3, mode = 8 }, { name = "I2C_STOP2", mask = 0x10, shift = 4, mode = 8 }, { name = "DA1", mask = 0x20, shift = 5, mode = 8 }, { name = "I2C_READ1", mask = 0x04, shift = 2, mode = 9 }, { name = "S2", mask = 0x08, shift = 3, mode = 9 }, { name = "P2", mask = 0x10, shift = 4, mode = 9 }, { name = "DATA_ADDRESS1", mask = 0x20, shift = 5, mode = 9 }, { name = "READ_WRITE1", mask = 0x04, shift = 2, mode = 10 }, { name = "D_A1", mask = 0x20, shift = 5, mode = 10 }, { name = "R_W1", mask = 0x04, shift = 2, mode = 11 }, { name = "D_nA1", mask = 0x20, shift = 5, mode = 11 }, { name = "R_nW1", mask = 0x04, shift = 2, mode = 12 }, { name = "I2C_DAT1", mask = 0x20, shift = 5, mode = 12 }, { name = "nW2", mask = 0x04, shift = 2, mode = 13 }, { name = "nA2", mask = 0x20, shift = 5, mode = 13 }, { name = "nWRITE1", mask = 0x04, shift = 2, mode = 14 }, { name = "nADDRESS1", mask = 0x20, shift = 5, mode = 14 }]
+
+[[sfrs]]
+name = "SSP1CON1"
+addr = 0x0790
+width = 1
+fields = [{ name = "SSPM", mask = 0x0F, shift = 0 }, { name = "CKP", mask = 0x10, shift = 4 }, { name = "SSPEN", mask = 0x20, shift = 5 }, { name = "SSPOV", mask = 0x40, shift = 6 }, { name = "WCOL", mask = 0x80, shift = 7 }, { name = "SSPM0", mask = 0x01, shift = 0, mode = 1 }, { name = "SSPM1", mask = 0x02, shift = 1, mode = 1 }, { name = "SSPM2", mask = 0x04, shift = 2, mode = 1 }, { name = "SSPM3", mask = 0x08, shift = 3, mode = 1 }, { name = "SSPM01", mask = 0x01, shift = 0, mode = 2 }, { name = "SSPM11", mask = 0x02, shift = 1, mode = 2 }, { name = "SSPM21", mask = 0x04, shift = 2, mode = 2 }, { name = "SSPM31", mask = 0x08, shift = 3, mode = 2 }, { name = "CKP1", mask = 0x10, shift = 4, mode = 2 }, { name = "SSPEN1", mask = 0x20, shift = 5, mode = 2 }, { name = "SSPOV1", mask = 0x40, shift = 6, mode = 2 }, { name = "WCOL1", mask = 0x80, shift = 7, mode = 2 }]
+
+[[sfrs]]
+name = "SSP1CON2"
+addr = 0x0791
+width = 1
+fields = [{ name = "SEN", mask = 0x01, shift = 0 }, { name = "RSEN", mask = 0x02, shift = 1 }, { name = "PEN", mask = 0x04, shift = 2 }, { name = "RCEN", mask = 0x08, shift = 3 }, { name = "ACKEN", mask = 0x10, shift = 4 }, { name = "ACKDT", mask = 0x20, shift = 5 }, { name = "ACKSTAT", mask = 0x40, shift = 6 }, { name = "GCEN", mask = 0x80, shift = 7 }, { name = "ADMSK", mask = 0x3E, shift = 1, mode = 1 }, { name = "ADMSK1", mask = 0x02, shift = 1, mode = 2 }, { name = "ADMSK2", mask = 0x04, shift = 2, mode = 2 }, { name = "ADMSK3", mask = 0x08, shift = 3, mode = 2 }, { name = "ADMSK4", mask = 0x10, shift = 4, mode = 2 }, { name = "ADMSK5", mask = 0x20, shift = 5, mode = 2 }, { name = "SEN1", mask = 0x01, shift = 0, mode = 3 }, { name = "ADMSK11", mask = 0x02, shift = 1, mode = 3 }, { name = "ADMSK21", mask = 0x04, shift = 2, mode = 3 }, { name = "ADMSK31", mask = 0x08, shift = 3, mode = 3 }, { name = "ACKEN1", mask = 0x10, shift = 4, mode = 3 }, { name = "ACKDT1", mask = 0x20, shift = 5, mode = 3 }, { name = "ACKSTAT1", mask = 0x40, shift = 6, mode = 3 }, { name = "GCEN1", mask = 0x80, shift = 7, mode = 3 }, { name = "RSEN1", mask = 0x02, shift = 1, mode = 4 }, { name = "PEN1", mask = 0x04, shift = 2, mode = 4 }, { name = "RCEN1", mask = 0x08, shift = 3, mode = 4 }, { name = "ADMSK41", mask = 0x10, shift = 4, mode = 4 }, { name = "ADMSK51", mask = 0x20, shift = 5, mode = 4 }]
+
+[[sfrs]]
+name = "SSP1CON3"
+addr = 0x0792
+width = 1
+fields = [{ name = "DHEN", mask = 0x01, shift = 0 }, { name = "AHEN", mask = 0x02, shift = 1 }, { name = "SBCDE", mask = 0x04, shift = 2 }, { name = "SDAHT", mask = 0x08, shift = 3 }, { name = "BOEN", mask = 0x10, shift = 4 }, { name = "SCIE", mask = 0x20, shift = 5 }, { name = "PCIE", mask = 0x40, shift = 6 }, { name = "ACKTIM", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CM1CON0"
+addr = 0x080C
+width = 1
+fields = [{ name = "SYNC", mask = 0x01, shift = 0 }, { name = "HYS", mask = 0x02, shift = 1 }, { name = "SP", mask = 0x04, shift = 2 }, { name = "POL", mask = 0x10, shift = 4 }, { name = "OUT", mask = 0x40, shift = 6 }, { name = "EN", mask = 0x80, shift = 7 }, { name = "C1SYNC", mask = 0x01, shift = 0, mode = 1 }, { name = "C1HYS", mask = 0x02, shift = 1, mode = 1 }, { name = "C1SP", mask = 0x04, shift = 2, mode = 1 }, { name = "C1POL", mask = 0x10, shift = 4, mode = 1 }, { name = "C1OUT", mask = 0x40, shift = 6, mode = 1 }, { name = "C1EN", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "CM1CON1"
+addr = 0x080D
+width = 1
+fields = [{ name = "INTN", mask = 0x01, shift = 0 }, { name = "INTP", mask = 0x02, shift = 1 }, { name = "C1INTN", mask = 0x01, shift = 0, mode = 1 }, { name = "C1INTP", mask = 0x02, shift = 1, mode = 1 }]
+
+[[sfrs]]
+name = "CM1NCH"
+addr = 0x080E
+width = 1
+fields = [{ name = "NCH", mask = 0x07, shift = 0 }, { name = "NCH0", mask = 0x01, shift = 0, mode = 1 }, { name = "NCH1", mask = 0x02, shift = 1, mode = 1 }, { name = "NCH2", mask = 0x04, shift = 2, mode = 1 }, { name = "C1NCH0", mask = 0x01, shift = 0, mode = 2 }, { name = "C1NCH1", mask = 0x02, shift = 1, mode = 2 }, { name = "C1NCH2", mask = 0x04, shift = 2, mode = 2 }]
+
+[[sfrs]]
+name = "CM1PCH"
+addr = 0x080F
+width = 1
+fields = [{ name = "PCH", mask = 0x07, shift = 0 }, { name = "PCH0", mask = 0x01, shift = 0, mode = 1 }, { name = "PCH1", mask = 0x02, shift = 1, mode = 1 }, { name = "PCH2", mask = 0x04, shift = 2, mode = 1 }, { name = "C1PCH0", mask = 0x01, shift = 0, mode = 2 }, { name = "C1PCH1", mask = 0x02, shift = 1, mode = 2 }, { name = "C1PCH2", mask = 0x04, shift = 2, mode = 2 }]
+
+[[sfrs]]
+name = "CM2CON0"
+addr = 0x0810
+width = 1
+fields = [{ name = "SYNC", mask = 0x01, shift = 0 }, { name = "HYS", mask = 0x02, shift = 1 }, { name = "SP", mask = 0x04, shift = 2 }, { name = "POL", mask = 0x10, shift = 4 }, { name = "OUT", mask = 0x40, shift = 6 }, { name = "EN", mask = 0x80, shift = 7 }, { name = "C2SYNC", mask = 0x01, shift = 0, mode = 1 }, { name = "C2HYS", mask = 0x02, shift = 1, mode = 1 }, { name = "C2SP", mask = 0x04, shift = 2, mode = 1 }, { name = "C2POL", mask = 0x10, shift = 4, mode = 1 }, { name = "C2OUT", mask = 0x40, shift = 6, mode = 1 }, { name = "C2EN", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "CM2CON1"
+addr = 0x0811
+width = 1
+fields = [{ name = "INTN", mask = 0x01, shift = 0 }, { name = "INTP", mask = 0x02, shift = 1 }, { name = "C2INTN", mask = 0x01, shift = 0, mode = 1 }, { name = "C2INTP", mask = 0x02, shift = 1, mode = 1 }]
+
+[[sfrs]]
+name = "CM2NCH"
+addr = 0x0812
+width = 1
+fields = [{ name = "NCH", mask = 0x07, shift = 0 }, { name = "NCH0", mask = 0x01, shift = 0, mode = 1 }, { name = "NCH1", mask = 0x02, shift = 1, mode = 1 }, { name = "NCH2", mask = 0x04, shift = 2, mode = 1 }, { name = "C2NCH0", mask = 0x01, shift = 0, mode = 2 }, { name = "C2NCH1", mask = 0x02, shift = 1, mode = 2 }, { name = "C2NCH2", mask = 0x04, shift = 2, mode = 2 }]
+
+[[sfrs]]
+name = "CM2PCH"
+addr = 0x0813
+width = 1
+fields = [{ name = "PCH", mask = 0x07, shift = 0 }, { name = "PCH0", mask = 0x01, shift = 0, mode = 1 }, { name = "PCH1", mask = 0x02, shift = 1, mode = 1 }, { name = "PCH2", mask = 0x04, shift = 2, mode = 1 }, { name = "C2PCH0", mask = 0x01, shift = 0, mode = 2 }, { name = "C2PCH1", mask = 0x02, shift = 1, mode = 2 }, { name = "C2PCH2", mask = 0x04, shift = 2, mode = 2 }]
+
+[[sfrs]]
+name = "CMOUT"
+addr = 0x081F
+width = 1
+fields = [{ name = "C1OUT", mask = 0x01, shift = 0 }, { name = "C2OUT", mask = 0x02, shift = 1 }]
+
+[[sfrs]]
+name = "PWM1DC"
+addr = 0x0820
+width = 2
+fields = []
+
+[[sfrs]]
+name = "PWM1DCL"
+addr = 0x0820
+width = 1
+fields = [{ name = "DCL", mask = 0xC0, shift = 6 }]
+
+[[sfrs]]
+name = "PWM1DCH"
+addr = 0x0821
+width = 1
+fields = []
+
+[[sfrs]]
+name = "PWM1CON"
+addr = 0x0822
+width = 1
+fields = [{ name = "POL", mask = 0x10, shift = 4 }, { name = "OUT", mask = 0x20, shift = 5 }, { name = "EN", mask = 0x80, shift = 7 }, { name = "PWM1POL", mask = 0x10, shift = 4, mode = 1 }, { name = "PWM1OUT", mask = 0x20, shift = 5, mode = 1 }, { name = "PWM1EN", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "PWM2DC"
+addr = 0x0823
+width = 2
+fields = []
+
+[[sfrs]]
+name = "PWM2DCL"
+addr = 0x0823
+width = 1
+fields = [{ name = "DCL", mask = 0xC0, shift = 6 }]
+
+[[sfrs]]
+name = "PWM2DCH"
+addr = 0x0824
+width = 1
+fields = []
+
+[[sfrs]]
+name = "PWM2CON"
+addr = 0x0825
+width = 1
+fields = [{ name = "POL", mask = 0x10, shift = 4 }, { name = "OUT", mask = 0x20, shift = 5 }, { name = "EN", mask = 0x80, shift = 7 }, { name = "PWM2POL", mask = 0x10, shift = 4, mode = 1 }, { name = "PWM2OUT", mask = 0x20, shift = 5, mode = 1 }, { name = "PWM2EN", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "PWMTMRS0"
+addr = 0x082F
+width = 1
+fields = [{ name = "P1TSEL", mask = 0x03, shift = 0 }, { name = "P2TSEL", mask = 0x0C, shift = 2 }]
+
+[[sfrs]]
+name = "DAC1CON"
+addr = 0x088C
+width = 1
+fields = [{ name = "PSS", mask = 0x0C, shift = 2 }, { name = "OE", mask = 0x30, shift = 4 }, { name = "REFRNG", mask = 0x40, shift = 6 }, { name = "EN", mask = 0x80, shift = 7 }, { name = "PSS0", mask = 0x04, shift = 2, mode = 1 }, { name = "PSS1", mask = 0x08, shift = 3, mode = 1 }, { name = "OE0", mask = 0x10, shift = 4, mode = 1 }, { name = "OE1", mask = 0x20, shift = 5, mode = 1 }]
+
+[[sfrs]]
+name = "DAC1DATL"
+addr = 0x088D
+width = 1
+fields = []
+
+[[sfrs]]
+name = "NVMADR"
+addr = 0x1C8C
+width = 2
+fields = []
+
+[[sfrs]]
+name = "NVMADRL"
+addr = 0x1C8C
+width = 1
+fields = [{ name = "NVMADR0", mask = 0x01, shift = 0 }, { name = "NVMADR1", mask = 0x02, shift = 1 }, { name = "NVMADR2", mask = 0x04, shift = 2 }, { name = "NVMADR3", mask = 0x08, shift = 3 }, { name = "NVMADR4", mask = 0x10, shift = 4 }, { name = "NVMADR5", mask = 0x20, shift = 5 }, { name = "NVMADR6", mask = 0x40, shift = 6 }, { name = "NVMADR7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "NVMADRH"
+addr = 0x1C8D
+width = 1
+fields = [{ name = "NVMADR", mask = 0x7F, shift = 0 }, { name = "NVMADR8", mask = 0x01, shift = 0, mode = 1 }, { name = "NVMADR9", mask = 0x02, shift = 1, mode = 1 }, { name = "NVMADR10", mask = 0x04, shift = 2, mode = 1 }, { name = "NVMADR11", mask = 0x08, shift = 3, mode = 1 }, { name = "NVMADR12", mask = 0x10, shift = 4, mode = 1 }, { name = "NVMADR13", mask = 0x20, shift = 5, mode = 1 }, { name = "NVMADR14", mask = 0x40, shift = 6, mode = 1 }]
+
+[[sfrs]]
+name = "NVMDAT"
+addr = 0x1C8E
+width = 2
+fields = []
+
+[[sfrs]]
+name = "NVMDATL"
+addr = 0x1C8E
+width = 1
+fields = [{ name = "NVMDAT0", mask = 0x01, shift = 0 }, { name = "NVMDAT1", mask = 0x02, shift = 1 }, { name = "NVMDAT2", mask = 0x04, shift = 2 }, { name = "NVMDAT3", mask = 0x08, shift = 3 }, { name = "NVMDAT4", mask = 0x10, shift = 4 }, { name = "NVMDAT5", mask = 0x20, shift = 5 }, { name = "NVMDAT6", mask = 0x40, shift = 6 }, { name = "NVMDAT7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "NVMDATH"
+addr = 0x1C8F
+width = 1
+fields = [{ name = "NVMDAT", mask = 0x3F, shift = 0 }, { name = "NVMDAT8", mask = 0x01, shift = 0, mode = 1 }, { name = "NVMDAT9", mask = 0x02, shift = 1, mode = 1 }, { name = "NVMDAT10", mask = 0x04, shift = 2, mode = 1 }, { name = "NVMDAT11", mask = 0x08, shift = 3, mode = 1 }, { name = "NVMDAT12", mask = 0x10, shift = 4, mode = 1 }, { name = "NVMDAT13", mask = 0x20, shift = 5, mode = 1 }]
+
+[[sfrs]]
+name = "NVMCON1"
+addr = 0x1C90
+width = 1
+fields = [{ name = "RD", mask = 0x01, shift = 0 }, { name = "WR", mask = 0x02, shift = 1 }, { name = "WREN", mask = 0x04, shift = 2 }, { name = "WRERR", mask = 0x08, shift = 3 }, { name = "FREE", mask = 0x10, shift = 4 }, { name = "LWLO", mask = 0x20, shift = 5 }, { name = "NVMREGS", mask = 0x40, shift = 6 }]
+
+[[sfrs]]
+name = "NVMCON2"
+addr = 0x1C91
+width = 1
+fields = []
+
+[[sfrs]]
+name = "SCANCON0"
+addr = 0x1C92
+width = 1
+fields = [{ name = "MD", mask = 0x03, shift = 0 }, { name = "INTM", mask = 0x08, shift = 3 }, { name = "DABORT", mask = 0x10, shift = 4 }, { name = "BUSY", mask = 0x20, shift = 5 }, { name = "SGO", mask = 0x40, shift = 6 }, { name = "EN", mask = 0x80, shift = 7 }, { name = "MD0", mask = 0x01, shift = 0, mode = 1 }, { name = "MD1", mask = 0x02, shift = 1, mode = 1 }]
+
+[[sfrs]]
+name = "SCANLADR"
+addr = 0x1C93
+width = 2
+fields = []
+
+[[sfrs]]
+name = "SCANLADRL"
+addr = 0x1C93
+width = 1
+fields = []
+
+[[sfrs]]
+name = "SCANLADRH"
+addr = 0x1C94
+width = 1
+fields = []
+
+[[sfrs]]
+name = "SCANHADR"
+addr = 0x1C96
+width = 2
+fields = []
+
+[[sfrs]]
+name = "SCANHADRL"
+addr = 0x1C96
+width = 1
+fields = []
+
+[[sfrs]]
+name = "SCANHADRH"
+addr = 0x1C97
+width = 1
+fields = []
+
+[[sfrs]]
+name = "SCANDPS"
+addr = 0x1C99
+width = 1
+fields = [{ name = "DPS", mask = 0x01, shift = 0 }]
+
+[[sfrs]]
+name = "SCANTRIG"
+addr = 0x1C9A
+width = 1
+fields = [{ name = "TSEL", mask = 0x0F, shift = 0 }]
+
+[[sfrs]]
+name = "CRCDATA"
+addr = 0x1C9D
+width = 2
+fields = []
+
+[[sfrs]]
+name = "CRCDATAL"
+addr = 0x1C9D
+width = 1
+fields = [{ name = "DATA0", mask = 0x01, shift = 0 }, { name = "DATA1", mask = 0x02, shift = 1 }, { name = "DATA2", mask = 0x04, shift = 2 }, { name = "DATA3", mask = 0x08, shift = 3 }, { name = "DATA4", mask = 0x10, shift = 4 }, { name = "DATA5", mask = 0x20, shift = 5 }, { name = "DATA6", mask = 0x40, shift = 6 }, { name = "DATA7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCDATAH"
+addr = 0x1C9E
+width = 1
+fields = [{ name = "DATA8", mask = 0x01, shift = 0 }, { name = "DATA9", mask = 0x02, shift = 1 }, { name = "DATA10", mask = 0x04, shift = 2 }, { name = "DATA11", mask = 0x08, shift = 3 }, { name = "DATA12", mask = 0x10, shift = 4 }, { name = "DATA13", mask = 0x20, shift = 5 }, { name = "DATA14", mask = 0x40, shift = 6 }, { name = "DATA15", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCDATAU"
+addr = 0x1C9F
+width = 1
+fields = [{ name = "DATA16", mask = 0x01, shift = 0 }, { name = "DATA17", mask = 0x02, shift = 1 }, { name = "DATA18", mask = 0x04, shift = 2 }, { name = "DATA19", mask = 0x08, shift = 3 }, { name = "DATA20", mask = 0x10, shift = 4 }, { name = "DATA21", mask = 0x20, shift = 5 }, { name = "DATA22", mask = 0x40, shift = 6 }, { name = "DATA23", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCDATAT"
+addr = 0x1CA0
+width = 1
+fields = [{ name = "DATA24", mask = 0x01, shift = 0 }, { name = "DATA25", mask = 0x02, shift = 1 }, { name = "DATA26", mask = 0x04, shift = 2 }, { name = "DATA27", mask = 0x08, shift = 3 }, { name = "DATA28", mask = 0x10, shift = 4 }, { name = "DATA29", mask = 0x20, shift = 5 }, { name = "DATA30", mask = 0x40, shift = 6 }, { name = "DATA31", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCOUT"
+addr = 0x1CA1
+width = 2
+aliases = ["CRCSHFT", "CRCXOR"]
+fields = []
+
+[[sfrs]]
+name = "CRCOUTL"
+addr = 0x1CA1
+width = 1
+fields = [{ name = "OUT0", mask = 0x01, shift = 0 }, { name = "OUT1", mask = 0x02, shift = 1 }, { name = "OUT2", mask = 0x04, shift = 2 }, { name = "OUT3", mask = 0x08, shift = 3 }, { name = "OUT4", mask = 0x10, shift = 4 }, { name = "OUT5", mask = 0x20, shift = 5 }, { name = "OUT6", mask = 0x40, shift = 6 }, { name = "OUT7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCSHFTL"
+addr = 0x1CA1
+width = 1
+aliases = ["CRCSHIFTL"]
+fields = [{ name = "SHIFT0", mask = 0x01, shift = 0 }, { name = "SHIFT1", mask = 0x02, shift = 1 }, { name = "SHIFT2", mask = 0x04, shift = 2 }, { name = "SHIFT3", mask = 0x08, shift = 3 }, { name = "SHIFT4", mask = 0x10, shift = 4 }, { name = "SHIFT5", mask = 0x20, shift = 5 }, { name = "SHIFT6", mask = 0x40, shift = 6 }, { name = "SHIFT7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCXORL"
+addr = 0x1CA1
+width = 1
+fields = [{ name = "XOR0", mask = 0x01, shift = 0 }, { name = "XOR1", mask = 0x02, shift = 1 }, { name = "XOR2", mask = 0x04, shift = 2 }, { name = "XOR3", mask = 0x08, shift = 3 }, { name = "XOR4", mask = 0x10, shift = 4 }, { name = "XOR5", mask = 0x20, shift = 5 }, { name = "XOR6", mask = 0x40, shift = 6 }, { name = "XOR7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCOUTH"
+addr = 0x1CA2
+width = 1
+fields = [{ name = "OUT8", mask = 0x01, shift = 0 }, { name = "OUT9", mask = 0x02, shift = 1 }, { name = "OUT10", mask = 0x04, shift = 2 }, { name = "OUT11", mask = 0x08, shift = 3 }, { name = "OUT12", mask = 0x10, shift = 4 }, { name = "OUT13", mask = 0x20, shift = 5 }, { name = "OUT14", mask = 0x40, shift = 6 }, { name = "OUT15", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCSHFTH"
+addr = 0x1CA2
+width = 1
+aliases = ["CRCSHIFTH"]
+fields = [{ name = "SHIFT8", mask = 0x01, shift = 0 }, { name = "SHIFT9", mask = 0x02, shift = 1 }, { name = "SHIFT10", mask = 0x04, shift = 2 }, { name = "SHIFT11", mask = 0x08, shift = 3 }, { name = "SHIFT12", mask = 0x10, shift = 4 }, { name = "SHIFT13", mask = 0x20, shift = 5 }, { name = "SHIFT14", mask = 0x40, shift = 6 }, { name = "SHIFT15", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCXORH"
+addr = 0x1CA2
+width = 1
+fields = [{ name = "XOR8", mask = 0x01, shift = 0 }, { name = "XOR9", mask = 0x02, shift = 1 }, { name = "XOR10", mask = 0x04, shift = 2 }, { name = "XOR11", mask = 0x08, shift = 3 }, { name = "XOR12", mask = 0x10, shift = 4 }, { name = "XOR13", mask = 0x20, shift = 5 }, { name = "XOR14", mask = 0x40, shift = 6 }, { name = "XOR15", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCOUTU"
+addr = 0x1CA3
+width = 1
+fields = [{ name = "OUT16", mask = 0x01, shift = 0 }, { name = "OUT17", mask = 0x02, shift = 1 }, { name = "OUT18", mask = 0x04, shift = 2 }, { name = "OUT19", mask = 0x08, shift = 3 }, { name = "OUT20", mask = 0x10, shift = 4 }, { name = "OUT21", mask = 0x20, shift = 5 }, { name = "OUT22", mask = 0x40, shift = 6 }, { name = "OUT23", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCSHFTU"
+addr = 0x1CA3
+width = 1
+aliases = ["CRCSHIFTU"]
+fields = [{ name = "SHIFT16", mask = 0x01, shift = 0 }, { name = "SHIFT17", mask = 0x02, shift = 1 }, { name = "SHIFT18", mask = 0x04, shift = 2 }, { name = "SHIFT19", mask = 0x08, shift = 3 }, { name = "SHIFT20", mask = 0x10, shift = 4 }, { name = "SHIFT21", mask = 0x20, shift = 5 }, { name = "SHIFT22", mask = 0x40, shift = 6 }, { name = "SHIFT23", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCXORU"
+addr = 0x1CA3
+width = 1
+fields = [{ name = "XOR16", mask = 0x01, shift = 0 }, { name = "XOR17", mask = 0x02, shift = 1 }, { name = "XOR18", mask = 0x04, shift = 2 }, { name = "XOR19", mask = 0x08, shift = 3 }, { name = "XOR20", mask = 0x10, shift = 4 }, { name = "XOR21", mask = 0x20, shift = 5 }, { name = "XOR22", mask = 0x40, shift = 6 }, { name = "XOR23", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCOUTT"
+addr = 0x1CA4
+width = 1
+fields = [{ name = "OUT24", mask = 0x01, shift = 0 }, { name = "OUT25", mask = 0x02, shift = 1 }, { name = "OUT26", mask = 0x04, shift = 2 }, { name = "OUT27", mask = 0x08, shift = 3 }, { name = "OUT28", mask = 0x10, shift = 4 }, { name = "OUT29", mask = 0x20, shift = 5 }, { name = "OUT30", mask = 0x40, shift = 6 }, { name = "OUT31", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCSHFTT"
+addr = 0x1CA4
+width = 1
+aliases = ["CRCSHIFTT"]
+fields = [{ name = "SHIFT24", mask = 0x01, shift = 0 }, { name = "SHIFT25", mask = 0x02, shift = 1 }, { name = "SHIFT26", mask = 0x04, shift = 2 }, { name = "SHIFT27", mask = 0x08, shift = 3 }, { name = "SHIFT28", mask = 0x10, shift = 4 }, { name = "SHIFT29", mask = 0x20, shift = 5 }, { name = "SHIFT30", mask = 0x40, shift = 6 }, { name = "SHIFT31", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCXORT"
+addr = 0x1CA4
+width = 1
+fields = [{ name = "XOR24", mask = 0x01, shift = 0 }, { name = "XOR25", mask = 0x02, shift = 1 }, { name = "XOR26", mask = 0x04, shift = 2 }, { name = "XOR27", mask = 0x08, shift = 3 }, { name = "XOR28", mask = 0x10, shift = 4 }, { name = "XOR29", mask = 0x20, shift = 5 }, { name = "XOR30", mask = 0x40, shift = 6 }, { name = "XOR31", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "CRCCON0"
+addr = 0x1CA5
+width = 1
+fields = [{ name = "FULL", mask = 0x01, shift = 0 }, { name = "SHIFTM", mask = 0x02, shift = 1 }, { name = "SETUP", mask = 0x0C, shift = 2 }, { name = "ACCMOD", mask = 0x10, shift = 4 }, { name = "CRCBUSY", mask = 0x20, shift = 5 }, { name = "CRCGO", mask = 0x40, shift = 6 }, { name = "CRCEN", mask = 0x80, shift = 7 }, { name = "LENDIAN", mask = 0x02, shift = 1, mode = 1 }, { name = "SETUP0", mask = 0x04, shift = 2, mode = 1 }, { name = "SETUP1", mask = 0x08, shift = 3, mode = 1 }, { name = "ACCM", mask = 0x10, shift = 4, mode = 1 }, { name = "BUSY", mask = 0x20, shift = 5, mode = 1 }, { name = "GO", mask = 0x40, shift = 6, mode = 1 }, { name = "EN", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "CRCCON1"
+addr = 0x1CA6
+width = 1
+fields = [{ name = "PLEN", mask = 0x1F, shift = 0 }, { name = "PLEN0", mask = 0x01, shift = 0, mode = 1 }, { name = "PLEN1", mask = 0x02, shift = 1, mode = 1 }, { name = "PLEN2", mask = 0x04, shift = 2, mode = 1 }, { name = "PLEN3", mask = 0x08, shift = 3, mode = 1 }, { name = "PLEN4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "CRCCON2"
+addr = 0x1CA7
+width = 1
+fields = [{ name = "DLEN", mask = 0x1F, shift = 0 }, { name = "DLEN0", mask = 0x01, shift = 0, mode = 1 }, { name = "DLEN1", mask = 0x02, shift = 1, mode = 1 }, { name = "DLEN2", mask = 0x04, shift = 2, mode = 1 }, { name = "DLEN3", mask = 0x08, shift = 3, mode = 1 }, { name = "DLEN4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "ADLTH"
+addr = 0x1D0C
+width = 2
+fields = []
+
+[[sfrs]]
+name = "ADLTHL"
+addr = 0x1D0C
+width = 1
+fields = [{ name = "ADLTH0", mask = 0x01, shift = 0 }, { name = "ADLTH1", mask = 0x02, shift = 1 }, { name = "ADLTH2", mask = 0x04, shift = 2 }, { name = "ADLTH3", mask = 0x08, shift = 3 }, { name = "ADLTH4", mask = 0x10, shift = 4 }, { name = "ADLTH5", mask = 0x20, shift = 5 }, { name = "ADLTH6", mask = 0x40, shift = 6 }, { name = "ADLTH7", mask = 0x80, shift = 7 }, { name = "LTH0", mask = 0x01, shift = 0, mode = 1 }, { name = "LTH1", mask = 0x02, shift = 1, mode = 1 }, { name = "LTH2", mask = 0x04, shift = 2, mode = 1 }, { name = "LTH3", mask = 0x08, shift = 3, mode = 1 }, { name = "LTH4", mask = 0x10, shift = 4, mode = 1 }, { name = "LTH5", mask = 0x20, shift = 5, mode = 1 }, { name = "LTH6", mask = 0x40, shift = 6, mode = 1 }, { name = "LTH7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADLTHH"
+addr = 0x1D0D
+width = 1
+fields = [{ name = "ADLTH8", mask = 0x01, shift = 0 }, { name = "ADLTH9", mask = 0x02, shift = 1 }, { name = "ADLTH10", mask = 0x04, shift = 2 }, { name = "ADLTH11", mask = 0x08, shift = 3 }, { name = "ADLTH12", mask = 0x10, shift = 4 }, { name = "ADLTH13", mask = 0x20, shift = 5 }, { name = "ADLTH14", mask = 0x40, shift = 6 }, { name = "ADLTH15", mask = 0x80, shift = 7 }, { name = "LTH8", mask = 0x01, shift = 0, mode = 1 }, { name = "LTH9", mask = 0x02, shift = 1, mode = 1 }, { name = "LTH10", mask = 0x04, shift = 2, mode = 1 }, { name = "LTH11", mask = 0x08, shift = 3, mode = 1 }, { name = "LTH12", mask = 0x10, shift = 4, mode = 1 }, { name = "LTH13", mask = 0x20, shift = 5, mode = 1 }, { name = "LTH14", mask = 0x40, shift = 6, mode = 1 }, { name = "LTH15", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADUTH"
+addr = 0x1D0E
+width = 2
+fields = []
+
+[[sfrs]]
+name = "ADUTHL"
+addr = 0x1D0E
+width = 1
+fields = [{ name = "ADUTH0", mask = 0x01, shift = 0 }, { name = "ADUTH1", mask = 0x02, shift = 1 }, { name = "ADUTH2", mask = 0x04, shift = 2 }, { name = "ADUTH3", mask = 0x08, shift = 3 }, { name = "ADUTH4", mask = 0x10, shift = 4 }, { name = "ADUTH5", mask = 0x20, shift = 5 }, { name = "ADUTH6", mask = 0x40, shift = 6 }, { name = "ADUTH7", mask = 0x80, shift = 7 }, { name = "UTH0", mask = 0x01, shift = 0, mode = 1 }, { name = "UTH1", mask = 0x02, shift = 1, mode = 1 }, { name = "UTH2", mask = 0x04, shift = 2, mode = 1 }, { name = "UTH3", mask = 0x08, shift = 3, mode = 1 }, { name = "UTH4", mask = 0x10, shift = 4, mode = 1 }, { name = "UTH5", mask = 0x20, shift = 5, mode = 1 }, { name = "UTH6", mask = 0x40, shift = 6, mode = 1 }, { name = "UTH7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADUTHH"
+addr = 0x1D0F
+width = 1
+fields = [{ name = "ADUTH8", mask = 0x01, shift = 0 }, { name = "ADUTH9", mask = 0x02, shift = 1 }, { name = "ADUTH10", mask = 0x04, shift = 2 }, { name = "ADUTH11", mask = 0x08, shift = 3 }, { name = "ADUTH12", mask = 0x10, shift = 4 }, { name = "ADUTH13", mask = 0x20, shift = 5 }, { name = "ADUTH14", mask = 0x40, shift = 6 }, { name = "ADUTH15", mask = 0x80, shift = 7 }, { name = "UTH8", mask = 0x01, shift = 0, mode = 1 }, { name = "UTH9", mask = 0x02, shift = 1, mode = 1 }, { name = "UTH10", mask = 0x04, shift = 2, mode = 1 }, { name = "UTH11", mask = 0x08, shift = 3, mode = 1 }, { name = "UTH12", mask = 0x10, shift = 4, mode = 1 }, { name = "UTH13", mask = 0x20, shift = 5, mode = 1 }, { name = "UTH14", mask = 0x40, shift = 6, mode = 1 }, { name = "UTH15", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADERR"
+addr = 0x1D10
+width = 2
+fields = []
+
+[[sfrs]]
+name = "ADERRL"
+addr = 0x1D10
+width = 1
+fields = [{ name = "ADERR0", mask = 0x01, shift = 0 }, { name = "ADERR1", mask = 0x02, shift = 1 }, { name = "ADERR2", mask = 0x04, shift = 2 }, { name = "ADERR3", mask = 0x08, shift = 3 }, { name = "ADERR4", mask = 0x10, shift = 4 }, { name = "ADERR5", mask = 0x20, shift = 5 }, { name = "ADERR6", mask = 0x40, shift = 6 }, { name = "ADERR7", mask = 0x80, shift = 7 }, { name = "ERR0", mask = 0x01, shift = 0, mode = 1 }, { name = "ERR1", mask = 0x02, shift = 1, mode = 1 }, { name = "ERR2", mask = 0x04, shift = 2, mode = 1 }, { name = "ERR3", mask = 0x08, shift = 3, mode = 1 }, { name = "ERR4", mask = 0x10, shift = 4, mode = 1 }, { name = "ERR5", mask = 0x20, shift = 5, mode = 1 }, { name = "ERR6", mask = 0x40, shift = 6, mode = 1 }, { name = "ERR7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADERRH"
+addr = 0x1D11
+width = 1
+fields = [{ name = "ADERR8", mask = 0x01, shift = 0 }, { name = "ADERR9", mask = 0x02, shift = 1 }, { name = "ADERR10", mask = 0x04, shift = 2 }, { name = "ADERR11", mask = 0x08, shift = 3 }, { name = "ADERR12", mask = 0x10, shift = 4 }, { name = "ADERR13", mask = 0x20, shift = 5 }, { name = "ADERR14", mask = 0x40, shift = 6 }, { name = "ADERR15", mask = 0x80, shift = 7 }, { name = "ERR8", mask = 0x01, shift = 0, mode = 1 }, { name = "ERR9", mask = 0x02, shift = 1, mode = 1 }, { name = "ERR10", mask = 0x04, shift = 2, mode = 1 }, { name = "ERR11", mask = 0x08, shift = 3, mode = 1 }, { name = "ERR12", mask = 0x10, shift = 4, mode = 1 }, { name = "ERR13", mask = 0x20, shift = 5, mode = 1 }, { name = "ERR14", mask = 0x40, shift = 6, mode = 1 }, { name = "ERR15", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADSTPT"
+addr = 0x1D12
+width = 2
+fields = []
+
+[[sfrs]]
+name = "ADSTPTL"
+addr = 0x1D12
+width = 1
+fields = [{ name = "ADSTPT0", mask = 0x01, shift = 0 }, { name = "ADSTPT1", mask = 0x02, shift = 1 }, { name = "ADSTPT2", mask = 0x04, shift = 2 }, { name = "ADSTPT3", mask = 0x08, shift = 3 }, { name = "ADSTPT4", mask = 0x10, shift = 4 }, { name = "ADSTPT5", mask = 0x20, shift = 5 }, { name = "ADSTPT6", mask = 0x40, shift = 6 }, { name = "ADSTPT7", mask = 0x80, shift = 7 }, { name = "STPT0", mask = 0x01, shift = 0, mode = 1 }, { name = "STPT1", mask = 0x02, shift = 1, mode = 1 }, { name = "STPT2", mask = 0x04, shift = 2, mode = 1 }, { name = "STPT3", mask = 0x08, shift = 3, mode = 1 }, { name = "STPT4", mask = 0x10, shift = 4, mode = 1 }, { name = "STPT5", mask = 0x20, shift = 5, mode = 1 }, { name = "STPT6", mask = 0x40, shift = 6, mode = 1 }, { name = "STPT7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADSTPTH"
+addr = 0x1D13
+width = 1
+fields = [{ name = "ADSTPT8", mask = 0x01, shift = 0 }, { name = "ADSTPT9", mask = 0x02, shift = 1 }, { name = "ADSTPT10", mask = 0x04, shift = 2 }, { name = "ADSTPT11", mask = 0x08, shift = 3 }, { name = "ADSTPT12", mask = 0x10, shift = 4 }, { name = "ADSTPT13", mask = 0x20, shift = 5 }, { name = "ADSTPT14", mask = 0x40, shift = 6 }, { name = "ADSTPT15", mask = 0x80, shift = 7 }, { name = "STPT8", mask = 0x01, shift = 0, mode = 1 }, { name = "STPT9", mask = 0x02, shift = 1, mode = 1 }, { name = "STPT10", mask = 0x04, shift = 2, mode = 1 }, { name = "STPT11", mask = 0x08, shift = 3, mode = 1 }, { name = "STPT12", mask = 0x10, shift = 4, mode = 1 }, { name = "STPT13", mask = 0x20, shift = 5, mode = 1 }, { name = "STPT15", mask = 0x40, shift = 6, mode = 1 }, { name = "STPT16", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADFLTR"
+addr = 0x1D14
+width = 2
+fields = []
+
+[[sfrs]]
+name = "ADFLTRL"
+addr = 0x1D14
+width = 1
+fields = [{ name = "ADFLTR0", mask = 0x01, shift = 0 }, { name = "ADFLTR1", mask = 0x02, shift = 1 }, { name = "ADFLTR2", mask = 0x04, shift = 2 }, { name = "ADFLTR3", mask = 0x08, shift = 3 }, { name = "ADFLTR4", mask = 0x10, shift = 4 }, { name = "ADFLTR5", mask = 0x20, shift = 5 }, { name = "ADFLTR6", mask = 0x40, shift = 6 }, { name = "ADFLTR7", mask = 0x80, shift = 7 }, { name = "FLTR0", mask = 0x01, shift = 0, mode = 1 }, { name = "FLTR1", mask = 0x02, shift = 1, mode = 1 }, { name = "FLTR2", mask = 0x04, shift = 2, mode = 1 }, { name = "FLTR3", mask = 0x08, shift = 3, mode = 1 }, { name = "FLTR4", mask = 0x10, shift = 4, mode = 1 }, { name = "FLTR5", mask = 0x20, shift = 5, mode = 1 }, { name = "FLTR6", mask = 0x40, shift = 6, mode = 1 }, { name = "FLTR7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADFLTRH"
+addr = 0x1D15
+width = 1
+fields = [{ name = "ADFLTR8", mask = 0x01, shift = 0 }, { name = "ADFLTR9", mask = 0x02, shift = 1 }, { name = "ADFLTR10", mask = 0x04, shift = 2 }, { name = "ADFLTR11", mask = 0x08, shift = 3 }, { name = "ADFLTR12", mask = 0x10, shift = 4 }, { name = "ADFLTR13", mask = 0x20, shift = 5 }, { name = "ADFLTR14", mask = 0x40, shift = 6 }, { name = "ADFLTR15", mask = 0x80, shift = 7 }, { name = "FLTR8", mask = 0x01, shift = 0, mode = 1 }, { name = "FLTR9", mask = 0x02, shift = 1, mode = 1 }, { name = "FLTR10", mask = 0x04, shift = 2, mode = 1 }, { name = "FLTR11", mask = 0x08, shift = 3, mode = 1 }, { name = "FLTR12", mask = 0x10, shift = 4, mode = 1 }, { name = "FLTR13", mask = 0x20, shift = 5, mode = 1 }, { name = "FLTR14", mask = 0x40, shift = 6, mode = 1 }, { name = "FLTR15", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADACC"
+addr = 0x1D16
+width = 2
+fields = []
+
+[[sfrs]]
+name = "ADACCL"
+addr = 0x1D16
+width = 1
+fields = [{ name = "ADACC0", mask = 0x01, shift = 0 }, { name = "ADACC1", mask = 0x02, shift = 1 }, { name = "ADACC2", mask = 0x04, shift = 2 }, { name = "ADACC3", mask = 0x08, shift = 3 }, { name = "ADACC4", mask = 0x10, shift = 4 }, { name = "ADACC5", mask = 0x20, shift = 5 }, { name = "ADACC6", mask = 0x40, shift = 6 }, { name = "ADACC7", mask = 0x80, shift = 7 }, { name = "ACC0", mask = 0x01, shift = 0, mode = 1 }, { name = "ACC1", mask = 0x02, shift = 1, mode = 1 }, { name = "ACC2", mask = 0x04, shift = 2, mode = 1 }, { name = "ACC3", mask = 0x08, shift = 3, mode = 1 }, { name = "ACC4", mask = 0x10, shift = 4, mode = 1 }, { name = "ACC5", mask = 0x20, shift = 5, mode = 1 }, { name = "ACC6", mask = 0x40, shift = 6, mode = 1 }, { name = "ACC7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADACCH"
+addr = 0x1D17
+width = 1
+fields = [{ name = "ADACC8", mask = 0x01, shift = 0 }, { name = "ADACC9", mask = 0x02, shift = 1 }, { name = "ADACC10", mask = 0x04, shift = 2 }, { name = "ADACC11", mask = 0x08, shift = 3 }, { name = "ADACC12", mask = 0x10, shift = 4 }, { name = "ADACC13", mask = 0x20, shift = 5 }, { name = "ADACC14", mask = 0x40, shift = 6 }, { name = "ADACC15", mask = 0x80, shift = 7 }, { name = "ACC8", mask = 0x01, shift = 0, mode = 1 }, { name = "ACC9", mask = 0x02, shift = 1, mode = 1 }, { name = "ACC10", mask = 0x04, shift = 2, mode = 1 }, { name = "ACC11", mask = 0x08, shift = 3, mode = 1 }, { name = "ACC12", mask = 0x10, shift = 4, mode = 1 }, { name = "ACC13", mask = 0x20, shift = 5, mode = 1 }, { name = "ACC14", mask = 0x40, shift = 6, mode = 1 }, { name = "ACC15", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADACCU"
+addr = 0x1D18
+width = 1
+fields = [{ name = "ADACC16", mask = 0x01, shift = 0 }, { name = "ADACC17", mask = 0x02, shift = 1 }, { name = "ACC16", mask = 0x01, shift = 0, mode = 1 }, { name = "ACC17", mask = 0x02, shift = 1, mode = 1 }]
+
+[[sfrs]]
+name = "ADCNT"
+addr = 0x1D19
+width = 1
+fields = [{ name = "ADCNT0", mask = 0x01, shift = 0 }, { name = "ADCNT1", mask = 0x02, shift = 1 }, { name = "ADCNT2", mask = 0x04, shift = 2 }, { name = "ADCNT3", mask = 0x08, shift = 3 }, { name = "ADCNT4", mask = 0x10, shift = 4 }, { name = "ADCNT5", mask = 0x20, shift = 5 }, { name = "ADCNT6", mask = 0x40, shift = 6 }, { name = "ADCNT7", mask = 0x80, shift = 7 }, { name = "CNT0", mask = 0x01, shift = 0, mode = 1 }, { name = "CNT1", mask = 0x02, shift = 1, mode = 1 }, { name = "CNT2", mask = 0x04, shift = 2, mode = 1 }, { name = "CNT3", mask = 0x08, shift = 3, mode = 1 }, { name = "CNT4", mask = 0x10, shift = 4, mode = 1 }, { name = "CNT5", mask = 0x20, shift = 5, mode = 1 }, { name = "CNT6", mask = 0x40, shift = 6, mode = 1 }, { name = "CNT7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADRPT"
+addr = 0x1D1A
+width = 1
+fields = [{ name = "ADRPT0", mask = 0x01, shift = 0 }, { name = "ADRPT1", mask = 0x02, shift = 1 }, { name = "ADRPT2", mask = 0x04, shift = 2 }, { name = "ADRPT3", mask = 0x08, shift = 3 }, { name = "ADRPT4", mask = 0x10, shift = 4 }, { name = "ADRPT5", mask = 0x20, shift = 5 }, { name = "ADRPT6", mask = 0x40, shift = 6 }, { name = "ADRPT7", mask = 0x80, shift = 7 }, { name = "RPT0", mask = 0x01, shift = 0, mode = 1 }, { name = "RPT1", mask = 0x02, shift = 1, mode = 1 }, { name = "RPT2", mask = 0x04, shift = 2, mode = 1 }, { name = "RPT3", mask = 0x08, shift = 3, mode = 1 }, { name = "RPT4", mask = 0x10, shift = 4, mode = 1 }, { name = "RPT5", mask = 0x20, shift = 5, mode = 1 }, { name = "RPT6", mask = 0x40, shift = 6, mode = 1 }, { name = "RPT7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADPREV"
+addr = 0x1D1B
+width = 2
+fields = []
+
+[[sfrs]]
+name = "ADPREVL"
+addr = 0x1D1B
+width = 1
+fields = [{ name = "ADPREV0", mask = 0x01, shift = 0 }, { name = "ADPREV1", mask = 0x02, shift = 1 }, { name = "ADPREV2", mask = 0x04, shift = 2 }, { name = "ADPREV3", mask = 0x08, shift = 3 }, { name = "ADPREV4", mask = 0x10, shift = 4 }, { name = "ADPREV5", mask = 0x20, shift = 5 }, { name = "ADPREV6", mask = 0x40, shift = 6 }, { name = "ADPREV7", mask = 0x80, shift = 7 }, { name = "PREV0", mask = 0x01, shift = 0, mode = 1 }, { name = "PREV1", mask = 0x02, shift = 1, mode = 1 }, { name = "PREV2", mask = 0x04, shift = 2, mode = 1 }, { name = "PREV3", mask = 0x08, shift = 3, mode = 1 }, { name = "PREV4", mask = 0x10, shift = 4, mode = 1 }, { name = "PREV5", mask = 0x20, shift = 5, mode = 1 }, { name = "PREV6", mask = 0x40, shift = 6, mode = 1 }, { name = "PREV7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADPREVH"
+addr = 0x1D1C
+width = 1
+fields = [{ name = "ADPREV8", mask = 0x01, shift = 0 }, { name = "ADPREV9", mask = 0x02, shift = 1 }, { name = "ADPREV10", mask = 0x04, shift = 2 }, { name = "ADPREV11", mask = 0x08, shift = 3 }, { name = "ADPREV12", mask = 0x10, shift = 4 }, { name = "ADPREV13", mask = 0x20, shift = 5 }, { name = "ADPREV14", mask = 0x40, shift = 6 }, { name = "ADPREV15", mask = 0x80, shift = 7 }, { name = "PREV8", mask = 0x01, shift = 0, mode = 1 }, { name = "PREV9", mask = 0x02, shift = 1, mode = 1 }, { name = "PREV10", mask = 0x04, shift = 2, mode = 1 }, { name = "PREV11", mask = 0x08, shift = 3, mode = 1 }, { name = "PREV12", mask = 0x10, shift = 4, mode = 1 }, { name = "PREV13", mask = 0x20, shift = 5, mode = 1 }, { name = "PREV14", mask = 0x40, shift = 6, mode = 1 }, { name = "PREV15", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADRES"
+addr = 0x1D1D
+width = 2
+fields = []
+
+[[sfrs]]
+name = "ADRESL"
+addr = 0x1D1D
+width = 1
+fields = [{ name = "ADRES0", mask = 0x01, shift = 0 }, { name = "ADRES1", mask = 0x02, shift = 1 }, { name = "ADRES2", mask = 0x04, shift = 2 }, { name = "ADRES3", mask = 0x08, shift = 3 }, { name = "ADRES4", mask = 0x10, shift = 4 }, { name = "ADRES5", mask = 0x20, shift = 5 }, { name = "ADRES6", mask = 0x40, shift = 6 }, { name = "ADRES7", mask = 0x80, shift = 7 }, { name = "RES0", mask = 0x01, shift = 0, mode = 1 }, { name = "RES1", mask = 0x02, shift = 1, mode = 1 }, { name = "RES2", mask = 0x04, shift = 2, mode = 1 }, { name = "RES3", mask = 0x08, shift = 3, mode = 1 }, { name = "RES4", mask = 0x10, shift = 4, mode = 1 }, { name = "RES5", mask = 0x20, shift = 5, mode = 1 }, { name = "RES6", mask = 0x40, shift = 6, mode = 1 }, { name = "RES7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADRESH"
+addr = 0x1D1E
+width = 1
+fields = [{ name = "ADRES8", mask = 0x01, shift = 0 }, { name = "ADRES9", mask = 0x02, shift = 1 }, { name = "ADRES10", mask = 0x04, shift = 2 }, { name = "ADRES11", mask = 0x08, shift = 3 }, { name = "ADRES12", mask = 0x10, shift = 4 }, { name = "ADRES13", mask = 0x20, shift = 5 }, { name = "ADRES14", mask = 0x40, shift = 6 }, { name = "ADRES15", mask = 0x80, shift = 7 }, { name = "RES8", mask = 0x01, shift = 0, mode = 1 }, { name = "RES9", mask = 0x02, shift = 1, mode = 1 }, { name = "RES10", mask = 0x04, shift = 2, mode = 1 }, { name = "RES11", mask = 0x08, shift = 3, mode = 1 }, { name = "RES12", mask = 0x10, shift = 4, mode = 1 }, { name = "RES13", mask = 0x20, shift = 5, mode = 1 }, { name = "RES14", mask = 0x40, shift = 6, mode = 1 }, { name = "RES15", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADPCH"
+addr = 0x1D1F
+width = 1
+fields = [{ name = "ADPCH0", mask = 0x01, shift = 0 }, { name = "ADPCH1", mask = 0x02, shift = 1 }, { name = "ADPCH2", mask = 0x04, shift = 2 }, { name = "ADPCH3", mask = 0x08, shift = 3 }, { name = "ADPCH4", mask = 0x10, shift = 4 }, { name = "ADPCH5", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "ADACQ"
+addr = 0x1D21
+width = 2
+fields = []
+
+[[sfrs]]
+name = "ADACQL"
+addr = 0x1D21
+width = 1
+fields = [{ name = "ADACQ0", mask = 0x01, shift = 0 }, { name = "ADACQ1", mask = 0x02, shift = 1 }, { name = "ADACQ2", mask = 0x04, shift = 2 }, { name = "ADACQ3", mask = 0x08, shift = 3 }, { name = "ADACQ4", mask = 0x10, shift = 4 }, { name = "ADACQ5", mask = 0x20, shift = 5 }, { name = "ADACQ6", mask = 0x40, shift = 6 }, { name = "ADACQ7", mask = 0x80, shift = 7 }, { name = "ACQ0", mask = 0x01, shift = 0, mode = 1 }, { name = "ACQ1", mask = 0x02, shift = 1, mode = 1 }, { name = "ACQ2", mask = 0x04, shift = 2, mode = 1 }, { name = "ACQ3", mask = 0x08, shift = 3, mode = 1 }, { name = "ACQ4", mask = 0x10, shift = 4, mode = 1 }, { name = "ACQ5", mask = 0x20, shift = 5, mode = 1 }, { name = "ACQ6", mask = 0x40, shift = 6, mode = 1 }, { name = "ACQ7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADACQH"
+addr = 0x1D22
+width = 1
+fields = [{ name = "ACQ", mask = 0x1F, shift = 0 }, { name = "ADACQ8", mask = 0x01, shift = 0, mode = 1 }, { name = "ADACQ9", mask = 0x02, shift = 1, mode = 1 }, { name = "ADACQ10", mask = 0x04, shift = 2, mode = 1 }, { name = "ADACQ11", mask = 0x08, shift = 3, mode = 1 }, { name = "ADACQ12", mask = 0x10, shift = 4, mode = 1 }, { name = "ADACQ", mask = 0x1F, shift = 0, mode = 2 }, { name = "ACQ8", mask = 0x01, shift = 0, mode = 3 }, { name = "ACQ9", mask = 0x02, shift = 1, mode = 3 }, { name = "ACQ10", mask = 0x04, shift = 2, mode = 3 }, { name = "ACQ11", mask = 0x08, shift = 3, mode = 3 }, { name = "ACQ12", mask = 0x10, shift = 4, mode = 3 }]
+
+[[sfrs]]
+name = "ADCAP"
+addr = 0x1D23
+width = 1
+fields = [{ name = "ADCAP0", mask = 0x01, shift = 0 }, { name = "ADCAP1", mask = 0x02, shift = 1 }, { name = "ADCAP2", mask = 0x04, shift = 2 }, { name = "ADCAP3", mask = 0x08, shift = 3 }, { name = "ADCAP4", mask = 0x10, shift = 4 }]
+
+[[sfrs]]
+name = "ADPRE"
+addr = 0x1D24
+width = 2
+fields = []
+
+[[sfrs]]
+name = "ADPREL"
+addr = 0x1D24
+width = 1
+fields = [{ name = "PRE0", mask = 0x01, shift = 0 }, { name = "PRE1", mask = 0x02, shift = 1 }, { name = "PRE2", mask = 0x04, shift = 2 }, { name = "PRE3", mask = 0x08, shift = 3 }, { name = "PRE4", mask = 0x10, shift = 4 }, { name = "PRE5", mask = 0x20, shift = 5 }, { name = "PRE6", mask = 0x40, shift = 6 }, { name = "PRE7", mask = 0x80, shift = 7 }, { name = "ADPRE0", mask = 0x01, shift = 0, mode = 1 }, { name = "ADPRE1", mask = 0x02, shift = 1, mode = 1 }, { name = "ADPRE2", mask = 0x04, shift = 2, mode = 1 }, { name = "ADPRE3", mask = 0x08, shift = 3, mode = 1 }, { name = "ADPRE4", mask = 0x10, shift = 4, mode = 1 }, { name = "ADPRE5", mask = 0x20, shift = 5, mode = 1 }, { name = "ADPRE6", mask = 0x40, shift = 6, mode = 1 }, { name = "ADPRE7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADPREH"
+addr = 0x1D25
+width = 1
+fields = [{ name = "PRE", mask = 0x1F, shift = 0 }, { name = "PRE8", mask = 0x01, shift = 0, mode = 1 }, { name = "PRE9", mask = 0x02, shift = 1, mode = 1 }, { name = "PRE10", mask = 0x04, shift = 2, mode = 1 }, { name = "PRE11", mask = 0x08, shift = 3, mode = 1 }, { name = "PRE12", mask = 0x10, shift = 4, mode = 1 }, { name = "ADPRE", mask = 0x1F, shift = 0, mode = 2 }, { name = "ADPRE8", mask = 0x01, shift = 0, mode = 3 }, { name = "ADPRE9", mask = 0x02, shift = 1, mode = 3 }, { name = "ADPRE10", mask = 0x04, shift = 2, mode = 3 }, { name = "ADPRE11", mask = 0x08, shift = 3, mode = 3 }, { name = "ADPRE12", mask = 0x10, shift = 4, mode = 3 }]
+
+[[sfrs]]
+name = "ADCON0"
+addr = 0x1D26
+width = 1
+fields = [{ name = "GO", mask = 0x01, shift = 0 }, { name = "FM", mask = 0x04, shift = 2 }, { name = "CS", mask = 0x10, shift = 4 }, { name = "CONT", mask = 0x40, shift = 6 }, { name = "ON", mask = 0x80, shift = 7 }, { name = "ADGO", mask = 0x01, shift = 0, mode = 1 }, { name = "ADFM", mask = 0x04, shift = 2, mode = 1 }, { name = "ADCS", mask = 0x10, shift = 4, mode = 1 }, { name = "ADCONT", mask = 0x40, shift = 6, mode = 1 }, { name = "ADON", mask = 0x80, shift = 7, mode = 1 }, { name = "DONE", mask = 0x01, shift = 0, mode = 2 }, { name = "FM0", mask = 0x04, shift = 2, mode = 2 }, { name = "GO_nDONE", mask = 0x01, shift = 0, mode = 3 }, { name = "ADFM0", mask = 0x04, shift = 2, mode = 3 }]
+
+[[sfrs]]
+name = "ADCON1"
+addr = 0x1D27
+width = 1
+fields = [{ name = "DSEN", mask = 0x01, shift = 0 }, { name = "PCSC", mask = 0x02, shift = 1 }, { name = "GPOL", mask = 0x20, shift = 5 }, { name = "IPEN", mask = 0x40, shift = 6 }, { name = "PPOL", mask = 0x80, shift = 7 }, { name = "ADDSEN", mask = 0x01, shift = 0, mode = 1 }, { name = "ADGPOL", mask = 0x20, shift = 5, mode = 1 }, { name = "ADIPEN", mask = 0x40, shift = 6, mode = 1 }, { name = "ADPPOL", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "ADCON2"
+addr = 0x1D28
+width = 1
+fields = [{ name = "MD", mask = 0x07, shift = 0 }, { name = "ACLR", mask = 0x08, shift = 3 }, { name = "CRS", mask = 0x70, shift = 4 }, { name = "PSIS", mask = 0x80, shift = 7 }, { name = "ADMD0", mask = 0x01, shift = 0, mode = 1 }, { name = "ADMD1", mask = 0x02, shift = 1, mode = 1 }, { name = "ADMD2", mask = 0x04, shift = 2, mode = 1 }, { name = "ADACLR", mask = 0x08, shift = 3, mode = 1 }, { name = "ADCRS0", mask = 0x10, shift = 4, mode = 1 }, { name = "ADCRS1", mask = 0x20, shift = 5, mode = 1 }, { name = "ADCRS2", mask = 0x40, shift = 6, mode = 1 }, { name = "ADPSIS", mask = 0x80, shift = 7, mode = 1 }, { name = "ADMD", mask = 0x07, shift = 0, mode = 2 }, { name = "ADCRS", mask = 0x70, shift = 4, mode = 2 }, { name = "MD0", mask = 0x01, shift = 0, mode = 3 }, { name = "MD1", mask = 0x02, shift = 1, mode = 3 }, { name = "MD2", mask = 0x04, shift = 2, mode = 3 }, { name = "CRS0", mask = 0x10, shift = 4, mode = 3 }, { name = "CRS1", mask = 0x20, shift = 5, mode = 3 }, { name = "CRS2", mask = 0x40, shift = 6, mode = 3 }]
+
+[[sfrs]]
+name = "ADCON3"
+addr = 0x1D29
+width = 1
+fields = [{ name = "TMD", mask = 0x07, shift = 0 }, { name = "SOI", mask = 0x08, shift = 3 }, { name = "CALC", mask = 0x70, shift = 4 }, { name = "ADTMD0", mask = 0x01, shift = 0, mode = 1 }, { name = "ADTMD1", mask = 0x02, shift = 1, mode = 1 }, { name = "ADTMD2", mask = 0x04, shift = 2, mode = 1 }, { name = "ADSOI", mask = 0x08, shift = 3, mode = 1 }, { name = "ADCALC0", mask = 0x10, shift = 4, mode = 1 }, { name = "ADCALC1", mask = 0x20, shift = 5, mode = 1 }, { name = "ADCALC2", mask = 0x40, shift = 6, mode = 1 }, { name = "ADTMD", mask = 0x07, shift = 0, mode = 2 }, { name = "ADCALC", mask = 0x70, shift = 4, mode = 2 }, { name = "TMD0", mask = 0x01, shift = 0, mode = 3 }, { name = "TMD1", mask = 0x02, shift = 1, mode = 3 }, { name = "TMD2", mask = 0x04, shift = 2, mode = 3 }, { name = "CALC0", mask = 0x10, shift = 4, mode = 3 }, { name = "CALC1", mask = 0x20, shift = 5, mode = 3 }, { name = "CALC2", mask = 0x40, shift = 6, mode = 3 }]
+
+[[sfrs]]
+name = "ADSTAT"
+addr = 0x1D2A
+width = 1
+fields = [{ name = "STAT", mask = 0x07, shift = 0 }, { name = "MATH", mask = 0x10, shift = 4 }, { name = "LTHR", mask = 0x20, shift = 5 }, { name = "UTHR", mask = 0x40, shift = 6 }, { name = "AOV", mask = 0x80, shift = 7 }, { name = "ADSTAT0", mask = 0x01, shift = 0, mode = 1 }, { name = "ADSTAT1", mask = 0x02, shift = 1, mode = 1 }, { name = "ADSTAT2", mask = 0x04, shift = 2, mode = 1 }, { name = "ADMATH", mask = 0x10, shift = 4, mode = 1 }, { name = "ADLTHR", mask = 0x20, shift = 5, mode = 1 }, { name = "ADUTHR", mask = 0x40, shift = 6, mode = 1 }, { name = "ADAOV", mask = 0x80, shift = 7, mode = 1 }, { name = "ADSTAT", mask = 0x07, shift = 0, mode = 2 }, { name = "ADOV", mask = 0x80, shift = 7, mode = 2 }, { name = "STAT0", mask = 0x01, shift = 0, mode = 3 }, { name = "STAT1", mask = 0x02, shift = 1, mode = 3 }, { name = "STAT2", mask = 0x04, shift = 2, mode = 3 }, { name = "OV", mask = 0x80, shift = 7, mode = 3 }]
+
+[[sfrs]]
+name = "ADREF"
+addr = 0x1D2B
+width = 1
+fields = [{ name = "PREF", mask = 0x03, shift = 0 }, { name = "ADPREF", mask = 0x03, shift = 0, mode = 1 }, { name = "PREF0", mask = 0x01, shift = 0, mode = 2 }, { name = "PREF1", mask = 0x02, shift = 1, mode = 2 }, { name = "ADPREF0", mask = 0x01, shift = 0, mode = 3 }, { name = "ADPREF1", mask = 0x02, shift = 1, mode = 3 }]
+
+[[sfrs]]
+name = "ADACT"
+addr = 0x1D2C
+width = 1
+fields = [{ name = "ADACT0", mask = 0x01, shift = 0 }, { name = "ADACT1", mask = 0x02, shift = 1 }, { name = "ADACT2", mask = 0x04, shift = 2 }, { name = "ADACT3", mask = 0x08, shift = 3 }, { name = "ADACT4", mask = 0x10, shift = 4 }, { name = "ADACT5", mask = 0x20, shift = 5 }, { name = "ACT0", mask = 0x01, shift = 0, mode = 1 }, { name = "ACT1", mask = 0x02, shift = 1, mode = 1 }, { name = "ACT2", mask = 0x04, shift = 2, mode = 1 }, { name = "ACT3", mask = 0x08, shift = 3, mode = 1 }, { name = "ACT4", mask = 0x10, shift = 4, mode = 1 }, { name = "ACT5", mask = 0x20, shift = 5, mode = 1 }]
+
+[[sfrs]]
+name = "ADCLK"
+addr = 0x1D2D
+width = 1
+fields = [{ name = "ADCS0", mask = 0x01, shift = 0 }, { name = "ADCS1", mask = 0x02, shift = 1 }, { name = "ADCS2", mask = 0x04, shift = 2 }, { name = "ADCS3", mask = 0x08, shift = 3 }, { name = "ADCS4", mask = 0x10, shift = 4 }, { name = "ADCS5", mask = 0x20, shift = 5 }, { name = "CS0", mask = 0x01, shift = 0, mode = 1 }, { name = "CS1", mask = 0x02, shift = 1, mode = 1 }, { name = "CS2", mask = 0x04, shift = 2, mode = 1 }, { name = "CS3", mask = 0x08, shift = 3, mode = 1 }, { name = "CS4", mask = 0x10, shift = 4, mode = 1 }, { name = "CS5", mask = 0x20, shift = 5, mode = 1 }]
+
+[[sfrs]]
+name = "ADCG1A"
+addr = 0x1D2E
+width = 1
+fields = [{ name = "CGA0", mask = 0x01, shift = 0 }, { name = "CGA1", mask = 0x02, shift = 1 }, { name = "CGA2", mask = 0x04, shift = 2 }, { name = "CGA4", mask = 0x10, shift = 4 }, { name = "CGA5", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "ADCG1B"
+addr = 0x1D2F
+width = 1
+fields = [{ name = "CGB4", mask = 0x10, shift = 4 }, { name = "CGB5", mask = 0x20, shift = 5 }, { name = "CGB6", mask = 0x40, shift = 6 }, { name = "CGB7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "ADCG1C"
+addr = 0x1D30
+width = 1
+fields = [{ name = "CGC0", mask = 0x01, shift = 0 }, { name = "CGC1", mask = 0x02, shift = 1 }, { name = "CGC2", mask = 0x04, shift = 2 }, { name = "CGC3", mask = 0x08, shift = 3 }, { name = "CGC4", mask = 0x10, shift = 4 }, { name = "CGC5", mask = 0x20, shift = 5 }, { name = "CGC6", mask = 0x40, shift = 6 }, { name = "CGC7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "RA0PPS"
+addr = 0x1D8C
+width = 1
+fields = [{ name = "RA0PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RA1PPS"
+addr = 0x1D8D
+width = 1
+fields = [{ name = "RA1PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RA2PPS"
+addr = 0x1D8E
+width = 1
+fields = [{ name = "RA2PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RA4PPS"
+addr = 0x1D90
+width = 1
+fields = [{ name = "RA4PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RA5PPS"
+addr = 0x1D91
+width = 1
+fields = [{ name = "RA5PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RB4PPS"
+addr = 0x1D98
+width = 1
+fields = [{ name = "RB4PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RB5PPS"
+addr = 0x1D99
+width = 1
+fields = [{ name = "RB5PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RB6PPS"
+addr = 0x1D9A
+width = 1
+fields = [{ name = "RB6PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RB7PPS"
+addr = 0x1D9B
+width = 1
+fields = [{ name = "RB7PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RC0PPS"
+addr = 0x1D9C
+width = 1
+fields = [{ name = "RC0PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RC1PPS"
+addr = 0x1D9D
+width = 1
+fields = [{ name = "RC1PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RC2PPS"
+addr = 0x1D9E
+width = 1
+fields = [{ name = "RC2PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RC3PPS"
+addr = 0x1D9F
+width = 1
+fields = [{ name = "RC3PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RC4PPS"
+addr = 0x1DA0
+width = 1
+fields = [{ name = "RC4PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RC5PPS"
+addr = 0x1DA1
+width = 1
+fields = [{ name = "RC5PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RC6PPS"
+addr = 0x1DA2
+width = 1
+fields = [{ name = "RC6PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "RC7PPS"
+addr = 0x1DA3
+width = 1
+fields = [{ name = "RC7PPS", mask = 0x3F, shift = 0 }]
+
+[[sfrs]]
+name = "PPSLOCK"
+addr = 0x1E0C
+width = 1
+fields = [{ name = "PPSLOCKED", mask = 0x01, shift = 0 }]
+
+[[sfrs]]
+name = "INTPPS"
+addr = 0x1E0D
+width = 1
+fields = [{ name = "INTPPS", mask = 0x1F, shift = 0 }, { name = "INTPPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "INTPPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "INTPPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "INTPPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "INTPPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "T0CKIPPS"
+addr = 0x1E0E
+width = 1
+fields = [{ name = "T0CKIPPS", mask = 0x1F, shift = 0 }, { name = "T0CKIPPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "T0CKIPPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "T0CKIPPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "T0CKIPPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "T0CKIPPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "T1CKIPPS"
+addr = 0x1E0F
+width = 1
+fields = [{ name = "T1CKIPPS", mask = 0x1F, shift = 0 }, { name = "T1CKIPPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "T1CKIPPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "T1CKIPPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "T1CKIPPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "T1CKIPPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "T1GPPS"
+addr = 0x1E10
+width = 1
+fields = [{ name = "T1GPPS", mask = 0x1F, shift = 0 }, { name = "T1GPPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "T1GPPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "T1GPPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "T1GPPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "T1GPPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "T2INPPS"
+addr = 0x1E19
+width = 1
+fields = [{ name = "T2INPPS", mask = 0x1F, shift = 0 }, { name = "T2INPPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "T2INPPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "T2INPPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "T2INPPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "T2INPPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "CCP1PPS"
+addr = 0x1E1E
+width = 1
+fields = [{ name = "CCP1PPS", mask = 0x1F, shift = 0 }, { name = "CCP1PPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "CCP1PPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "CCP1PPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "CCP1PPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "CCP1PPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "CCP2PPS"
+addr = 0x1E1F
+width = 1
+fields = [{ name = "CCP2PPS", mask = 0x1F, shift = 0 }, { name = "CCP2PPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "CCP2PPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "CCP2PPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "CCP2PPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "CCP2PPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "CLCIN0PPS"
+addr = 0x1E3D
+width = 1
+fields = [{ name = "CLCIN0PPS", mask = 0x1F, shift = 0 }, { name = "CLCIN0PPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "CLCIN0PPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "CLCIN0PPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "CLCIN0PPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "CLCIN0PPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "CLCIN1PPS"
+addr = 0x1E3E
+width = 1
+fields = [{ name = "CLCIN1PPS", mask = 0x1F, shift = 0 }, { name = "CLCIN1PPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "CLCIN1PPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "CLCIN1PPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "CLCIN1PPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "CLCIN1PPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "CLCIN2PPS"
+addr = 0x1E3F
+width = 1
+fields = [{ name = "CLCIN2PPS", mask = 0x1F, shift = 0 }, { name = "CLCIN2PPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "CLCIN2PPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "CLCIN2PPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "CLCIN2PPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "CLCIN2PPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "CLCIN3PPS"
+addr = 0x1E40
+width = 1
+fields = [{ name = "CLCIN3PPS", mask = 0x1F, shift = 0 }, { name = "CLCIN3PPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "CLCIN3PPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "CLCIN3PPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "CLCIN3PPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "CLCIN3PPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "CK1PPS"
+addr = 0x1E41
+width = 1
+aliases = ["RX1DTPPS"]
+fields = [{ name = "CK1PPS", mask = 0x1F, shift = 0 }]
+
+[[sfrs]]
+name = "RX1PPS"
+addr = 0x1E42
+width = 1
+aliases = ["TX1CKPPS"]
+fields = [{ name = "RX1PPS", mask = 0x1F, shift = 0 }]
+
+[[sfrs]]
+name = "SSP1CLKPPS"
+addr = 0x1E47
+width = 1
+fields = [{ name = "SSP1CLKPPS", mask = 0x1F, shift = 0 }, { name = "SSP1CLKPPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "SSP1CLKPPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "SSP1CLKPPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "SSP1CLKPPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "SSP1CLKPPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "SSP1DATPPS"
+addr = 0x1E48
+width = 1
+fields = [{ name = "SSP1DATPPS", mask = 0x1F, shift = 0 }, { name = "SSP1DATPPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "SSP1DATPPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "SSP1DATPPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "SSP1DATPPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "SSP1DATPPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "SSP1SSPPS"
+addr = 0x1E49
+width = 1
+fields = [{ name = "SSP1SSPPS", mask = 0x1F, shift = 0 }, { name = "SSP1SSPPS0", mask = 0x01, shift = 0, mode = 1 }, { name = "SSP1SSPPS1", mask = 0x02, shift = 1, mode = 1 }, { name = "SSP1SSPPS2", mask = 0x04, shift = 2, mode = 1 }, { name = "SSP1SSPPS3", mask = 0x08, shift = 3, mode = 1 }, { name = "SSP1SSPPS4", mask = 0x10, shift = 4, mode = 1 }]
+
+[[sfrs]]
+name = "ADACTPPS"
+addr = 0x1E50
+width = 1
+fields = [{ name = "ADACTPPS", mask = 0x1F, shift = 0 }]
+
+[[sfrs]]
+name = "CLBIN0PPS"
+addr = 0x1E57
+width = 1
+fields = [{ name = "CLBIN0PPS", mask = 0x1F, shift = 0 }]
+
+[[sfrs]]
+name = "CLBIN1PPS"
+addr = 0x1E58
+width = 1
+fields = [{ name = "CLBIN1PPS", mask = 0x1F, shift = 0 }]
+
+[[sfrs]]
+name = "CLBIN2PPS"
+addr = 0x1E59
+width = 1
+fields = [{ name = "CLBIN2PPS", mask = 0x1F, shift = 0 }]
+
+[[sfrs]]
+name = "CLBIN3PPS"
+addr = 0x1E5A
+width = 1
+fields = [{ name = "CLBIN3PPS", mask = 0x1F, shift = 0 }]
+
+[[sfrs]]
+name = "ANSELA"
+addr = 0x1E8C
+width = 1
+fields = [{ name = "ANSELA0", mask = 0x01, shift = 0 }, { name = "ANSELA1", mask = 0x02, shift = 1 }, { name = "ANSELA2", mask = 0x04, shift = 2 }, { name = "ANSELA4", mask = 0x10, shift = 4 }, { name = "ANSELA5", mask = 0x20, shift = 5 }, { name = "ANSA0", mask = 0x01, shift = 0, mode = 1 }, { name = "ANSA1", mask = 0x02, shift = 1, mode = 1 }, { name = "ANSA2", mask = 0x04, shift = 2, mode = 1 }, { name = "ANSA4", mask = 0x10, shift = 4, mode = 1 }, { name = "ANSA5", mask = 0x20, shift = 5, mode = 1 }]
+
+[[sfrs]]
+name = "WPUA"
+addr = 0x1E8D
+width = 1
+fields = [{ name = "WPUA0", mask = 0x01, shift = 0 }, { name = "WPUA1", mask = 0x02, shift = 1 }, { name = "WPUA2", mask = 0x04, shift = 2 }, { name = "WPUA3", mask = 0x08, shift = 3 }, { name = "WPUA4", mask = 0x10, shift = 4 }, { name = "WPUA5", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "ODCONA"
+addr = 0x1E8E
+width = 1
+fields = [{ name = "ODCA0", mask = 0x01, shift = 0 }, { name = "ODCA1", mask = 0x02, shift = 1 }, { name = "ODCA2", mask = 0x04, shift = 2 }, { name = "ODCA4", mask = 0x10, shift = 4 }, { name = "ODCA5", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "SLRCONA"
+addr = 0x1E8F
+width = 1
+fields = [{ name = "SLRA0", mask = 0x01, shift = 0 }, { name = "SLRA1", mask = 0x02, shift = 1 }, { name = "SLRA2", mask = 0x04, shift = 2 }, { name = "SLRA4", mask = 0x10, shift = 4 }, { name = "SLRA5", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "INLVLA"
+addr = 0x1E90
+width = 1
+fields = [{ name = "INLVLA0", mask = 0x01, shift = 0 }, { name = "INLVLA1", mask = 0x02, shift = 1 }, { name = "INLVLA2", mask = 0x04, shift = 2 }, { name = "INLVLA3", mask = 0x08, shift = 3 }, { name = "INLVLA4", mask = 0x10, shift = 4 }, { name = "INLVLA5", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "IOCAP"
+addr = 0x1E91
+width = 1
+fields = [{ name = "IOCAP0", mask = 0x01, shift = 0 }, { name = "IOCAP1", mask = 0x02, shift = 1 }, { name = "IOCAP2", mask = 0x04, shift = 2 }, { name = "IOCAP3", mask = 0x08, shift = 3 }, { name = "IOCAP4", mask = 0x10, shift = 4 }, { name = "IOCAP5", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "IOCAN"
+addr = 0x1E92
+width = 1
+fields = [{ name = "IOCAN0", mask = 0x01, shift = 0 }, { name = "IOCAN1", mask = 0x02, shift = 1 }, { name = "IOCAN2", mask = 0x04, shift = 2 }, { name = "IOCAN3", mask = 0x08, shift = 3 }, { name = "IOCAN4", mask = 0x10, shift = 4 }, { name = "IOCAN5", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "IOCAF"
+addr = 0x1E93
+width = 1
+fields = [{ name = "IOCAF0", mask = 0x01, shift = 0 }, { name = "IOCAF1", mask = 0x02, shift = 1 }, { name = "IOCAF2", mask = 0x04, shift = 2 }, { name = "IOCAF3", mask = 0x08, shift = 3 }, { name = "IOCAF4", mask = 0x10, shift = 4 }, { name = "IOCAF5", mask = 0x20, shift = 5 }]
+
+[[sfrs]]
+name = "ANSELB"
+addr = 0x1E96
+width = 1
+fields = [{ name = "ANSELB4", mask = 0x10, shift = 4 }, { name = "ANSELB5", mask = 0x20, shift = 5 }, { name = "ANSELB6", mask = 0x40, shift = 6 }, { name = "ANSELB7", mask = 0x80, shift = 7 }, { name = "ANSB4", mask = 0x10, shift = 4, mode = 1 }, { name = "ANSB5", mask = 0x20, shift = 5, mode = 1 }, { name = "ANSB6", mask = 0x40, shift = 6, mode = 1 }, { name = "ANSB7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "WPUB"
+addr = 0x1E97
+width = 1
+fields = [{ name = "WPUB4", mask = 0x10, shift = 4 }, { name = "WPUB5", mask = 0x20, shift = 5 }, { name = "WPUB6", mask = 0x40, shift = 6 }, { name = "WPUB7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "ODCONB"
+addr = 0x1E98
+width = 1
+fields = [{ name = "ODCB4", mask = 0x10, shift = 4 }, { name = "ODCB5", mask = 0x20, shift = 5 }, { name = "ODCB6", mask = 0x40, shift = 6 }, { name = "ODCB7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "SLRCONB"
+addr = 0x1E99
+width = 1
+fields = [{ name = "SLRB4", mask = 0x10, shift = 4 }, { name = "SLRB5", mask = 0x20, shift = 5 }, { name = "SLRB6", mask = 0x40, shift = 6 }, { name = "SLRB7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "INLVLB"
+addr = 0x1E9A
+width = 1
+fields = [{ name = "INLVLB4", mask = 0x10, shift = 4 }, { name = "INLVLB5", mask = 0x20, shift = 5 }, { name = "INLVLB6", mask = 0x40, shift = 6 }, { name = "INLVLB7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "IOCBP"
+addr = 0x1E9B
+width = 1
+fields = [{ name = "IOCBP4", mask = 0x10, shift = 4 }, { name = "IOCBP5", mask = 0x20, shift = 5 }, { name = "IOCBP6", mask = 0x40, shift = 6 }, { name = "IOCBP7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "IOCBN"
+addr = 0x1E9C
+width = 1
+fields = [{ name = "IOCBN4", mask = 0x10, shift = 4 }, { name = "IOCBN5", mask = 0x20, shift = 5 }, { name = "IOCBN6", mask = 0x40, shift = 6 }, { name = "IOCBN7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "IOCBF"
+addr = 0x1E9D
+width = 1
+fields = [{ name = "IOCBF4", mask = 0x10, shift = 4 }, { name = "IOCBF5", mask = 0x20, shift = 5 }, { name = "IOCBF6", mask = 0x40, shift = 6 }, { name = "IOCBF7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "ANSELC"
+addr = 0x1EA0
+width = 1
+fields = [{ name = "ANSELC0", mask = 0x01, shift = 0 }, { name = "ANSELC1", mask = 0x02, shift = 1 }, { name = "ANSELC2", mask = 0x04, shift = 2 }, { name = "ANSELC3", mask = 0x08, shift = 3 }, { name = "ANSELC4", mask = 0x10, shift = 4 }, { name = "ANSELC5", mask = 0x20, shift = 5 }, { name = "ANSELC6", mask = 0x40, shift = 6 }, { name = "ANSELC7", mask = 0x80, shift = 7 }, { name = "ANSC0", mask = 0x01, shift = 0, mode = 1 }, { name = "ANSC1", mask = 0x02, shift = 1, mode = 1 }, { name = "ANSC2", mask = 0x04, shift = 2, mode = 1 }, { name = "ANSC3", mask = 0x08, shift = 3, mode = 1 }, { name = "ANSC4", mask = 0x10, shift = 4, mode = 1 }, { name = "ANSC5", mask = 0x20, shift = 5, mode = 1 }, { name = "ANSC6", mask = 0x40, shift = 6, mode = 1 }, { name = "ANSC7", mask = 0x80, shift = 7, mode = 1 }]
+
+[[sfrs]]
+name = "WPUC"
+addr = 0x1EA1
+width = 1
+fields = [{ name = "WPUC0", mask = 0x01, shift = 0 }, { name = "WPUC1", mask = 0x02, shift = 1 }, { name = "WPUC2", mask = 0x04, shift = 2 }, { name = "WPUC3", mask = 0x08, shift = 3 }, { name = "WPUC4", mask = 0x10, shift = 4 }, { name = "WPUC5", mask = 0x20, shift = 5 }, { name = "WPUC6", mask = 0x40, shift = 6 }, { name = "WPUC7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "ODCONC"
+addr = 0x1EA2
+width = 1
+fields = [{ name = "ODCC0", mask = 0x01, shift = 0 }, { name = "ODCC1", mask = 0x02, shift = 1 }, { name = "ODCC2", mask = 0x04, shift = 2 }, { name = "ODCC3", mask = 0x08, shift = 3 }, { name = "ODCC4", mask = 0x10, shift = 4 }, { name = "ODCC5", mask = 0x20, shift = 5 }, { name = "ODCC6", mask = 0x40, shift = 6 }, { name = "ODCC7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "SLRCONC"
+addr = 0x1EA3
+width = 1
+fields = [{ name = "SLRC0", mask = 0x01, shift = 0 }, { name = "SLRC1", mask = 0x02, shift = 1 }, { name = "SLRC2", mask = 0x04, shift = 2 }, { name = "SLRC3", mask = 0x08, shift = 3 }, { name = "SLRC4", mask = 0x10, shift = 4 }, { name = "SLRC5", mask = 0x20, shift = 5 }, { name = "SLRC6", mask = 0x40, shift = 6 }, { name = "SLRC7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "INLVLC"
+addr = 0x1EA4
+width = 1
+fields = [{ name = "INLVLC0", mask = 0x01, shift = 0 }, { name = "INLVLC1", mask = 0x02, shift = 1 }, { name = "INLVLC2", mask = 0x04, shift = 2 }, { name = "INLVLC3", mask = 0x08, shift = 3 }, { name = "INLVLC4", mask = 0x10, shift = 4 }, { name = "INLVLC5", mask = 0x20, shift = 5 }, { name = "INLVLC6", mask = 0x40, shift = 6 }, { name = "INLVLC7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "IOCCP"
+addr = 0x1EA5
+width = 1
+fields = [{ name = "IOCCP0", mask = 0x01, shift = 0 }, { name = "IOCCP1", mask = 0x02, shift = 1 }, { name = "IOCCP2", mask = 0x04, shift = 2 }, { name = "IOCCP3", mask = 0x08, shift = 3 }, { name = "IOCCP4", mask = 0x10, shift = 4 }, { name = "IOCCP5", mask = 0x20, shift = 5 }, { name = "IOCCP6", mask = 0x40, shift = 6 }, { name = "IOCCP7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "IOCCN"
+addr = 0x1EA6
+width = 1
+fields = [{ name = "IOCCN0", mask = 0x01, shift = 0 }, { name = "IOCCN1", mask = 0x02, shift = 1 }, { name = "IOCCN2", mask = 0x04, shift = 2 }, { name = "IOCCN3", mask = 0x08, shift = 3 }, { name = "IOCCN4", mask = 0x10, shift = 4 }, { name = "IOCCN5", mask = 0x20, shift = 5 }, { name = "IOCCN6", mask = 0x40, shift = 6 }, { name = "IOCCN7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "IOCCF"
+addr = 0x1EA7
+width = 1
+fields = [{ name = "IOCCF0", mask = 0x01, shift = 0 }, { name = "IOCCF1", mask = 0x02, shift = 1 }, { name = "IOCCF2", mask = 0x04, shift = 2 }, { name = "IOCCF3", mask = 0x08, shift = 3 }, { name = "IOCCF4", mask = 0x10, shift = 4 }, { name = "IOCCF5", mask = 0x20, shift = 5 }, { name = "IOCCF6", mask = 0x40, shift = 6 }, { name = "IOCCF7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "RB4I2C"
+addr = 0x1EE5
+width = 1
+fields = [{ name = "TH", mask = 0x03, shift = 0 }, { name = "PU", mask = 0x30, shift = 4 }, { name = "SLEW", mask = 0x40, shift = 6 }]
+
+[[sfrs]]
+name = "RB6I2C"
+addr = 0x1EE7
+width = 1
+fields = [{ name = "TH", mask = 0x03, shift = 0 }, { name = "PU", mask = 0x30, shift = 4 }, { name = "SLEW", mask = 0x40, shift = 6 }]
+
+[[sfrs]]
+name = "UMTOAP"
+addr = 0x1F0C
+width = 1
+fields = []
+
+[[sfrs]]
+name = "UMTOAL"
+addr = 0x1F0D
+width = 1
+fields = []
+
+[[sfrs]]
+name = "UMTOAH"
+addr = 0x1F0E
+width = 1
+fields = []
+
+[[sfrs]]
+name = "STATUS_SHAD"
+addr = 0x1FE4
+width = 1
+fields = [{ name = "STATUS_SHAD", mask = 0x07, shift = 0 }, { name = "STATUS_SHAD0", mask = 0x01, shift = 0, mode = 1 }, { name = "STATUS_SHAD1", mask = 0x02, shift = 1, mode = 1 }, { name = "STATUS_SHAD2", mask = 0x04, shift = 2, mode = 1 }]
+
+[[sfrs]]
+name = "WREG_SHAD"
+addr = 0x1FE5
+width = 1
+fields = []
+
+[[sfrs]]
+name = "BSR_SHAD"
+addr = 0x1FE6
+width = 1
+fields = []
+
+[[sfrs]]
+name = "PCLATH_SHAD"
+addr = 0x1FE7
+width = 1
+fields = []
+
+[[sfrs]]
+name = "FSR0_SHAD"
+addr = 0x1FE8
+width = 2
+fields = []
+
+[[sfrs]]
+name = "FSR0L_SHAD"
+addr = 0x1FE8
+width = 1
+fields = []
+
+[[sfrs]]
+name = "FSR0H_SHAD"
+addr = 0x1FE9
+width = 1
+fields = []
+
+[[sfrs]]
+name = "FSR1_SHAD"
+addr = 0x1FEA
+width = 2
+fields = []
+
+[[sfrs]]
+name = "FSR1L_SHAD"
+addr = 0x1FEA
+width = 1
+fields = []
+
+[[sfrs]]
+name = "FSR1H_SHAD"
+addr = 0x1FEB
+width = 1
+fields = []
+
+[[sfrs]]
+name = "STKPTR"
+addr = 0x1FED
+width = 1
+fields = [{ name = "STKPTR0", mask = 0x01, shift = 0 }, { name = "STKPTR1", mask = 0x02, shift = 1 }, { name = "STKPTR2", mask = 0x04, shift = 2 }, { name = "STKPTR3", mask = 0x08, shift = 3 }, { name = "STKPTR4", mask = 0x10, shift = 4 }]
+
+[[sfrs]]
+name = "TOSL"
+addr = 0x1FEE
+width = 1
+fields = [{ name = "TOSL0", mask = 0x01, shift = 0 }, { name = "TOSL1", mask = 0x02, shift = 1 }, { name = "TOSL2", mask = 0x04, shift = 2 }, { name = "TOSL3", mask = 0x08, shift = 3 }, { name = "TOSL4", mask = 0x10, shift = 4 }, { name = "TOSL5", mask = 0x20, shift = 5 }, { name = "TOSL6", mask = 0x40, shift = 6 }, { name = "TOSL7", mask = 0x80, shift = 7 }]
+
+[[sfrs]]
+name = "TOSH"
+addr = 0x1FEF
+width = 1
+fields = [{ name = "TOSH0", mask = 0x01, shift = 0 }, { name = "TOSH1", mask = 0x02, shift = 1 }, { name = "TOSH2", mask = 0x04, shift = 2 }, { name = "TOSH3", mask = 0x08, shift = 3 }, { name = "TOSH4", mask = 0x10, shift = 4 }, { name = "TOSH5", mask = 0x20, shift = 5 }, { name = "TOSH6", mask = 0x40, shift = 6 }, { name = "TOSH7", mask = 0x80, shift = 7 }]

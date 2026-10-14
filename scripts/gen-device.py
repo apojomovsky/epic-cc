@@ -102,9 +102,14 @@ FIELD_ALIAS = {
 # Per-part raw-DFP-name overrides, same shape as PART_DEFAULTS below: a
 # part whose DFP spells a field differently than the name we already ship
 # for a sibling gets an entry here instead of a bespoke if-branch.
+# p16f13145: the 16F1xxxx DFP splits the classic FOSC field into FEXTOSC
+# (external modes, the lp/xt/hs/ecl/ech vocabulary the pic14e fosc
+# derivation matches literally) and RSTOSC (reset clock source); only the
+# former aliases to the shipped `osc` name.
 PART_FIELD_ALIASES = {
     "p16f877a": {"BOREN": "bor", "BODEN": "bor"},
     "p18f2550": {"BOR": "boren"},
+    "p16f13145": {"FEXTOSC": "osc"},
 }
 
 
@@ -600,6 +605,9 @@ EDC_ARCH_TO_CORE = {
 INI_ARCH_TO_CORE = {
     "PIC14": "pic14",
     "PIC14E": "pic14e",
+    # The 16F1xxxx DFP states ARCH=PIC14EX for the PIC16F131xx family
+    # (xc8/pic/dat/ini/16f13145.ini); same core as PIC14E.
+    "PIC14EX": "pic14e",
     "PIC16": "pic18",
     "PIC12": "pic-baseline",
 }

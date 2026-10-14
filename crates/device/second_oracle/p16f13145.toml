@@ -1,0 +1,11 @@
+name = "p16f13145"
+flash_words = 8192
+ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF], [0x0120, 0x016F], [0x01A0, 0x01EF], [0x0220, 0x026F], [0x02A0, 0x02EF], [0x0320, 0x036F], [0x03A0, 0x03EF], [0x0420, 0x046F], [0x04A0, 0x04EF], [0x0520, 0x056F], [0x05A0, 0x05EF], [0x0620, 0x064F]]
+common_ram = [0x0070, 0x007F]
+
+[provenance]
+pack = "Microchip.PIC16F1xxxx_DFP.1.32.471"
+ini = "xc8/pic/dat/ini/16f13145.ini"
+ini_sha256 = "1b51cb8942ec0d39c06a0a0d998b14764f491556d39f48d9ff9738a026f67e46"
+datasheet = "DS40002519D"
+datasheet_section = "9.1 Table 9-1 (flash), 9.2 Figure 9-4 (RAM)"
