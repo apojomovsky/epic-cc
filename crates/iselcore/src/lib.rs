@@ -820,11 +820,13 @@ pub fn find_value_folds(
         }
     }
     // A load source both stages read as RAM: a known mutable global.
-    // Flash consts read through TBLRD, so they never fold.
+    // Flash consts read through TBLRD, so they never fold. Bit entities
+    // (epic-cc#707) are not RAM either: folding would drop the bit-op
+    // lowering and read a byte that is never placed.
     let ram_source = |ptr: &str| -> Option<String> {
         let g = ptr.strip_prefix('@')?;
         let known = m.globals.iter().find(|x| x.name == g)?;
-        if known.is_const {
+        if known.is_const || known.addr.is_some_and(|p| p.bit.is_some()) {
             return None;
         }
         Some(g.to_string())
@@ -1041,7 +1043,9 @@ pub fn find_value_folds(
             let Some(known) = m.globals.iter().find(|x| x.name == dst) else {
                 continue;
             };
-            if known.is_const {
+            // A bit entity (epic-cc#707) takes no forwarded computation:
+            // the producer stages and the store serves a bit op.
+            if known.is_const || known.addr.is_some_and(|p| p.bit.is_some()) {
                 continue;
             }
             let Some(&(pbi, pi)) = def_at.get(r.as_str()) else {

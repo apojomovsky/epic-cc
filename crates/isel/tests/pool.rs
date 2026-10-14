@@ -90,7 +90,10 @@ fn pool_skips_non_flash_candidates() {
     // Empty, oversized, mapped, and non-const members never pool, even
     // when the candidate set names them.
     let mut pinned = cg("pinned", b"zz", vec![]);
-    pinned.addr = Some(0x40);
+    pinned.addr = Some(ir::Placed {
+        byte: 0x40,
+        bit: None,
+    });
     let mut ram = cg("ram", b"zz", vec![]);
     ram.is_const = false;
     let pool = pool_of(vec![
