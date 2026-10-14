@@ -36,7 +36,11 @@ of an interrupted run against a clean baseline run.
 
 ## What each kernel pins
 
-- `speed-mul-u8/u16/u32`: the widening multiply per width.
+- `speed-mul-u8/u16/u32`: the widening multiply per width. `speed-mul-u32`
+  also runs on 16F1937 and 16F505, plus a 12F509 row through the
+  const-operand reduced kernel `speed-mul-u32-12f509.c`, which pins the
+  same routine with the identical product (the full two-volatile kernel
+  cannot allocate in the 509 bank).
 - `speed-divmod-u8/u16/u32`: software division both cores lower to.
 - `speed-divmod-i8/i16/i32`: the signed half (abs, unsigned loop, negate).
 - `speed-shift`: variable-count shifts with unknown counts.
