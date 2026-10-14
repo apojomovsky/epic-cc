@@ -170,10 +170,10 @@ fn legalize_inner(m: Module, pic18: bool, core: device::Core) -> Module {
                             // A clang-emitted intrinsic (`llvm.smax.*`,
                             // `llvm.smin.*`, `llvm.abs.*`,
                             // `llvm.bitreverse.i6`) becomes the
-                            // icmp/select or logic tree; an unknown
-                            // intrinsic panics so a new one surfaces as a
-                            // clear error instead of a hole the assembler
-                            // misses.
+                            // icmp/select or logic tree; `llvm.assume`
+                            // lowers to nothing. An unknown intrinsic
+                            // panics so a new one surfaces as a clear
+                            // error instead of a hole the assembler misses.
                             insts.extend(lower_intrinsic(&c, &mut names, &mut used));
                         } else {
                             insts.push(Inst::Call(c));
@@ -4270,8 +4270,14 @@ fn lower_fconv(c: &ir::FloatConv, used: &mut Vec<String>) -> Inst {
 /// smax: sgt+select, smin: slt+select, abs: slt0+sub+select.
 /// Width-parametric (i8/i16/i32) via byte-generic isel. Abs flag
 /// ignored (wraps INT_MIN for false, poison allows any value for true).
+/// `llvm.assume` lowers to nothing: a false condition is UB in the
+/// source, so any codegen is allowed there, and no backend pass reads
+/// the hint, so dropping it changes no defined behavior (epic-cc#1276).
 /// Unknown `llvm.*` panics: no lowering exists for it.
 fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<String>) -> Vec<Inst> {
+    if c.func == "llvm.assume" {
+        return Vec::new();
+    }
     let dst = c
         .dst
         .clone()
