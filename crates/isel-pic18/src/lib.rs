@@ -2332,8 +2332,16 @@ impl<'m> Gen<'m> {
             )
         };
         let mut marked: HashSet<String> = HashSet::new();
+        let mut zexts: HashSet<String> = HashSet::new();
         for b in &f.blocks {
             for inst in &b.insts {
+                if let Inst::Zext(z) = inst {
+                    // Byte sources only: a wider source's lane 1 holds
+                    // real data, never an exact zero (review on #1245).
+                    if z.to.bytes() >= 2 && z.from.bytes() == 1 {
+                        zexts.insert(z.dst.clone());
+                    }
+                }
                 let dst = match inst {
                     Inst::Bin(q) if lane_op(&q.op) && q.ty.bytes() >= 2 => &q.dst,
                     Inst::Zext(z) if z.to.bytes() >= 2 => &z.dst,
@@ -2419,7 +2427,15 @@ impl<'m> Gen<'m> {
                             }
                         }
                         Inst::Load(l) => {
-                            Self::scan_ptr_terms(g, &key, &l.ptr, None, &mut marked, &mut changed);
+                            Self::scan_ptr_terms(
+                                g,
+                                &key,
+                                &l.ptr,
+                                None,
+                                &mut marked,
+                                &mut changed,
+                                &zexts,
+                            );
                         }
                         Inst::Store(s) => {
                             Self::scan_ptr_terms(
@@ -2429,6 +2445,7 @@ impl<'m> Gen<'m> {
                                 Some(&s.val),
                                 &mut marked,
                                 &mut changed,
+                                &zexts,
                             );
                             if let Val::Reg(r) = &s.val {
                                 if marked.remove(r) {
@@ -2479,13 +2496,11 @@ impl<'m> Gen<'m> {
     /// One access's share of the narrowing scan: each resolved index
     /// term reads lane 0 only on a `PLUSW` shape and whole on every
     /// other address computation (which adds the full 16-bit index
-    /// into `FSR0`). The pointer reg itself is the virtual `Gep`'s
-    /// def, never a narrowable dst, so it needs no edge. A store takes
-    /// the `PLUSW` path only for a register value with a slot: constants
-    /// and address-valued regs keep the `INDF0` lowering (epic-cc#665),
-    /// whose full-width `FSR0` adjust reads lane 1, so their terms read
-    /// whole too (banked_ptr.c proved it: a `CLRF`-free high lane held
-    /// an `sret` byte).
+    /// into `FSR0`). A store takes the `PLUSW` path only for a slotted
+    /// register value (epic-cc#665); other stores keep the `INDF0`
+    /// lowering. A narrowed byte-widening `zext` dst is exempt from the
+    /// whole-term read: its high lane is exactly zero, so the add uses
+    /// the `MOVLW 0x00` form and never reads the skipped slot (epic-cc#1245).
     fn scan_ptr_terms(
         g: &Gen,
         key: &dyn Fn(&str) -> String,
@@ -2493,9 +2508,16 @@ impl<'m> Gen<'m> {
         store_val: Option<&Val>,
         marked: &mut HashSet<String>,
         changed: &mut bool,
+        zexts: &HashSet<String>,
     ) {
-        let unmark_terms = |terms: &[String], marked: &mut HashSet<String>, changed: &mut bool| {
+        let unmark_terms = |terms: &[String],
+                            marked: &mut HashSet<String>,
+                            changed: &mut bool,
+                            zexts: &HashSet<String>| {
             for t in terms {
+                if zexts.contains(t) {
+                    continue;
+                }
                 if marked.remove(t) {
                     *changed = true;
                 }
@@ -2509,7 +2531,7 @@ impl<'m> Gen<'m> {
             .get(&key(r))
             .map(|(_, _, ts)| ts.iter().map(|(_, t)| t.clone()).collect())
             .unwrap_or_default();
-        let mut unmark = || unmark_terms(&terms, marked, changed);
+        let mut unmark = || unmark_terms(&terms, marked, changed, zexts);
         if g.plusw_shape(&Val::Reg(r.to_string())).is_none() {
             unmark();
             return;
@@ -6052,6 +6074,35 @@ impl<'m> Gen<'m> {
         self.m.funcs.iter().any(|f| f.name == name)
     }
 
+    /// Whether `reg` is a byte-widening 2-byte `Zext` dst in `f`: its
+    /// high lane is exactly zero by construction, so no consumer ever
+    /// needs the slot's high byte. Lane-wise `Bin` dsts are excluded:
+    /// their high lane is real and may be nonzero (epic-cc#1245).
+    fn is_wide_zext(f: &Func, reg: &str) -> bool {
+        f.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+            matches!(inst, Inst::Zext(z) if z.dst == reg && z.to.bytes() >= 2 && z.from.bytes() == 1)
+        })
+    }
+    /// Whether a resolved index term adds its high lane into an
+    /// FSR/TBLPTR address. Two-byte regs do, except a narrowed `zext`
+    /// dst: the scan keeps those marked at full-width consumers, the
+    /// `CLRF` stays skipped, and the add uses the `MOVLW 0x00` form
+    /// instead of reading the stale slot (epic-cc#1245).
+    fn term_wide(&self, reg: &str) -> bool {
+        if self.reg_width(reg) != 2 {
+            return false;
+        }
+        if !self.narrow_lo.contains(reg) {
+            return true;
+        }
+        let f = self
+            .m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .unwrap_or_else(|| panic!("isel-pic18: no function {}", self.cur_func));
+        !Self::is_wide_zext(f, reg)
+    }
     /// The byte width of a value-defining register in the current function
     /// (its slot is `bytes` wide), for folding a 16-bit index register's
     /// high byte into scaled GEP terms (RAM and const-table paths).
@@ -6937,7 +6988,7 @@ impl<'m> Gen<'m> {
         // zero-seeds and re-adds the base as a literal afterwards.
         let (scale, reg) = &terms[ci];
         let a = self.slot_addr(self.cur_func, reg).direct();
-        let wide = self.reg_width(reg) == 2;
+        let wide = self.term_wide(reg);
         match form {
             Scaled::Mulwf => {
                 self.emit(format!("    LFSR 1, 0x{lit:03X}"));
@@ -6969,7 +7020,7 @@ impl<'m> Gen<'m> {
         if let Some((ci, form)) = chain {
             let (scale, reg) = &terms[ci];
             let a = self.slot_addr(self.cur_func, reg).direct();
-            let wide = self.reg_width(reg) == 2;
+            let wide = self.term_wide(reg);
             match form {
                 Scaled::Mulwf => {
                     // Seed the pointer's own value, then add the scaled
@@ -7009,7 +7060,7 @@ impl<'m> Gen<'m> {
     fn add_term_to_fsr1(&mut self, terms: &[(u16, String)]) {
         for (scale, reg) in terms {
             let a = self.slot_addr(self.cur_func, reg).direct();
-            let wide = self.reg_width(reg) == 2;
+            let wide = self.term_wide(reg);
             for _ in 0..*scale {
                 self.emit_fsr_pair_add(0xFE1, 0xFE2, a, wide);
             }
@@ -7347,7 +7398,7 @@ impl<'m> Gen<'m> {
         // seeds the base first and adds the scaled term onto it.
         let (scale, reg) = &terms[ci];
         let a = self.slot_addr(self.cur_func, reg).direct();
-        let wide = self.reg_width(reg) == 2;
+        let wide = self.term_wide(reg);
         match form {
             Scaled::Mulwf => {
                 let lit = base_addr.wrapping_add(static_part) & 0xFFF;
@@ -7399,7 +7450,7 @@ impl<'m> Gen<'m> {
         if let Some((ci, form)) = chain {
             let (scale, reg) = &terms[ci];
             let a = self.slot_addr(self.cur_func, reg).direct();
-            let wide = self.reg_width(reg) == 2;
+            let wide = self.term_wide(reg);
             match form {
                 Scaled::Mulwf => {
                     // Seed the pointer's own value, then add the scaled
@@ -7448,7 +7499,7 @@ impl<'m> Gen<'m> {
     fn add_term_to_fsr0(&mut self, terms: &[(u16, String)]) {
         for (scale, reg) in terms {
             let a = self.slot_addr(self.cur_func, reg).direct();
-            let wide = self.reg_width(reg) == 2;
+            let wide = self.term_wide(reg);
             for _ in 0..*scale {
                 self.emit_fsr_pair_add(0xFE9, 0xFEA, a, wide);
             }
@@ -7661,6 +7712,9 @@ impl<'m> Gen<'m> {
     /// Returns the term's index and which form won.
     fn chain_term_index(&self, terms: &[(u16, String)], extra: u16) -> Option<(usize, Scaled)> {
         let (i, scale) = Self::biggest_chainable_term(terms)?;
+        // Cost math only: keep the full-width rank so a narrowed term
+        // cannot flip the MULWF/chain decision (epic-cc#1245). The
+        // winning form re-reads the term through `term_wide` itself.
         let wide = self.reg_width(&terms[i].1) == 2;
         let mut best: Option<(Scaled, u16)> = None;
         if Self::mulwf_scale_wins(scale, wide) {
@@ -7687,7 +7741,7 @@ impl<'m> Gen<'m> {
                 continue;
             }
             let a = self.slot_addr(self.cur_func, reg).direct();
-            let wide = self.reg_width(reg) == 2;
+            let wide = self.term_wide(reg);
             for _ in 0..*scale {
                 self.emit_fsr_pair_add(lo, hi, a, wide);
             }
@@ -7758,7 +7812,7 @@ impl<'m> Gen<'m> {
             .filter_map(|(i, t)| (Some(i) != skip).then_some(t))
         {
             let lo = self.slot_addr(self.cur_func, reg).direct();
-            let wide = self.reg_width(reg) == 2;
+            let wide = self.term_wide(reg);
             for _ in 0..*scale {
                 let (ra, rf) = self.operand(lo);
                 self.emit(format!(
@@ -7812,6 +7866,7 @@ impl<'m> Gen<'m> {
     /// scale.
     fn tblptr_chain_term(&self, terms: &[(u16, String)], static_part: u16) -> Option<(usize, u16)> {
         let (i, scale) = Self::biggest_chainable_term(terms)?;
+        // Cost math only: same no-flip rule as `chain_term_index`.
         let wide = self.reg_width(&terms[i].1) == 2;
         (u32::from(Self::tblptr_chain_words(scale, wide, static_part)) + 2
             <= u32::from(Self::tblptr_naive_words(wide)) * u32::from(scale))
@@ -7886,7 +7941,7 @@ impl<'m> Gen<'m> {
     /// product, mirroring the FSR pair's chain shape.
     fn emit_tblptr_dynamic_chain(&mut self, table: &str, static_part: u16, scale: u16, reg: &str) {
         let lo = self.slot_addr(self.cur_func, reg).direct();
-        let wide = self.reg_width(reg) == 2;
+        let wide = self.term_wide(reg);
         self.emit("    CLRF 0xF6,A".to_string()); // TBLPTRL = 0
         self.emit("    CLRF 0xF7,A".to_string()); // TBLPTRH = 0
         self.emit("    CLRF 0xF8,A".to_string()); // TBLPTRU = 0

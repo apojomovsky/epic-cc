@@ -3826,11 +3826,13 @@ fn byte_index_zext_and_add_keep_only_the_low_lane() {
 }
 
 #[test]
-fn byte_index_const_store_keeps_the_zext_high_lane() {
+fn byte_index_const_store_adds_zero_for_the_zext_high_lane() {
     // A literal stored through `ram[e]` cannot use `PLUSW0` (`W` is both
-    // index and data), so the access adds the whole 16-bit index into
-    // `FSR0`. The zext must therefore fill its high lane: a stale byte
-    // there moved the write 0x100 per unit (epic-cc#1237).
+    // index and data), so the access adds the index into `FSR0`. The
+    // index is a `zext` whose high lane is exactly zero, so the high
+    // fill (`CLRF`) is dead and the add takes the `MOVLW 0x00` form,
+    // which never reads the slot's stale high byte (epic-cc#1245;
+    // the `0x134 = 1` plant below proves it).
     let m = parse(
         "global ram i64\n\
          global idx i8\n\
@@ -3851,8 +3853,12 @@ fn byte_index_const_store_keeps_the_zext_high_lane() {
     let asm = select(&PIC18F4550, &m, &addrs, None);
     let main_asm = asm.split("__start:").next().unwrap_or(&asm);
     assert!(
-        main_asm.contains("CLRF"),
-        "full-width index add needs the zext high fill:\n{asm}"
+        !main_asm.contains("CLRF"),
+        "zero high lane needs no zext fill:\n{asm}"
+    );
+    assert!(
+        main_asm.contains("MOVLW 0x00"),
+        "full-width index add takes the zero form:\n{asm}"
     );
     let words = asm::assemble_pic18(&asm);
     for x in 0..8u8 {
