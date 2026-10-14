@@ -299,8 +299,8 @@ ram_bytes = 43
 name = "speed-shift-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 536
-flash_words = 216
+cycles = 310
+flash_words = 266
 ram_bytes = 43
 
 [[entry]]

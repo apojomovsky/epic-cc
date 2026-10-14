@@ -133,6 +133,11 @@ fn upper_mnem(body: &str) -> String {
         .to_ascii_uppercase()
 }
 
+/// Fold case and whitespace only: absolute addresses stay in the key.
+/// `rewrite` shares the first site verbatim, so grouping runs that
+/// differ only in addresses would miscompile (two FSR0 setups for
+/// different slots sharing one loader). Exact text is what makes
+/// sharing sound under static allocation (docs/44).
 fn normalize(body: &str) -> String {
     let mut parts = body.splitn(2, char::is_whitespace);
     let m = parts.next().unwrap_or("").to_ascii_uppercase();
