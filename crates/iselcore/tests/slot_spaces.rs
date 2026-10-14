@@ -240,3 +240,137 @@ fn fan_in_stops_at_params_and_ram() {
     let fan = iselcore::const_fan_in(&m, &r, "main", &ir::Val::Reg("v".to_string()));
     assert!(fan.is_empty(), "data regs carry no const: {fan:?}");
 }
+
+// epic-cc#1119 review: an indirect store resolving to a global writes it
+// precisely, so a RAM overwrite prunes the slot back to RAM.
+#[test]
+fn indirect_store_through_global_gep_prunes_flash_slot() {
+    let m = parse(
+        "const c i8\n\
+         global g i16\n\
+         global buf i8\n\
+         global in i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store ptr @c @g\n\
+             %x = gep @g +0\n\
+             %q = gep @buf +0\n\
+             store ptr %q %x\n\
+             %v = load i8 @in\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let prov = iselcore::flash_provenance(&m);
+    let s = iselcore::flash_slot_spaces(&m, &r, &prov, |n| n == "c");
+    assert!(
+        !s.contains("@g"),
+        "indirect RAM overwrite must prune: {s:?}"
+    );
+}
+
+// An unknown-target store demotes taken globals but spares untaken ones:
+// purely dereferenced pointer globals keep their proof.
+#[test]
+fn unknown_store_demotes_only_taken_globals() {
+    let m = parse(
+        "const c i8\n\
+         const c2 i8\n\
+         global g i16\n\
+         global t i16\n\
+         global sink i16\n\
+         global in i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store ptr @c @g\n\
+             store ptr @c2 @t\n\
+             store ptr @t @sink\n\
+             %u = load ptr @sink\n\
+             %v = load i8 @in\n\
+             store i8 %v %u\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let prov = iselcore::flash_provenance(&m);
+    let is_flash = |n: &str| n == "c" || n == "c2";
+    let s = iselcore::flash_slot_spaces(&m, &r, &prov, is_flash);
+    assert!(s.contains("@g"), "untaken global must stay flash: {s:?}");
+    assert!(!s.contains("@t"), "taken global must demote: {s:?}");
+}
+
+// A memcpy into a global overwrites its bytes with unknown ones.
+#[test]
+fn memcpy_into_global_prunes_flash_slot() {
+    let m = parse(
+        "const c i8\n\
+         global g i16\n\
+         global buf i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store ptr @c @g\n\
+             memcpy @g @buf 2\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let prov = iselcore::flash_provenance(&m);
+    let s = iselcore::flash_slot_spaces(&m, &r, &prov, |n| n == "c");
+    assert!(!s.contains("@g"), "memcpy overwrite must prune: {s:?}");
+}
+
+// A partial write is not an address write.
+#[test]
+fn partial_store_prunes_flash_slot() {
+    let m = parse(
+        "const c i8\n\
+         global g i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store ptr @c @g\n\
+             store i8 0 @g\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let prov = iselcore::flash_provenance(&m);
+    let s = iselcore::flash_slot_spaces(&m, &r, &prov, |n| n == "c");
+    assert!(!s.contains("@g"), "partial zeroing must prune: {s:?}");
+}
+
+// An asm output operand writes its destination.
+#[test]
+fn asm_output_to_global_prunes_flash_slot() {
+    let m = parse(
+        "const c i8\n\
+         global g i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store ptr @c @g\n\
+             asm \"clrf $0\" =*m @g\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let prov = iselcore::flash_provenance(&m);
+    let s = iselcore::flash_slot_spaces(&m, &r, &prov, |n| n == "c");
+    assert!(!s.contains("@g"), "asm output must prune: {s:?}");
+}
+
+#[test]
+fn init_ref_to_flash_const_grounds_global() {
+    let mut m = parse(
+        "const c i8\n\
+         global g i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %p = load ptr @g\n\
+             ret void\n",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" {
+            g.bytes = vec![0, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let r = resolve_pointers(&m);
+    let prov = iselcore::flash_provenance(&m);
+    let s = iselcore::flash_slot_spaces(&m, &r, &prov, |n| n == "c");
+    assert!(s.contains("@g"), "init-ref global must be flash: {s:?}");
+    assert!(s.contains("main::p"), "load out of it must be flash: {s:?}");
+}
