@@ -241,6 +241,11 @@ def expand_includes(text: str, base_dir: pathlib.Path, stack=()) -> str:
                 raise ValueError(
                     f"line {lineno}: bad region {region!r}, want file:start:end"
                 ) from None
+            if not 1 <= start <= end <= len(content):
+                raise ValueError(
+                    f"line {lineno}: region {region!r} out of range "
+                    f"(file has {len(content)} lines)"
+                )
             content = content[start - 1 : end]
         out.extend(
             expand_includes(

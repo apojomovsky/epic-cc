@@ -234,6 +234,16 @@ class IncludeTests(unittest.TestCase):
             out = gen_docs_reference.expand_includes('--8<-- "frag.md:2:3"\n', td)
         self.assertEqual(out, "two\nthree\n")
 
+    def test_out_of_range_region_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = pathlib.Path(td)
+            (td / "frag.md").write_text("one\ntwo\nthree\n")
+            for region in ("100:200", "0:2", "3:2", "1:4"):
+                with self.assertRaises(ValueError, msg=region):
+                    gen_docs_reference.expand_includes(
+                        f'--8<-- "frag.md:{region}"\n', td
+                    )
+
     def test_missing_include_fails(self):
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaises(ValueError):
