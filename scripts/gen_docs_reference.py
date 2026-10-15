@@ -279,20 +279,22 @@ def render_user_cli(sections) -> str:
 
 
 def write_user_pages(rows, facts, sections) -> list:
-    """Write docs/user/{devices,compiler} pages; returns the paths written."""
+    """Write docs/user/{devices,compiler} pages; returns the paths written.
+    Everything is rendered first, so a render error leaves the tree alone."""
+    pages = {
+        USER_FAMILIES_DIR / f"{family_slug(family, core)}.md": render_family(
+            family, core, group, facts
+        )
+        for (family, core), group in group_families(rows).items()
+    }
+    pages[USER_DEVICES_DIR / "index.md"] = render_user_devices(rows)
+    pages[USER_CLI_MD] = render_user_cli(sections)
     for stale in USER_FAMILIES_DIR.glob("*.md"):
         stale.unlink()
-    USER_FAMILIES_DIR.mkdir(parents=True, exist_ok=True)
-    USER_CLI_MD.parent.mkdir(parents=True, exist_ok=True)
-    written = []
-    for (family, core), group in group_families(rows).items():
-        path = USER_FAMILIES_DIR / f"{family_slug(family, core)}.md"
-        path.write_text(render_family(family, core, group, facts))
-        written.append(path)
-    index = USER_DEVICES_DIR / "index.md"
-    index.write_text(render_user_devices(rows))
-    USER_CLI_MD.write_text(render_user_cli(sections))
-    return written + [index, USER_CLI_MD]
+    for path, text in pages.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    return list(pages)
 
 
 def capture_help(binary: str, args: list) -> str:

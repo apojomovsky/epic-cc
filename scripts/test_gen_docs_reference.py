@@ -281,6 +281,25 @@ class UserPageTests(unittest.TestCase):
         )
         self.assertIn("| none | supported | Active | not listed |", text)
 
+    def test_write_removes_stale_family_pages(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = pathlib.Path(td)
+            g = gen_docs_reference
+            saved = (g.USER_DEVICES_DIR, g.USER_FAMILIES_DIR, g.USER_CLI_MD)
+            g.USER_DEVICES_DIR = td / "devices"
+            g.USER_FAMILIES_DIR = td / "devices" / "families"
+            g.USER_CLI_MD = td / "compiler" / "cli-flags.md"
+            try:
+                g.USER_FAMILIES_DIR.mkdir(parents=True)
+                (g.USER_FAMILIES_DIR / "old.md").write_text("x")
+                g.write_user_pages(self.ROWS, self.FACTS, [("epic-cc --help", "u\n")])
+                names = sorted(p.name for p in g.USER_FAMILIES_DIR.glob("*.md"))
+                self.assertEqual(names, ["pic16f-pic14.md", "pic16f-pic14e.md"])
+                self.assertTrue((g.USER_DEVICES_DIR / "index.md").is_file())
+                self.assertTrue(g.USER_CLI_MD.is_file())
+            finally:
+                g.USER_DEVICES_DIR, g.USER_FAMILIES_DIR, g.USER_CLI_MD = saved
+
     def test_cli_page_title(self):
         text = gen_docs_reference.render_user_cli([("epic-cc --help", "u\n")])
         self.assertIn("# CLI flags", text)
