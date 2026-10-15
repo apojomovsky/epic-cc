@@ -264,6 +264,12 @@ mechanical rules fails the ritual and blocks the push.
 - **Panics are the error surface today.** Unsupported input aborts with
   a precise message; that is deliberate (correct over silent
   miscompile). Don't "fix" panics by emitting wrong code.
+- **Push through the helper.** Run `epic-tasks push` instead of `git push`: it
+  verifies the remote ref after the pre-push hook and retries once without
+  re-running the suite. Trust its exit code: 0 means the branch landed and the
+  remote matches `HEAD`, 3 means the remote is unreachable, anything else means
+  the push did not land (check the output, never push again by hand to "make
+  sure"). The helper runs the hooks; `--no-verify` stays forbidden.
 - **No force pushes.** Rewriting a branch that already exists on the
   remote drops it for every other agent and clone; the pre-push hook
   refuses it. If the guard is triggered, rebase onto master and get
