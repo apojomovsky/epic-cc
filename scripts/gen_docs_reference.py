@@ -41,6 +41,9 @@ README_MD = ROOT / "README.md"
 
 GENERATED_BY = "scripts/gen_docs_reference.py"
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import shared_includes  # noqa: E402
+
 _spec = importlib.util.spec_from_file_location(
     "add_device", ROOT / "scripts" / "add_device.py"
 )
@@ -269,6 +272,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, help="built epic-cc binary")
     args = parser.parse_args()
+
+    problems = shared_includes.check(ROOT)
+    if problems:
+        for problem in problems:
+            print(f"gen_docs_reference: {problem}", file=sys.stderr)
+        return 1
 
     catalog = load_catalog(CATALOG)
     status = load_status(STATUS_FILE)
