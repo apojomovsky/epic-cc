@@ -509,3 +509,31 @@ fn mixed_global_pointer_load_is_refused() {
         None,
     );
 }
+
+#[test]
+#[should_panic(expected = "laundered through an integer")]
+fn int_laundered_through_local_slot_is_refused() {
+    // epic-cc#1284 review: the integer copy parks in an alloca.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %a = alloca 2\n    store ptr @c @g\n    %x = load i16 @g\n    store i16 %x %a\n    %y = load i16 %a\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("main::a", 0x13),
+            ("main::x", 0x15),
+            ("main::y", 0x17),
+            ("main::p", 0x19),
+            ("main::v", 0x1b),
+        ]),
+        None,
+    );
+}

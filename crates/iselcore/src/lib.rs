@@ -2566,9 +2566,6 @@ pub fn add_flash_laundering(
             None => None,
         }
     };
-    let global_of = |func: &str, ptr: &str| -> Option<String> {
-        slot_of(func, ptr).filter(|k| k.starts_with('@'))
-    };
     // Pointer loads from a maybe-flash slot, then derivations of them.
     for f in &m.funcs {
         for b in &f.blocks {
@@ -2686,8 +2683,8 @@ pub fn add_flash_laundering(
                             }
                         }
                         Inst::Store(s) if tv(&t, prov, &f.name, &s.val) => {
-                            if let Some(g) = global_of(&f.name, &s.ptr) {
-                                add.push(g);
+                            if let Some(k) = slot_of(&f.name, &s.ptr) {
+                                add.push(k);
                             }
                         }
                         Inst::Call(c) => {
