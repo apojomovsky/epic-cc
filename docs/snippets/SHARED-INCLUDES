@@ -1,0 +1,5 @@
+# Vendored from apojomovsky/epic-docs. Do not edit the copy: change the
+# hub file, then run make sync-shared-includes REF=<commit>.
+source = apojomovsky/epic-docs:includes/ways-to-use-epic8.md
+commit = 2ad7d851c1d39888dda84adcbf9fa8d0667453c8
+sha256 = 0a54fe1e12c604163cf3ab0533bd04f1593818c0607f59fa566bb874ae31eb40
