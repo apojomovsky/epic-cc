@@ -75,6 +75,8 @@ def check(root: pathlib.Path) -> list[str]:
     problems = []
     if not _COMMIT_RE.match(fields.get("commit", "")):
         problems.append(f"{RECORD}: commit must be a full 40-character sha")
+    if fields.get("source") != f"{HUB}:{HUB_FILE}":
+        problems.append(f"{RECORD}: source must be {HUB}:{HUB_FILE}")
     digest = fields.get("sha256", "")
     digest_ok = bool(_DIGEST_RE.match(digest))
     if not digest_ok:

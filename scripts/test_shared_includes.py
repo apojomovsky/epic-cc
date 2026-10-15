@@ -79,6 +79,18 @@ class TestCheck(unittest.TestCase):
             problems = shared_includes.check(root)
             self.assertTrue(any("40-character" in p for p in problems))
 
+    def test_wrong_source_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _synced_root(pathlib.Path(tmp))
+            text = (root / shared_includes.RECORD).read_text()
+            _write(
+                root,
+                shared_includes.RECORD,
+                text.replace("source = ", "source = other/", 1).encode(),
+            )
+            problems = shared_includes.check(root)
+            self.assertTrue(any("source must be" in p for p in problems))
+
     def test_malformed_record_line_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _synced_root(pathlib.Path(tmp))
