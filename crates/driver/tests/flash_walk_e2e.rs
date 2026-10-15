@@ -9,9 +9,9 @@
 //! a constant-offset gep over the walk phi (`q = p + 1; q[1]`), whose result
 //! is pinned against the literal bytes.
 //!
-//! The mixed-phi fixtures (epic-cc#1099) join a flash literal with a RAM buffer.
-//! Direct and runtime-indexed loads and stores through them are refused at
-//! compile time, never emitted as a read or write at a flash address.
+//! The mixed-phi fixtures (epic-cc#1099, epic-cc#1119) join a flash literal
+//! with a RAM buffer. The literal keeps a RAM copy, so each path reads
+//! RAM: direct, indexed, stored, and memcpy'd shapes all run correctly.
 
 use std::process::Command;
 
@@ -50,7 +50,6 @@ fn run_p18(fixture: &str) -> (Vec<u8>, String, bool) {
     (p.ram().to_vec(), map, p.halted())
 }
 
-/// Reads a global's RAM address off the compiler's `--map` output.
 fn map_addr(map: &str, name: &str) -> usize {
     let prefix = format!("global {name} 0x");
     let line = map
@@ -114,6 +113,27 @@ fn flash_walk_selected_arm_reads_program_memory_on_p18() {
         ram[map_addr(&map, "out")],
         b'P',
         "q[0] with c == 1 must be the second literal byte"
+    );
+    assert!(halted);
+}
+
+/// Two flash literals reach one non-inlined pointer parameter (epic-cc#1092,
+/// epic-cc#1119): the slot is flash-kind, the callee walks it through
+/// TBLPTR, and neither literal keeps a RAM copy. Each side is pinned.
+#[test]
+fn flash_arg_walk_reads_program_memory_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_arg_walk.c");
+    assert_eq!(ram[map_addr(&map, "out")], b'P', "long literal byte 1");
+    assert!(
+        !map.lines().any(|l| l.starts_with("global .str")),
+        "literals keep no RAM copies: {map}"
+    );
+    assert!(halted);
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_arg_walk_short.c");
+    assert_eq!(ram[map_addr(&map, "out")], b'k', "short literal byte 1");
+    assert!(
+        !map.lines().any(|l| l.starts_with("global .str")),
+        "literals keep no RAM copies: {map}"
     );
     assert!(halted);
 }
@@ -183,14 +203,15 @@ fn flash_walk_store_of_rom_address_reads_ram_copy_on_p18() {
     assert!(halted);
 }
 
-/// A const over 255 bytes has no RAM copy: storing its address is still
-/// refused (epic-cc#1223 boundary).
+/// A const over 255 bytes has no RAM copy: storing its address into a
+/// flash-kind global lowers instead (epic-cc#1119, epic-cc#1223
+/// boundary). `g` takes the table address and `g[0]` reads it back
+/// through TBLRD.
 #[test]
-fn flash_walk_store_of_large_rom_address_is_rejected_on_p18() {
-    expect_p18_rejection(
-        "tests/fixtures/flash_walk_store_address_large.c",
-        "store of a ROM address into RAM",
-    );
+fn flash_walk_store_of_large_rom_address_reads_flash_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_store_address_large.c");
+    assert_eq!(ram[map_addr(&map, "out")], 1, "g[0] must read the table");
+    assert!(halted);
 }
 
 /// Compiles `fixture` for p18f4550 and asserts the driver refuses it with a
@@ -214,25 +235,30 @@ fn expect_p18_rejection(fixture: &str, needle: &str) {
     assert!(stderr.contains(needle), "stderr:\n{stderr}");
 }
 
-/// A flash literal joined with a RAM buffer (`p = buf` in the walk loop) has
-/// no single address space. The driver must refuse it (epic-cc#1099) rather
-/// than emit an INDF0 read at a flash address.
+/// A flash literal joined with a RAM buffer (`p = buf` in the walk loop)
+/// keeps a RAM copy of the literal (epic-cc#1099, epic-cc#1119): both
+/// paths read RAM, so `n == 0` takes the literal path and `n > 0` the
+/// buffer path.
 #[test]
-fn flash_walk_phi_joined_with_ram_is_rejected_on_p18() {
-    expect_p18_rejection(
-        "tests/fixtures/flash_walk_mixed_phi.c",
-        "maybe-flash address",
-    );
+fn flash_walk_phi_joined_with_ram_reads_ram_copy_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_mixed_phi.c");
+    assert_eq!(ram[map_addr(&map, "out")], b'E', "literal path reads 'E'");
+    assert!(halted);
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_mixed_phi_ram.c");
+    assert_eq!(ram[map_addr(&map, "out")], b'a', "buffer path reads buf[0]");
+    assert!(halted);
 }
 
-/// A runtime index over the same phi joins flash and RAM, so the load is refused
-/// as a maybe-flash address (epic-cc#1099).
+/// A runtime index over the same phi reads the RAM copy on the literal
+/// path and the buffer on the RAM path (epic-cc#1099, epic-cc#1119).
 #[test]
-fn flash_walk_mixed_runtime_index_load_is_rejected_on_p18() {
-    expect_p18_rejection(
-        "tests/fixtures/flash_walk_mixed_index.c",
-        "maybe-flash address",
-    );
+fn flash_walk_mixed_runtime_index_reads_ram_copy_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_mixed_index.c");
+    assert_eq!(ram[map_addr(&map, "out")], b'E', "p[0] reads 'E'");
+    assert!(halted);
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_mixed_index_ram.c");
+    assert_eq!(ram[map_addr(&map, "out")], b'c', "p[2] reads buf[2]");
+    assert!(halted);
 }
 
 /// Two `const char *` walk phis swap each iteration, one advancing through a
@@ -251,14 +277,17 @@ fn flash_walk_phi_swap_reads_program_memory_on_p18() {
     assert!(halted);
 }
 
-/// The store through the runtime-indexed mixed phi lands on the same slot as
-/// the load above: refused, never written to RAM at a flash address (epic-cc#1099).
+/// A runtime-indexed store through the mixed phi lands in RAM on both
+/// paths: the literal's RAM copy on the literal path, the buffer on the
+/// RAM path (epic-cc#1099, epic-cc#1119).
 #[test]
-fn flash_walk_mixed_runtime_index_store_is_rejected_on_p18() {
-    expect_p18_rejection(
-        "tests/fixtures/flash_walk_mixed_store.c",
-        "ROM is not writable",
-    );
+fn flash_walk_mixed_runtime_index_store_writes_ram_copy_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_mixed_store.c");
+    assert_eq!(ram[map_addr(&map, ".str")], 1, "copy[0] takes the write");
+    assert!(halted);
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_mixed_store_ram.c");
+    assert_eq!(ram[map_addr(&map, "buf") + 3], 1, "buf[3] takes the write");
+    assert!(halted);
 }
 
 /// A constant-length `memcpy` from a flash walk must copy program memory
@@ -282,14 +311,17 @@ fn flash_walk_memcpy_reads_program_memory_on_p18() {
     assert!(halted);
 }
 
-/// A `memcpy` from a pointer phi joining flash and RAM has no single address
-/// space, so it is refused at compile time (epic-cc#1100, epic-cc#1099).
+/// A `memcpy` from a pointer phi joining flash and RAM copies RAM on
+/// both paths: the literal's RAM copy on the literal path, the buffer
+/// on the RAM path (epic-cc#1100, epic-cc#1099, epic-cc#1119).
 #[test]
-fn flash_walk_mixed_memcpy_is_rejected_on_p18() {
-    expect_p18_rejection(
-        "tests/fixtures/flash_walk_mixed_memcpy.c",
-        "memcpy from maybe-flash address",
-    );
+fn flash_walk_mixed_memcpy_reads_ram_copy_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_mixed_memcpy.c");
+    assert_eq!(ram[map_addr(&map, "out")], b'E', "copy[0] lands in dst");
+    assert!(halted);
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_walk_mixed_memcpy_ram.c");
+    assert_eq!(ram[map_addr(&map, "out")], b'0', "buf[0] lands in dst");
+    assert!(halted);
 }
 
 /// The ticket's shape: a plain `memcpy` call (not `__builtin_memcpy`) from a

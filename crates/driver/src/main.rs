@@ -517,6 +517,9 @@ fn main() {
     // ISR analysis reads the same memcpy shapes clang emits (epic-cc#639).
     // Core-gated inside: every other core keeps byte-identical IR.
     driver::const_runs::run(&mut m, device.core);
+    // Fuse volatile single-bit SFR read-modify-writes into bit stores
+    // (epic-cc#1281); PIC14 only, before legalize and alloc see the IR.
+    driver::bit_rmw::run(&mut m, device.core);
     m = if device.core == device::Core::Pic18 {
         legalize::legalize_pic18(m)
     } else {
