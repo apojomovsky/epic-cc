@@ -159,6 +159,7 @@ class CatalogCheckTests(unittest.TestCase):
         self.assertEqual(
             rows[0],
             {
+                "name": "p16f877a",
                 "part": "PIC16F877A",
                 "family": "PIC16F",
                 "core": "PIC14",
@@ -215,6 +216,74 @@ class SubcommandTests(unittest.TestCase):
         self.assertEqual(
             gen_docs_reference.discover_subcommands(help_text), ["build", "clean"]
         )
+
+
+class UserPageTests(unittest.TestCase):
+    ROWS = [
+        {
+            "name": "p16f877a",
+            "part": "PIC16F877A",
+            "family": "PIC16F",
+            "core": "PIC14",
+            "flash": 8192,
+            "ram": 176,
+            "status": "experimental",
+        },
+        {
+            "name": "p16f1937",
+            "part": "PIC16F1937",
+            "family": "PIC16F",
+            "core": "PIC14E",
+            "flash": 8192,
+            "ram": 512,
+            "status": "supported",
+        },
+    ]
+    FACTS = {
+        "p16f877a": {
+            "eeprom_bytes": 256,
+            "lifecycle": "Active",
+            "pdf": "https://x/a.pdf",
+        },
+        "p16f1937": {"lifecycle": "Active"},
+    }
+
+    def test_slug_is_url_safe(self):
+        self.assertEqual(
+            gen_docs_reference.family_slug("PIC12F", "PIC12 baseline"),
+            "pic12f-pic12-baseline",
+        )
+
+    def test_groups_split_by_core(self):
+        groups = gen_docs_reference.group_families(self.ROWS)
+        self.assertEqual(list(groups), [("PIC16F", "PIC14"), ("PIC16F", "PIC14E")])
+
+    def test_matrix_links_family_page(self):
+        text = gen_docs_reference.render_user_devices(self.ROWS)
+        self.assertIn("[PIC16F](families/pic16f-pic14e.md)", text)
+        self.assertNotIn("\u2014", text)
+
+    def test_family_page_uses_catalog_facts(self):
+        text = gen_docs_reference.render_family(
+            "PIC16F", "PIC14", self.ROWS[:1], self.FACTS
+        )
+        self.assertIn("# PIC16F (PIC14)", text)
+        self.assertIn(
+            "| PIC16F877A | 8192 | 176 | 256 | experimental | Active "
+            "| [datasheet](https://x/a.pdf) |",
+            text,
+        )
+        self.assertIn("## Notes", text)
+
+    def test_family_page_marks_missing_facts(self):
+        text = gen_docs_reference.render_family(
+            "PIC16F", "PIC14E", self.ROWS[1:], self.FACTS
+        )
+        self.assertIn("| none | supported | Active | not listed |", text)
+
+    def test_cli_page_title(self):
+        text = gen_docs_reference.render_user_cli([("epic-cc --help", "u\n")])
+        self.assertIn("# CLI flags", text)
 
 
 class IncludeTests(unittest.TestCase):
