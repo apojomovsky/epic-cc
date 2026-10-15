@@ -2010,6 +2010,591 @@ pub fn flash_walk_refusal(
     }
 }
 
+/// A store destination behind the space proof: a precise global, an
+/// object-local slot (writes stay inside the object), or an unknown
+/// target (demote taken globals).
+#[derive(Clone, Debug)]
+enum DstSpace {
+    Global(String),
+    Object,
+    Unknown,
+}
+
+/// A writer into a pointer slot, classified for the flash-kind proof below.
+/// `Src` grounds flash: a flash const global or a walk reg already proven
+/// flash (itself grounded in consts). `Null` is compatible but grounds
+/// nothing, so a slot holding only null stays RAM. `Node` delegates to
+/// another candidate. Anything else (RAM values, unknown callers) is `Bad`
+/// and prunes the slot to RAM.
+#[derive(Clone, Debug)]
+enum SlotWriter {
+    Src,
+    Null,
+    Node(String),
+    Bad,
+}
+
+/// Static address space of every pointer slot (epic-cc#1119): params and
+/// phi/select/gep/load-ptr dsts keyed `{func}::{slot}`, globals as
+/// `@{global}`. A slot is flash-kind when every address it can hold is a
+/// flash table address or null, so loads through it must read program
+/// memory. Greatest fixpoint over writers, then an ungrounded prune: a
+/// cycle of slots passing each other addresses with no const source (two
+/// functions forwarding a RAM pointer back and forth) stays RAM.
+/// `is_flash_const` names the consts resident in flash, `prov` the
+/// already-proven flash walks, `resolved` the pointer chains for
+/// load-source slots. Const globals are never slots: their bytes are
+/// tables, read through the const paths instead.
+pub fn flash_slot_spaces(
+    m: &Module,
+    resolved: &PtrResolution,
+    prov: &FlashProvenance,
+    is_flash_const: impl Fn(&str) -> bool,
+) -> HashSet<String> {
+    let is_func = |n: &str| m.funcs.iter().any(|f| f.name == n);
+    // Candidate slots: plain ptr params plus every reg that can hold an
+    // address (ptr phis/selects, geps, ptr loads). byval/sret params hold
+    // caller copies, call results and inttoptr/va_arg/alloca slots hold
+    // RAM or runtime integers, so none of those are candidates.
+    let mut cands: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for p in &f.params {
+            if p.ptr && p.byval.is_none() && !p.sret {
+                cands.insert(ssa_key(&f.name, &p.name));
+            }
+        }
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Phi(p) if p.ptr => {
+                        cands.insert(ssa_key(&f.name, &p.dst));
+                    }
+                    Inst::Select(s) if s.ptr => {
+                        cands.insert(ssa_key(&f.name, &s.dst));
+                    }
+                    Inst::Gep(g) => {
+                        cands.insert(ssa_key(&f.name, &g.dst));
+                    }
+                    Inst::Load(l) if l.ptr_ty => {
+                        cands.insert(ssa_key(&f.name, &l.dst));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for g in &m.globals {
+        if !g.is_const {
+            cands.insert(format!("@{}", g.name));
+        }
+    }
+    // Slots whose bytes ARE an object, never an address: stores through
+    // pointers derived from them stay object-local and never touch a
+    // global slot. Allocas and byval params qualify; every other slot
+    // with address bytes may point anywhere.
+    let mut objects: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Alloca(a) = i {
+                    objects.insert(ssa_key(&f.name, &a.dst));
+                }
+            }
+        }
+        for p in &f.params {
+            if p.byval.is_some() {
+                objects.insert(ssa_key(&f.name, &p.name));
+            }
+        }
+    }
+    // Globals whose address is taken as a value anywhere (stored,
+    // passed, returned, or selected): only these can be overwritten
+    // through an unknown pointer, so only these demote on one.
+    let mut taken: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Store(s) => {
+                        taken.extend(global_fan_in(m, resolved, &f.name, &s.val));
+                    }
+                    Inst::Call(c) => {
+                        for arg in &c.args {
+                            taken.extend(global_fan_in(m, resolved, &f.name, &arg.val));
+                        }
+                    }
+                    Inst::Ret(Some((_, v)), _) => {
+                        taken.extend(global_fan_in(m, resolved, &f.name, v));
+                    }
+                    Inst::Select(s) if s.ptr => {
+                        taken.extend(global_fan_in(m, resolved, &f.name, &s.a));
+                        taken.extend(global_fan_in(m, resolved, &f.name, &s.b));
+                    }
+                    Inst::Phi(p) if p.ptr => {
+                        for (v, _) in &p.incoming {
+                            taken.extend(global_fan_in(m, resolved, &f.name, v));
+                        }
+                    }
+                    Inst::Memcpy(mc) => {
+                        taken.extend(global_fan_in(m, resolved, &f.name, &mc.src));
+                        taken.extend(global_fan_in(m, resolved, &f.name, &mc.dst));
+                    }
+                    Inst::Freeze(fr) => {
+                        taken.extend(global_fan_in(m, resolved, &f.name, &fr.val));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // A value offered to a slot: flash consts and proven walks ground it,
+    // null is compatible, candidate regs delegate, everything else prunes.
+    // Function addresses are RAM-kind: calls through them copy bytes, but
+    // a dereference must never TBLRD code space (epic-cc#1119).
+    let val_writer = |v: &ir::Val, func: &str| -> SlotWriter {
+        match v {
+            ir::Val::Global(n) => {
+                if is_func(n) || !is_flash_const(n) {
+                    SlotWriter::Bad
+                } else {
+                    SlotWriter::Src
+                }
+            }
+            ir::Val::Reg(r) => {
+                let key = ssa_key(func, r);
+                if prov.flash.contains(&key) {
+                    SlotWriter::Src
+                } else if cands.contains(&key) {
+                    SlotWriter::Node(key)
+                } else {
+                    SlotWriter::Bad
+                }
+            }
+            ir::Val::Const(0) => SlotWriter::Null,
+            ir::Val::Const(_) => SlotWriter::Bad,
+        }
+    };
+    // Indirect-call targets gain an unknown caller: their params can
+    // receive any address, so they prune to RAM.
+    let mut indirect_targets: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Call(c) = i {
+                    if !c.callees.is_empty() {
+                        indirect_targets.extend(c.callees.iter().cloned());
+                    }
+                }
+            }
+        }
+    }
+    let mut writers: HashMap<String, Vec<SlotWriter>> = HashMap::new();
+    let mut push = |key: String, w: SlotWriter| {
+        writers.entry(key).or_default().push(w);
+    };
+    // An unknown-target write may overwrite any taken global.
+    let mut unknown_write = false;
+    // Classify a store destination: a precise global target, an
+    // object-local slot (alloca/byval writes stay inside the object),
+    // or an unknown target. Literal addresses name SFR/MMIO, never a
+    // global slot: user code cannot know our GPR layout.
+    let dst_space = |func: &str, ptr: &str| -> DstSpace {
+        if let Some(g) = ptr.strip_prefix('@') {
+            return DstSpace::Global(g.to_string());
+        }
+        if ptr.starts_with("0x") {
+            return DstSpace::Object;
+        }
+        let Some(r) = ptr.strip_prefix('%') else {
+            return DstSpace::Unknown;
+        };
+        match resolved.get(&ssa_key(func, r)) {
+            Some((Base::Global(g), _, _)) => DstSpace::Global(g.clone()),
+            Some((Base::Slot(sname, _), _, _)) => {
+                if objects.contains(&ssa_key(func, sname)) {
+                    DstSpace::Object
+                } else {
+                    DstSpace::Unknown
+                }
+            }
+            None => DstSpace::Unknown,
+        }
+    };
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Phi(p) if p.ptr => {
+                        let key = ssa_key(&f.name, &p.dst);
+                        for (v, _) in &p.incoming {
+                            push(key.clone(), val_writer(v, &f.name));
+                        }
+                    }
+                    Inst::Select(s) if s.ptr => {
+                        let key = ssa_key(&f.name, &s.dst);
+                        push(key.clone(), val_writer(&s.a, &f.name));
+                        push(key, val_writer(&s.b, &f.name));
+                    }
+                    Inst::Gep(g) => {
+                        let key = ssa_key(&f.name, &g.dst);
+                        match &g.base {
+                            GepBase::Global(n) => {
+                                if is_func(n) || !is_flash_const(n) {
+                                    push(key, SlotWriter::Bad);
+                                } else {
+                                    push(key, SlotWriter::Src);
+                                }
+                            }
+                            GepBase::Reg(r) => {
+                                push(key, val_writer(&ir::Val::Reg(r.clone()), &f.name));
+                            }
+                        }
+                    }
+                    Inst::Load(l) if l.ptr_ty => {
+                        let key = ssa_key(&f.name, &l.dst);
+                        if let Some(g) = l.ptr.strip_prefix('@') {
+                            if let Some(gl) = m.globals.iter().find(|x| x.name == g) {
+                                if gl.is_const {
+                                    // Bytes come from the flash table: every
+                                    // byte must be zero or covered by a ref
+                                    // to a flash const, else RAM-kind.
+                                    let mut covered = vec![false; gl.bytes.len()];
+                                    let mut ok = true;
+                                    for (pos, t, _) in &gl.refs {
+                                        if is_func(t) || !is_flash_const(t) {
+                                            ok = false;
+                                            break;
+                                        }
+                                        if *pos < covered.len() {
+                                            covered[*pos] = true;
+                                        }
+                                    }
+                                    if ok
+                                        && gl.bytes.iter().enumerate().all(|(n, b)| {
+                                            *b == 0 || covered.get(n).copied().unwrap_or(false)
+                                        })
+                                    {
+                                        push(key, SlotWriter::Src);
+                                    } else {
+                                        push(key, SlotWriter::Bad);
+                                    }
+                                } else {
+                                    push(key, SlotWriter::Node(format!("@{g}")));
+                                }
+                            } else {
+                                push(key, SlotWriter::Bad);
+                            }
+                        } else if let Some(r) = l.ptr.strip_prefix('%') {
+                            match resolved.get(&ssa_key(&f.name, r)) {
+                                Some((Base::Slot(sname, _), _, _)) => {
+                                    let skey = ssa_key(&f.name, sname);
+                                    if cands.contains(&skey) {
+                                        push(key, SlotWriter::Node(skey));
+                                    } else {
+                                        push(key, SlotWriter::Bad);
+                                    }
+                                }
+                                _ => push(key, SlotWriter::Bad),
+                            }
+                        } else {
+                            push(key, SlotWriter::Bad);
+                        }
+                    }
+                    Inst::Store(s) => {
+                        // A partial or wide write is not an address write.
+                        // Indirect targets resolving to a global write it
+                        // precisely; object-local and unknown targets are
+                        // classified by `dst_space`.
+                        match dst_space(&f.name, &s.ptr) {
+                            DstSpace::Global(g) => {
+                                if m.globals.iter().any(|x| x.name == g && !x.is_const) {
+                                    if s.ty.bytes() == 2 {
+                                        push(format!("@{g}"), val_writer(&s.val, &f.name));
+                                    } else {
+                                        push(format!("@{g}"), SlotWriter::Bad);
+                                    }
+                                }
+                            }
+                            DstSpace::Object => {}
+                            DstSpace::Unknown => {
+                                unknown_write = true;
+                            }
+                        }
+                    }
+                    Inst::Memcpy(mc) => {
+                        // A copy into a slot overwrites its bytes with
+                        // unknown ones: precise globals go Bad, unknown
+                        // targets demote taken globals.
+                        let dst = |v: &ir::Val| match v {
+                            ir::Val::Global(g) => DstSpace::Global(g.clone()),
+                            ir::Val::Reg(r) => dst_space(&f.name, &format!("%{r}")),
+                            ir::Val::Const(_) => DstSpace::Unknown,
+                        };
+                        match dst(&mc.dst) {
+                            DstSpace::Global(g) => {
+                                if m.globals.iter().any(|x| x.name == g && !x.is_const) {
+                                    push(format!("@{g}"), SlotWriter::Bad);
+                                }
+                            }
+                            DstSpace::Object => {}
+                            DstSpace::Unknown => {
+                                unknown_write = true;
+                            }
+                        }
+                    }
+                    Inst::Asm(a) => {
+                        // Only outputs (constraints starting with `=` or
+                        // `+`) write; reads never touch a slot. Blanket
+                        // clobbers demote taken globals.
+                        if a.clobbers_memory {
+                            unknown_write = true;
+                        }
+                        for op in &a.operands {
+                            if !(op.constraint.starts_with('=') || op.constraint.starts_with('+')) {
+                                continue;
+                            }
+                            match dst_space(&f.name, &op.ptr) {
+                                DstSpace::Global(g) => {
+                                    if m.globals.iter().any(|x| x.name == g && !x.is_const) {
+                                        push(format!("@{g}"), SlotWriter::Bad);
+                                    }
+                                }
+                                DstSpace::Object => {}
+                                DstSpace::Unknown => {
+                                    unknown_write = true;
+                                }
+                            }
+                        }
+                    }
+                    Inst::Call(c) => {
+                        if c.callees.is_empty() {
+                            if let Some(callee) = m.funcs.iter().find(|x| x.name == c.func) {
+                                for (p, arg) in callee.params.iter().zip(c.args.iter()) {
+                                    if !(p.ptr && p.byval.is_none() && !p.sret) {
+                                        continue;
+                                    }
+                                    if arg.byval.is_some() || arg.sret {
+                                        push(ssa_key(&c.func, &p.name), SlotWriter::Bad);
+                                    } else {
+                                        push(
+                                            ssa_key(&c.func, &p.name),
+                                            val_writer(&arg.val, &f.name),
+                                        );
+                                    }
+                                }
+                                if c.args.len() < callee.params.len() {
+                                    for p in &callee.params[c.args.len()..] {
+                                        if p.ptr && p.byval.is_none() && !p.sret {
+                                            push(ssa_key(&c.func, &p.name), SlotWriter::Bad);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Globals start with their initializer as a writer: zero bytes are
+    // null, refs to flash consts are flash (and ground it), anything
+    // else is RAM.
+    for g in &m.globals {
+        if g.is_const {
+            continue;
+        }
+        let key = format!("@{}", g.name);
+        let mut covered = vec![false; g.bytes.len()];
+        let mut ok = true;
+        for (pos, t, _) in &g.refs {
+            if is_func(t) || !is_flash_const(t) {
+                ok = false;
+                break;
+            }
+            if *pos < covered.len() {
+                covered[*pos] = true;
+            }
+        }
+        if ok
+            && g.bytes
+                .iter()
+                .enumerate()
+                .all(|(n, b)| *b == 0 || covered.get(n).copied().unwrap_or(false))
+        {
+            if g.refs.is_empty() {
+                push(key, SlotWriter::Null);
+            } else {
+                push(key, SlotWriter::Src);
+            }
+        } else {
+            push(key, SlotWriter::Bad);
+        }
+    }
+    // Params of indirectly-called functions gain the unknown caller.
+    for f in &m.funcs {
+        if !indirect_targets.contains(&f.name) {
+            continue;
+        }
+        for p in &f.params {
+            if p.ptr && p.byval.is_none() && !p.sret {
+                push(ssa_key(&f.name, &p.name), SlotWriter::Bad);
+            }
+        }
+    }
+    // An unknown-target write may overwrite any taken global: demote
+    // them all. Globals never taken as values cannot be reached this
+    // way, so purely dereferenced pointer globals keep their proof.
+    if unknown_write {
+        for t in &taken {
+            writers
+                .entry(format!("@{t}"))
+                .or_default()
+                .push(SlotWriter::Bad);
+        }
+    }
+    // Greatest fixpoint: drop candidates with a RAM writer, then drop
+    // cycles no const grounds.
+    let mut live: HashSet<String> = cands;
+    loop {
+        let dead: Vec<String> = writers
+            .iter()
+            .filter(|(k, ws)| {
+                live.contains(*k)
+                    && ws.iter().any(|w| match w {
+                        SlotWriter::Bad => true,
+                        SlotWriter::Node(n) => !live.contains(n),
+                        SlotWriter::Src | SlotWriter::Null => false,
+                    })
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        if dead.is_empty() {
+            break;
+        }
+        for d in dead {
+            live.remove(&d);
+        }
+    }
+    let mut grounded: HashSet<String> = HashSet::new();
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (k, ws) in &writers {
+            if !live.contains(k) || grounded.contains(k) {
+                continue;
+            }
+            let seeded = ws.iter().any(|w| match w {
+                SlotWriter::Src => true,
+                SlotWriter::Node(n) => grounded.contains(n),
+                SlotWriter::Null | SlotWriter::Bad => false,
+            });
+            if seeded {
+                grounded.insert(k.clone());
+                grew = true;
+            }
+        }
+    }
+    live.intersection(&grounded).cloned().collect()
+}
+
+/// Global names an address value may carry, following pointer
+/// derivations (GEP bases, select/phi arms, freeze copies) and folded
+/// global bases transitively. Loads, params, and call results stop the
+/// walk: their consts are governed where they are written, not where
+/// they are read. `keep` selects which globals to report.
+fn val_fan_in(
+    m: &Module,
+    resolved: &PtrResolution,
+    func: &str,
+    v: &ir::Val,
+    keep: impl Fn(&str) -> bool,
+) -> HashSet<String> {
+    // Pointer derivations per reg: GEP bases, select/phi arms, and
+    // freeze copies (a freeze is a byte-identity move of the address).
+    let mut arms: HashMap<String, Vec<ir::Val>> = HashMap::new();
+    if let Some(f) = m.funcs.iter().find(|x| x.name == func) {
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Gep(g) => {
+                        arms.insert(
+                            g.dst.clone(),
+                            vec![match &g.base {
+                                GepBase::Global(n) => ir::Val::Global(n.clone()),
+                                GepBase::Reg(r) => ir::Val::Reg(r.clone()),
+                            }],
+                        );
+                    }
+                    Inst::Select(s) if s.ptr => {
+                        arms.insert(s.dst.clone(), vec![s.a.clone(), s.b.clone()]);
+                    }
+                    Inst::Phi(p) if p.ptr => {
+                        arms.insert(
+                            p.dst.clone(),
+                            p.incoming.iter().map(|(av, _)| av.clone()).collect(),
+                        );
+                    }
+                    Inst::Freeze(fr) => {
+                        arms.insert(fr.dst.clone(), vec![fr.val.clone()]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut out: HashSet<String> = HashSet::new();
+    let mut stack = vec![v.clone()];
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(top) = stack.pop() {
+        match top {
+            ir::Val::Global(n) => {
+                if keep(&n) {
+                    out.insert(n);
+                }
+            }
+            ir::Val::Reg(r) => {
+                if !seen.insert(ssa_key(func, &r)) {
+                    continue;
+                }
+                if let Some(conts) = arms.get(&r) {
+                    stack.extend(conts.iter().cloned());
+                } else if let Some((Base::Global(cg), _, _)) = resolved.get(&ssa_key(func, &r)) {
+                    if keep(cg) {
+                        out.insert(cg.clone());
+                    }
+                }
+            }
+            ir::Val::Const(_) => {}
+        }
+    }
+    out
+}
+
+/// Const globals whose addresses the value `v` in `func` may carry
+/// (epic-cc#1119).
+pub fn const_fan_in(
+    m: &Module,
+    resolved: &PtrResolution,
+    func: &str,
+    v: &ir::Val,
+) -> HashSet<String> {
+    val_fan_in(m, resolved, func, v, |n| {
+        m.globals.iter().any(|g| g.name == n && g.is_const)
+    })
+}
+
+/// Every global name the value `v` in `func` may carry, const or not:
+/// the address-taken set behind unknown-store demotion (epic-cc#1119).
+pub fn global_fan_in(
+    m: &Module,
+    resolved: &PtrResolution,
+    func: &str,
+    v: &ir::Val,
+) -> HashSet<String> {
+    val_fan_in(m, resolved, func, v, |_| true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_directive, resolve_pointers, Base};

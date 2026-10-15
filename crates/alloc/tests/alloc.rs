@@ -401,11 +401,11 @@ fn sized_array_global_does_not_break_frame_overlay() {
 }
 
 #[test]
-fn const_select_arms_are_copied_to_ram_when_the_select_does_not_fold() {
-    // A pointer select over two distinct const globals is a runtime
-    // address VALUE (iselcore seeds it as an indirect slot, epic-cc#147):
-    // the selected arm's bytes are read through the slot with RAM
-    // semantics, so both const arms must be copied to RAM.
+fn pure_flash_select_arms_stay_in_flash_on_pic18() {
+    // A pointer select over two flash consts keeps a flash-kind slot on
+    // PIC18 (epic-cc#1119): isel materializes each arm as LOW/HIGH and
+    // reads through TBLRD, so neither arm needs a RAM copy. A mixed
+    // select still copies its const arm (next test).
     let mut m = parse(
         "const a i8\n\
          const b i8\n\
@@ -418,12 +418,16 @@ fn const_select_arms_are_copied_to_ram_when_the_select_does_not_fold() {
     m.globals[1].size = 4; // b: [4 x i8]
     let out = allocate(&PIC18F4550, &m, "depth 1\n");
     assert!(
-        out.globals.contains_key("a"),
-        "const select arm @a must be copied to RAM"
+        !out.globals.contains_key("a"),
+        "pure-flash select arm @a must keep no RAM copy"
     );
     assert!(
-        out.globals.contains_key("b"),
-        "const select arm @b must be copied to RAM"
+        !out.globals.contains_key("b"),
+        "pure-flash select arm @b must keep no RAM copy"
+    );
+    assert!(
+        out.const_globals.contains("a") && out.const_globals.contains("b"),
+        "pure-flash select arms must stay in the flash set"
     );
 }
 
@@ -452,12 +456,68 @@ fn a_single_const_select_arm_is_copied_to_ram() {
         "RAM arm @b keeps its address"
     );
 }
+#[test]
+fn const_spilled_through_pointer_keeps_copy_on_pic18() {
+    // Spilling a const address through a pointer (an alloca slot here)
+    // reads back through RAM: it keeps a RAM copy like a direct store
+    // (epic-cc#1119 review).
+    let m = parse(
+        "const c i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = alloca 2\n\
+             store ptr @c %a\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "spilled const @c must be copied to RAM"
+    );
+    assert!(
+        !out.const_globals.contains("c"),
+        "copied const @c must leave the flash set"
+    );
+}
 
 #[test]
-fn const_direct_ptr_call_arg_is_copied_to_ram() {
-    // Menu-demo `.str` (epic-cc#754): a const passed directly as a plain
-    // pointer call argument is read through the generic pointer path, so
-    // it needs a RAM address; flash tables need TBLPTR, not FSR/INDF.
+fn init_ref_into_mixed_global_keeps_copy_on_pic18() {
+    // A global initialized with a flash address but also written with
+    // RAM reads back through RAM: its const keeps a copy (epic-cc#1119
+    // review). Without the RAM store it would stay flash.
+    let mut m = parse(
+        "const c i8\n\
+         global g i16\n\
+         global buf i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %q = gep @buf +0\n\
+             store ptr %q @g\n\
+             ret void\n",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" {
+            g.bytes = vec![0, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "init-ref const @c into a mixed global must be copied to RAM"
+    );
+    assert!(
+        !out.const_globals.contains("c"),
+        "copied const @c must leave the flash set"
+    );
+}
+
+#[test]
+fn const_direct_ptr_call_arg_stays_in_flash_on_pic18() {
+    // Menu-demo `.str` (epic-cc#754, epic-cc#1119): a const passed
+    // directly as a plain pointer call argument keeps no RAM copy when
+    // the callee never exposes it to RAM; isel passes the table address
+    // and reads through TBLRD.
     let mut m = parse(
         "const c i8\n\
          fn main(void) ()\n\
@@ -471,8 +531,36 @@ fn const_direct_ptr_call_arg_is_copied_to_ram() {
     m.globals[0].size = 2; // c: [2 x i8], like menu-demo .str
     let out = allocate(&PIC18F4550, &m, "edge main f\n");
     assert!(
+        !out.globals.contains_key("c"),
+        "pure-flash call arg @c must keep no RAM copy"
+    );
+    assert!(
+        out.const_globals.contains("c"),
+        "pure-flash call arg @c must stay in the flash set"
+    );
+}
+
+#[test]
+fn const_direct_ptr_call_arg_is_copied_to_ram_when_mixed() {
+    // The same call also passing a RAM global joins the param's spaces:
+    // the const keeps its RAM copy so the callee reads RAM either way.
+    let mut m = parse(
+        "const c i8\n\
+         global buf i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(@c)\n\
+             call void @f(@buf)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 2; // c: [2 x i8], like menu-demo .str
+    let out = allocate(&PIC18F4550, &m, "edge main f\n");
+    assert!(
         out.globals.contains_key("c"),
-        "const ptr call arg @c must be copied to RAM"
+        "mixed call arg @c must be copied to RAM"
     );
     assert!(
         !out.const_globals.contains("c"),
@@ -539,7 +627,9 @@ fn const_gep_select_arm_is_copied_to_ram() {
 fn const_to_ram_set_holds_only_pointer_path_consts() {
     // The surviving set, pinned: a const flowing through a generic pointer
     // path is copied, one that never does stays in flash. A future const
-    // joining RAM must update this test, never slip in silently.
+    // joining RAM must update this test, never slip in silently. On
+    // PIC18 a const passed only to flash-proven params stays flash too
+    // (epic-cc#1119); a RAM-joined one still copies (previous test).
     let mut m = parse(
         "const used i8\n\
          const table i8\n\
@@ -555,8 +645,8 @@ fn const_to_ram_set_holds_only_pointer_path_consts() {
     m.globals[1].size = 4; // table: [4 x i8]
     let out = allocate(&PIC18F4550, &m, "edge main f\n");
     assert!(
-        out.globals.contains_key("used"),
-        "const ptr call arg @used must be copied to RAM"
+        !out.globals.contains_key("used"),
+        "pure-flash call arg @used must keep no RAM copy"
     );
     assert!(
         !out.globals.contains_key("table"),
@@ -567,8 +657,8 @@ fn const_to_ram_set_holds_only_pointer_path_consts() {
         "flash-only const @table must stay in the flash set"
     );
     assert!(
-        !out.const_globals.contains("used"),
-        "copied const @used must leave the flash set"
+        out.const_globals.contains("used"),
+        "pure-flash call arg @used must stay in the flash set"
     );
 }
 

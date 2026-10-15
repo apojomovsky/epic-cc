@@ -51,6 +51,7 @@ one-line index entry here, e.g.:
 - ADR-051: Short const-table readers share their base's page (caller sets full HIGH(base), 2-word entries; pic14e port in #1188), 2026-10-12
 - ADR-052: All-constant search loops fold by guarded unrolling (unroll-disable scoped off constant-divide functions, fold kept only when IR shrinks; encoder-sim 6495 to 5215 words), 2026-10-12
 - ADR-053: Bare bit names as section-placed `_Bool` entities (PIC14 headers emit `.epic.bit` declarations, backend lowers to BSF/BCF/BTFSC; PIC18 needs a binding rule first), 2026-10-14
+- ADR-054: PIC18 pointer slots carry a static flash or RAM address space (whole-program slot proof, TBLPTR slot-seed loads, RAM copies for mixed; decides #1119 and #1092), 2026-10-14
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 

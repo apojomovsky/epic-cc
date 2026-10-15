@@ -31,7 +31,10 @@ use std::collections::{HashMap, HashSet};
 
 use device::{Core, Device};
 use ir::{Inst, Module};
-use iselcore::{find_value_folds, resolve_pointers, ssa_key, Base, PtrResolution, ValueFolds};
+use iselcore::{
+    add_flash_walks, const_fan_in, find_value_folds, flash_provenance, flash_slot_spaces,
+    resolve_pointers, ssa_key, Base, PtrResolution, ValueFolds,
+};
 use retain::Retention;
 
 /// One shared flag byte (epic-cc#1162): the synthetic holder placed in
@@ -2917,6 +2920,167 @@ enum Dip {
     All,
 }
 
+/// Consts that stay flash-resident on PIC18 (epic-cc#1119): every use is
+/// in a flash-proven position, so no RAM copy is needed and isel's slot
+/// proof (same predicate over the final map) lowers their walks through
+/// TBLPTR. Greatest fixpoint over the slot proof, dropping consts with a
+/// RAM-forcing use. Loads, derefs, and pure flash walks never force.
+/// Returns the resident set plus the final slot spaces for the
+/// initializer-ref rule below.
+fn flash_resident_consts(
+    m: &Module,
+    resolved: &PtrResolution,
+) -> (HashSet<String>, HashSet<String>) {
+    let mut live: HashSet<String> = m
+        .globals
+        .iter()
+        .filter(|g| g.is_const && !g.name.starts_with("_ZTV"))
+        .map(|g| g.name.clone())
+        .collect();
+    let mut spaces: HashSet<String>;
+    loop {
+        let mut prov = flash_provenance(m);
+        add_flash_walks(&mut prov, m, |n| live.contains(n));
+        spaces = flash_slot_spaces(m, resolved, &prov, |n| live.contains(n));
+        let mut bad: HashSet<String> = HashSet::new();
+        // Every const an offending value may carry leaves. Values are
+        // followed through GEP chains and select/phi arms, so a pure
+        // derivation passed to a RAM position still forces its consts.
+        let mut force_val = |func: &str, v: &ir::Val| {
+            for g in const_fan_in(m, resolved, func, v) {
+                if live.contains(&g) {
+                    bad.insert(g);
+                }
+            }
+        };
+        for f in &m.funcs {
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    match inst {
+                        ir::Inst::Call(c) => {
+                            if !c.callees.is_empty() {
+                                // Indirect targets are unknown: every const
+                                // argument keeps its RAM copy.
+                                for arg in &c.args {
+                                    force_val(&f.name, &arg.val);
+                                }
+                                continue;
+                            }
+                            // An unknown callee never reaches arg lowering
+                            // (isel refuses the call), so only known ones
+                            // judge their arguments here.
+                            let Some(callee) = m.funcs.iter().find(|x| x.name == c.func) else {
+                                continue;
+                            };
+                            for (n, arg) in c.args.iter().enumerate() {
+                                // Variadic extras land in the `__va` region
+                                // and read back through RAM (epic-cc#131).
+                                let ok = arg.ty.is_none()
+                                    && arg.byval.is_none()
+                                    && !arg.sret
+                                    && callee.params.get(n).is_some_and(|p| {
+                                        p.ptr
+                                            && p.byval.is_none()
+                                            && !p.sret
+                                            && p.width == 2
+                                            && spaces.contains(&ssa_key(&c.func, &p.name))
+                                    });
+                                if !ok {
+                                    force_val(&f.name, &arg.val);
+                                }
+                            }
+                        }
+                        ir::Inst::Store(s) => {
+                            // A partial or wide write is not an address
+                            // write; an SFR destination is refused in isel
+                            // either way (epic-cc#1101), so only `@global`
+                            // destinations participate.
+                            if s.ty.bytes() != 2 {
+                                force_val(&f.name, &s.val);
+                                continue;
+                            }
+                            match s.ptr.strip_prefix('@') {
+                                Some(g) => {
+                                    let dst_const =
+                                        m.globals.iter().any(|x| x.name == g && x.is_const);
+                                    if !dst_const && !spaces.contains(&format!("@{g}")) {
+                                        force_val(&f.name, &s.val);
+                                    }
+                                }
+                                // Spilling a const address through a pointer
+                                // (an alloca slot, a RAM global) reads back
+                                // through RAM: it keeps a copy like a direct
+                                // store (epic-cc#1119 review).
+                                None => {
+                                    force_val(&f.name, &s.val);
+                                }
+                            }
+                        }
+                        ir::Inst::Asm(a) => {
+                            for op in &a.operands {
+                                if let Some(name) = op.ptr.strip_prefix('@') {
+                                    force_val(&f.name, &ir::Val::Global(name.to_string()));
+                                }
+                            }
+                        }
+                        ir::Inst::Ret(Some((_, v)), _) => {
+                            force_val(&f.name, v);
+                        }
+                        ir::Inst::Select(s) if s.ptr => {
+                            if spaces.contains(&ssa_key(&f.name, &s.dst)) {
+                                continue;
+                            }
+                            force_val(&f.name, &s.a);
+                            force_val(&f.name, &s.b);
+                        }
+                        ir::Inst::Phi(p) if p.ptr => {
+                            if spaces.contains(&ssa_key(&f.name, &p.dst)) {
+                                continue;
+                            }
+                            for (v, _) in &p.incoming {
+                                force_val(&f.name, v);
+                            }
+                        }
+                        ir::Inst::Memcpy(_) => {
+                            // A memcpy into flash-derived space is refused
+                            // in isel either way; no copy can serve it.
+                        }
+                        ir::Inst::IntToPtr(_) => {
+                            // Integer-domain addresses are out of scope
+                            // (epic-cc#1119 follow-up).
+                        }
+                        ir::Inst::Freeze(_) => {
+                            // Uses of the frozen value force through
+                            // fan-in following; the freeze itself needs
+                            // no copy.
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Initializer refs into a RAM-kind global read back through RAM:
+        // their consts keep copies like stored ones.
+        for g in &m.globals {
+            if g.is_const || spaces.contains(&format!("@{}", g.name)) {
+                continue;
+            }
+            for (_, t, _) in &g.refs {
+                if live.contains(t) {
+                    bad.insert(t.clone());
+                }
+            }
+        }
+        if bad.is_empty() {
+            break;
+        }
+        for g in bad {
+            live.remove(&g);
+        }
+    }
+    (live, spaces)
+}
+
 /// Address allocation with a value-fold gate (epic-cc#863). `None`
 /// places every slot; `Some` drops the access-safe folds it names. The
 /// public `allocate` pairs a bounding pass with the gated one. The
@@ -3532,6 +3696,18 @@ fn allocate_inner(
     // generic pointer load (FSR/INDF through the param slot) reads the
     // literal correctly. Only small consts (<=255 bytes) are copied; larger
     // tables stay in flash.
+    // Flash-resident consts (epic-cc#1119, PIC18 only): every use sits in
+    // a flash-proven position, so they keep no RAM copy and isel lowers
+    // their walks through TBLPTR from the slot bytes. Other cores keep
+    // every copy: their backends still address staged copies and pools.
+    let (flash_resident, flash_spaces): (HashSet<String>, HashSet<String>) =
+        if device.core == Core::Pic18 {
+            flash_resident_consts(m, &resolved)
+        } else {
+            (HashSet::new(), HashSet::new())
+        };
+    let stays_flash = |g: &str| device.core == Core::Pic18 && flash_resident.contains(g);
+
     let mut const_globals: HashSet<String> = HashSet::new();
     let mut fixed: Vec<(String, u16, u16)> = Vec::new(); // (name, addr, size)
     let mut floating: Vec<&ir::Global> = Vec::new();
@@ -3649,7 +3825,22 @@ fn allocate_inner(
                             // A const whose address is stored into memory is
                             // read back through RAM pointers, which cannot name
                             // flash: it keeps a RAM copy like a phi incoming
-                            // (epic-cc#1223).
+                            // (epic-cc#1223). A flash-kind destination slot
+                            // instead takes the flash address whole, so its
+                            // const keeps no copy (epic-cc#1119).
+                            // Every const the stored value may carry keeps a
+                            // copy: derivations are followed, so a select or
+                            // phi of consts stored to RAM copies each arm.
+                            for g in const_fan_in(m, &resolved, &f.name, &s.val) {
+                                if let Some(gl) =
+                                    m.globals.iter().find(|gl| gl.name == g && gl.is_const)
+                                {
+                                    if gl.size <= 255 && !stays_flash(&g) {
+                                        const_to_ram.insert(g.clone());
+                                    }
+                                }
+                            }
+                            // Records stay syntactic (epic-cc#1223).
                             let stored = match &s.val {
                                 ir::Val::Global(g) => Some(g.clone()),
                                 ir::Val::Reg(r) => find_const_base(r).or_else(|| {
@@ -3664,9 +3855,8 @@ fn allocate_inner(
                                 if let Some(gl) =
                                     m.globals.iter().find(|gl| gl.name == g && gl.is_const)
                                 {
-                                    if gl.size <= 255 {
-                                        const_to_ram.insert(g.clone());
-                                        const_phi.insert(g);
+                                    if gl.size <= 255 && !stays_flash(&g) {
+                                        const_phi.insert(g.clone());
                                     }
                                 }
                             }
@@ -3687,6 +3877,45 @@ fn allocate_inner(
                             }
                         }
                         ir::Inst::Call(_) => {}
+                        ir::Inst::Ret(Some((_, v)), _) => {
+                            // A returned const address reads back through
+                            // the caller's RAM slot, which cannot name
+                            // flash: it keeps a RAM copy like a phi
+                            // incoming (epic-cc#1119).
+                            for g in const_fan_in(m, &resolved, &f.name, v) {
+                                if let Some(gl) =
+                                    m.globals.iter().find(|gl| gl.name == g && gl.is_const)
+                                {
+                                    if gl.size <= 255 {
+                                        const_to_ram.insert(g.clone());
+                                    }
+                                }
+                            }
+                            // Records stay syntactic.
+                            let base = match v {
+                                ir::Val::Global(g) => m
+                                    .globals
+                                    .iter()
+                                    .any(|gl| gl.name == *g && gl.is_const)
+                                    .then(|| g.clone()),
+                                ir::Val::Reg(r) => find_const_base(r).or_else(|| {
+                                    match resolved.get(&ssa_key(&f.name, r)) {
+                                        Some((Base::Global(cg), _, _)) => Some(cg.clone()),
+                                        _ => None,
+                                    }
+                                }),
+                                ir::Val::Const(_) => None,
+                            };
+                            if let Some(g) = base {
+                                if let Some(gl) =
+                                    m.globals.iter().find(|gl| gl.name == g && gl.is_const)
+                                {
+                                    if gl.size <= 255 {
+                                        const_phi.insert(g.clone());
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     // Every non-call instruction contributes read_vals uses
@@ -3712,7 +3941,7 @@ fn allocate_inner(
                                             if let Some(gl) =
                                                 m.globals.iter().find(|gl| &gl.name == g)
                                             {
-                                                if gl.size <= 255 {
+                                                if gl.size <= 255 && !stays_flash(g) {
                                                     const_to_ram.insert(g.clone());
                                                     // Byval/sret args copy
                                                     // bulk: never staging
@@ -3727,6 +3956,29 @@ fn allocate_inner(
                                         }
                                     }
                                     ir::Val::Reg(r) => {
+                                        // Every const the argument may carry
+                                        // keeps a copy: derivations are
+                                        // followed, so a select or phi of
+                                        // consts passed to RAM copies each
+                                        // arm. Bookkeeping below stays
+                                        // syntactic: a derived fan-in member
+                                        // must not poison staging for a
+                                        // directly recorded const.
+                                        for member in const_fan_in(m, &resolved, &f.name, &arg.val)
+                                        {
+                                            // Copies only: pool routing sees
+                                            // the use through the select and
+                                            // pool-gates when routable, so no
+                                            // reg record here may vote to
+                                            // keep (epic-cc#817).
+                                            if let Some(gl) =
+                                                m.globals.iter().find(|gl| gl.name == member)
+                                            {
+                                                if gl.size <= 255 && !stays_flash(&member) {
+                                                    const_to_ram.insert(member.clone());
+                                                }
+                                            }
+                                        }
                                         // A select of two arms on one const base has no GEP
                                         // chain, so fall back to the resolved base (epic-cc#1026).
                                         let base = find_const_base(r).or_else(|| {
@@ -3745,8 +3997,7 @@ fn allocate_inner(
                                             if let Some(gl) =
                                                 m.globals.iter().find(|gl| gl.name == base)
                                             {
-                                                if gl.size <= 255 {
-                                                    const_to_ram.insert(base.clone());
+                                                if gl.size <= 255 && !stays_flash(&base) {
                                                     const_derived.insert(base.clone());
                                                     const_reg_uses
                                                         .entry(base)
@@ -3839,6 +4090,19 @@ fn allocate_inner(
                         if arms[0].0 != arms[1].0 {
                             let mut direct_arms: Vec<String> = Vec::new();
                             for ((base, is_direct), v) in arms.into_iter().zip([&s.a, &s.b]) {
+                                // Copies follow derivations: a select arm that
+                                // is itself a select or phi of consts copies
+                                // each const behind it.
+                                for g in const_fan_in(m, &resolved, &f.name, v) {
+                                    if let Some(gl) = m.globals.iter().find(|gl| gl.name == g) {
+                                        if gl.size <= 255 && !stays_flash(&g) {
+                                            const_to_ram.insert(g.clone());
+                                        }
+                                    }
+                                }
+                                // Records stay syntactic: pool and staging
+                                // bookkeeping below must not see derived
+                                // fan-in members (epic-cc#817, epic-cc#790).
                                 let Some(g) = base else { continue };
                                 // A GEP/reg-derived arm needs a real address
                                 // and keeps a RAM copy; a directly named arm
@@ -3846,8 +4110,7 @@ fn allocate_inner(
                                 // the arm reads back through the select's
                                 // indirect slot, so gating never drops it.
                                 if let Some(gl) = m.globals.iter().find(|gl| gl.name == g) {
-                                    if gl.size <= 255 {
-                                        const_to_ram.insert(g.clone());
+                                    if gl.size <= 255 && !stays_flash(&g) {
                                         const_sel.insert(g.clone());
                                         if is_direct {
                                             const_direct.insert(g.clone());
@@ -3879,12 +4142,31 @@ fn allocate_inner(
                     // seeds the phi as an indirect slot, and every read through
                     // it derefs RAM (the LSR chase shape, epic-cc#811). Without
                     // a copy the slot holds a flash label and the walk reads RAM
-                    // there (epic-cc#1197, epic-cc#1203). The copy is never
-                    // staged (the buffer is clobbered mid-walk) or pool-gated.
-                    // Over 255 bytes no copy exists and isel refuses the walk.
+                    // there (epic-cc#1197, epic-cc#1203). On PIC18 a phi the
+                    // slot proof covers keeps no copy and reads through
+                    // TBLPTR instead; a mixed phi still copies (epic-cc#1119).
+                    // The copy is never staged (the buffer is clobbered
+                    // mid-walk) or pool-gated. Over 255 bytes no copy exists
+                    // and isel refuses the walk.
                     if let ir::Inst::Phi(p) = inst {
                         if p.ptr {
                             for (v, _) in &p.incoming {
+                                // Copies follow derivations: a phi over
+                                // selects or phis of consts copies each
+                                // const behind them.
+                                for g in const_fan_in(m, &resolved, &f.name, v) {
+                                    let small =
+                                        m.globals.iter().any(|gl| gl.name == g && gl.size <= 255);
+                                    if small && matches!(device.core, Core::Pic14 | Core::Pic14e) {
+                                        const_to_ram.insert(g.clone());
+                                    }
+                                    if small && device.core == Core::Pic18 && !stays_flash(&g) {
+                                        const_to_ram.insert(g.clone());
+                                    }
+                                }
+                                // Records stay syntactic: pool and staging
+                                // bookkeeping below must not see derived
+                                // fan-in members (epic-cc#816).
                                 let base = match v {
                                     ir::Val::Global(g) => {
                                         if m.globals.iter().any(|gl| &gl.name == g && gl.is_const) {
@@ -3900,13 +4182,32 @@ fn allocate_inner(
                                     let small =
                                         m.globals.iter().any(|gl| gl.name == g && gl.size <= 255);
                                     if small && matches!(device.core, Core::Pic14 | Core::Pic14e) {
-                                        const_to_ram.insert(g.clone());
                                         const_derived.insert(g.clone());
                                     }
                                     const_phi.insert(g);
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+    // Initializer refs into a RAM-kind global read back through RAM on
+    // PIC18: their consts keep the copies the fixpoint forced
+    // (epic-cc#1119 review). Flash-kind globals keep none.
+    if device.core == Core::Pic18 {
+        for g in &m.globals {
+            if g.is_const || flash_spaces.contains(&format!("@{}", g.name)) {
+                continue;
+            }
+            for (_, t, _) in &g.refs {
+                if t.starts_with("_ZTV") {
+                    continue;
+                }
+                if let Some(gl) = m.globals.iter().find(|x| x.name == *t && x.is_const) {
+                    if gl.size <= 255 {
+                        const_to_ram.insert(t.clone());
                     }
                 }
             }

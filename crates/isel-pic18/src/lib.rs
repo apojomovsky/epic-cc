@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use device::Device;
 use ir::{Block, Func, Icmp, Inst, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    add_flash_walks, flash_provenance, resolve_pointers, ssa_key, Base, FlashProvenance,
-    PtrResolution, Slot,
+    add_flash_walks, flash_provenance, flash_slot_spaces, resolve_pointers, ssa_key, Base,
+    FlashProvenance, PtrResolution, Slot,
 };
 
 /// The high Access Bank segment's start: every classic-mode PIC18's SFRs
@@ -376,6 +376,12 @@ struct Gen<'m> {
     /// `iselcore::flash_provenance`: regs holding vtable-derived flash
     /// addresses lower through runtime `TBLRD` (epic-cc#832).
     prov: FlashProvenance,
+    /// Static address space of every pointer slot, computed once per
+    /// module by `iselcore::flash_slot_spaces`: `{func}::{slot}` for
+    /// params and phi/select/gep/load-ptr dsts, `@{global}` for globals.
+    /// A member slot holds only flash table addresses or null, so loads
+    /// through it seed `TBLPTR` from the slot bytes (epic-cc#1119).
+    slot_flash: HashSet<String>,
     /// Fixed, `BSR`-independent return-value region (up to 4 bytes, from `device.fixed_retval`).
     /// Holds call results independent of the bank selection.
     retval_lo: u16,
@@ -7007,6 +7013,91 @@ impl<'m> Gen<'m> {
         self.m.funcs.iter().any(|f| f.name == name)
     }
 
+    /// Whether slot `slot` of `func` is flash-kind: every address it can
+    /// hold is a flash table address or null (epic-cc#1119).
+    fn slot_is_flash(&self, func: &str, slot: &str) -> bool {
+        self.slot_flash.contains(&ssa_key(func, slot))
+    }
+
+    /// Whether global `name` is a flash-kind pointer slot.
+    fn global_slot_is_flash(&self, name: &str) -> bool {
+        self.slot_flash.contains(&format!("@{name}"))
+    }
+
+    /// Whether `v` evaluates to a flash address or null in `func`: a flash
+    /// const global, a proven flash or flash-kind reg, a GEP over a flash
+    /// const, or a null constant. RAM addresses, functions, and unproven
+    /// shapes are false. Callers use it to route values into flash-kind
+    /// slots and to refuse flash values bound for RAM slots.
+    fn flash_val(&self, func: &str, v: &Val) -> bool {
+        match v {
+            Val::Global(g) => !self.is_function(g) && self.global_is_const(g),
+            Val::Reg(r) => {
+                let key = ssa_key(func, r);
+                if self.prov.flash.contains(&key) || self.slot_flash.contains(&key) {
+                    return true;
+                }
+                matches!(
+                    self.resolved.get(&key),
+                    Some((Base::Global(n), _, _)) if self.global_is_const(n)
+                )
+            }
+            Val::Const(0) => true,
+            Val::Const(_) => false,
+        }
+    }
+
+    /// Store the flash address value `val` into the slot at `dst`: static
+    /// addresses materialize as `LOW`/`HIGH` literals through the shared
+    /// move, dynamic ones seed `TBLPTR` first and store its low bytes (the
+    /// upper byte stays zero by the slot-seed convention). The seed
+    /// clobbers any tracked static `TBLPTR` position.
+    fn emit_flash_addr_store(&mut self, val: &Val, ty: Ty, dst: u16) {
+        self.invalidate_fsr0_if_slot_written(dst, u16::from(ty.bytes()));
+        match val {
+            Val::Global(_) => self.emit_move_val_to_slot(val, ty, dst),
+            Val::Reg(r) => {
+                let (base, k, terms) = self.resolved_for(r);
+                match &base {
+                    Base::Global(name)
+                        if self.global_is_const(name) && matches!(terms.as_slice(), [] | [(1, _)]) =>
+                    {
+                        self.emit_move_val_to_slot(val, ty, dst);
+                    }
+                    Base::Global(name) if self.global_is_const(name) => {
+                        self.emit_tblptr_setup(name, k, &terms, 0);
+                        self.tblptr_holds = None;
+                        self.emit_copy_byte(0xF6, dst);
+                        self.emit_copy_byte(0xF7, dst + 1);
+                    }
+                    Base::Slot(sname, _) => {
+                        let sa = self.slot_addr(self.cur_func, sname).direct();
+                        if k == 0 && terms.is_empty() {
+                            for i in 0..ty.bytes() {
+                                self.emit_copy_byte(
+                                    sa + u16::from(i),
+                                    dst + u16::from(i),
+                                );
+                            }
+                        } else {
+                            self.emit_flash_tblptr_seed(sa, k);
+                            self.add_dynamic_to_tblptr(&terms, None);
+                            self.tblptr_holds = None;
+                            self.emit_copy_byte(0xF6, dst);
+                            self.emit_copy_byte(0xF7, dst + 1);
+                        }
+                    }
+                    _ => panic!(
+                        "isel-pic18: flash address value %{r} has no flash form for a slot store (epic-cc#1119)"
+                    ),
+                }
+            }
+            _ => panic!(
+                "isel-pic18: flash address value {val:?} has no flash form for a slot store (epic-cc#1119)"
+            ),
+        }
+    }
+
     /// Whether `reg` is a byte-widening 2-byte `Zext` dst in `f`: its
     /// high lane is exactly zero by construction, so no consumer ever
     /// needs the slot's high byte. Lane-wise `Bin` dsts are excluded:
@@ -7173,12 +7264,21 @@ impl<'m> Gen<'m> {
 
     /// Names the walk-phi slot that a runtime-indexed gep over `key` reads through,
     /// when that slot may hold a flash address (flash or maybe-flash, epic-cc#1091,
-    /// epic-cc#1099). Such a gep has no provenance key of its own.
+    /// epic-cc#1099, or a flash-kind slot, epic-cc#1119). Such a gep has no
+    /// provenance key of its own. Plain-param slots seed like indirect ones:
+    /// their bytes are the address (epic-cc#1127).
     fn maybe_flash_slot_under_index(&self, key: &str) -> Option<String> {
         match self.resolved.get(key) {
             Some((Base::Slot(sname, true), _, terms)) if !terms.is_empty() => {
                 let sk = ssa_key(self.cur_func, sname);
-                (self.prov.flash.contains(&sk) || self.prov.mixed.contains(&sk))
+                (self.prov.flash.contains(&sk)
+                    || self.prov.mixed.contains(&sk)
+                    || self.slot_flash.contains(&sk))
+                .then(|| sname.clone())
+            }
+            Some((Base::Slot(sname, false), _, terms)) if !terms.is_empty() => {
+                let sk = ssa_key(self.cur_func, sname);
+                (self.prov.flash.contains(&sk) || self.slot_flash.contains(&sk))
                     .then(|| sname.clone())
             }
             _ => None,
@@ -8064,7 +8164,7 @@ impl<'m> Gen<'m> {
         // FSR1 would read RAM at a flash address.
         if let Val::Reg(r) = &mc.src {
             let key = ssa_key(self.cur_func, r);
-            if self.prov.flash.contains(&key) {
+            if self.prov.flash.contains(&key) || self.slot_flash.contains(&key) {
                 let (sname, k) = match self.resolved.get(&key) {
                     Some((Base::Slot(sname, true), k, terms)) => {
                         if !terms.is_empty() {
@@ -8072,6 +8172,11 @@ impl<'m> Gen<'m> {
                                 "isel-pic18: memcpy from a runtime-indexed walk over flash pointer %{sname} is not supported (epic-cc#1091, epic-cc#1100)"
                             );
                         }
+                        (sname.clone(), *k)
+                    }
+                    Some((Base::Slot(sname, false), k, terms))
+                        if self.slot_is_flash(self.cur_func, sname) && terms.is_empty() =>
+                    {
                         (sname.clone(), *k)
                     }
                     _ => panic!(
@@ -8108,7 +8213,10 @@ impl<'m> Gen<'m> {
         }
         if let Val::Reg(r) = dst {
             let key = ssa_key(self.cur_func, r);
-            if self.prov.flash.contains(&key) || self.prov.mixed.contains(&key) {
+            if self.prov.flash.contains(&key)
+                || self.prov.mixed.contains(&key)
+                || self.slot_flash.contains(&key)
+            {
                 panic!(
                     "isel-pic18: ROM is not writable: memcpy into flash-derived address %{r} (epic-cc#1100)"
                 );
@@ -8133,6 +8241,7 @@ impl<'m> Gen<'m> {
                 let key = ssa_key(self.cur_func, r);
                 self.prov.flash.contains(&key)
                     || self.prov.mixed.contains(&key)
+                    || self.slot_flash.contains(&key)
                     || self.maybe_flash_slot_under_index(&key).is_some()
             }
             _ => false,
@@ -9271,6 +9380,39 @@ impl<'m> Gen<'m> {
                             "    MOVWF 0x{f1:03X},{}",
                             if a1 == 0 { "A" } else { "B" }
                         ));
+                    } else if self.global_is_const(g) {
+                        // A flash const with no RAM copy passes its table
+                        // address: byte 0 = LOW(g), byte 1 = HIGH(g), the
+                        // same label literals a function address uses. A
+                        // RAM-kind param cannot take it: refuse, keeping
+                        // the over-255 user error for big tables
+                        // (epic-cc#1119).
+                        if !self.slot_is_flash(func, &callee.params[i].name) {
+                            let big = self
+                                .m
+                                .globals
+                                .iter()
+                                .find(|gl| gl.name == *g)
+                                .is_some_and(|gl| gl.size > 255);
+                            if big {
+                                missing_global_addr(self.m, self.cur_func, g);
+                            }
+                            panic!(
+                                "isel-pic18: cannot pass flash address @{g} to a RAM pointer param (epic-cc#1119)"
+                            );
+                        }
+                        let (a0, f0) = self.operand(pa);
+                        self.emit(format!("    MOVLW LOW({g})"));
+                        self.emit(format!(
+                            "    MOVWF 0x{f0:03X},{}",
+                            if a0 == 0 { "A" } else { "B" }
+                        ));
+                        let (a1, f1) = self.operand(pa + 1);
+                        self.emit(format!("    MOVLW HIGH({g})"));
+                        self.emit(format!(
+                            "    MOVWF 0x{f1:03X},{}",
+                            if a1 == 0 { "A" } else { "B" }
+                        ));
                     } else {
                         let addr = self.global_addr(g);
                         let (a0, f0) = self.operand(pa);
@@ -9287,12 +9429,50 @@ impl<'m> Gen<'m> {
                         ));
                     }
                 } else if let Val::Reg(r) = &arg.val {
-                    // A runtime pointer value (a `load ptr` result, e.g.
-                    // the taskmgr `t->arg` field): the two address bytes
-                    // live in the reg's slot. Copy them into the param
-                    // slot; the callee's FSR-based deref resolves the
-                    // address at runtime. (epic-cc#155)
-                    if !self.resolved.contains_key(&ssa_key(self.cur_func, r)) {
+                    // A flash address bound for a RAM param slot would read back
+                    // through FSR: refuse, and likewise a maybe-flash one
+                    // (epic-cc#1099). A flash-kind param takes the bytes
+                    // whole; slot-based values copy as before, a static flash
+                    // base materializes as LOW/HIGH, a dynamic one seeds
+                    // TBLPTR first (epic-cc#1119).
+                    let vflash = self.flash_val(self.cur_func, &arg.val);
+                    let vmixed = self.prov.mixed.contains(&ssa_key(self.cur_func, r));
+                    let param_flash = self.slot_is_flash(func, &callee.params[i].name);
+                    if vflash && !param_flash {
+                        panic!(
+                            "isel-pic18: cannot pass flash address %{r} to a RAM pointer param (epic-cc#1119)"
+                        );
+                    }
+                    if vmixed {
+                        panic!(
+                            "isel-pic18: cannot pass maybe-flash address %{r} to a pointer param (a pointer joins flash and RAM; epic-cc#1099, epic-cc#1119)"
+                        );
+                    }
+                    let flash_base = if vflash {
+                        match self.resolved_for(r) {
+                            (Base::Global(tname), kk, tterms) if self.global_is_const(&tname) => {
+                                Some((tname, kk, tterms))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((name, k, terms)) = flash_base {
+                        if matches!(terms.as_slice(), [] | [(1, _)]) {
+                            self.emit_move_val_to_slot(&arg.val, Ty::I16, pa);
+                        } else {
+                            self.emit_tblptr_setup(&name, k, &terms, 0);
+                            self.tblptr_holds = None;
+                            self.emit_copy_byte(0xF6, pa);
+                            self.emit_copy_byte(0xF7, pa + 1);
+                        }
+                    } else if !self.resolved.contains_key(&ssa_key(self.cur_func, r)) {
+                        // A runtime pointer value (a `load ptr` result, e.g.
+                        // the taskmgr `t->arg` field): the two address bytes
+                        // live in the reg's slot. Copy them into the param
+                        // slot; the callee's FSR-based deref resolves the
+                        // address at runtime. (epic-cc#155)
                         let sa = self.slot_addr(self.cur_func, r).direct();
                         self.emit_copy_byte(sa, pa);
                         self.emit_copy_byte(sa + 1, pa + 1);
@@ -9938,18 +10118,26 @@ impl<'m> Gen<'m> {
                 }
                 // A load through a vptr-derived reg reads program memory:
                 // seed `TBLPTR` from the reg's two bytes and `TBLRD` each
-                // byte (epic-cc#832). A maybe-flash reg is a shape the
-                // runtime sequence does not serve: panic, never emit a
-                // data-memory read of a flash address.
+                // byte (epic-cc#832). A reg in a flash-kind slot reads the
+                // same way: the slot bytes are a flash address or null
+                // (epic-cc#1119). A maybe-flash reg is a shape the runtime
+                // sequence does not serve: panic, never emit a data-memory
+                // read of a flash address.
                 if let Val::Reg(r) = &ptr_val {
                     let key = ssa_key(self.cur_func, r);
-                    if self.prov.flash.contains(&key) {
+                    if self.prov.flash.contains(&key) || self.slot_flash.contains(&key) {
                         // A walk gep or a select that folds onto a walk phi has no
                         // slot of its own: read through the phi's slot at the folded
                         // offset. Each runtime term (a loop index over the phi) is added
                         // to TBLPTR from the slot, then TBLRDs per byte (epic-cc#1101).
+                        // A plain ptr param's slot holds the address the same way.
                         let (sname, k, terms) = match self.resolved.get(&key) {
                             Some((Base::Slot(sname, true), k, terms)) => {
+                                (sname.clone(), *k, terms.clone())
+                            }
+                            Some((Base::Slot(sname, false), k, terms))
+                                if self.slot_is_flash(self.cur_func, sname) =>
+                            {
                                 (sname.clone(), *k, terms.clone())
                             }
                             _ => panic!(
@@ -10031,14 +10219,17 @@ impl<'m> Gen<'m> {
                     }
                 }
                 // A ROM address has no RAM form: a later load through the stored
-                // slot reads RAM at that address, silently wrong. Refused until
-                // flash pointers can live in RAM (epic-cc#1101).
+                // slot reads RAM at that address, silently wrong. A flash-kind
+                // slot takes it whole (epic-cc#1119); anything else still
+                // refuses (epic-cc#1101). A maybe-flash address has no single
+                // space either: storing it anywhere is refused (epic-cc#1099).
                 let stores_rom = match &s.val {
                     Val::Global(g) => self.global_is_const(g),
-                    Val::Reg(r) => matches!(
-                        self.resolved.get(&ssa_key(self.cur_func, r)),
-                        Some((Base::Global(g), _, _)) if self.global_is_const(g)
-                    ),
+                    Val::Reg(_) => self.flash_val(self.cur_func, &s.val),
+                    _ => false,
+                };
+                let stores_mixed = match &s.val {
+                    Val::Reg(r) => self.prov.mixed.contains(&ssa_key(self.cur_func, r)),
                     _ => false,
                 };
                 // A const destination is a ROM write: leave it to the const-base refusal below.
@@ -10046,7 +10237,25 @@ impl<'m> Gen<'m> {
                     .ptr
                     .strip_prefix('@')
                     .is_some_and(|g| self.global_is_const(g));
-                if stores_rom && !dst_is_const {
+                if (stores_rom || stores_mixed) && !dst_is_const {
+                    if let Some(g) = s.ptr.strip_prefix('@') {
+                        if self.global_slot_is_flash(g) {
+                            if stores_rom {
+                                let dst = self.global_addr(g);
+                                self.emit_flash_addr_store(&s.val, s.ty, dst);
+                                return;
+                            }
+                            panic!(
+                                "isel-pic18: store of a maybe-flash address into a flash-kind slot is not supported (epic-cc#1099, epic-cc#1119)"
+                            );
+                        }
+                    }
+                    if stores_mixed {
+                        panic!(
+                            "isel-pic18: store of a maybe-flash address {:?} is not supported (a pointer joins flash and RAM; epic-cc#1099, epic-cc#1119)",
+                            s.val
+                        );
+                    }
                     panic!(
                         "isel-pic18: store of a ROM address into RAM is not supported: {:?} (epic-cc#1101)",
                         s.val
@@ -10115,7 +10324,10 @@ impl<'m> Gen<'m> {
                 // above, never emit it as a RAM write (epic-cc#832).
                 if let Val::Reg(r) = &ptr_val {
                     let key = ssa_key(self.cur_func, r);
-                    if self.prov.flash.contains(&key) || self.prov.mixed.contains(&key) {
+                    if self.prov.flash.contains(&key)
+                        || self.prov.mixed.contains(&key)
+                        || self.slot_flash.contains(&key)
+                    {
                         panic!(
                             "isel-pic18: ROM is not writable: store through flash-derived address %{r} (epic-cc#832)"
                         );
@@ -16724,6 +16936,13 @@ pub fn select_with_opts(
     add_flash_walks(&mut prov, m, |n| {
         !n.starts_with("_ZTV") && is_flash_const_global(m, addrs, n)
     });
+    // Static address space of every pointer slot (epic-cc#1119): a slot
+    // whose writers are all flash addresses or null lowers its loads
+    // through `TBLPTR` seeded from the slot bytes. Same flash predicate
+    // as the walks above, so both proofs agree on what lives in flash.
+    let slot_flash = flash_slot_spaces(m, &resolved, &prov, |n| {
+        !n.starts_with("_ZTV") && is_flash_const_global(m, addrs, n)
+    });
     // Priority ISRs (epic-cc#346): at most one handler per vector. A lone
     // handler of any priority keeps the P5 compatibility wiring (body at
     // the 0x0008 vector, fixed save block); a high/low pair uses priority
@@ -16805,6 +17024,7 @@ pub fn select_with_opts(
                 packed_bits: packed,
                 resolved: &resolved,
                 prov: prov.clone(),
+                slot_flash: slot_flash.clone(),
                 retval_lo: common_lo,
                 access_bank_hi,
                 bsr: None,
@@ -16893,6 +17113,7 @@ pub fn select_with_opts(
             packed_bits: packed,
             resolved: &resolved,
             prov: prov.clone(),
+            slot_flash: slot_flash.clone(),
             retval_lo: common_lo,
             access_bank_hi,
             bsr: None,
@@ -17907,9 +18128,23 @@ pub fn select_with_opts(
                 }
                 Some(Inst::Ret(Some((ty, v)), loc)) => {
                     g.cur_loc = loc.clone();
-                    // A call result homed into the retval region (epic-cc#738)
-                    // is already home: the load/store round trip is a
-                    // self-copy through W, so skip it like any coalesced one.
+                    // A flash address has no RAM form for the caller: its
+                    // call-dst slot would read RAM at that address. Refuse,
+                    // and likewise a maybe-flash one (epic-cc#1099).
+                    // (alloc copies returned consts to RAM, epic-cc#1119).
+                    // A null constant is space-neutral and stays allowed.
+                    if !matches!(v, Val::Const(_)) && g.flash_val(&f.name, v) {
+                        panic!(
+                            "isel-pic18: cannot return flash address {v:?} to a RAM caller (epic-cc#1119)"
+                        );
+                    }
+                    if let Val::Reg(r) = v {
+                        if g.prov.mixed.contains(&ssa_key(&f.name, r)) {
+                            panic!(
+                                "isel-pic18: cannot return maybe-flash address %{r} to a caller (a pointer joins flash and RAM; epic-cc#1099, epic-cc#1119)"
+                            );
+                        }
+                    }
                     let home = match v {
                         Val::Reg(r) => g.addrs.get(&ssa_key(&f.name, r)).copied(),
                         _ => None,
@@ -17974,6 +18209,7 @@ pub fn select_with_opts(
             packed_bits: packed,
             resolved: &resolved,
             prov: prov.clone(),
+            slot_flash: slot_flash.clone(),
             retval_lo: common_lo,
             access_bank_hi,
             bsr: None,
@@ -18407,6 +18643,7 @@ mod tests {
                 packed_bits: empty_packed_bits(),
                 resolved: &resolved,
                 prov: FlashProvenance::default(),
+                slot_flash: HashSet::new(),
                 retval_lo: 0,
                 access_bank_hi: 0x5F,
                 bsr: None,
@@ -18461,6 +18698,7 @@ mod tests {
                 packed_bits: empty_packed_bits(),
                 resolved: &resolved,
                 prov: FlashProvenance::default(),
+                slot_flash: HashSet::new(),
                 retval_lo: 0,
                 access_bank_hi: 0x5F,
                 bsr: None,
@@ -18609,6 +18847,7 @@ mod p3_gen_tests {
             packed_bits: empty_packed_bits(),
             resolved,
             prov: FlashProvenance::default(),
+            slot_flash: HashSet::new(),
             retval_lo: 0,
             access_bank_hi: 0x5F,
             bsr: None,
