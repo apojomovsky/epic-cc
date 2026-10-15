@@ -64,6 +64,5 @@ divide in the emitted code.
 - `epic-menu-demo`'s epic-cc leg produces a full session with
   `EPIC_HARNESS_RESULT: PASS`; its SPBRG reads 1249 (`0x04E1`) under MPLAB
   SIM where it read the `0xFFFF` sentinel. The remaining XC8/epic-cc UART
-  divergence is the fired-stimulus tick values only (`0005 000A 000F 0014
-  0019` versus XC8's `0005 001A 001A 001A 001A`), a timing difference the
-  harness already documents as non-asserted, filed separately.
+  divergence is the fired-stimulus tick values only, a timing difference
+  the harness already documents as non-asserted, filed separately.
