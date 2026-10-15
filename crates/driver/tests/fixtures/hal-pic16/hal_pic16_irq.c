@@ -1,4 +1,4 @@
-/* Vendored slice of the real epic-hal pic16f87xa-hal IRQ controller
+/* Vendored slice of the real epic-hal hal/pic14/16f87xa IRQ controller
  * (DS39582B §14.11), adapted to compile under epic-cc. The const
  * `irq_table` is the regression shape of epic-cc#114: a static const
  * array of a named struct, read by field, must emit its real

@@ -1,6 +1,6 @@
-/* Vendored slice of the real epic-hal pic18fxx5x-hal Timer2 driver
+/* Vendored slice of the real epic-hal hal/pic18/18fxx5x Timer2 driver
  * (DS39632E §12.0), adapted to compile under epic-cc. Timer2 is the
- * auto-reload 1 ms timebase of epic-tick: PR2 period, prescaler, and a
+ * auto-reload 1 ms timebase of `lib/tick`: PR2 period, prescaler, and a
  * postscaler, with TMR2IF firing on each PR2 match.
  *
  * Adapted around two open backend gaps (see hal_pic18.h): the real driver

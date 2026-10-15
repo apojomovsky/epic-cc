@@ -1,4 +1,4 @@
-/* Vendored slice of the real epic-hal pic16f87xa-hal for the PIC16F877A,
+/* Vendored slice of the real epic-hal hal/pic14/16f87xa for the PIC16F877A,
  * adapted to compile and run under epic-cc. This is the epic-cc variant of
  * the HAL's SFR/GPIO/Timer0/IRQ layer, reduced to the slice the callback
  * e2e needs: GPIO on RB0, Timer0 with a cross-context overflow callback,
