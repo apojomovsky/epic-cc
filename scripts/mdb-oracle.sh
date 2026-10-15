@@ -61,7 +61,7 @@ cc_bin() {
 hal_mdb() {
   if [ -n "${MDB_ORACLE_HAL_IMAGE:-}" ]; then
     docker run --rm -v "$HAL:/repo" -w /repo "$MDB_ORACLE_HAL_IMAGE" \
-      scripts/mdb-hex-run.sh "$1" "$2" "$3" "$4" > "$5" 2>&1
+      scripts/sim/mdb-hex-run.sh "$1" "$2" "$3" "$4" > "$5" 2>&1
   else
     make -C "$HAL" mdb-hex HEX="$1" DEVICE="$2" WAIT_MS="$3" EXTRA_MDB="$4" > "$5" 2>&1
   fi
