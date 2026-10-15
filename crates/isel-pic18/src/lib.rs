@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use device::Device;
 use ir::{Block, Func, Icmp, Inst, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    add_flash_walks, flash_provenance, flash_slot_spaces, resolve_pointers, ssa_key, Base,
-    FlashProvenance, PtrResolution, Slot,
+    add_flash_laundering, add_flash_walks, flash_provenance, flash_slot_spaces_ex,
+    resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot,
 };
 
 /// The high Access Bank segment's start: every classic-mode PIC18's SFRs
@@ -11110,6 +11110,18 @@ impl<'m> Gen<'m> {
                     !matches!(p.val, Val::Const(_)),
                     "isel-pic18: const source IntToPtr not yet supported"
                 );
+                // A flash table address copied through integers would be
+                // dereferenced as RAM: refuse (epic-cc#1284).
+                let launders = match &p.val {
+                    Val::Reg(r) => self.prov.int_flash.contains(&ssa_key(self.cur_func, r)),
+                    Val::Global(n) => self.prov.int_flash.contains(&format!("@{n}")),
+                    Val::Const(_) => false,
+                };
+                assert!(
+                    !launders,
+                    "isel-pic18: inttoptr of %{} may carry a flash address laundered through an integer; a dereference would read RAM, not program memory (epic-cc#1284, epic-cc#1119)",
+                    p.dst
+                );
                 let src = self.val_addr(&p.val).direct();
                 let dst = self.slot_addr(self.cur_func, &p.dst).direct();
                 for i in 0..p.from.bytes() {
@@ -16940,7 +16952,13 @@ pub fn select_with_opts(
     // whose writers are all flash addresses or null lowers its loads
     // through `TBLPTR` seeded from the slot bytes. Same flash predicate
     // as the walks above, so both proofs agree on what lives in flash.
-    let slot_flash = flash_slot_spaces(m, &resolved, &prov, |n| {
+    let (slot_flash, slot_mixed) = flash_slot_spaces_ex(m, &resolved, &prov, |n| {
+        !n.starts_with("_ZTV") && is_flash_const_global(m, addrs, n)
+    });
+    // Flash addresses laundered through integers or read back from
+    // maybe-flash slots (epic-cc#1284): marked so the backend refuses
+    // rather than dereferencing a table address as RAM.
+    add_flash_laundering(&mut prov, m, &resolved, &slot_flash, &slot_mixed, |n| {
         !n.starts_with("_ZTV") && is_flash_const_global(m, addrs, n)
     });
     // Priority ISRs (epic-cc#346): at most one handler per vector. A lone

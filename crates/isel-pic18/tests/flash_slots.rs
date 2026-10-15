@@ -418,3 +418,94 @@ fn mixed_select_returned_is_refused() {
         None,
     );
 }
+
+#[test]
+#[should_panic(expected = "laundered through an integer")]
+fn int_laundered_flash_address_is_refused() {
+    // epic-cc#1284: a flash-kind slot read as `i16` and `inttoptr`ed back
+    // would be dereferenced as RAM at the table address. Refuse.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("main::x", 0x13),
+            ("main::p", 0x15),
+            ("main::v", 0x17),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "laundered through an integer")]
+fn int_laundered_through_second_global_is_refused() {
+    // The integer copy travels through another global and a trunc/zext.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    store i16 %x @h\n    %y = load i16 @h\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x12),
+            ("out", 0x14),
+            ("main::x", 0x15),
+            ("main::y", 0x17),
+            ("main::p", 0x19),
+            ("main::v", 0x1b),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "maybe-flash address")]
+fn mixed_global_pointer_load_is_refused() {
+    // epic-cc#1284: `const char *g = "lit"; g = buf;` holds a flash
+    // address (initializer) on one path and a RAM one on another. The
+    // loaded pointer has no single space: refuse the dereference instead
+    // of reading RAM at a table address.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %q = gep @buf +0\n    store ptr %q @g\n    %p = load ptr @g\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" {
+            g.bytes = vec![1, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("buf", 0x12),
+            ("out", 0x13),
+            ("main::q", 0x14),
+            ("main::p", 0x16),
+            ("main::v", 0x18),
+        ]),
+        None,
+    );
+}

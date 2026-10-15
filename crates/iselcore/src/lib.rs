@@ -1614,6 +1614,11 @@ pub fn callee_reads_param(m: &Module, callee: &str, idx: usize) -> bool {
 pub struct FlashProvenance {
     pub flash: HashSet<String>,
     pub mixed: HashSet<String>,
+    /// Integer regs (`{func}::{reg}`) and integer globals (`@{name}`) that
+    /// may carry a flash table address laundered through the integer
+    /// domain (epic-cc#1284). An `inttoptr` of one would dereference the
+    /// table address as RAM, so the backend refuses it.
+    pub int_flash: HashSet<String>,
 }
 
 /// One ultimate address base behind a pointer value: a global plus a
@@ -2051,6 +2056,19 @@ pub fn flash_slot_spaces(
     prov: &FlashProvenance,
     is_flash_const: impl Fn(&str) -> bool,
 ) -> HashSet<String> {
+    flash_slot_spaces_ex(m, resolved, prov, is_flash_const).0
+}
+
+/// `flash_slot_spaces` plus the maybe-flash slots: those that can hold a
+/// flash table address on some path and a RAM (or unknown) one on another,
+/// so no single space applies (epic-cc#1284). Loads of such a slot must
+/// never be dereferenced as RAM.
+pub fn flash_slot_spaces_ex(
+    m: &Module,
+    resolved: &PtrResolution,
+    prov: &FlashProvenance,
+    is_flash_const: impl Fn(&str) -> bool,
+) -> (HashSet<String>, HashSet<String>) {
     let is_func = |n: &str| m.funcs.iter().any(|f| f.name == n);
     // Candidate slots: plain ptr params plus every reg that can hold an
     // address (ptr phis/selects, geps, ptr loads). byval/sret params hold
@@ -2495,7 +2513,223 @@ pub fn flash_slot_spaces(
             }
         }
     }
-    live.intersection(&grounded).cloned().collect()
+    let flash: HashSet<String> = live.intersection(&grounded).cloned().collect();
+    // Least fixpoint of "may hold a flash address": a flash writer, or a
+    // delegate that may. Whatever is not flash-kind is maybe-flash.
+    let mut may: HashSet<String> = writers
+        .iter()
+        .filter(|(_, ws)| ws.iter().any(|w| matches!(w, SlotWriter::Src)))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (k, ws) in &writers {
+            if may.contains(k) {
+                continue;
+            }
+            if ws
+                .iter()
+                .any(|w| matches!(w, SlotWriter::Node(n) if may.contains(n)))
+            {
+                may.insert(k.clone());
+                grew = true;
+            }
+        }
+    }
+    let mixed: HashSet<String> = may.difference(&flash).cloned().collect();
+    (flash, mixed)
+}
+
+/// Mark the results of pointer loads from maybe-flash slots as mixed
+/// (they carry flash or RAM per path, epic-cc#1284), propagate through
+/// pointer derivations, and compute the integer-domain flash taint. Call
+/// after `flash_slot_spaces_ex`; `slot_flash` and `slot_mixed` are its
+/// two sets.
+pub fn add_flash_laundering(
+    prov: &mut FlashProvenance,
+    m: &Module,
+    resolved: &PtrResolution,
+    slot_flash: &HashSet<String>,
+    slot_mixed: &HashSet<String>,
+    is_flash_const: impl Fn(&str) -> bool,
+) {
+    // Slot key a load/store pointer operand names, if any.
+    let slot_of = |func: &str, ptr: &str| -> Option<String> {
+        if let Some(g) = ptr.strip_prefix('@') {
+            return Some(format!("@{g}"));
+        }
+        let r = ptr.strip_prefix('%')?;
+        match resolved.get(&ssa_key(func, r)) {
+            Some((Base::Global(g), _, _)) => Some(format!("@{g}")),
+            Some((Base::Slot(sname, _), _, _)) => Some(ssa_key(func, sname)),
+            None => None,
+        }
+    };
+    let global_of = |func: &str, ptr: &str| -> Option<String> {
+        slot_of(func, ptr).filter(|k| k.starts_with('@'))
+    };
+    // Pointer loads from a maybe-flash slot, then derivations of them.
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Load(l) = i {
+                    if l.ptr_ty {
+                        if let Some(k) = slot_of(&f.name, &l.ptr) {
+                            if slot_mixed.contains(&k) {
+                                prov.mixed.insert(ssa_key(&f.name, &l.dst));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for f in &m.funcs {
+            for b in &f.blocks {
+                for i in &b.insts {
+                    let (dst, srcs): (&String, Vec<&ir::Val>) = match i {
+                        Inst::Gep(g) => match &g.base {
+                            GepBase::Reg(r) => {
+                                let key = ssa_key(&f.name, r);
+                                if prov.mixed.contains(&key)
+                                    && prov.mixed.insert(ssa_key(&f.name, &g.dst))
+                                {
+                                    grew = true;
+                                }
+                                continue;
+                            }
+                            GepBase::Global(_) => continue,
+                        },
+                        Inst::Phi(p) if p.ptr => {
+                            (&p.dst, p.incoming.iter().map(|(v, _)| v).collect())
+                        }
+                        Inst::Select(s) if s.ptr => (&s.dst, vec![&s.a, &s.b]),
+                        Inst::Freeze(fr) => (&fr.dst, vec![&fr.val]),
+                        _ => continue,
+                    };
+                    let hit = srcs.iter().any(|v| match v {
+                        ir::Val::Reg(r) => prov.mixed.contains(&ssa_key(&f.name, r)),
+                        _ => false,
+                    });
+                    if hit && prov.mixed.insert(ssa_key(&f.name, dst)) {
+                        grew = true;
+                    }
+                }
+            }
+        }
+    }
+    // Integer-domain taint: a flash address copied as integer data.
+    let mut t: HashSet<String> = HashSet::new();
+    let tv = |t: &HashSet<String>, prov: &FlashProvenance, func: &str, v: &ir::Val| -> bool {
+        match v {
+            ir::Val::Global(n) => is_flash_const(n),
+            ir::Val::Reg(r) => {
+                let k = ssa_key(func, r);
+                t.contains(&k)
+                    || prov.flash.contains(&k)
+                    || prov.mixed.contains(&k)
+                    || slot_flash.contains(&k)
+                    || slot_mixed.contains(&k)
+            }
+            ir::Val::Const(_) => false,
+        }
+    };
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for f in &m.funcs {
+            for b in &f.blocks {
+                for i in &b.insts {
+                    let mut add: Vec<String> = Vec::new();
+                    match i {
+                        Inst::Zext(z) if tv(&t, prov, &f.name, &z.val) => {
+                            add.push(ssa_key(&f.name, &z.dst))
+                        }
+                        Inst::Sext(z) if tv(&t, prov, &f.name, &z.val) => {
+                            add.push(ssa_key(&f.name, &z.dst))
+                        }
+                        Inst::Trunc(z) if tv(&t, prov, &f.name, &z.val) => {
+                            add.push(ssa_key(&f.name, &z.dst))
+                        }
+                        Inst::Freeze(z) if tv(&t, prov, &f.name, &z.val) => {
+                            add.push(ssa_key(&f.name, &z.dst))
+                        }
+                        Inst::Bin(x)
+                            if tv(&t, prov, &f.name, &x.a) || tv(&t, prov, &f.name, &x.b) =>
+                        {
+                            add.push(ssa_key(&f.name, &x.dst))
+                        }
+                        Inst::Select(s)
+                            if !s.ptr
+                                && (tv(&t, prov, &f.name, &s.a) || tv(&t, prov, &f.name, &s.b)) =>
+                        {
+                            add.push(ssa_key(&f.name, &s.dst))
+                        }
+                        Inst::Phi(p)
+                            if !p.ptr
+                                && p.incoming.iter().any(|(v, _)| tv(&t, prov, &f.name, v)) =>
+                        {
+                            add.push(ssa_key(&f.name, &p.dst))
+                        }
+                        Inst::Load(l) if !l.ptr_ty => {
+                            if let Some(k) = slot_of(&f.name, &l.ptr) {
+                                if t.contains(&k)
+                                    || slot_flash.contains(&k)
+                                    || slot_mixed.contains(&k)
+                                {
+                                    add.push(ssa_key(&f.name, &l.dst));
+                                }
+                            }
+                        }
+                        Inst::Store(s) if tv(&t, prov, &f.name, &s.val) => {
+                            if let Some(g) = global_of(&f.name, &s.ptr) {
+                                add.push(g);
+                            }
+                        }
+                        Inst::Call(c) => {
+                            let targets: Vec<&String> = if c.callees.is_empty() {
+                                vec![&c.func]
+                            } else {
+                                c.callees.iter().collect()
+                            };
+                            for name in targets {
+                                let Some(callee) = m.funcs.iter().find(|x| &x.name == name) else {
+                                    continue;
+                                };
+                                for (p, a) in callee.params.iter().zip(c.args.iter()) {
+                                    if tv(&t, prov, &f.name, &a.val) {
+                                        add.push(ssa_key(name, &p.name));
+                                    }
+                                }
+                                if let Some(d) = &c.dst {
+                                    let ret_taint = callee.blocks.iter().any(|bb| {
+                                        bb.insts.iter().any(|ri| {
+                                            matches!(ri, Inst::Ret(Some((_, v)), _)
+                                                if tv(&t, prov, name, v))
+                                        })
+                                    });
+                                    if ret_taint {
+                                        add.push(ssa_key(&f.name, d));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    for k in add {
+                        if t.insert(k) {
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    prov.int_flash = t;
 }
 
 /// Global names an address value may carry, following pointer
