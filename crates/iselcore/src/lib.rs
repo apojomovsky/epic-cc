@@ -2620,7 +2620,78 @@ pub fn add_flash_laundering(
         }
     }
     // Integer-domain taint: a flash address copied as integer data.
+    // Registers are tracked by name; memory by (slot, byte offset) so a
+    // struct holding a flash pointer next to an integer address field only
+    // taints the pointer's bytes. A dynamic offset widens to the whole slot.
+    #[derive(Default)]
+    struct MemTaint {
+        bytes: HashSet<(String, u32)>,
+        wide: HashSet<String>,
+    }
+    impl MemTaint {
+        fn mark(&mut self, slot: &str, off: Option<u32>, n: u32) {
+            match off {
+                Some(o) => {
+                    for i in 0..n.max(1) {
+                        self.bytes.insert((slot.to_string(), o + i));
+                    }
+                }
+                None => {
+                    self.wide.insert(slot.to_string());
+                }
+            }
+        }
+        fn query(&self, slot: &str, off: Option<u32>, n: u32) -> bool {
+            if self.wide.contains(slot) {
+                return true;
+            }
+            match off {
+                Some(o) => (0..n.max(1)).any(|i| self.bytes.contains(&(slot.to_string(), o + i))),
+                None => self.bytes.iter().any(|(s, _)| s == slot),
+            }
+        }
+        fn size(&self) -> usize {
+            self.bytes.len() + self.wide.len()
+        }
+    }
+    // Memory location a pointer operand names: slot key plus constant byte
+    // offset (`None` when a runtime term makes it dynamic).
+    let loc = |func: &str, ptr: &str| -> Option<(String, Option<u32>)> {
+        if let Some(g) = ptr.strip_prefix('@') {
+            return Some((format!("@{g}"), Some(0)));
+        }
+        let r = ptr.strip_prefix('%')?;
+        match resolved.get(&ssa_key(func, r)) {
+            Some((Base::Global(g), k, terms)) => {
+                Some((format!("@{g}"), terms.is_empty().then_some(u32::from(*k))))
+            }
+            Some((Base::Slot(sname, _), k, terms)) => Some((
+                ssa_key(func, sname),
+                terms.is_empty().then_some(u32::from(*k)),
+            )),
+            None => Some((ssa_key(func, r), Some(0))),
+        }
+    };
+    let val_loc = |func: &str, v: &ir::Val| -> Option<(String, Option<u32>)> {
+        match v {
+            ir::Val::Global(g) => Some((format!("@{g}"), Some(0))),
+            ir::Val::Reg(r) => loc(func, &format!("%{r}")),
+            ir::Val::Const(_) => None,
+        }
+    };
     let mut t: HashSet<String> = HashSet::new();
+    let mut mt = MemTaint::default();
+    // Flash references in a global's initializer are flash addresses.
+    for g in &m.globals {
+        if g.is_const {
+            continue;
+        }
+        for (pos, target, _) in &g.refs {
+            if is_flash_const(target) {
+                mt.mark(&format!("@{}", g.name), Some(*pos as u32), 2);
+            }
+        }
+    }
     let tv = |t: &HashSet<String>, prov: &FlashProvenance, func: &str, v: &ir::Val| -> bool {
         match v {
             ir::Val::Global(n) => is_flash_const(n),
@@ -2631,13 +2702,36 @@ pub fn add_flash_laundering(
                     || prov.mixed.contains(&k)
                     || slot_flash.contains(&k)
                     || slot_mixed.contains(&k)
+                    || match resolved.get(&k) {
+                        Some((Base::Global(g), _, _)) => is_flash_const(g),
+                        Some((Base::Slot(sn, _), _, _)) => {
+                            let sk = ssa_key(func, sn);
+                            slot_flash.contains(&sk) || slot_mixed.contains(&sk)
+                        }
+                        None => false,
+                    }
             }
             ir::Val::Const(_) => false,
         }
     };
-    let mut grew = true;
-    while grew {
-        grew = false;
+    // Whether a binary op over a tainted operand can still be an address.
+    let bin_taints = |x: &ir::Bin, ta: bool, tb: bool| -> bool {
+        if !(ta || tb) {
+            return false;
+        }
+        let small = |v: &ir::Val| matches!(v, ir::Val::Const(c) if (0..=0xFF).contains(c));
+        match x.op {
+            // A difference of two addresses is a length.
+            ir::BinOp::Sub => !(ta && tb),
+            // Masking to a byte cannot leave a 16-bit address.
+            ir::BinOp::And => !(small(&x.a) || small(&x.b)),
+            // Shifting right by a byte or more drops the address.
+            ir::BinOp::LShr | ir::BinOp::AShr => !matches!(&x.b, ir::Val::Const(c) if *c >= 8),
+            _ => true,
+        }
+    };
+    loop {
+        let before = (t.len(), mt.size());
         for f in &m.funcs {
             for b in &f.blocks {
                 for i in &b.insts {
@@ -2655,10 +2749,12 @@ pub fn add_flash_laundering(
                         Inst::Freeze(z) if tv(&t, prov, &f.name, &z.val) => {
                             add.push(ssa_key(&f.name, &z.dst))
                         }
-                        Inst::Bin(x)
-                            if tv(&t, prov, &f.name, &x.a) || tv(&t, prov, &f.name, &x.b) =>
-                        {
-                            add.push(ssa_key(&f.name, &x.dst))
+                        Inst::Bin(x) => {
+                            let ta = tv(&t, prov, &f.name, &x.a);
+                            let tb = tv(&t, prov, &f.name, &x.b);
+                            if bin_taints(x, ta, tb) {
+                                add.push(ssa_key(&f.name, &x.dst));
+                            }
                         }
                         Inst::Select(s)
                             if !s.ptr
@@ -2673,21 +2769,44 @@ pub fn add_flash_laundering(
                             add.push(ssa_key(&f.name, &p.dst))
                         }
                         Inst::Load(l) if !l.ptr_ty => {
-                            if let Some(k) = slot_of(&f.name, &l.ptr) {
-                                if t.contains(&k)
-                                    || slot_flash.contains(&k)
-                                    || slot_mixed.contains(&k)
-                                {
+                            if let Some((slot, off)) = loc(&f.name, &l.ptr) {
+                                if mt.query(&slot, off, u32::from(l.ty.bytes())) {
                                     add.push(ssa_key(&f.name, &l.dst));
                                 }
                             }
                         }
                         Inst::Store(s) if tv(&t, prov, &f.name, &s.val) => {
-                            if let Some(k) = slot_of(&f.name, &s.ptr) {
-                                add.push(k);
+                            if let Some((slot, off)) = loc(&f.name, &s.ptr) {
+                                mt.mark(&slot, off, u32::from(s.ty.bytes()));
+                            }
+                        }
+                        Inst::Memcpy(mc) => {
+                            if let (Some((ss, so)), Some((ds, dof))) =
+                                (val_loc(&f.name, &mc.src), val_loc(&f.name, &mc.dst))
+                            {
+                                let n = match &mc.len {
+                                    ir::MemLen::Const(n) => Some(u32::from(*n)),
+                                    ir::MemLen::Reg(_) => None,
+                                };
+                                match (so, dof, n) {
+                                    (Some(so), Some(dof), Some(n)) if !mt.wide.contains(&ss) => {
+                                        for k in 0..n {
+                                            if mt.bytes.contains(&(ss.clone(), so + k)) {
+                                                mt.mark(&ds, Some(dof + k), 1);
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        if mt.query(&ss, so, n.unwrap_or(1)) {
+                                            mt.mark(&ds, None, 1);
+                                        }
+                                    }
+                                }
                             }
                         }
                         Inst::Call(c) => {
+                            // Context-insensitive: one tainted call site taints
+                            // the callee param for every caller (conservative).
                             let targets: Vec<&String> = if c.callees.is_empty() {
                                 vec![&c.func]
                             } else {
@@ -2717,13 +2836,12 @@ pub fn add_flash_laundering(
                         }
                         _ => {}
                     }
-                    for k in add {
-                        if t.insert(k) {
-                            grew = true;
-                        }
-                    }
+                    t.extend(add);
                 }
             }
+        }
+        if before == (t.len(), mt.size()) {
+            break;
         }
     }
     prov.int_flash = t;

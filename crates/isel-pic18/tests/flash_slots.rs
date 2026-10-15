@@ -420,7 +420,7 @@ fn mixed_select_returned_is_refused() {
 }
 
 #[test]
-#[should_panic(expected = "laundered through an integer")]
+#[should_panic(expected = "flash address that passed through integers")]
 fn int_laundered_flash_address_is_refused() {
     // epic-cc#1284: a flash-kind slot read as `i16` and `inttoptr`ed back
     // would be dereferenced as RAM at the table address. Refuse.
@@ -447,7 +447,7 @@ fn int_laundered_flash_address_is_refused() {
 }
 
 #[test]
-#[should_panic(expected = "laundered through an integer")]
+#[should_panic(expected = "flash address that passed through integers")]
 fn int_laundered_through_second_global_is_refused() {
     // The integer copy travels through another global and a trunc/zext.
     let m = with_bytes(
@@ -511,7 +511,7 @@ fn mixed_global_pointer_load_is_refused() {
 }
 
 #[test]
-#[should_panic(expected = "laundered through an integer")]
+#[should_panic(expected = "flash address that passed through integers")]
 fn int_laundered_through_local_slot_is_refused() {
     // epic-cc#1284 review: the integer copy parks in an alloca.
     let m = with_bytes(
@@ -535,5 +535,129 @@ fn int_laundered_through_local_slot_is_refused() {
             ("main::v", 0x1b),
         ]),
         None,
+    );
+}
+
+/// Parse `ir`, give the const `c` the bytes `P` and assign addresses to
+/// every non-const global and every `%reg =` / `%reg` def of `main`.
+fn laundering_asm(ir: &str, mutate: impl FnOnce(&mut ir::Module)) -> String {
+    let mut m = with_bytes(parse(ir), "c", b"P");
+    mutate(&mut m);
+    let mut pairs: Vec<(String, u16)> = Vec::new();
+    let mut next = 0x20u16;
+    for line in ir.split('\n') {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("global ") {
+            pairs.push((rest.split_whitespace().next().unwrap().to_string(), next));
+            next += 8;
+        } else if let Some(rest) = t.strip_prefix('%') {
+            if let Some((name, _)) = rest.split_once(" =") {
+                pairs.push((format!("main::{name}"), next));
+                next += 8;
+            }
+        }
+    }
+    let map: HashMap<String, u16> = pairs.into_iter().collect();
+    select(&PIC18F4550, &m, &map, None)
+}
+
+#[test]
+fn struct_table_integer_field_next_to_flash_pointer_compiles() {
+    // epic-cc#1284 review: `{ const char *name; uintptr_t addr; }` must not
+    // be refused for dereferencing the integer field.
+    let asm = laundering_asm(
+        "const c i8\nglobal tab i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %a = gep @tab +2\n    %x = load i16 %a\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |m| {
+            for g in &mut m.globals {
+                if g.name == "tab" {
+                    g.bytes = vec![1, 0, 0x81, 0x0F];
+                    g.size = 4;
+                    g.refs = vec![(0, "c".to_string(), 0)];
+                }
+            }
+        },
+    );
+    assert!(
+        asm.contains("LFSR 0"),
+        "integer field derefs as RAM:\n{asm}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn struct_table_pointer_field_read_as_integer_is_refused() {
+    let _ = laundering_asm(
+        "const c i8\nglobal tab i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %a = gep @tab +0\n    %x = load i16 %a\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |m| {
+            for g in &mut m.globals {
+                if g.name == "tab" {
+                    g.bytes = vec![1, 0, 0x81, 0x0F];
+                    g.size = 4;
+                    g.refs = vec![(0, "c".to_string(), 0)];
+                }
+            }
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn ptrtoint_of_flash_gep_is_refused() {
+    // The IR a `(uintptr_t)"lit"` cast produces: a gep, an integer cast,
+    // then inttoptr.
+    let _ = laundering_asm(
+        "const c i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %q = gep @c +0\n    %x = zext i16 %q to i16\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn memcpy_of_tainted_slot_is_propagated() {
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal h i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    memcpy @h @g 2\n    %y = load i16 @h\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+fn memcpy_of_untainted_offset_compiles() {
+    // Only bytes 0..2 of `tab` are a flash pointer; the copy of bytes 2..4
+    // stays clean.
+    let _ = laundering_asm(
+        "const c i8\nglobal tab i8\nglobal h i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %s = gep @tab +2\n    memcpy @h %s 2\n    %y = load i16 @h\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |m| {
+            for g in &mut m.globals {
+                if g.name == "tab" {
+                    g.bytes = vec![1, 0, 0x81, 0x0F];
+                    g.size = 4;
+                    g.refs = vec![(0, "c".to_string(), 0)];
+                }
+            }
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn address_arithmetic_keeps_the_taint() {
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %y = add i16 %x, 1\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+fn pointer_difference_and_byte_mask_are_not_addresses() {
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal g2 i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    store ptr @c @g2\n    %x = load i16 @g\n    %z = load i16 @g2\n    %d = sub i16 %x, %z\n    %m = and i16 %x, 255\n    %s = add i16 %d, %m\n    %p = inttoptr i16 %s to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
     );
 }

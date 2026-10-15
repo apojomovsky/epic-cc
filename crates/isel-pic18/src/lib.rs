@@ -11114,12 +11114,11 @@ impl<'m> Gen<'m> {
                 // dereferenced as RAM: refuse (epic-cc#1284).
                 let launders = match &p.val {
                     Val::Reg(r) => self.prov.int_flash.contains(&ssa_key(self.cur_func, r)),
-                    Val::Global(n) => self.prov.int_flash.contains(&format!("@{n}")),
-                    Val::Const(_) => false,
+                    Val::Global(_) | Val::Const(_) => false,
                 };
                 assert!(
                     !launders,
-                    "isel-pic18: inttoptr of %{} may carry a flash address laundered through an integer; a dereference would read RAM, not program memory (epic-cc#1284, epic-cc#1119)",
+                    "isel-pic18: inttoptr of %{} is derived from a flash address that passed through integers (ptrtoint or an integer copy of a pointer); a dereference would read RAM, not program memory (epic-cc#1284, epic-cc#1119)",
                     p.dst
                 );
                 let src = self.val_addr(&p.val).direct();
