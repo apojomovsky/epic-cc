@@ -545,14 +545,30 @@ fn laundering_asm(ir: &str, mutate: impl FnOnce(&mut ir::Module)) -> String {
     mutate(&mut m);
     let mut pairs: Vec<(String, u16)> = Vec::new();
     let mut next = 0x20u16;
+    let mut func = String::from("main");
     for line in ir.split('\n') {
         let t = line.trim();
-        if let Some(rest) = t.strip_prefix("global ") {
+        if let Some(rest) = t.strip_prefix("fn ") {
+            func = rest
+                .split(|c: char| c == '(' || c.is_whitespace())
+                .next()
+                .unwrap()
+                .to_string();
+            // `fn name(ret) (p=ptr, ...)`: params need slots too.
+            if let Some(params) = rest.rsplit_once(") (").map(|x| x.1.trim_end_matches(')')) {
+                for prm in params.split(',') {
+                    if let Some((n, _)) = prm.trim().split_once('=') {
+                        pairs.push((format!("{func}::{n}"), next));
+                        next += 8;
+                    }
+                }
+            }
+        } else if let Some(rest) = t.strip_prefix("global ") {
             pairs.push((rest.split_whitespace().next().unwrap().to_string(), next));
             next += 8;
         } else if let Some(rest) = t.strip_prefix('%') {
             if let Some((name, _)) = rest.split_once(" =") {
-                pairs.push((format!("main::{name}"), next));
+                pairs.push((format!("{func}::{name}"), next));
                 next += 8;
             }
         }
@@ -658,6 +674,59 @@ fn pointer_difference_and_byte_mask_are_not_addresses() {
     let _ = laundering_asm(
         "const c i8\nglobal g i16\nglobal g2 i16\nglobal out i8\n\
          fn main(void) ()\n  block entry:\n    store ptr @c @g\n    store ptr @c @g2\n    %x = load i16 @g\n    %z = load i16 @g2\n    %d = sub i16 %x, %z\n    %m = and i16 %x, 255\n    %s = add i16 %d, %m\n    %p = inttoptr i16 %s to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+fn tab_mut(m: &mut ir::Module, constant: bool) {
+    for g in &mut m.globals {
+        if g.name == "tab" {
+            g.bytes = vec![1, 0, 0x81, 0x0F, 2, 0, 0x82, 0x0F];
+            g.size = 8;
+            g.refs = vec![(0, "c".to_string(), 0), (4, "c".to_string(), 0)];
+            g.is_const = constant;
+        }
+    }
+}
+
+#[test]
+fn indexed_table_address_field_compiles() {
+    // `tbl[i].addr` over `{ const char *name; uintptr_t addr; }` (stride 4,
+    // offset 2) must compile for a RAM table.
+    let _ = laundering_asm(
+        "const c i8\nglobal tab i8\nglobal idx i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %i = load i8 @idx\n    %a = gep @tab +2 +4*%i\n    %x = load i16 %a\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |m| tab_mut(m, false),
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn indexed_table_name_field_read_as_integer_is_refused() {
+    let _ = laundering_asm(
+        "const c i8\nglobal tab i8\nglobal idx i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %i = load i8 @idx\n    %a = gep @tab +0 +4*%i\n    %x = load i16 %a\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |m| tab_mut(m, false),
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn const_table_name_field_read_as_integer_is_refused() {
+    let _ = laundering_asm(
+        "const c i8\nconst tab i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %x = load i16 @tab\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |m| tab_mut(m, true),
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn tainted_store_through_param_pointer_reaches_the_caller_slot() {
+    let _ = laundering_asm(
+        "const c i8\nglobal s i16\nglobal out i8\n\
+         fn put(void) (p=ptr)\n  block entry:\n    %q = gep @c +0\n    %z = zext i16 %q to i16\n    store i16 %z %p\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    call void @put(ptr @s)\n    %y = load i16 @s\n    %q = inttoptr i16 %y to ptr\n    %v = load i8 %q\n    store i8 %v @out\n    ret void\n",
         |_| {},
     );
 }

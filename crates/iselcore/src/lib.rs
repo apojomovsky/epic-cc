@@ -2627,54 +2627,98 @@ pub fn add_flash_laundering(
     struct MemTaint {
         bytes: HashSet<(String, u32)>,
         wide: HashSet<String>,
+        /// A tainted store went through a pointer we could not resolve to
+        /// a slot: any integer load may see it.
+        all: bool,
     }
+    /// Constant offset `k`; `g > 0` means a runtime index in steps of
+    /// multiples of `g` (the gcd of the term scales) on top of `k`.
+    type Off = (u32, u32);
     impl MemTaint {
-        fn mark(&mut self, slot: &str, off: Option<u32>, n: u32) {
-            match off {
-                Some(o) => {
-                    for i in 0..n.max(1) {
-                        self.bytes.insert((slot.to_string(), o + i));
-                    }
-                }
-                None => {
-                    self.wide.insert(slot.to_string());
-                }
+        fn mark(&mut self, slot: &str, off: Off, n: u32) {
+            if off.1 > 0 {
+                self.wide.insert(slot.to_string());
+                return;
+            }
+            for i in 0..n.max(1) {
+                self.bytes.insert((slot.to_string(), off.0 + i));
             }
         }
-        fn query(&self, slot: &str, off: Option<u32>, n: u32) -> bool {
-            if self.wide.contains(slot) {
+        fn query(&self, slot: &str, off: Off, n: u32) -> bool {
+            if self.all || self.wide.contains(slot) {
                 return true;
             }
-            match off {
-                Some(o) => (0..n.max(1)).any(|i| self.bytes.contains(&(slot.to_string(), o + i))),
-                None => self.bytes.iter().any(|(s, _)| s == slot),
-            }
+            let (k, g) = off;
+            self.bytes.iter().any(|(s, t)| {
+                s == slot
+                    && (0..n.max(1)).any(|j| {
+                        if g == 0 {
+                            *t == k + j
+                        } else {
+                            (i64::from(*t) - i64::from(k + j)).rem_euclid(i64::from(g)) == 0
+                        }
+                    })
+            })
         }
         fn size(&self) -> usize {
-            self.bytes.len() + self.wide.len()
+            self.bytes.len() + self.wide.len() + usize::from(self.all)
         }
     }
     // Memory location a pointer operand names: slot key plus constant byte
     // offset (`None` when a runtime term makes it dynamic).
-    let loc = |func: &str, ptr: &str| -> Option<(String, Option<u32>)> {
+    // Slots whose bytes are an object (alloca, byval param); every other
+    // slot with address bytes may point anywhere.
+    let mut objects: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Alloca(a) = i {
+                    objects.insert(ssa_key(&f.name, &a.dst));
+                }
+            }
+        }
+        for p in &f.params {
+            if p.byval.is_some() {
+                objects.insert(ssa_key(&f.name, &p.name));
+            }
+        }
+    }
+    let stride = |terms: &[(u16, String)]| -> u32 {
+        fn gcd(a: u32, b: u32) -> u32 {
+            if b == 0 {
+                a
+            } else {
+                gcd(b, a % b)
+            }
+        }
+        terms
+            .iter()
+            .fold(0u32, |g, (sc, _)| gcd(g, u32::from(*sc)))
+            .max(u32::from(!terms.is_empty()))
+    };
+    // The bool is true when the pointer did not resolve to a known slot.
+    let loc = |func: &str, ptr: &str| -> Option<(String, Off, bool)> {
         if let Some(g) = ptr.strip_prefix('@') {
-            return Some((format!("@{g}"), Some(0)));
+            return Some((format!("@{g}"), (0, 0), false));
         }
         let r = ptr.strip_prefix('%')?;
         match resolved.get(&ssa_key(func, r)) {
             Some((Base::Global(g), k, terms)) => {
-                Some((format!("@{g}"), terms.is_empty().then_some(u32::from(*k))))
+                Some((format!("@{g}"), (u32::from(*k), stride(terms)), false))
             }
-            Some((Base::Slot(sname, _), k, terms)) => Some((
-                ssa_key(func, sname),
-                terms.is_empty().then_some(u32::from(*k)),
-            )),
-            None => Some((ssa_key(func, r), Some(0))),
+            // A slot holding a pointer value (param, loaded pointer): the
+            // pointee may alias any slot, so it is an unknown location.
+            Some((Base::Slot(sname, _), k, terms)) => {
+                let key = ssa_key(func, sname);
+                let unknown = !objects.contains(&key);
+                Some((key, (u32::from(*k), stride(terms)), unknown))
+            }
+            None => Some((ssa_key(func, r), (0, 0), true)),
         }
     };
-    let val_loc = |func: &str, v: &ir::Val| -> Option<(String, Option<u32>)> {
+    let val_loc = |func: &str, v: &ir::Val| -> Option<(String, Off, bool)> {
         match v {
-            ir::Val::Global(g) => Some((format!("@{g}"), Some(0))),
+            ir::Val::Global(g) => Some((format!("@{g}"), (0, 0), false)),
             ir::Val::Reg(r) => loc(func, &format!("%{r}")),
             ir::Val::Const(_) => None,
         }
@@ -2683,12 +2727,9 @@ pub fn add_flash_laundering(
     let mut mt = MemTaint::default();
     // Flash references in a global's initializer are flash addresses.
     for g in &m.globals {
-        if g.is_const {
-            continue;
-        }
         for (pos, target, _) in &g.refs {
             if is_flash_const(target) {
-                mt.mark(&format!("@{}", g.name), Some(*pos as u32), 2);
+                mt.mark(&format!("@{}", g.name), (*pos as u32, 0), 2);
             }
         }
     }
@@ -2723,7 +2764,9 @@ pub fn add_flash_laundering(
         match x.op {
             // A difference of two addresses is a length.
             ir::BinOp::Sub => !(ta && tb),
-            // Masking to a byte cannot leave a 16-bit address.
+            // Masking to a byte cannot leave a 16-bit address. Known gap: an
+            // address split into bytes (and/lshr) and reassembled (shl/or)
+            // escapes the taint (epic-cc#1299).
             ir::BinOp::And => !(small(&x.a) || small(&x.b)),
             // Shifting right by a byte or more drops the address.
             ir::BinOp::LShr | ir::BinOp::AShr => !matches!(&x.b, ir::Val::Const(c) if *c >= 8),
@@ -2769,38 +2812,48 @@ pub fn add_flash_laundering(
                             add.push(ssa_key(&f.name, &p.dst))
                         }
                         Inst::Load(l) if !l.ptr_ty => {
-                            if let Some((slot, off)) = loc(&f.name, &l.ptr) {
+                            if let Some((slot, off, _)) = loc(&f.name, &l.ptr) {
                                 if mt.query(&slot, off, u32::from(l.ty.bytes())) {
                                     add.push(ssa_key(&f.name, &l.dst));
                                 }
                             }
                         }
                         Inst::Store(s) if tv(&t, prov, &f.name, &s.val) => {
-                            if let Some((slot, off)) = loc(&f.name, &s.ptr) {
+                            if let Some((slot, off, fake)) = loc(&f.name, &s.ptr) {
                                 mt.mark(&slot, off, u32::from(s.ty.bytes()));
+                                if fake {
+                                    mt.all = true;
+                                }
                             }
                         }
                         Inst::Memcpy(mc) => {
-                            if let (Some((ss, so)), Some((ds, dof))) =
+                            if let (Some((ss, so, _)), Some((ds, dof, dfake))) =
                                 (val_loc(&f.name, &mc.src), val_loc(&f.name, &mc.dst))
                             {
                                 let n = match &mc.len {
                                     ir::MemLen::Const(n) => Some(u32::from(*n)),
                                     ir::MemLen::Reg(_) => None,
                                 };
-                                match (so, dof, n) {
-                                    (Some(so), Some(dof), Some(n)) if !mt.wide.contains(&ss) => {
+                                match n {
+                                    Some(n)
+                                        if so.1 == 0 && dof.1 == 0 && !mt.wide.contains(&ss) =>
+                                    {
                                         for k in 0..n {
-                                            if mt.bytes.contains(&(ss.clone(), so + k)) {
-                                                mt.mark(&ds, Some(dof + k), 1);
+                                            if mt.bytes.contains(&(ss.clone(), so.0 + k)) {
+                                                mt.mark(&ds, (dof.0 + k, 0), 1);
                                             }
                                         }
                                     }
                                     _ => {
-                                        if mt.query(&ss, so, n.unwrap_or(1)) {
-                                            mt.mark(&ds, None, 1);
+                                        // Unknown length or index: any taint in the
+                                        // source slot may be copied anywhere in dst.
+                                        if mt.query(&ss, (0, 1), 1) {
+                                            mt.mark(&ds, (0, 1), 1);
                                         }
                                     }
+                                }
+                                if dfake && mt.bytes.iter().any(|(s, _)| s == &ss) {
+                                    mt.all = true;
                                 }
                             }
                         }
