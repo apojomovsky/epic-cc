@@ -34,7 +34,7 @@ already sets `ServerAliveInterval` is left alone. One-off escape hatch
 on a machine without the entry:
 
 ```bash
-GIT_SSH_COMMAND='ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=40' git push
+GIT_SSH_COMMAND='ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=40' epic-tasks push
 ```
 
 ## What is pinned
