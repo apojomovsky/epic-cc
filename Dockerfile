@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# epic-cc toolchain images (docs/internals/design/30-distribution-design.md, ADR-008).
+# epic-cc toolchain images (docs/30-distribution-design.md, ADR-008).
 # Stages: base, only clang-builder's own build deps and nothing else, since
 # a change here would bust its ~2h cached LLVM build; clang-builder, LLVM
 # 20.1.8, GHCR-cached; dev, clang-builder plus rustup, gputils, oracle/fuzz
@@ -44,7 +44,7 @@ RUN curl -fsSL -o /tmp/llvm.tar.xz \
 # platform runtimes — no libLLVM.so, nothing to bundle or rpath-patch.
 # All targets (no -DLLVM_TARGETS_TO_BUILD): this clang is also the fuzz
 # harness's HOST reference — it compiles the generated program for x86-64
-# and runs it (docs/internals/design/27-phase6-random-testing-plan.md). MSP430-only would
+# and runs it (docs/27-phase6-random-testing-plan.md). MSP430-only would
 # break the differential tests' host side.
 RUN --mount=type=cache,target=/ccache \
     cmake -S /src/llvm/llvm -B /build/llvm -G Ninja \
@@ -100,7 +100,7 @@ RUN curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh \
     && rustup component add rustfmt clippy rust-src \
     && rm /tmp/rustup.sh
 
-# SDCC 4.6.0: the SDCC parity oracle (docs/internals/design/35). Built from source,
+# SDCC 4.6.0: the SDCC parity oracle (docs/35). Built from source,
 # digest-pinned, exactly like gputils. SDCC is GPL: it lives in the image as
 # an external oracle only, never linked or committed into the MIT repo. Its
 # pic14/pic16 ports need gputils (built above) and the boost graph library
@@ -162,7 +162,7 @@ RUN curl -fsSL -o /tmp/sdcc.tar.bz2 \
 # (crates/driver/tests/debug_session_e2e.rs runs it as a subprocess against
 # epic-cc-gdbserver, epic-cc#259); gpsim runs the SDCC regression suite's
 # pic14/pic16 ports and serves as the independent simulator in arbitration
-# (docs/internals/design/35 section 4, external process only); csmith/creduce/cvise/
+# (docs/35 section 4, external process only); csmith/creduce/cvise/
 # poppler-utils are the fuzz-corpus/reduction toolchain.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
