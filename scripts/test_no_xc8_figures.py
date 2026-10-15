@@ -8,6 +8,7 @@ manifest strings. Power-of-two figures are device capacities
 (512 words, 2048 bytes), not measurements, and version numbers, error codes
 and part numbers carry no unit, so none of them trip the rule."""
 
+import os
 import pathlib
 import re
 import subprocess
@@ -101,10 +102,31 @@ class TestDetector(unittest.TestCase):
         self.assertEqual(find_xc8_figures("blink uses 777 words"), [])
 
 
+WALK_PRUNED = {".git", "target", "node_modules", ".worktrees", "dist"}
+
+
+def _walked_files():
+    """Fallback when git is unusable (the CI container): walk the tree."""
+    for root, dirs, names in os.walk(REPO_ROOT):
+        dirs[:] = [d for d in dirs if d not in WALK_PRUNED]
+        for name in names:
+            rel = os.path.relpath(os.path.join(root, name), REPO_ROOT)
+            if rel.endswith(SCANNED) and not any(s in rel for s in SKIPPED_PARTS):
+                yield rel
+
+
 def _tracked_files():
-    out = subprocess.run(
-        ["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout
+    try:
+        out = subprocess.run(
+            ["git", "ls-files"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, OSError):
+        yield from _walked_files()
+        return
     for rel in out.splitlines():
         if rel.endswith(SCANNED) and not any(s in rel for s in SKIPPED_PARTS):
             yield rel
@@ -113,11 +135,7 @@ def _tracked_files():
 class TestTrackedFiles(unittest.TestCase):
     def test_no_xc8_figures_in_tracked_text(self):
         found = []
-        try:
-            files = list(_tracked_files())
-        except (subprocess.CalledProcessError, OSError):
-            self.skipTest("no git checkout visible (container worktree mount)")
-        for rel in files:
+        for rel in _tracked_files():
             path = REPO_ROOT / rel
             if not path.is_file():
                 continue
