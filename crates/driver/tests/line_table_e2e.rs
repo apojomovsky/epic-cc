@@ -104,3 +104,23 @@ fn banksel_words_inherit_the_preceding_line() {
         );
     }
 }
+
+#[test]
+fn bank_switched_sfr_setup_keeps_later_lines() {
+    // A bank-1 SFR store inserts BANKSELs; the stores after it must keep
+    // their own lines, not inherit the setup's (epic-cc#1316).
+    let src = "tests/fixtures/sfr_switch.c";
+    let table = line_table(src, "p16f877a", "sfr_switch");
+    let joined = table
+        .lines()
+        .filter(|l| !l.starts_with(';'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!joined.is_empty(), "line table must have records:\n{table}");
+    for line_no in ["4:", "5:", "6:"] {
+        assert!(
+            joined.contains(&format!("sfr_switch.c:{line_no}")),
+            "line {line_no} missing from table:\n{joined}"
+        );
+    }
+}
