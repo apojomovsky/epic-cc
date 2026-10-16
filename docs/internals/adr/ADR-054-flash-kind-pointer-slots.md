@@ -50,6 +50,10 @@ same question as storing a flash address into a RAM slot.
   call args, returns). Integer-laundered addresses (loaded as data,
   converted back) stay out of scope in `epic-cc#1284`.
 
+- The PIC18 driver predefines `__EPIC_CC_FLASH_PARAMS__` so sources can
+  gate away the RAM-staging workaround for const literals while still
+  building with releases that predate this ADR.
+
 ## Rationale
 
 A runtime tag charges every pointer dereference about 6 words plus a
