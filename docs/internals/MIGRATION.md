@@ -118,5 +118,5 @@ Numbered design notes are also cited by their short form `docs/NN` (for example
 | `docs/superpowers/specs/2026-08-26-size-map-reporting-design.md` | `docs/internals/specs/2026-08-26-size-map-reporting-design.md` |
 | `docs/superpowers/specs/2026-09-01-liveness-frame-overlay-design.md` | `docs/internals/specs/2026-09-01-liveness-frame-overlay-design.md` |
 | `docs/superpowers/specs/2026-09-22-pic18-exit-bank-carry-design.md` | `docs/internals/specs/2026-09-22-pic18-exit-bank-carry-design.md` |
-| `docs/superpowers/specs/2026-09-22-xc8-size-parity-microbench-design.md` | `docs/internals/specs/2026-09-22-xc8-size-parity-microbench-design.md` |
+| `docs/superpowers/specs/2026-09-22-xc8-size-parity-microbench-design.md` | moved to the private epic-benchmarks repo (`xc8/docs/2026-09-22-xc8-size-parity-microbench-design.md`, epic-cc#1320) |
 | `docs/superpowers/specs/2026-09-24-code-factoring-pass-design.md` | `docs/internals/specs/2026-09-24-code-factoring-pass-design.md` |

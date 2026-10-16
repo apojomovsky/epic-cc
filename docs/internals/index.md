@@ -121,5 +121,5 @@ Old paths are listed in [`MIGRATION.md`](MIGRATION.md).
 - [`2026-08-26-size-map-reporting-design.md`](specs/2026-08-26-size-map-reporting-design.md): Size and map reporting design
 - [`2026-09-01-liveness-frame-overlay-design.md`](specs/2026-09-01-liveness-frame-overlay-design.md): Liveness-based intra-frame overlay design
 - [`2026-09-22-pic18-exit-bank-carry-design.md`](specs/2026-09-22-pic18-exit-bank-carry-design.md): PIC18 interprocedural BSR exit-bank carry (design)
-- [`2026-09-22-xc8-size-parity-microbench-design.md`](specs/2026-09-22-xc8-size-parity-microbench-design.md): XC8 size-parity microbench ladder (design)
+- `2026-09-22-xc8-size-parity-microbench-design.md`: moved to the private epic-benchmarks repo (see MIGRATION.md)
 - [`2026-09-24-code-factoring-pass-design.md`](specs/2026-09-24-code-factoring-pass-design.md): PIC18 code-factoring pass (design)
