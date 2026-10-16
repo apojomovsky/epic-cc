@@ -317,7 +317,7 @@ static void staged_exception(uint8_t fc, uint8_t exc)
 /**
  * @brief Answer a staged FC03/FC04 read from one register table.
  *
- * Validation mirrors epic-modbus exactly (same codes for the same
+ * Validation mirrors lib/modbus exactly (same codes for the same
  * faults), so the seam and the live slave can never disagree about
  * what a frame means.
  *
@@ -517,7 +517,7 @@ static void expander_sync(void)
  *
  * The tick timebase doubles as the staged-frame T3.5 clock, so no
  * extra timer is configured here. Call once before spawning any
- * epic-taskmgr task below.
+ * lib/taskmgr task below.
  */
 void bridge_demo_init(void)
 {

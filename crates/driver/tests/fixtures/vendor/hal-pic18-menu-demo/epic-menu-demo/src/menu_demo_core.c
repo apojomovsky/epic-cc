@@ -205,7 +205,7 @@ static void redraw_brightness(void)
 /** @brief Redraw the ABOUT screen (name + EEPROM write count). */
 static void redraw_about(void)
 {
-    BUILD_LINE("epic-menu-demo");
+    BUILD_LINE("demos/menu");
     lcd_write_line(0U);
     BUILD_LINE("EEwr:");
     put_u16_tail(g_eeprom_writes, 5U);
@@ -234,8 +234,8 @@ void menu_demo_init(void)
     /* static, not a stack local: epic_lcd_init stores &ops into global
      * g_lcd, dereferenced by every later epic_lcd_* call, long after
      * this function returns (a stack local here would dangle -- see
-     * docs/pic18f4550-menu-demo.md). ops_ctx stays a plain local: only
-     * its value, not its address, ever gets stored anywhere. */
+     * docs/internals/pic18f4550-menu-demo.md). ops_ctx stays a plain local:
+     * only its value, not its address, ever gets stored anywhere. */
     static epic_lcd_ops_t ops;
     void *ops_ctx;
     /* Field-by-field, not a partial `{ ..., .row_addr = {0U} }`
@@ -256,7 +256,7 @@ void menu_demo_init(void)
     EPIC_GPIO_Init(GPIOB, BTN_UP_PIN | BTN_DOWN_PIN | BTN_SELECT_PIN, GPIO_MODE_INPUT);
     EPIC_GPIO_SetPullups(GPIO_PULLUP);
 
-    /* epic-tick (Timer2-based) drives the LCD transport's startup
+    /* lib/tick (Timer2-based) drives the LCD transport's startup
      * delays (epic_lcd_gpio4.c: gpio4_delay_ms -> epic_tick_delay_ms);
      * epic_tick_init enables GIE itself, so its ISR advances the tick
      * during the blocking init delays below. Timer2 is reclaimed for

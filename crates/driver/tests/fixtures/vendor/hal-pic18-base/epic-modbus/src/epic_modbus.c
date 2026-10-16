@@ -75,7 +75,7 @@ static uint32_t compute_t3_5_ms(uint32_t baud)
 {
     if (baud > 19200u)
     {
-        return 2u; /* spec fixes T3.5 = 1.75 ms above 19200 baud; epic-tick's
+        return 2u; /* spec fixes T3.5 = 1.75 ms above 19200 baud; lib/tick's
                        1 ms resolution rounds that up to 2 ticks. */
     }
     /* ceil(3.5 chars * 11 bits/char * 1000 ms/s / baud); round up so the

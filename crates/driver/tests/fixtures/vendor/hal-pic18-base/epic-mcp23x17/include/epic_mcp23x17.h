@@ -31,9 +31,9 @@ typedef enum {
 
 /**
  * Injectable register transport. When a handle's transport is NULL the
- * built-in epic-bus transports are used (I2C mem ops for the MCP23017,
+ * built-in lib/bus transports are used (I2C mem ops for the MCP23017,
  * raw SPI ops with the control-byte framing for the MCP23S17). The
- * callbacks mirror the epic-bus mem idiom: -1 on NACK/error, n on
+ * callbacks mirror the lib/bus mem idiom: -1 on NACK/error, n on
  * success.
  */
 typedef struct {

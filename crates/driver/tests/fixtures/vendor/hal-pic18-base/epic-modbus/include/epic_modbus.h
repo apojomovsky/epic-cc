@@ -1,4 +1,4 @@
-/* Family-agnostic Modbus RTU slave on epic-serial (UART), epic-tick
+/* Family-agnostic Modbus RTU slave on lib/serial (UART), lib/tick
  * (T3.5 silence timing), and the HAL's GPIO (optional RS-485 driver
  * enable). RTU only, slave role only, FC 01-06/15/16. Register access
  * is plain caller-owned
@@ -67,7 +67,7 @@ void epic_modbus_slave_set_rs485_dir_pin(uint8_t port, uint8_t pin);
 
 /**
  * @brief  Poll the slave once. Call every main-loop iteration (or wire as a
- *         `epic-taskmgr` task). Drains newly received UART bytes into the
+ *         `lib/taskmgr` task). Drains newly received UART bytes into the
  *         frame buffer; once the RTU T3.5 silence has elapsed since the
  *         last received byte, validates the frame (length, CRC-16, address
  *         match or broadcast) and, if valid, dispatches it and transmits

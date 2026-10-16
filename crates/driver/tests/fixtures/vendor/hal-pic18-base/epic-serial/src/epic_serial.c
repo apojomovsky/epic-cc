@@ -231,7 +231,9 @@ void putch(char c)
 static char s_fmt_buf[12];               /* sign + 10 digits + NUL fits i32 */
 /* Shared staging buffer for epic_serial_put_str; external linkage, every TU that
  * expands the macro needs this symbol (epic-hal#123). */
+#ifdef EPIC_SERIAL_STR_STAGED
 char g_epic_serial_str_scratch[EPIC_SERIAL_STR_SCRATCH_SZ];
+#endif
 #endif
 /**
  * @brief Emit v in decimal via a local buffer.
@@ -326,23 +328,33 @@ void epic_serial_put_char(char c)
     putch(c);
 }
 
-/* epic-cc expands put_str at each call site instead (see epic_serial.h):
- * a const pointer cannot cross a call boundary there (epic-cc#148). */
+/* An epic-cc without __EPIC_CC_FLASH_PARAMS__ expands put_str at each call
+ * site instead (see epic_serial.h): a const pointer cannot cross a call
+ * boundary there (epic-cc#148). */
 /**
  * @brief Emit a null-terminated string.
  * @param s Null-terminated string.
  */
-#ifndef __EPIC_CC__
+#ifndef EPIC_SERIAL_STR_STAGED
 void epic_serial_put_str(const char *s)
 {
+#ifdef __EPIC_CC__
+    uint8_t b;
+    while (*s != '\0')
+    {
+        b = (uint8_t)*s++;
+        epic_serial_write(&b, 1);
+    }
+#else
     int len = 0;
     while (s[len] != '\0')
     {
         len++;
     }
     epic_serial_write((const uint8_t *)s, len);
+#endif
 }
-#endif /* !__EPIC_CC__ */
+#endif /* !EPIC_SERIAL_STR_STAGED */
 
 /**
  * @brief Emit v in decimal.

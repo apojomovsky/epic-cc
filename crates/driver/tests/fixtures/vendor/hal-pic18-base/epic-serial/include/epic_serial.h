@@ -151,7 +151,10 @@ void epic_serial_put_hex16(uint16_t v);
  * call site: the literal lands in const data and is copied byte-wise
  * into a RAM staging buffer, and the RAM copy is written (the
  * EPIC_HARNESS_LOG_STATIC pattern). The argument must be a string
- * literal; XC8 and host keep the out-of-line function.
+ * literal; XC8 and host keep the out-of-line function. An epic-cc
+ * that defines __EPIC_CC_FLASH_PARAMS__ (flash-kind pointer params,
+ * epic-cc#1285) keeps the out-of-line function too: no scratch, no
+ * per-site copy.
  *
  * One shared file-scope buffer (g_epic_serial_str_scratch), not one
  * per call site: distinct same-shape statics never merge, so every
@@ -161,7 +164,8 @@ void epic_serial_put_hex16(uint16_t v);
  * EPIC_SERIAL_STR_SCRATCH_SZ; epic_str_len_ok_ still asserts a
  * literal fits at compile time, no silent truncation.
  */
-#ifdef __EPIC_CC__
+#if defined(__EPIC_CC__) && !defined(__EPIC_CC_FLASH_PARAMS__)
+#define EPIC_SERIAL_STR_STAGED 1
 #ifndef EPIC_SERIAL_STR_SCRATCH_SZ
 #define EPIC_SERIAL_STR_SCRATCH_SZ 64u
 #endif
@@ -179,7 +183,9 @@ extern char g_epic_serial_str_scratch[EPIC_SERIAL_STR_SCRATCH_SZ];
         epic_serial_write((const uint8_t *)g_epic_serial_str_scratch,                  \
                           (int)sizeof(epic_str_src_) - 1);                             \
     } while (0)
+#endif /* EPIC_SERIAL_STR_STAGED */
 
+#ifdef __EPIC_CC__
 /*
  * Literal-only printf for XC8-era call sites. A printf with arguments
  * is a compile error here (macro arity): the variadic ABI is
