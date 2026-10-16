@@ -285,6 +285,11 @@ mechanical rules fails the ritual and blocks the push.
   in this repository, carrying the draft text for the human to send, and
   stops there (canonical: epic-tasks' `AGENTS.md`, "Third-party
   repositories").
+- **External contributions are the human's alone.** A PR or issue from
+  anyone but the owner, or any PR from a fork, belongs to the human:
+  never merge, review, comment on, label, close, rebase, rerun CI on,
+  claim, resume or hand one to an agent; tell the human and stop
+  (canonical: epic-tasks' `AGENTS.md`, "External contributions").
 
 ## Expression conventions (comments and docs)
 
