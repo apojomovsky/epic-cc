@@ -17,6 +17,12 @@
 //! irparse (0 = compatibility single-vector, 1 = high, 2 = low). Empty
 //! means 0 via `__VA_OPT__`; any spelling present adds `+ 0`, which clang
 //! folds first. The priority words ride as PIC18-only defines.
+//!
+//! `__EPIC_CC_FLASH_PARAMS__` (PIC18 only) is a feature test: pointer
+//! params and slots carry a proven flash address space (ADR-054), so a
+//! const literal may cross a call boundary and be walked through TBLPTR.
+//! Sources that need the older RAM-staging workaround keep it when the
+//! macro is absent (releases before epic-cc#1285).
 
 use device;
 
@@ -40,6 +46,7 @@ pub fn xc8_predefines(core: device::Core, device_name: &str) -> Vec<String> {
             defs.push("_PIC18".into());
             defs.push("high_priority=1".into());
             defs.push("low_priority=2".into());
+            defs.push("__EPIC_CC_FLASH_PARAMS__=1".into());
         }
         device::Core::PicBaseline => {
             defs.push("_PIC14".into());
@@ -67,9 +74,22 @@ mod tests {
                 "_PIC18",
                 "high_priority=1",
                 "low_priority=2",
+                "__EPIC_CC_FLASH_PARAMS__=1",
                 "_18F4550"
             ]
         );
+    }
+
+    #[test]
+    fn flash_params_feature_macro_is_pic18_only() {
+        let has = |c, n| {
+            xc8_predefines(c, n)
+                .iter()
+                .any(|d| d == "__EPIC_CC_FLASH_PARAMS__=1")
+        };
+        assert!(has(device::Core::Pic18, "p18f4550"));
+        assert!(!has(device::Core::Pic14, "p16f877a"));
+        assert!(!has(device::Core::Pic14e, "p16f1939"));
     }
 
     #[test]
