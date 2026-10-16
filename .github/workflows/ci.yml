@@ -489,8 +489,9 @@ jobs:
 
   docs-gen:
     # Regenerate-and-diff for the generated reference pages (epic-cc#1280):
-    # the device matrix, the CLI reference, and the rendered README. No
-    # non-code skip: docs-only PRs are exactly the ones that must prove
+    # the device matrix, the CLI reference, the hub pages under docs/user
+    # (epic-cc#1297), and the rendered README.
+    # No non-code skip: docs-only PRs are exactly the ones that must prove
     # the pages match their sources.
     name: docs reference (regenerate and diff)
     needs: warm-toolchain-cache
@@ -543,7 +544,12 @@ jobs:
 
       - name: Fail on stale generated pages
         run: |
-          if ! git diff --exit-code -- docs/reference/devices.md docs/reference/cli.md README.md; then
+          # Stage, then compare the index with HEAD: new, modified and
+          # removed pages all fail (a plain worktree diff misses both
+          # new and removed files).
+          pages="docs/reference/devices.md docs/reference/cli.md README.md docs/user"
+          git add -A -- $pages
+          if ! git diff --cached --exit-code -- $pages; then
             echo "::error::generated reference pages are stale; run 'make docs-gen' and commit the result"
             exit 1
           fi
