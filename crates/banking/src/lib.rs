@@ -778,9 +778,9 @@ pub fn assign_banks_with_locs(
                         } else {
                             emit_banksel(&mut out, &mut cur_bank, bank, !known);
                         }
-                        // The inserted BANKSEL/MOVLB lines inherit the banked
-                        // operand's source location.
-                        let n = out.len() - before;
+                        // Inserted lines inherit the banked operand's loc, one
+                        // per line: the slice grew by bytes, not lines.
+                        let n = out[before..].lines().count();
                         for _ in 0..n {
                             out_locs.push(cur_loc.clone());
                         }

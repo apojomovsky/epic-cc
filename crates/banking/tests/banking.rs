@@ -1,4 +1,5 @@
 use banking::assign_banks;
+use banking::assign_banks_with_locs;
 use device::PIC16F1938;
 use device::PIC16F877A;
 use device::{ConfigRegion, Core, Device};
@@ -649,4 +650,50 @@ fn skip_fork_joins_labels_between_test_and_target() {
     let asm = "main:\n    CALL f\n    RETURN\nf:\n    MOVF 0x20, W\n    BTFSC 0x0C, 0\nmid:\n    GOTO done\ndone:\n    MOVF 0x21, W\n    RETURN\n";
     let expected = "main:\n    CALL f\n    RETURN\nf:\n    MOVF 0x20, W\n    BTFSC 0x0C, 0\nmid:\n    GOTO done\ndone:\n    MOVF 0x21, W\n    RETURN\n";
     assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn inserted_banksel_lines_keep_locs_parallel() {
+    // One loc per inserted line, inheriting the banked operand's own. The
+    // insert once pushed its byte count, shifting every later row onto the
+    // wrong source line (epic-cc#1316).
+    let asm = "main:\n    MOVWF 0x86\n    MOVWF 0x20\n    RETURN\n";
+    let loc = |line: u32| {
+        Some(ir::SrcLoc {
+            file: "f.c".to_string(),
+            line,
+            col: 1,
+        })
+    };
+    let locs = vec![None, loc(6), loc(7), loc(9)];
+    let (out, out_locs) = assign_banks_with_locs(&PIC16F877A, asm, &locs);
+    assert!(
+        out.lines().count() > asm.lines().count(),
+        "fixture must insert a BANKSEL:\n{out}"
+    );
+    assert_eq!(
+        out.lines().count(),
+        out_locs.len(),
+        "one loc per output line:\n{out}\n{out_locs:?}"
+    );
+    let rows: Vec<(&str, &Option<ir::SrcLoc>)> = out.lines().zip(out_locs.iter()).collect();
+    for (i, (line, got)) in rows.iter().enumerate() {
+        let want = if line.contains("STATUS,") {
+            // An inserted select inherits the banked operand it precedes:
+            // the next non-select line's loc.
+            rows[i + 1..]
+                .iter()
+                .find(|(l, _)| !l.contains("STATUS,"))
+                .and_then(|(_, o)| (*o).clone())
+        } else if line.contains("0x06") {
+            loc(6)
+        } else if line.contains("0x20") {
+            loc(7)
+        } else if line.contains("RETURN") {
+            loc(9)
+        } else {
+            None
+        };
+        assert_eq!(**got, want, "loc of {line}:\n{out}");
+    }
 }
