@@ -106,6 +106,7 @@ Numbered design notes are also cited by their short form `docs/NN` (for example
 | `docs/adr/ADR-051-short-table-readers.md` | `docs/internals/adr/ADR-051-short-table-readers.md` |
 | `docs/adr/ADR-052-const-search-fold.md` | `docs/internals/adr/ADR-052-const-search-fold.md` |
 | `docs/adr/ADR-053-bare-bit-entities.md` | `docs/internals/adr/ADR-053-bare-bit-entities.md` |
+| `docs/adr/ADR-054-flash-kind-pointer-slots.md` | `docs/internals/adr/ADR-054-flash-kind-pointer-slots.md` |
 | `docs/superpowers/specs/2026-08-21-cc4-inline-assembly-design.md` | `docs/internals/specs/2026-08-21-cc4-inline-assembly-design.md` |
 | `docs/superpowers/specs/2026-08-22-pic-variants-design.md` | `docs/internals/specs/2026-08-22-pic-variants-design.md` |
 | `docs/superpowers/specs/2026-08-23-device-provenance-design.md` | `docs/internals/specs/2026-08-23-device-provenance-design.md` |
