@@ -79,7 +79,7 @@ extern volatile uint8_t epic_bank1_scratch __at(0x71);
 /* Read the TMR1IE bit (PIE1 bit 0, Bank 1) through the same
  * bank-in/read/bank-out scratch mechanism as EPIC_BANK1_READ8. The
  * dispatcher skips TIMER1_IRQHandler when TMR1IE is off: Timer1
- * free-runs with its overflow interrupt disabled (epic-swuart needs
+ * free-runs with its overflow interrupt disabled (lib/swuart needs
  * the counter but never the overflow), so TMR1IF latches at every
  * 65536-cycle wrap and would make every CCP event pay the full
  * handler cost before its own dispatch. */

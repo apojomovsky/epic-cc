@@ -30,7 +30,7 @@ typedef enum {
 /**
  * @brief Initialize the LCD, ADC, EEPROM-backed settings, and PWM.
  *
- * Call once before spawning any epic-taskmgr task below.
+ * Call once before spawning any lib/taskmgr task below.
  */
 void menu_demo_init(void);
 

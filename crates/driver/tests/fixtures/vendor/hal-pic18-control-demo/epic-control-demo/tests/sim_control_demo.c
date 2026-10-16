@@ -11,7 +11,7 @@
  * empty-ring contract. Tick-driven scheduling keeps the command
  * timeline and EEPROM write count reproducible across toolchains.
  *
- * Timer0 tick config mirrors epic-taskmgr's own proven sim gate
+ * Timer0 tick config mirrors lib/taskmgr's own proven sim gate
  * (tests/sim_taskmgr.c): 1:16 prescaler, reload 0, ~341 us/tick at
  * 48 MHz.
  */

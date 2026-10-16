@@ -57,7 +57,7 @@ static void gpio4_send(void *ctx, uint8_t rs, uint8_t byte)
 /**
  * @brief Delay a number of microseconds using epic-tick.
  *
- * epic-tick's resolution is 1 ms; sub-ms delays are a best-effort busy
+ * lib/tick's resolution is 1 ms; sub-ms delays are a best-effort busy
  * wait. Fine for HD44780 commands, since the timing is a minimum, not
  * exact.
  *

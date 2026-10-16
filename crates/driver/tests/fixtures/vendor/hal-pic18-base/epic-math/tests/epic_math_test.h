@@ -1,5 +1,5 @@
 /*
- * Tiny shared host-test harness for epic-math, no external framework: a
+ * Tiny shared host-test harness for lib/math, no external framework: a
  * CHECK macro, a fixed-seed deterministic LCG for reproducible
  * randomized tests, and a pass/fail exit-code reporter. Host-only; not
  * built by the XC8 target Makefiles.

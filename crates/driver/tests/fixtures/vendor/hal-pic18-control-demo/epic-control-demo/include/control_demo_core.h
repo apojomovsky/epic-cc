@@ -14,7 +14,7 @@
 /**
  * @brief Initialize the serial console, ADC, EEPROM-backed settings, PID, and PWM.
  *
- * Call once before spawning any epic-taskmgr task below.
+ * Call once before spawning any lib/taskmgr task below.
  */
 void control_demo_init(void);
 

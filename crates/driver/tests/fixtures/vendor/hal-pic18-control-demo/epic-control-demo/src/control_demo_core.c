@@ -48,7 +48,7 @@ typedef enum { EE_IDLE = 0, EE_WRITING_MAGIC, EE_WRITING_BODY } ee_state_t;
 static uint8_t g_ee_image[EE_IMAGE_SZ];
 
 /* One control block instead of scattered tiny globals: the
- * linker's small-data pools (access RAM holding epic-math's
+ * linker's small-data pools (access RAM holding lib/math's
  * absolute-addressed asm temporaries) are nearly full on this part, so
  * a single multi-byte symbol packs into a banked pool and leaves that
  * room for symbols that cannot move. */
@@ -471,7 +471,7 @@ static void pwm_init(void)
 /**
  * @brief Initialize the serial console, ADC, EEPROM-backed settings, PID, and PWM.
  *
- * Call once before spawning any epic-taskmgr task below.
+ * Call once before spawning any lib/taskmgr task below.
  */
 void control_demo_init(void)
 {
