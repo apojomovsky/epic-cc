@@ -2,7 +2,7 @@
 //! checks what `llvm-link` lets through on the merged module, then drops
 //! `internal` globals nothing references so alloc never reserves RAM for
 //! them. Expects N translation units already merged into one `.ll` by
-//! `llvm-link` (docs/31 §7); this stage does not link.
+//! `llvm-link` (docs/internals/design/31 §7); this stage does not link.
 
 use ir::{collect_global_vals, GepBase, Inst, Module, SrcLoc, Val};
 use std::collections::{BTreeMap, BTreeSet, HashSet};

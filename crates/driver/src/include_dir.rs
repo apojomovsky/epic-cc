@@ -1,4 +1,4 @@
-//! The shipped `include/` directory (epic-cc#690, docs/46 D-6).
+//! The shipped `include/` directory (epic-cc#690, docs/internals/design/46 D-6).
 //!
 //! An IDE cannot resolve headers materialized into a per-run temp dir, so
 //! the release bundle ships `include/` next to the binary and the driver

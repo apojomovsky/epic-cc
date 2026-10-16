@@ -1,4 +1,4 @@
-//! The D-2 ordering-hazard acceptance test (docs/37 section 2 D-2, section
+//! The D-2 ordering-hazard acceptance test (docs/internals/design/37 section 2 D-2, section
 //! 3 P1): on baseline, `FSR<5>` is the bank select for *both* direct and
 //! indirect addressing, and `FSR` is also the only indirect pointer. A
 //! direct access to bank 1 followed by an indirect access through a live

@@ -26,7 +26,7 @@ pub fn is_directive(line: &str, name: &str) -> bool {
 }
 
 /// Where a local's bytes live. Only `Direct` is constructed: the `Frame`
-/// case stays reserved (docs/29 §2) so frame-pointer handling for
+/// case stays reserved (docs/internals/design/29 §2) so frame-pointer handling for
 /// recursion and reentrancy adds a case here and at `Slot`
 /// construction sites without touching address-resolution call sites.
 pub enum Slot {

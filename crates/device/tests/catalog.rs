@@ -1,5 +1,5 @@
 //! The catalog gate. The catalog (`catalog/parts.toml`) is roadmap data per
-//! docs/38 D-3, not compiler input, so the gate guards what consumers rely
+//! docs/internals/design/38 D-3, not compiler input, so the gate guards what consumers rely
 //! on: F-generation scope, column shape, tier consistency, and agreement
 //! with the shipped device registry the catalog claims to track.
 

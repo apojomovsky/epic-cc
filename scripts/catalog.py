@@ -3,7 +3,7 @@
 
 The catalog (crates/device/catalog/parts.toml) tracks every 8-bit PIC flash
 part (PIC10F/12F/16F/18F, never the EPROM/OTP C parts) as roadmap data. It is
-deliberately NOT a pile of devices/*.toml: docs/38 D-3 keeps full device data
+deliberately NOT a pile of devices/*.toml: docs/internals/design/38 D-3 keeps full device data
 on-demand, this table is the triage view that decides what to port next.
 
 Sources and posture:
@@ -744,7 +744,7 @@ def cmd_build(args: argparse.Namespace) -> int:
 
     lines = [
         "# Every 8-bit PIC flash part (PIC10F/12F/16F/18F, LF and HV variants",
-        "# included): the roadmap table behind docs/38 D-3's on-demand device",
+        "# included): the roadmap table behind docs/internals/design/38 D-3's on-demand device",
         "# rule. This table tracks and prioritizes; devices/*.toml stays the",
         "# ported, verified set.",
         "# Derived data, regenerate with scripts/catalog.py: memory and core",

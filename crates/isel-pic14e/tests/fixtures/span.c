@@ -1,5 +1,5 @@
 // P3 (PIC14E) acceptance: a bank-straddling array addressed through the
-// linear region (docs/33 D-2), alongside a single-bank array addressed
+// linear region (docs/internals/design/33 D-2), alongside a single-bank array addressed
 // through the physical (banked) FSR path, in one program. The emitted
 // `.asm` must use a linear FSR base (0x2000-0x29AF) for the spanning array
 // and a physical base for the single-bank one.

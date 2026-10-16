@@ -1,4 +1,4 @@
-# SDCC parity ratio baseline (docs/35, P0). Do not hand-edit the
+# SDCC parity ratio baseline (docs/internals/design/35, P0). Do not hand-edit the
 # numbers; regenerate inside the dev image with:
 #   UPDATE_SDCC_BASELINE=1 cargo test -p sdcc-parity --test regression_gate
 # then diff and commit deliberately. epic-cc/SDCC flash and

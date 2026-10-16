@@ -1,5 +1,5 @@
-//! Milestone-5 pointer/const acceptance: the spike's probe (docs/11) — a
-//! runtime RAM pointer AND a const-table read in one program. Acceptance:
+//! Milestone-5 pointer/const acceptance: the spike's probe (docs/internals/design/11).
+//! It has a runtime RAM pointer AND a const-table read in one program. Acceptance:
 //! (a) the emitted .asm engages both lowerings — `CALL __read_table` (the
 //! RETLW const-table reader) and `MOVWF FSR` (the FSR/INDF RAM indirect
 //! path); (b) the driver's HEX runs to halt in the simulator with

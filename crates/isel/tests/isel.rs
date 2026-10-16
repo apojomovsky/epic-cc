@@ -9438,7 +9438,7 @@ fn isr_prologue_body_epilogue_simulates_with_retfie_return() {
 fn isr_save_area_uses_the_devices_own_common_ram_not_a_hardcoded_0x70() {
     // Regression: the ISR prologue/epilogue used to hardcode 0x70-0x7F
     // literally, correct only because every device shipped before
-    // ADR-034 (docs/39 D-1) happened to place common_ram there. p16f84's
+    // ADR-034 (docs/internals/design/39 D-1) happened to place common_ram there. p16f84's
     // common_ram is 0x40-0x4F (epic-cc#398): an ISR compiled for it must
     // save/restore through those addresses, not PIC16F877A's.
     let m = parse(
@@ -10912,7 +10912,7 @@ fn config_table_crossing_window_top_is_256_aligned() {
 }
 
 // ---------------------------------------------------------------------------
-// Lane E (docs/36): volatile access ordering and count. A differential
+// Lane E (docs/internals/design/36): volatile access ordering and count. A differential
 // oracle compares a final checksum, which cannot see whether N stores to N
 // distinct volatile globals were coalesced or reordered: real register
 // sequencing depends on write count and order, not just the final bit

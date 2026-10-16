@@ -1,4 +1,4 @@
-//! The SDCC parity regression gate (docs/35, P0): "a ratio regression
+//! The SDCC parity regression gate (docs/internals/design/35, P0): "a ratio regression
 //! fails CI".
 //!
 //! Runs the committed corpus (Tier 1 + Tier 2) through both compilers and
@@ -57,7 +57,8 @@ struct BaselineToml {
 }
 
 fn save_baseline(rows: &[Row]) {
-    let header = "# SDCC parity ratio baseline (docs/35, P0). Do not hand-edit the\n\
+    let header =
+        "# SDCC parity ratio baseline (docs/internals/design/35, P0). Do not hand-edit the\n\
                   # numbers; regenerate inside the dev image with:\n\
                   #   UPDATE_SDCC_BASELINE=1 cargo test -p sdcc-parity --test regression_gate\n\
                   # then diff and commit deliberately. epic-cc/SDCC flash and\n\
@@ -188,7 +189,7 @@ fn corpus_matches_ratio_baseline() {
                     if r.pass {
                         // A clean row also pins the hand-computed value:
                         // epic-cc and SDCC agreeing on a wrong answer is
-                        // still a conformance failure (docs/35 section 5
+                        // still a conformance failure (docs/internals/design/35 section 5
                         // item 2, arbitration).
                         let out = prog.outputs.first();
                         let got = out.and_then(|o| r.epic.outputs.get(o)).copied();

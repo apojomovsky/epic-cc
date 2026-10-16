@@ -1,4 +1,4 @@
-//! PIC18 code factoring on the final listing (epic-cc#662, docs/44).
+//! PIC18 code factoring on the final listing (epic-cc#662, docs/internals/design/44).
 //!
 //! Runs between `isel-pic18` and `asm`: listing in, listing out, with the
 //! per-line source locations carried along. Repeated straight-line runs
@@ -137,7 +137,7 @@ fn upper_mnem(body: &str) -> String {
 /// `rewrite` shares the first site verbatim, so grouping runs that
 /// differ only in addresses would miscompile (two FSR0 setups for
 /// different slots sharing one loader). Exact text is what makes
-/// sharing sound under static allocation (docs/44).
+/// sharing sound under static allocation (docs/internals/design/44).
 fn normalize(body: &str) -> String {
     let mut parts = body.splitn(2, char::is_whitespace);
     let m = parts.next().unwrap_or("").to_ascii_uppercase();

@@ -1,4 +1,4 @@
-// P2 end-to-end acceptance (docs/37 section 3 P2): the integer spine
+// P2 end-to-end acceptance (docs/internals/design/37 section 3 P2): the integer spine
 // compiled through the real PIC baseline pipeline (clang -> irparse ->
 // wholeprog -> legalize -> callgraph -> alloc -> isel-pic-baseline ->
 // asm) and executed in the real `PicBaseline` simulator. The fixtures
@@ -176,7 +176,7 @@ fn const_sub_c_runs_correctly() {
     assert!(p.halted());
 }
 
-/// D-2's end-to-end acceptance (docs/37 section 3 P2): a fixture with
+/// D-2's end-to-end acceptance (docs/internals/design/37 section 3 P2): a fixture with
 /// globals in both banks plus a pointer (FSR/INDF) deref, exercising the
 /// `BCF`/`BSF FSR,5` reassertion sequence through real codegen. The `.asm`
 /// is inspected to assert the reassertion instructions are present before
@@ -217,7 +217,7 @@ fn banked_c_runs_correctly_and_reasserts_fsr5() {
     }
 }
 
-/// P3 pointer/array acceptance (docs/37 section 3 P3): a runtime RAM
+/// P3 pointer/array acceptance (docs/internals/design/37 section 3 P3): a runtime RAM
 /// pointer (FSR/INDF path) with a volatile index. `in` is a 16-bit
 /// volatile so clang keeps the index mask as an i16 `and`. Expected:
 /// in = 1 -> ram[1] = 2 -> out = 2.
@@ -351,7 +351,7 @@ fn indirect_store_of_banked_value_lands_in_the_right_bank() {
     assert_eq!(p.ram()[globals["src"] as usize], 5, "src must be 5");
 }
 
-/// P4 const acceptance (docs/37 section 3 P4): a 128-byte flash table
+/// P4 const acceptance (docs/internals/design/37 section 3 P4): a 128-byte flash table
 /// read at a runtime index plus a direct scalar const read, served from
 /// the page-0 low half through RETLW tables. Expected: in = 10 -> i =
 /// 10, table[10] = 0x89, magic low byte 0x34 -> out = 0xBD.
@@ -506,7 +506,7 @@ fn gpasm_agrees(asm: &str, stem: &str) {
     }
 }
 
-/// P6 div-half acceptance (docs/37 section 3 P6): udiv/urem/sdiv/srem
+/// P6 div-half acceptance (docs/internals/design/37 section 3 P6): udiv/urem/sdiv/srem
 /// on i16 and i8 through the software routine copies, laid out across
 /// pages with PA0-managed CALLs. Expected: in = 301 -> out = 21.
 #[test]
@@ -537,7 +537,7 @@ fn muldiv_mul_c_runs_correctly() {
     gpasm_agrees(&asm, "muldiv_mul");
 }
 
-/// P6 i32 add/mul acceptance (docs/37 section 3 P6): inline add,
+/// P6 i32 add/mul acceptance (docs/internals/design/37 section 3 P6): inline add,
 /// mul_u32 (the only routine copy), const shifts and logic.
 /// Expected: x = 0x12345678 -> 0xBF41AAC5.
 #[test]

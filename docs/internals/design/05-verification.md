@@ -1,0 +1,265 @@
+# 05 — Verification strategy
+
+This is the part that makes unsupervised agent work viable, and it is deliberately
+prioritised **early** — before most of the compiler.
+
+The goal is a closed loop that **manufactures its own minimal failing test cases with no
+human in the sequence**:
+
+```
+random program generator ──► our compiler ──┐
+                        └──► oracle compiler ┴──► simulator ──► differ ──► cvise ──► minimal repro
+```
+
+## Two independent oracles
+
+### 1. XC8 (`xc8-cc`)
+
+**Not in this repo.** XC8 is licence-gated and its benchmark results are confidential
+([ADR-006](03-decisions.md)), so its oracle image and every XC8 comparison live in the
+private epic-benchmarks repository (epic-cc#682). The differential runner described here
+is **not built**: `docs/internals/design/13` defers it to phase 6, and if it is built it belongs there too. epic-hal's
+`build-cmp` scripts are the only working XC8 users in the family, and they use it for size
+comparison, not correctness differencing.
+
+When built, it compiles the same source with XC8, runs both outputs on our simulator, and
+compares observable state (RAM contents, port writes, cycle counts). Until then, no
+program in this repo has been differenced against XC8.
+
+**Black-box only.** Never disassemble or reverse-engineer the XC8 binaries — see
+[ADR-006](03-decisions.md). We observe its *output*, not its internals.
+
+XC8 free mode applies no optimization limits that affect *correctness*, which makes it a
+sound correctness oracle even in its unlicensed configuration.
+
+### 2. gpsim
+
+Version 0.32.1 (Nov 2023), supports the 14-bit core. GPL — invoke as an external process
+only, never link. Useful as an independent check on our own simulator's semantics: if our
+simulator and gpsim disagree about what a program does, one of them is wrong, and that is
+worth knowing before we blame the compiler.
+
+### 3. gpasm (assembler cross-check)
+
+gputils v1.5.2 (2025-10-23), actively maintained. Assemble our emitted `.asm` with `gpasm`
+and diff the resulting HEX against our own assembler's output. This isolates
+"our assembler is wrong" from "our codegen is wrong" — two failure modes that otherwise
+look identical.
+
+### 4. MPLAB SIM (`mdb`), the PIC18 execution oracle
+
+gpsim covers the 14-bit core only, so PIC18 sequences verified in-sim had
+no independent executor: a second run of the same model. `mdb` (MPLAB SIM,
+driven headless through epic-hal's `make mdb-hex` gate) replays every
+superopt-landed sequence on the 18F4550 and diffs final RAM, `W`, and
+`STATUS` against `Pic18`, byte for byte. Microchip tooling stays an
+external process behind epic-hal's own target; nothing is vendored here,
+and XC8 remains black-box per ADR-006.
+
+Harness (`crates/superopt/src/mdb.rs`, specs in `src/specs.rs`, driver
+`src/bin/mdb_oracle.rs`, `scripts/mdb-oracle.sh`, `make mdb-oracle`):
+each spec emits unrolled replay programs (setup, candidate, result
+save, spin) assembled with `asm::assemble_pic18` and rendered with
+`asm::to_hex`, one MDB session per chunk, read back with `x /1xbr`
+(`print` needs symbol names; bare addresses return null). Two tiers:
+`pr` (small domains whole, large domains stratified) gating landings,
+`nightly` (wider sweeps) in `.github/workflows/mdb-oracle.yml`, which
+pulls epic-hal's private toolchain image the way its family-check does.
+The PR tier runs only on oracle-input changes (`crates/sim`, `crates/asm`,
+`crates/superopt` including the spec case lists, `scripts/mdb-oracle.sh`,
+this workflow); `isel-pic18` changes skip it and ride the nightly sweep,
+which fails red in Actions like every other scheduled job.
+Full 65536-pair and 2^32 domains stay sim-only: they exceed 16K-word
+flash and 2 KB RAM as unrolled HEX, and executor divergence is
+systematic, so structured edges plus deterministic LCG samples catch it.
+
+The opcode sweep (`crates/superopt/src/sweep.rs`, six matrix shards:
+`pic18-arith`, `pic18-logic`, `pic14-arith`, `pic14-logic`,
+`pic18-noflag`, `pic14-noflag`) replays one opcode per lane across
+entry-`W`, operand, and entry-`STATUS` corners, so the sim cannot share
+the compiler's wrong belief about an opcode the way the
+`SUBFWB`/`SUBWFB` mixup did. Each mismatch log names every failing
+lane. The PIC14 lanes store through RP1:RP0 bank selects into a table
+spanning banks 0-3, mask TO/PD out of the captured `STATUS` in-program
+(SIM reports POR-or-WDT values there nondeterministically), and park on
+`clrwdt`/`goto` against WDT resets during the wait. The no-flag shards
+cover the compare-skips, test/skip, bit, multiply, and flag-free move
+lanes the flag sweep excluded, crossing entry-`W` with operand corners
+over a two-value `STATUS` invariance pair instead of the
+carry-dependence cross; skip lanes pair the op with a `movlw` marker so
+`W` reads taken versus missed, and multiply lanes split `PRODH:PRODL`
+into the `W` and watched slots. The PR tier runs only on oracle-input
+changes (`crates/sim`, `crates/asm`, `crates/superopt`, the oracle
+script and workflow); wider corners ride the nightly sweep. Running the
+sweep convicted MPLAB SIM 6.35 itself on three flag models,
+hand-verified against boolean truth and triangulated with gpsim: ADDWFC
+drops the (W+C) low-nibble carry from DC, SUBWFB and SUBFWB miscompute
+DC+OV with borrow-in, and DAW tests the original high nibble (wrong for
+valid BCD like 0x99+0x06). Those STATUS bits are masked per lane
+in-program on both executors, DAW has no lane, and the masked behavior
+stays pinned by in-tree sim tests instead (epic-cc#819, remainder in
+#1001).
+
+Three hardware facts the harness depends on: reset `STATUS` reads `0x00`
+in both SIM and model (no TO/PD masking needed); the device proof reads
+`TRISB`, never `TRISA` (RA6/RA7 are oscillator pins and the SIM returns
+its unimplemented bit set); access-bank GPR is `0x000-0x07F` only, so
+`0x080-0x0FF` goes through `movff` (an access-bit write there aliases
+the SFR region). A wrong sequence is caught by construction: `--mutate`
+drops the candidate's first line after confirming in-sim that the mutant
+fails the chunk, and `EPIC_MDB_GATE=1` turns "mdb unavailable" from a
+local skip into a gating-job failure.
+
+## Our own simulator
+
+Despite gpsim existing, we plan our own PIC14 instruction-set simulator.
+
+**Why:** 35 instructions makes it small (~1500 lines). Owning it gives us determinism,
+speed, embeddability in `cargo test`, cycle counting, and the ability to assert on internal
+state directly. It also removes a GPL process boundary from the inner test loop.
+
+**Why gpsim still matters:** as an independent semantic reference to validate our simulator
+against. Our simulator being wrong in the same way our compiler is wrong is the one failure
+mode that a single-oracle setup cannot catch.
+
+## Random program generation
+
+**YARPGen** is preferred over Csmith.
+
+- Generates **UB-free** programs by construction, using generation policies to increase
+  diversity and trigger more optimizations. Found 220+ bugs in GCC, LLVM, and ICC.
+- Csmith leans on 32-bit-`int` assumptions and UB-adjacent patterns that would waste
+  substantial time on a 16-bit-`int` target. Csmith-generated programs also contain a lot
+  of dead code that gets eliminated, yielding little actual machine code.
+
+Generation must be **constrained to our supported C subset** and to the 877A's resource
+limits (368 bytes RAM, 8K words flash) — an unconstrained generator will mostly produce
+programs that legitimately do not fit.
+
+## Automatic test-case reduction
+
+**C-Reduce / cvise.** Per Regehr et al. (PLDI'12), outputs average **>25× smaller** than
+delta debugging or other reducers, and avoid the classic failure of reducing a program into
+undefined behaviour.
+
+Interface: an **oracle shell script** that returns whether the unwanted behaviour still
+occurs. Writing good oracle scripts is the skill here — they must distinguish "still
+miscompiles" from "now fails for an unrelated reason."
+
+This is the component that most directly enables unsupervised operation: it converts "a
+10,000-line random program produces the wrong answer" into "here are 15 lines that
+miscompile," automatically.
+
+## Stage-boundary snapshot testing
+
+Because every pipeline stage boundary is a text artifact ([`04-pipeline-design.md`](04-pipeline-design.md)),
+snapshot tests (`insta`) can pin each stage's output. A miscompile is then bisected to a
+stage *before* anyone reads code.
+
+## Flash size: a gate and a profile
+
+Two separate jobs, deliberately split. `crates/driver/tests/size_regression_e2e.rs`
+is the **gate**: a checked-in baseline per fixture, failing when a program
+grows. It says that something got bigger, never where.
+
+`scripts/density-profile.py` is the **profile**, and answers where. It reads
+an `--emit asm` listing, sizes every instruction with the word table it
+parses out of the `asm` crate itself (so it cannot drift from the encoder),
+attributes each instruction to its nearest preceding function label, and
+buckets the result into named codegen sinks: struct-copy `MOVFF` runs, wide
+constant materialisation, bank switches, boolean diamonds, unrolled shift
+chains, dead store/reload round trips, switch dispatch. Output is a table
+ranked by words, optionally against an XC8 reference count.
+
+```bash
+epic-cc --target 18F4550 --emit asm -o out.asm src/*.c
+python3 scripts/density-profile.py out.asm --xc8-words <N> --show-other
+python3 scripts/density-profile.py out.asm --json > before.json
+# ... land a codegen fix, rebuild ...
+python3 scripts/density-profile.py after.asm --compare before.json
+```
+
+The listing is the assembler's *input*: far-branch expansion and PCL
+alignment padding land during assembly, so a PIC18 total reads a little
+under the driver's own flash report. `--flash-words` prints that residual
+rather than hiding it. Sink categories live in one precedence-ordered rule
+table (`SINK_RULES`); a new category is one entry and one matcher.
+
+`make size-report` runs the ladder and the profiler over the tree and
+rewrites `crates/driver/tests/fixtures/SIZE_REPORT.md` (numbers, date,
+commit) from those same tools, so the report never rots. XC8 comparisons
+render from the private epic-benchmarks repo through the same
+`scripts/size-report.py --xc8`.
+
+Micro-savings are invisible unless measured on the final packed image.
+Small code-word wins routinely vanish before the ladder: epic-cc#714
+removed 22 reload words for a net-zero row (page packing and alignment
+absorbed them), #732 found nothing reorderable in straight-line runs,
+and #805 fired exactly once. Price a density ticket on the ladder rows
+(`size_baseline.toml` through the e2e suite), never on listing diffs or
+profiler bucket deltas, and re-measure after every rebase: the padding
+baseline moves under you.
+
+## Hardware-in-the-loop
+
+The final oracle is real silicon. HEX files can be flashed via MPLAB IPE. This is out of
+scope for automated loops but is the ultimate acceptance test for
+[`00-charter.md`](00-charter.md)'s goal ("write C, flash it, have my hardware work").
+
+
+## CI stratification - canonical per core + per-device lightweight
+
+CI does not grow as `devices x fixtures`. A bug is core-wide (wrong
+`isel` for a C construct, fails on one `pic14` iff it fails on every
+`pic14`) or data-wide (wrong TOML value, caught by schema plus one
+sanity compile for that device). The gate is split per
+`docs/internals/specs/2026-08-22-pic-variants-design.md` §8 and
+ADR-019.
+
+| Gate | When | What |
+|------|------|------|
+| **Canonical per core** | Every PR, always | `p16f877a` (`pic14`) + `p18f4550` (`pic18`): fixed 2-job matrix in `ci.yml`. Runs the full gate that ran before one job: `bash scripts/ci-test.sh` (every crate's `cargo test`, 15 e2e fixtures to HEX to `gpasm -p <canonical>` byte-match + `sim` + `fuzz` seeded 200). Cost `O(cores)=2`, not `O(devices)`. |
+| **Per-device lightweight** | PR iff `devices/*.toml` touched; nightly always | For each touched device: schema/invariants (`build.rs` validation), `alloc` empty-prog does not panic, one 80-byte global lands inside `ram_banks`, `asm` flash-bound tiny program, single `add.c` to HEX for that `--target` + `gpasm -p <device>` assemble of that asm. `~0.5 s/device`. No fuzz, no float/const tortures. |
+| **Nightly** | `schedule: 02:00 UTC` + `workflow_dispatch` (`nightly.yml`) | Lightweight for every `devices/*.toml`. Proves no TOML drifted. |
+| **Never** | - | Full per-device `devices x 15` e2e, full per-device fuzz. A fuzz bug is core-wide by construction and the canonical already found it. |
+
+Implementation:
+
+* `ci.yml` has a `canonical` job with a `matrix.include` of the two
+  canonical stems and a `devices-changed` job that does
+  `git diff --name-only origin/master...HEAD -- crates/device/devices/*.toml`
+  and loops `bash scripts/sanity.sh <stem>` for each stem touched. PRs
+  that touch only `p16f887.toml` do not re-run 15 fixtures for `p16f877a`.
+* `nightly.yml` loops the same helper over every TOML.
+
+### Local helpers
+
+```bash
+# One device (the cheap drill, ~0.5 s):
+make sanity DEVICE=p16f887
+bash scripts/sanity.sh p16f887
+
+# Every device (what nightly runs):
+make sanity-all
+for f in crates/device/devices/*.toml; do bash scripts/sanity.sh $(basename $f .toml); done
+
+# Only TOMLs touched vs origin/master (what PR CI does):
+make sanity-changed
+git diff --name-only origin/master -- crates/device/devices/*.toml | while read f; do bash scripts/sanity.sh $(basename $f .toml); done
+
+# Direct cargo test for the alloc/asm slice (the --changed-only equivalent):
+#   SANITY_DEVICE filters the per-device test to one stem:
+SANITY_DEVICE=p16f887 cargo test -p device --test sanity -- --nocapture
+cargo test -p device --test sanity -- --nocapture   # all devices
+```
+
+The `SANITY_DEVICE` filter is the `cargo test -p device --test sanity -- --changed-only`
+equivalent referenced in the issue: pair it with the `git diff` list to
+run only the touched stems, or use `make sanity-changed` which does the
+diff and the loop for you.
+
+## Licensing boundary — important
+
+`gputils` and `gpsim` are **GPL**. Invoking them as external processes from a test harness
+does not affect our licensing. **Linking them into our compiler would.** Keep them behind a
+process boundary.

@@ -1,5 +1,5 @@
 //! #461 corpus: operator overloading as the mangling/ABI guard.
-//! Hand asserts in the `Pic18` sim (primary oracle, docs/40 §5).
+//! Hand asserts in the `Pic18` sim (primary oracle, docs/internals/design/40 §5).
 
 use std::process::Command;
 

@@ -1,0 +1,134 @@
+# 08 - Status and next steps
+
+**Start here if you are resuming cold.** This is the current-state map; the detailed
+designs and their ADRs are the source of truth.
+
+Last updated: 2026-09-09
+
+---
+
+## Where we are
+
+The design conversation from 2026-08-14 is closed and implemented. The repository
+now contains a complete compiler, not just documentation:
+
+- **Build environment:** docker multi-stage toolchain, verified. `make image` builds the
+  `dev` image with pinned clang 20.1.8, rustc 1.97.1, gpasm 1.5.2, csmith, creduce and
+  cvise. See [`09-build-environment.md`](09-build-environment.md) and
+  [ADR-008](03-decisions.md).
+- **PIC14 backend:** feature-complete for the v1 C surface. Core C89, 8/16/32-bit ints,
+  pointers, arrays, structs, `const` in flash via `RETLW` tables, frame overlay across
+  the whole-program call graph, multi-bank RAM and multi-page flash, interrupts with
+  SFR headers, and IEEE-754 single soft-float. Every feature has an e2e fixture under
+  `crates/driver/tests/fixtures` and a gpasm byte-for-byte cross-check.
+- **PIC18 backend:** P0 through P8 landed per [`29-pic18-port-design.md`](29-pic18-port-design.md).
+  `device` abstraction, PIC18 `asm` encoder and `sim` core, integer spine with Access
+  Bank and `BSR` banking, pointers via `FSR0`/`INDF0` ([ADR-009](../adr/ADR-009-pic18-pointer-model.md)),
+  `const` via `TBLRD` ([ADR-010](../adr/ADR-010-pic18-const-tblrd.md)),
+  interrupts in single-vector compat mode ([ADR-013](../adr/ADR-013-pic18-interrupts.md)),
+  32-bit `long` with hardware `MULWF` ([ADR-014](../adr/ADR-014-pic18-hw-arithmetic-routines.md)),
+  soft-float ([ADR-015](../adr/ADR-015-pic18-softfloat.md)),
+  and a device-threaded differential fuzz gate ([ADR-016](../adr/ADR-016-pic18-fuzz-gate.md)).
+- **PIC baseline backend:** P0 through P8 landed per
+  [`37-pic-baseline-port-design.md`](37-pic-baseline-port-design.md): the `p12f509` device
+  profile, the 12-bit-word `asm` encoder and `sim` core, the integer spine with D-2's
+  unconditional `FSR` bank-bit reassertion inside `isel-pic-baseline`, pointers and arrays
+  via `FSR` flat addressing, `const` via `RETLW` tables under the 256-word half-page
+  ceiling, 32-bit `long` with mul/div routines, and a device-threaded differential fuzz
+  gate on `p12f509`. Soft-float is a documented non-goal on this core (#386); interrupts
+  do not exist on it (docs/internals/design/37 section 1). The family's other parts (PIC10F, PIC12F508,
+  PIC16F505) stay unprofiled until a consumer wants one. Scope remains bounded to 8-bit
+  PIC only; dsPIC, PIC24 and PIC32 remain out of scope entirely.
+- **Device registry:** file-per-device TOML under `crates/device/devices/` with
+  `build.rs` codegen and a `--target` flag ([ADR-019](../adr/ADR-019-pic-variants-device-registry.md)),
+  holding twelve profiles across all four cores: `p16f877a`, `p16f887`,
+  `p16f628a`, the `p16f193x` PIC14E family (33/34/36/37/38/39), `p18f4550`,
+  `p18f2550`, and the baseline `p12f509`. A DFP to TOML generator
+  ingests Microchip ATDF ([ADR-020](../adr/ADR-020-dfp-toml-generator.md)), a provenance
+  stanza records where each field came from, and an always-on gputils cross-check
+  catches drift against the oracle ([ADR-021](../adr/ADR-021-device-provenance-and-cross-check.md)).
+  Adding a device on an already-supported core is now a documented, twice-proven
+  runbook, [`32-adding-a-device.md`](32-adding-a-device.md). What to port next
+  is triaged by the flash-generation part catalog
+  (`crates/device/catalog/parts.toml`, all 1007 F-family parts with memory
+  facts, lifecycle, datasheet URLs and GitHub popularity tiers; ADR-029), the
+  ported set staying the verified `devices/*.toml` registry. Device names
+  resolve in every spelling the toolchain uses, so no caller keeps a mapping table. CI is
+  stratified into a canonical job per core plus a lightweight per-device job, and a
+  `hal-887` job builds epic-hal's 887 firmware inside an epic-cc job so a compiler change
+  cannot silently break the HAL. `Device`'s schema is closed over what the compiler needs
+  to place code and data and resolve config fuses: core, flash geometry, RAM banks,
+  stack depth and interrupt vectors, config/fuse fields, and the PIC18-only
+  `access_bank`/`fixed_retval` layout facts.
+  Peripheral register semantics are permanently out of scope; `epic-hal` owns them. The
+  core set is closed at four: Baseline, Mid-Range, Enhanced Mid-Range and PIC18, the four
+  8-bit families in Microchip's own product taxonomy (Microchip, "8-bit PIC
+  Microcontroller Solutions," DS-39630D, and the current-catalog brochure at
+  farnell.com/datasheets/1523199.pdf; no fifth 8-bit core exists in the current lineup)
+  [VERIFY]: the per-family device counts (16 baseline, 58 mid-range, 29 enhanced
+  mid-range, 193 PIC18, the brochure's count) were not independently refetched in this
+  pass, and the PIC17 dismissal rests on PIC17's absence from the two cited sources, not
+  on a direct Microchip statement.
+- **Multi-TU and distribution:** `llvm-link` merge and `epic-cc` binary naming per
+  [ADR-011](../adr/ADR-011-multi-tu-front-end.md); silicon-real codegen (`EPIC_AT`,
+  `EPIC_CONFIG`, `EPIC_FOSC_HZ`) per [ADR-012](../adr/ADR-012-cc3-silicon-real-codegen.md);
+  freestanding libc headers per [ADR-018](../adr/ADR-018-cc2-freestanding-libc.md);
+  inline assembly (rungs 1-4) per [ADR-017](../adr/ADR-017-cc4-inline-assembly.md).
+  Public binary distribution is designed in [`30-distribution-design.md`](30-distribution-design.md);
+  ecosystem integration (epic-cc as the default toolchain for epic-hal, PlatformIO)
+  is designed in [`31-ecosystem-integration-design.md`](31-ecosystem-integration-design.md),
+  whose section 6 is the current state of that effort: CC-1 through CC-5 landed, HAL-1 and
+  HAL-2 landed, HAL-3 decomposed into clusters, and parity amended to three families.
+
+What used to live in this document, the phasing table, the "never presented" sections,
+and the open-questions list, is superseded by [`12-backend-design.md`](12-backend-design.md)
+(the approved PIC14 spec), [`29-pic18-port-design.md`](29-pic18-port-design.md),
+[`30-distribution-design.md`](30-distribution-design.md),
+[`31-ecosystem-integration-design.md`](31-ecosystem-integration-design.md) and the
+ADRs in [`03-decisions.md`](03-decisions.md) plus `docs/internals/adr/`.
+
+## What the user has decided (still settled)
+
+1. **Goal:** a usable compiler for real PIC16F877A projects, write C, flash it,
+   hardware works. Not a research artifact, not an XC8 clone.
+2. **Toolchain:** whole-program compilation, we own everything down to Intel HEX.
+3. **C surface:** all of it, core C89 + 8/16-bit ints, 32-bit `long` with soft
+   arithmetic, soft-float, and interrupts with SFR headers.
+4. **Architecture:** Approach A, clang as an out-of-process front end emitting `.ll` text;
+   custom whole-program PIC14 backend. Not an LLVM backend.
+5. **Commits:** conventional commits, single line, at most 3 lines.
+6. **Implementation language:** Rust ([ADR-005](03-decisions.md)).
+7. **Build isolation:** docker multi-stage toolchain, nothing installed system-wide;
+   clang pinned to 20.1.8 ([ADR-008](03-decisions.md)).
+8. **Vendored material:** user supplies Microchip installers, datasheets, and the reference
+   books under `vendor/`, gitignored ([`../vendor/README.md`](../../../vendor/README.md)).
+
+## Where to go next
+
+| If you want | Read |
+|---|---|
+| The PIC14 architecture and why it is hard | [`01-target-pic14.md`](01-target-pic14.md) |
+| The consolidated backend spec | [`12-backend-design.md`](12-backend-design.md) |
+| The ten-stage pipeline and stage contracts | [`04-pipeline-design.md`](04-pipeline-design.md) |
+| Verification: simulator, gpasm oracle, fuzzing | [`05-verification.md`](05-verification.md) |
+| Build environment and pinned versions | [`09-build-environment.md`](09-build-environment.md) |
+| PIC18 port: why it is smaller than a second compiler, and its phases | [`29-pic18-port-design.md`](29-pic18-port-design.md) |
+| Adding a device on a core this compiler already supports | [`32-adding-a-device.md`](32-adding-a-device.md) |
+| PIC14E port: Enhanced Mid-range backend plan and its phases | [`33-pic14e-port-design.md`](33-pic14e-port-design.md) |
+| Public binary distribution | [`30-distribution-design.md`](30-distribution-design.md) |
+| Ecosystem integration: epic-cc + epic-hal + PlatformIO | [`31-ecosystem-integration-design.md`](31-ecosystem-integration-design.md) |
+| Architecture decisions and rejected alternatives | [`03-decisions.md`](03-decisions.md) and `docs/internals/adr/` |
+
+Implementation plans (`docs/internals/plans/`) are ephemeral and never tracked on
+`master` (see `AGENTS.md`); load-bearing decisions are distilled into ADRs. The
+numbered milestone plans `docs/internals/design/13-` through `docs/internals/design/28-` are the historical record of
+the PIC14 spine and remain as reference.
+
+## Corrections that still apply
+
+- **"LLVM cannot target accumulator machines" is false.** llvm-mos disproves it. The
+  argument against the LLVM route is cost, not possibility. See [ADR-001](03-decisions.md).
+- **"gputils is largely unmaintained" is false.** v1.5.2 shipped 2025-10-23 and it is
+  actively maintained. It is a useful oracle and device-data source.
+- **"XC8 is clang-based, so its PIC16 codegen is LLVM" is false.** clang is the front end;
+  `cgpic` (HI-TECH lineage) is the mid-range code generator.

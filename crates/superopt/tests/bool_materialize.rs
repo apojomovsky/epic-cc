@@ -21,7 +21,7 @@
 //! that varies incoming Z independently of the `clrf`) and by hand: `CLRF
 //! dst` given entry Z=0 leaves Z=1 after the `CLRF`, so `B<inv>` reads the
 //! wrong flag. Landing that fix as literally written would be a
-//! miscompile, not a density win; see docs/41-superopt-spike-findings.md.
+//! miscompile, not a density win; see docs/internals/design/41-superopt-spike-findings.md.
 //!
 //! Destination register: 0x020 (an arbitrary access-bank GPR; which
 //! physical address `alloc` actually picks does not affect which
@@ -72,7 +72,7 @@ fn cases(w_values: &[u8]) -> Vec<Case> {
 /// The alphabet: instructions plausible for a Z-to-byte materialization,
 /// curated rather than the full ISA (the full PIC18 opcode set, including
 /// every addressing mode and literal value, is a much larger spike than
-/// this one; see docs/41 for the scoping call). All operate on `DST`
+/// this one; see docs/internals/design/41 for the scoping call). All operate on `DST`
 /// (0x020) or the flag bits `SUBWF`'s successor would have already set.
 const ALPHABET: &[&str] = &[
     "clrf 0x020,A",

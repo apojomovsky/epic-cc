@@ -77,13 +77,13 @@ fn delay_is_exact_on_pic14() {
 
 #[test]
 fn delay_is_exact_on_pic14_no_common_ram() {
-    // docs/39 bucket 2 (F74): counters in banked `isr_home_window`.
+    // docs/internals/design/39 bucket 2 (F74): counters in banked `isr_home_window`.
     delay_is_exact_on(&device::PIC16F74, "p16f74");
 }
 
 #[test]
 fn delay_is_exact_on_pic14_no_common_ram_bucket1() {
-    // docs/39 bucket 1 (873A): same pin, other bucket.
+    // docs/internals/design/39 bucket 1 (873A): same pin, other bucket.
     delay_is_exact_on(&device::PIC16F873A, "p16f873a");
 }
 

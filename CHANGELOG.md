@@ -178,7 +178,7 @@ Conventional Commits. Dates are UTC.
 - Onboard 15 catalog-selected high-tier devices (#394)
 - Add p12f683 (PIC12F683) (#396)
 - Implement ADR-034 single-region common_ram split (#399)
-- PIC16F74 full interrupt support (docs/39 D-2) (#401)
+- PIC16F74 full interrupt support (docs/internals/design/39 D-2) (#401)
 - Pic-baseline differential fuzz gate and PicBaseline arm in run_pic (#402)
 - Git-cliff changelog and automated release-cutting workflow (#404)
 - Mid-range groundwork, exemplar parts and the ISR carve-out widening fix (#412)
@@ -217,19 +217,19 @@ Conventional Commits. Dates are UTC.
 ### Documentation
 
 - ADR-027, a bank-aware instruction scheduler pass (#219)
-- Write docs/32-adding-a-device.md, the same-core device runbook (#235)
+- Write docs/internals/design/32-adding-a-device.md, the same-core device runbook (#235)
 - PIC14E (Enhanced Mid-range) backend port design (#236)
-- Land the phase 2-4 design doc as docs/34 (#241)
+- Land the phase 2-4 design doc as docs/internals/design/34 (#241)
 - Revise the port design per independent review (#243)
 - Require a separate code review before takeoff (#254)
 - Track PIC baseline core as a future backend candidate (#256)
 - Record settled phase 2-4 scope, fix full -g mechanism (#260)
 - Board-track every filed issue (#262)
-- SDCC parity epic design (docs/35) (#271)
+- SDCC parity epic design (docs/internals/design/35) (#271)
 - PIC18 float-routine access-bank frame allocation (design) (#285)
-- Robustness test strategy beyond differential fuzzing (docs/36) (#292)
-- PIC baseline core port design (docs/37) (#321)
-- Device onboarding hardening design (docs/38) (#332)
+- Robustness test strategy beyond differential fuzzing (docs/internals/design/36) (#292)
+- PIC baseline core port design (docs/internals/design/37) (#321)
+- Device onboarding hardening design (docs/internals/design/38) (#332)
 - State peripheral-blindness and four-core scope decisions (#341)
 - Rewrite as a two-speed pitch instead of a design doc (#377)
 
@@ -258,7 +258,7 @@ Conventional Commits. Dates are UTC.
 - PIC14E differential fuzz gate (P8) (#298)
 - PIC14E differential parity on 16F1938 (#302)
 - Coverage-guided fuzz target for irparse parser (Lane B) (#311)
-- Arbitration gate with sdcc-known-bugs.toml (docs/35 5.2) (#313)
+- Arbitration gate with sdcc-known-bugs.toml (docs/internals/design/35 5.2) (#313)
 - Valid comparison protocol, ratio gate, P0 closure (#319)
 - Wire w_holds into const-table index and i8 add stores (#320)
 - SDCC regression-suite pass rate as nightly context (Tier 3) (#322)
@@ -288,7 +288,7 @@ Conventional Commits. Dates are UTC.
 - Lane D idempotence, fixpoint, and determinism checks (#288) (#305)
 - Compile-time bound for adversarial BANKSEL dataflow (Lane G) (#306)
 - Resource-exhaustion boundary tests (Lane F) (#309)
-- Pin volatile store ordering and count (docs/36 lane E) (#316)
+- Pin volatile store ordering and count (docs/internals/design/36 lane E) (#316)
 - Lane C mutants-killing tests and triage checklist (#317)
 ## [0.1.0] - 2026-09-03
 
@@ -631,7 +631,7 @@ outside the 0x4000-word flash window (config words are not flash).
 
 * test(driver): PIC18 4550 HAL slice smoke (blink + epic-tick)
 
-The amendment recorded in docs/31 section 4: once CC-1 and CC-3 landed,
+The amendment recorded in docs/internals/design/31 section 4: once CC-1 and CC-3 landed,
 run a thin PIC18 smoke slice so the PIC18 path cannot drift silently
 while PIC14 integration proceeds. Two programs compiled through the real
 epic-cc binary (--target 18F4550, with the config-word TU exercising

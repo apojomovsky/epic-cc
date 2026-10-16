@@ -1,5 +1,5 @@
 # Every 8-bit PIC flash part (PIC10F/12F/16F/18F, LF and HV variants
-# included): the roadmap table behind docs/38 D-3's on-demand device
+# included): the roadmap table behind docs/internals/design/38 D-3's on-demand device
 # rule. This table tracks and prioritizes; devices/*.toml stays the
 # ported, verified set.
 # Derived data, regenerate with scripts/catalog.py: memory and core

@@ -581,7 +581,7 @@ pub fn assign_banks_with_locs(
 ) -> (String, Vec<Option<SrcLoc>>) {
     if device.core == device::Core::PicBaseline {
         panic!(
-            "banking: {} is pic-baseline; its bank changes are FSR bit writes owned by isel-pic-baseline (docs/37 D-2), not this pass",
+            "banking: {} is pic-baseline; its bank changes are FSR bit writes owned by isel-pic-baseline (docs/internals/design/37 D-2), not this pass",
             device.name
         );
     }

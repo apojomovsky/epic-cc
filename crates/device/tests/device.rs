@@ -241,7 +241,7 @@ fn by_name_case_insensitive_helper() {
     );
 }
 
-/// The public beta's parts (docs/46 D-2): their generated headers need a
+/// The public beta's parts (docs/internals/design/46 D-2): their generated headers need a
 /// register table, so an empty one is a regression, not a gap.
 const BETA_PARTS: &[&str] = &[
     "p16f877a", "p16f887", "p16f628a", "p12f675", "p16f1937", "p18f4550",
@@ -391,7 +391,7 @@ fn pic14_flash_words_is_a_multiple_of_the_page_size() {
     // PC, no paging) and pic-baseline (isel-pic-baseline pages
     // differently) have no such requirement. Confirmed on PIC18F2525's
     // real, datasheet-stated 24576-word flash: not a power of two either.
-    // A device under one page (PIC12F629/675's real 1023 words, docs/39
+    // A device under one page (PIC12F629/675's real 1023 words, docs/internals/design/39
     // D-1) has no page boundary to misalign in the first place -- only a
     // multi-page device's *partial last page* is the real problem.
     for d in device::ALL {

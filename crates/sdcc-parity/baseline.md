@@ -1,8 +1,8 @@
 # SDCC parity baseline (P0, epic-cc#266)
 
 The honest starting table: epic-cc vs SDCC 4.6.0 on the committed corpus,
-regenerated under the P0 comparison protocol (docs/35 section 4). This is
-the anchor for "when we're done" (docs/35 section 5). Regenerate with
+regenerated under the P0 comparison protocol (docs/internals/design/35 section 4). This is
+the anchor for "when we're done" (docs/internals/design/35 section 5). Regenerate with
 `scripts/sdcc-parity.sh` in the dev image; the machine-readable rows live
 in `crates/sdcc-parity/baseline.toml` (regenerated with
 `UPDATE_SDCC_BASELINE=1 cargo test -p sdcc-parity --test regression_gate`)

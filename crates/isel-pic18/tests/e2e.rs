@@ -549,7 +549,7 @@ fn compat_isr_preserves_zero_flag_when_w_is_nonzero() {
 
 #[test]
 fn ptr_probe_c_runs_correctly() {
-    // The ORIGINAL ptr_probe.c (full parity with PIC14, per docs/29's P3
+    // The ORIGINAL ptr_probe.c (full parity with PIC14, per docs/internals/design/29's P3
     // note): a runtime RAM pointer AND a const-table read in one program.
     // Mirrors crates/driver/tests/ptr_probe_e2e.rs: in = 1 -> i = 1 ->
     // ram[1] = table[1] = 20 (via TBLRD) -> out = 20.

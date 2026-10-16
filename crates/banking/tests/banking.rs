@@ -3,7 +3,7 @@ use device::PIC16F1938;
 use device::PIC16F877A;
 use device::{ConfigRegion, Core, Device};
 
-/// PIC16F74's real shape (docs/39 D-2, epic-cc#393): two non-aliased GPR
+/// PIC16F74's real shape (docs/internals/design/39 D-2, epic-cc#393): two non-aliased GPR
 /// regions, no common_ram. isr_w_shadow (0x20) and isr_home_window
 /// (0x70-0x7F) are carved out of ram_banks the same way common_ram is on
 /// every other PIC14 device -- see crates/device/build.rs's isr_home_window
@@ -34,10 +34,10 @@ const D2_SHAPE: Device = Device {
 fn retval_region_gets_a_real_bankselect_on_a_docs39_d2_device() {
     // The identical address (0x71, isel's retval_lo) needs no BANKSEL on a
     // common_ram-backed device (bank_of returns None) but a real one on a
-    // docs/39 D-2 device, where the same address is an ordinary ram_banks
+    // docs/internals/design/39 D-2 device, where the same address is an ordinary ram_banks
     // byte reached through isr_home_window instead -- crates/isel's own
     // ~148 retval/scratch call sites need no changes for this (the whole
-    // point of D-2's design, see docs/39 section 3's revised cost estimate):
+    // point of D-2's design, see docs/internals/design/39 section 3's revised cost estimate):
     // banking already inserts the select generically, keyed only on the
     // address, exactly as it would for any ordinary local.
     let asm = "    BSF STATUS, 5\n    MOVF 0xA5, W\n    MOVF 0x71, W\n";
@@ -486,9 +486,9 @@ fn region_with_computed_jump_keeps_full_resets() {
     assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
-/// Lane G (docs/36, #291): a compile-time bound ("does not hang") test for
+/// Lane G (docs/internals/design/36, #291): a compile-time bound ("does not hang") test for
 /// the BANKSEL minimization dataflow. The pass is NP-hard in the worst
-/// case (docs/01, docs/12), so an adversarial control-flow shape with many
+/// case (docs/internals/design/01, docs/internals/design/12), so an adversarial control-flow shape with many
 /// distinct-bank accesses interleaved with branching could regress into a
 /// combinatorial blowup. This fixture is sized to be practical to keep in
 /// the repo (200 branch diamonds, 4 banks, ~2000 lines) and asserts the

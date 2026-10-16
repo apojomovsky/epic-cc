@@ -1,4 +1,4 @@
-//! SDCC parity differential tests (docs/35, P0).
+//! SDCC parity differential tests (docs/internals/design/35, P0).
 //!
 //! Runs the committed corpus (Tier 1 + Tier 2) through both compilers and
 //! compares named outputs. Requires SDCC in the image (PIC8_SDCC); the test
@@ -9,7 +9,7 @@
 use sdcc_parity::corpus;
 use sdcc_parity::run_differential;
 
-/// The committed SDCC-known-bugs table (docs/35 section 5 item 2): programs
+/// The committed SDCC-known-bugs table (docs/internals/design/35 section 5 item 2): programs
 /// where SDCC is wrong (epic-cc matches the hand-computed expected value,
 /// SDCC does not). These are excluded from the differential gate.
 #[derive(serde::Deserialize)]
@@ -47,14 +47,14 @@ fn corpus_differential_clean() {
 
     let bugs = known_bugs();
     // Versions stamp every output so a baseline row is reproducible
-    // (docs/35 section 7, pinning).
+    // (docs/internals/design/35 section 7, pinning).
     eprintln!("versions: {}", sdcc_parity::tool_versions());
     let mut clean = 0usize;
     let mut failures = Vec::new();
     let mut excluded = 0usize;
     let mut surface_gaps = Vec::new();
     // Comparable rows (both compilers measured, outputs agree) feed the
-    // aggregate ratios (docs/35 section 5 items 3-4): epic flash, sdcc
+    // aggregate ratios (docs/internals/design/35 section 5 items 3-4): epic flash, sdcc
     // flash, epic RAM, sdcc RAM, epic cycles, sdcc cycles.
     let mut comparable: Vec<(usize, usize, usize, usize, usize, usize)> = Vec::new();
     for prog in corpus::corpus() {
@@ -99,7 +99,7 @@ fn corpus_differential_clean() {
                     );
                 }
                 Ok(Ok(r)) => {
-                    // Arbitration (docs/35 section 5 item 2): a mismatch
+                    // Arbitration (docs/internals/design/35 section 5 item 2): a mismatch
                     // where SDCC is the wrong side is a recorded known bug,
                     // excluded from the gate. Otherwise it's a real finding.
                     if is_known_bug(&prog.name, device.name) {
@@ -166,7 +166,7 @@ fn corpus_differential_clean() {
     }
     // Aggregate geometric-mean ratios, epic-cc/SDCC, over comparable rows
     // (flash and cycles; RAM is informational). These anchor the "<= SDCC"
-    // gates in docs/35 section 5 items 3-4 and the committed ratio
+    // gates in docs/internals/design/35 section 5 items 3-4 and the committed ratio
     if !comparable.is_empty() {
         let geo = |pick: fn(&(usize, usize, usize, usize, usize, usize)) -> (usize, usize)| {
             let rows: Vec<f64> = comparable

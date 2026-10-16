@@ -9,7 +9,7 @@
 //! into `pic14-sim` and through host clang natively, seeds volatile inputs
 //! identically on both sides, and compares checksums.
 //!
-//! Harness contracts (docs/27 §1):
+//! Harness contracts (docs/internals/design/27 §1):
 //! `generate(seed)` stays deterministic with no entropy; the discipline
 //! keeps host and PIC semantics identical, so a checksum mismatch, a
 //! non-halting sim, or a compiler panic signals a real bug. The PIC side

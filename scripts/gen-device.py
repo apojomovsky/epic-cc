@@ -16,7 +16,7 @@ Output: crates/device/devices/<stem>.toml deterministically formatted.
   python3 scripts/gen-device.py PIC16F887 --out crates/device/devices/p16f887.toml
   python3 scripts/gen-device.py p16f887 --check   # CI: fails if drift
 
-Sweep mode (breadth proofing, docs/38 D-2):
+Sweep mode (breadth proofing, docs/internals/design/38 D-2):
   python3 scripts/gen-device.py --sweep <pack-dir> [--out-dir <scratch>] [--pack <name>]
   Attempts generation for every part in an unpacked DFP directory and
   prints a triage report (ok / missing-facts / error) instead of stopping
@@ -612,7 +612,7 @@ INI_ARCH_TO_CORE = {
     "PIC12": "pic-baseline",
 }
 
-# Not a DFP-stated fact (docs/39 D-1, ADR-034): a PIC14/PIC14E/baseline part
+# Not a DFP-stated fact (docs/internals/design/39 D-1, ADR-034): a PIC14/PIC14E/baseline part
 # whose entire GPR is one bank-independent region (PIC16F84/PIC12F629/
 # PIC12F675's full-bank-shadow shape, PIC10F320/322's single bank, or
 # PIC16F54's mirrored 25 bytes) has no DFP-stated sub-boundary. Carve the
@@ -1045,7 +1045,7 @@ def generate_toml(
                 ]
             )
     # 2+ real, non-aliased regions (PIC16F74) have no bank-independent
-    # byte at all -- docs/39 D-2 (epic-cc#393)'s isr_w_shadow/
+    # byte at all -- docs/internals/design/39 D-2 (epic-cc#393)'s isr_w_shadow/
     # isr_home_window pair substitutes for one. The lowest region's top
     # COMMON_RAM_CARVE_SIZE bytes become isr_home_window; the low 7 bits
     # of its own first byte become isr_w_shadow, reachable from any
@@ -1107,7 +1107,7 @@ def generate_toml(
         else None,
     )
     # Baseline bank selection lives in FSR high bits, a per-part count
-    # the DFP states as GPR bank numbers (docs/37 D-3; reproduces the
+    # the DFP states as GPR bank numbers (docs/internals/design/37 D-3; reproduces the
     # 0/1/2 of 508/509/16F505). More than two needs a schema and
     # backend decision first (build.rs caps pic-baseline at two), so
     # those parts stay MissingFacts instead of emitting TOMLs the
@@ -1392,7 +1392,7 @@ def generate_toml(
 def sweep_pack(pack_dir: pathlib.Path, out_dir=None, pack=None):
     """Attempt generation for every part in an unpacked DFP directory.
 
-    The sweep's job is breadth proofing (docs/38 D-2): surface DFP spelling
+    The sweep's job is breadth proofing (docs/internals/design/38 D-2): surface DFP spelling
     quirks across a whole pack cheaply, before a human meets them one
     device at a time. It never commits anything; `out_dir` is a scratch
     directory for the successful TOMLs, and the report is the deliverable.

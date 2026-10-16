@@ -5,7 +5,7 @@
 //! the dynamic type at runtime (`-D SEL=`); all three overrides return from
 //! the same vtable layout. PIC18 only.
 //! The dispatch sequence replays on hardware through the `tblrd-flash-ptr`
-//! superopt spec; per-fixture runs stay sim-only (docs/40 §5).
+//! superopt spec; per-fixture runs stay sim-only (docs/internals/design/40 §5).
 
 use std::process::Command;
 

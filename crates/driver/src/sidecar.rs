@@ -3,8 +3,8 @@
 //! the typed variable table into one DWARF compile unit with aggregate
 //! DIEs (struct/union members, array subranges, enums), every location
 //! constant addresses (`DW_OP_addr`, chained with `DW_OP_piece` for a split
-//! local) per docs/34 §1, inside an `EM_386` ELF container
-//! (docs/34 §3: the session runs as i386, so the sidecar declares the
+//! local) per docs/internals/design/34 §1, inside an `EM_386` ELF container
+//! (docs/internals/design/34 §3: the session runs as i386, so the sidecar declares the
 //! architecture gdb uses).
 
 use alloc::AllocLayout;

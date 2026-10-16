@@ -87,4 +87,4 @@ mask = 0x08
 shift = 3
 default = "off"
 values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
-# gputils-divergence: 0x0070-0x007F reserved isr_home_window, real RAM; 16f874_g.lkr models it as unprotected SHAREBANK gprnobnk (docs/39 D-2)
+# gputils-divergence: 0x0070-0x007F reserved isr_home_window, real RAM; 16f874_g.lkr models it as unprotected SHAREBANK gprnobnk (docs/internals/design/39 D-2)

@@ -1,4 +1,4 @@
-# SDCC known bugs (docs/35 section 5 item 2, arbitration). Where epic-cc
+# SDCC known bugs (docs/internals/design/35 section 5 item 2, arbitration). Where epic-cc
 # matches the hand-computed expected value and SDCC does not, the case is
 # recorded here and excluded from the differential gate. If epic-cc also
 # missed the expected value, it belongs in the gap tracker, not here.
@@ -40,7 +40,7 @@ sdcc_observed = 0x1
 expected = 0x78
 
 # i64 on the pic14-family cores is an SDCC limitation, not a bug: SDCC's
-# pic14 port has no 64-bit integer type at all (docs/35 section 3 PIC14
+# pic14 port has no 64-bit integer type at all (docs/internals/design/35 section 3 PIC14
 # table: "no support for 64 bit integer types"), so `long long` does not
 # compile (error 206). epic-cc supports it; the probe cannot run against
 # SDCC here, so it is excluded rather than a mismatch.

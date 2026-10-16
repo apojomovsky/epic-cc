@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Helpers for scripts/add-device.sh (docs/38 D-1): EPIC_CONFIG synthesis,
+"""Helpers for scripts/add-device.sh (docs/internals/design/38 D-1): EPIC_CONFIG synthesis,
 the gputils RAM correction, and the sibling field-diff. Stdlib only, and
 runs on the dev container's Python 3.10 (no tomllib), so it carries a
 minimal TOML parser for the device-Toml subset gen-device.py emits.
@@ -119,7 +119,7 @@ def normalize_stem(raw):
 def synthesize_config(toml_path):
     """Build an EPIC_CONFIG spec covering every declared field: the locked
     value if locked, else the default if present, else the first enumerated
-    value (docs/38 D-1 step 4). Handling locked explicitly avoids a
+    value (docs/internals/design/38 D-1 step 4). Handling locked explicitly avoids a
     synthesis-only false failure on a locked-without-default field."""
     data = _load(toml_path)
     fields = data["config"]["fields"]
@@ -238,7 +238,7 @@ def _fmt_ram(ranges):
 
 def correct_ram(toml_path, lkr_path):
     """Widen ram_banks to match gputils when the DFP understates RAM
-    (docs/32 §3: gputils wins). Returns True if the TOML was corrected.
+    (docs/internals/design/32 §3: gputils wins). Returns True if the TOML was corrected.
 
     PIC18: ram_banks lumps the GPR part of the access window (0x10-0x5F)
     with the banked banks, so the corrected span is fixed_retval.1+1 to
@@ -279,7 +279,7 @@ def correct_ram(toml_path, lkr_path):
                 new_ram.append([lo, hi])
     else:
         new_ram = [[lo, hi] for lo, hi in banks]
-        # docs/39 D-1 and D-2: carve-outs survive the widening. gputils'
+        # docs/internals/design/39 D-1 and D-2: carve-outs survive the widening. gputils'
         # gpr* spans describe silicon; this compiler additionally
         # reserves common_ram (hardware or policy) and the ADR-034
         # isr_home_window span, and a widened bank re-covering a
@@ -349,7 +349,7 @@ def correct_ram(toml_path, lkr_path):
 
 def field_diff(toml_path, sibling_path):
     """Diff the generated TOML's config fields against a sibling's by
-    (byte_offset, shift), the docs/32 §2 review shape. Returns a list of
+    (byte_offset, shift), the docs/internals/design/32 §2 review shape. Returns a list of
     human-readable lines naming fields the sibling lacks, fields the
     generated TOML lacks, and fields whose value set differs."""
     gen = _load(toml_path)
@@ -392,7 +392,7 @@ def _shared_prefix_len(a, b):
 
 
 def sibling(toml_path, devices_dir):
-    """The closest existing registry sibling on the same core (docs/38 D-1
+    """The closest existing registry sibling on the same core (docs/internals/design/38 D-1
     step 5): the device whose stem shares the longest name prefix (e.g.
     p16f84a's real sibling is p16f84, not some other same-core device that
     merely happens to have an equal-length name), name-length distance as

@@ -1,6 +1,6 @@
 # PIC12F509: baseline (12-bit instruction word) core, 1024 x 12-bit flash,
 # 41 GPR bytes in three regions. First baseline part, landed behind the
-# driver firewall; design of record is docs/37-pic-baseline-port-design.md.
+# driver firewall; design of record is docs/internals/design/37-pic-baseline-port-design.md.
 # Hand-transcribed from the datasheets and cross-checked against gputils
 # 1.5.2 (12f509_g.lkr, p12f509.inc), hence the datasheet tier below; the
 # DFP (Microchip.PIC10-12Fxxx_DFP) now reproduces these device numbers
@@ -16,12 +16,12 @@ ram_banks = [[0x0010, 0x001F], [0x0030, 0x003F]]
 # banks (gputils: unprotected SHAREBANK gprnobnk). This is the allocatable
 # BANKSEL-free window the field means everywhere else; it is NOT the SFR
 # mirror at 0x00-0x06, which is core architecture (bank_of's mirrored
-# block), not device data. Resolves docs/37 D-3's [VERIFY]: the sketch's
+# block), not device data. Resolves docs/internals/design/37 D-3's [VERIFY]: the sketch's
 # common_ram = [0x00, 0x06] would mark SFR space allocatable.
 common_ram = [0x0007, 0x000F]
 # FSR<5> selects the bank for direct and indirect addressing alike
 # (DS41236E Figures 4-7/4-8). Unimplemented on the 508, two bits on the
-# 16F505. Consumed by the BCF/BSF bank sequencing from docs/37 D-2 on.
+# 16F505. Consumed by the BCF/BSF bank sequencing from docs/internals/design/37 D-2 on.
 fsr_bank_bits = 1
 # "2-deep, 12-bit wide hardware PUSH/POP stack" (DS41236E section 4.8,
 # page 27); the existing callgraph rejection path applies unchanged.
@@ -39,7 +39,7 @@ ticket = "epic-cc#323"
 # Not user addressable at runtime. DS41227B section 2.3 places the word at
 # 0x7FF in the 509's config memory space; the HEX convention of MPASM and
 # gputils (p12f509.inc `_CONFIG EQU 0FFFh`, .lkr `.config 0xFFF`, gpasm
-# 1.5.2 emits the record at byte 0x1FFE) is word 0xFFF. Resolves docs/37
+# 1.5.2 emits the record at byte 0x1FFE) is word 0xFFF. Resolves docs/internals/design/37
 # D-3's other [VERIFY].
 base_byte_addr = 0x1FFE
 num_bytes = 2

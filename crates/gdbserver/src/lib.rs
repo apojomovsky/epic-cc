@@ -4,7 +4,7 @@
 //! (`--sidecar` at compile time) stays on the gdb side and is never read
 //! here.
 //!
-//! Register convention (docs/34 §3): gdb sees an i386
+//! Register convention (docs/internals/design/34 §3): gdb sees an i386
 //! architecture, so PIC14 state is mapped onto the x86 core registers:
 //! `eip` <- PC (word address), `eax` <- W, `ecx` <- STATUS, `edx` <- FSR,
 //! `ebx` <- PCLATH. Memory reads/writes address the RAM image physically
