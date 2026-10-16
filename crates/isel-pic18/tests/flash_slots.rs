@@ -730,3 +730,49 @@ fn tainted_store_through_param_pointer_reaches_the_caller_slot() {
         |_| {},
     );
 }
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn split_address_reassembled_with_or_is_refused() {
+    // epic-cc#1299: `and 0xFF`/`lshr 8` split the address into bytes and
+    // `shl`/`or` rebuilds it. The pair must re-taint.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %lo = and i16 %x, 255\n    %hi = lshr i16 %x, 8\n    %hi2 = shl i16 %hi, 8\n    %r = or i16 %hi2, %lo\n    %p = inttoptr i16 %r to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn split_address_reassembled_with_add_is_refused() {
+    // Same split, reassembled with `add` instead of `or`.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %lo = and i16 %x, 255\n    %hi = lshr i16 %x, 8\n    %hi2 = shl i16 %hi, 8\n    %r = add i16 %hi2, %lo\n    %p = inttoptr i16 %r to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+fn single_address_byte_dereference_compiles() {
+    // One fragment alone cannot name the table address: dereferencing
+    // just the low or the high byte stays a RAM read, not a refusal.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %lo = and i16 %x, 255\n    %hi = lshr i16 %x, 8\n    %p = inttoptr i16 %lo to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    %q = inttoptr i16 %hi to ptr\n    %w = load i8 %q\n    store i8 %w @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn split_address_with_noop_on_one_leg_is_refused() {
+    // Review on epic-cc#1299: `or %frag, 0` is an identity, so a no-op on
+    // one leg must not break the reassembly pair back into clean values.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %lo = and i16 %x, 255\n    %lo2 = or i16 %lo, 0\n    %hi = lshr i16 %x, 8\n    %hi2 = shl i16 %hi, 8\n    %r = or i16 %hi2, %lo2\n    %p = inttoptr i16 %r to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
