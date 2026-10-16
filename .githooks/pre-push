@@ -46,14 +46,33 @@ if [ -n "$force_refs" ]; then
     fi
 fi
 
-# The suite is a gate, not a report: a red `make ci-local` refuses the
-# push (epic-cc#1238). No bypass exists for parked branches with known
-# red tests: AGENTS.md forbids skipping this hook, so a red suite means
-# fixing the tests first, not pushing around them.
-echo "pre-push: make ci-local (docker epic-cc-ci bash scripts/ci-test.sh) — see #99"
-if ! make ci-local; then
-    echo "pre-push: local CI failed; refusing the push" >&2
-    exit 1
+# ---- suite stamp (epic-cc#1296) ----
+# `epic-tasks push` retries a dropped connection once; the retry must not
+# pay for `make ci-local` twice. Stamp the tree the suite already passed,
+# keyed on the tree hash plus this hook's own content hash, so any tree or
+# hook change runs the suite again. The prose gate below still runs on
+# every push: it is cheap, and skipping it would weaken the gate.
+stamp_file="$(git rev-parse --absolute-git-dir 2>/dev/null)/epic-pre-push-stamp"
+tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null)"
+hook_sum="$(git hash-object "${0}" 2>/dev/null)"
+if [ -n "$tree" ] && [ -n "$hook_sum" ] && [ -f "$stamp_file" ] \
+    && grep -qx "$tree $hook_sum" "$stamp_file" 2>/dev/null; then
+    echo "pre-push: suite already passed for this tree, skipping"
+else
+    # The suite is a gate, not a report: a red `make ci-local` refuses the
+    # push (epic-cc#1238). No bypass exists for parked branches with known
+    # red tests: AGENTS.md forbids skipping this hook, so a red suite means
+    # fixing the tests first, not pushing around them.
+    echo "pre-push: make ci-local (docker epic-cc-ci bash scripts/ci-test.sh) — see #99"
+    if ! make ci-local; then
+        echo "pre-push: local CI failed; refusing the push" >&2
+        exit 1
+    fi
+    # The suite passed on this tree under this hook: stamp it so a retry of
+    # the same push skips the re-run above.
+    if [ -n "$tree" ] && [ -n "$hook_sum" ] && [ -n "$stamp_file" ]; then
+        printf '%s %s\n' "$tree" "$hook_sum" > "$stamp_file" 2>/dev/null || true
+    fi
 fi
 
 # ---- prose lint gate (fires even when the ritual was never run) ----
