@@ -3,7 +3,7 @@
 //
 // This is PIC14's ptr_probe.c with the `const` table and its read
 // REMOVED: on PIC18 a const-flash read needs TBLRD, which is P4's job
-// (docs/29-pic18-port-design.md §4). See this plan's fixture-scope note
+// (docs/internals/design/29-pic18-port-design.md §4). See this plan's fixture-scope note
 // for why the two backends' ptr_probe fixtures differ for now. Once P4
 // lands, the ORIGINAL ptr_probe.c (unmodified) becomes a P4 acceptance
 // addition for PIC18 too, and at that point running the same file through

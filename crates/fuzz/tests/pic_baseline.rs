@@ -1,4 +1,4 @@
-//! PIC baseline differential gate (P8, docs/37): the PIC14E gate's corpora
+//! PIC baseline differential gate (P8, docs/internals/design/37): the PIC14E gate's corpora
 //! threaded through `&device::PIC12F509` and the 509's 41-byte GPR file.
 //! The fast subsets (seeds 0..8) run as normal tests; the full corpora run
 //! under `--ignored` and must be clean. No float corpus: P7 soft-float is
@@ -200,7 +200,7 @@ fn pic_baseline_signed_corpus_differential_clean_under_o2() {
     assert_eq!(clean, 50, "all 50 signed seeds clean under -O2");
 }
 
-/// docs/37 D-2's ordering hazard end to end: INDF accesses through a
+/// docs/internals/design/37 D-2's ordering hazard end to end: INDF accesses through a
 /// runtime pointer interleave with direct accesses to a bank-1 global, in
 /// both orders. The pad count calibrates against the real allocator so
 /// @b1 lands in bank 1: without it a placement change would silently

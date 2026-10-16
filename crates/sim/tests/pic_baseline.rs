@@ -1,5 +1,5 @@
 //! PIC baseline (12-bit-word core) simulator tests, one per instruction
-//! group from the P1 acceptance (docs/37 section 3): the byte ops (flags,
+//! group from the P1 acceptance (docs/internals/design/37 section 3): the byte ops (flags,
 //! d routing), bit ops, literals, the 2-level CALL/RETLW stack, GOTO page
 //! bit, PCL write, direct bank selection via `BSF`/`BCF FSR,5`, indirect
 //! addressing through INDF, shared GPR mirroring, TRIS/OPTION shadow

@@ -1,4 +1,4 @@
-//! Clock resolution acceptance (epic-cc#691, docs/46 D-4): the sources,
+//! Clock resolution acceptance (epic-cc#691, docs/internals/design/46 D-4): the sources,
 //! their agreement, the header line, and the delay-macro error.
 
 use std::process::Command;

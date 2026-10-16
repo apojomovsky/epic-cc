@@ -119,7 +119,7 @@ fn assert_banked_selects(asm: &str) {
 
 #[test]
 fn delay_stays_exact_without_common_ram() {
-    // docs/39 buckets 2 (F74) and 1 (873A): the counters sit in banked
+    // docs/internals/design/39 buckets 2 (F74) and 1 (873A): the counters sit in banked
     // `isr_home_window` behind the 2-cycle bank-0 pin, so the smallest
     // plannable request is 2 and every delta is measured against it.
     for device in [&device::PIC16F74, &device::PIC16F873A] {

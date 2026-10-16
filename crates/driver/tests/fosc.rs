@@ -199,7 +199,7 @@ fn pic18_hs_no_pll_cpudiv2_divides_the_crystal() {
 
 #[test]
 fn pic14_xt_without_xtal_hz_is_unknown_until_needed() {
-    // docs/46 D-4: no source at all is fine until something needs the
+    // docs/internals/design/46 D-4: no source at all is fine until something needs the
     // clock; the crystal-less config fixes nothing, so hz stays 0.
     let hz = resolve_fosc_hz(&PIC16F877A, "osc=xt");
     assert_eq!(hz, 0);
@@ -271,7 +271,7 @@ fn j_series_intoscpll_refuses_rather_than_guesses() {
 
 #[test]
 fn pragma_without_a_derivable_clock_is_unknown() {
-    // epic-cc#706 left the erased fallback in resolution; docs/46 D-4
+    // epic-cc#706 left the erased fallback in resolution; docs/internals/design/46 D-4
     // turns the old missing-crystal error into an unknown clock: an 877A
     // pragma without FOSC reads the erased nibble (rc) and still needs a
     // crystal, while the strict spelling keeps reporting EPIC_CONFIG.

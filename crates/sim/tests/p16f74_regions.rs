@@ -1,4 +1,4 @@
-//! epic-cc#420: pins p16f74's bucket-2 memory model (docs/39): bank0's
+//! epic-cc#420: pins p16f74's bucket-2 memory model (docs/internals/design/39): bank0's
 //! 0x70-0x7F (the ISR home window) and bank1's 0xF0-0xFF are distinct
 //! cells, so bank1 keeps its full A1-FF extent and no mirror clip
 //! applies to this part.

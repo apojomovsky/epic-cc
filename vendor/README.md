@@ -28,12 +28,12 @@ Proprietary installers, kept so the environment can be rebuilt on another machin
 - MPLAB IPE / MPLAB X installers, if you want flashing tooling reproducible
 
 XC8 is not used by this repository. Its oracle image and installer live in the private
-epic-benchmarks repository (epic-cc#682); see [ADR-006](../docs/03-decisions.md) for why.
+epic-benchmarks repository (epic-cc#682); see [ADR-006](../docs/internals/design/03-decisions.md) for why.
 
 ### `microchip/datasheets/`
 
 Free downloads from Microchip. These resolve the `[VERIFY]` items in
-[`../docs/01-target-pic14.md`](../docs/01-target-pic14.md), which is currently the single
+[`../docs/internals/design/01-target-pic14.md`](../docs/internals/design/01-target-pic14.md), which is currently the single
 biggest source of unconfirmed facts in the design.
 
 | File | Doc № | Why we need it |
@@ -46,7 +46,7 @@ biggest source of unconfirmed facts in the design.
 ### `microchip/device-data/`
 
 Device description inputs. `gputils` ships `.inc` files that are a good source for the
-device database described in [ADR-004](../docs/03-decisions.md) — in the Nix shell they are
+device database described in [ADR-004](../docs/internals/design/03-decisions.md) — in the Nix shell they are
 already available under `$(dirname $(readlink -f $PIC8_GPASM))/../share/gputils/header`, so
 copying them here is only needed if you want a specific version frozen.
 
@@ -57,7 +57,7 @@ Compiler reference PDFs. Currently:
 - `Advanced Compiler Design and Implementation` — Muchnick, 1997, 887 pp
 - `A retargetable C compiler - design and implementation` — Fraser & Hanson (lcc), 1995, 578 pp
 
-**Reading these:** see [`../docs/06-environment.md`](../docs/06-environment.md). In
+**Reading these:** see [`../docs/internals/design/06-environment.md`](../docs/internals/design/06-environment.md). In
 particular, Muchnick's OCR text layer is fullwidth Unicode and needs NFKC normalisation
 before `grep` will match anything.
 

@@ -1,6 +1,6 @@
 //! Per-part memory-map and capability facts, threaded through `alloc`,
 //! `isel`, `banking`, and `driver` instead of being hard-coded PIC16F877A
-//! literals in each of them. See docs/29 §2 for the design this implements.
+//! literals in each of them. See docs/internals/design/29 §2 for the design this implements.
 //! `has_hardware_multiply`/`has_tblrd` aren't added (no consumer reads
 //! them).
 
@@ -43,7 +43,7 @@ pub struct Device {
     /// `retval_lo`.
     pub fixed_retval: Option<(u16, u16)>,
     /// PIC14/PIC14E only, and only on a device with `common_ram: None`
-    /// (docs/39 D-2, e.g. PIC16F74's two non-aliased GPR regions): the
+    /// (docs/internals/design/39 D-2, e.g. PIC16F74's two non-aliased GPR regions): the
     /// fixed low-7-bit offset reserved out of *every* `ram_banks`
     /// region's normal allocation pool, reachable via direct addressing
     /// regardless of which region is currently selected (PIC14 direct
@@ -70,14 +70,14 @@ pub struct Device {
     /// (`FSR<5>` on the p12f509, `FSR<6:5>` on the 16F505, unimplemented
     /// on the 508). Zero on every other core, whose bank selection never
     /// rides on `FSR`. Baseline bank changes are bit-granular
-    /// `BCF`/`BSF FSR` sequences (docs/37 §2) and need this width.
+    /// `BCF`/`BSF FSR` sequences (docs/internals/design/37 §2) and need this width.
     pub fsr_bank_bits: u8,
     /// Interrupt vector word address(es): one for PIC14; two (high/low
     /// priority) for a PIC18 device with IPEN set.
     pub interrupt_vectors: &'static [u16],
     pub config: ConfigRegion,
     /// The pack's register names, filled by `scripts/device_names.py` for the
-    /// devices whose generated headers carry XC8's SFR spelling (docs/46
+    /// devices whose generated headers carry XC8's SFR spelling (docs/internals/design/46
     /// D-3); empty elsewhere. Code generation never reads a name from it.
     pub sfrs: &'static [Sfr],
 }
@@ -117,7 +117,7 @@ const MIRRORED_SFRS: &[u16] = &[0x00, 0x02, 0x03, 0x04, 0x0A, 0x0B];
 /// PIC14E's mirrored block, confirmed byte for byte against DS41364E's
 /// memory map (Table 3-3): every bank's first 12 bytes are `INDF0, INDF1,
 /// PCL, STATUS, FSR0L, FSR0H, FSR1L, FSR1H, BSR, WREG, PCLATH, INTCON`.
-/// The design (docs/33 §1) names this as the encoder's `MIRRORED_SFRS` growth:
+/// The design (docs/internals/design/33 §1) names this as the encoder's `MIRRORED_SFRS` growth:
 /// classic PIC14's six-register subset is wrong for the Enhanced core.
 const MIRRORED_SFRS_PIC14E: &[u16] = &[
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
@@ -286,7 +286,7 @@ pub struct ConfigRegion {
     pub base_byte_addr: u32,
     pub num_bytes: u16,
     /// Raw flash content before any FuseField is applied. Confirmed
-    /// per-device, not assumed uniform; see docs/31 §9.
+    /// per-device, not assumed uniform; see docs/internals/design/31 §9.
     pub erased_baseline: &'static [u8],
     pub fields: &'static [FuseField],
 }

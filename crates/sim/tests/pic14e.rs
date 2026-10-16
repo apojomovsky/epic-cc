@@ -1,5 +1,5 @@
 //! PIC14E (Enhanced Mid-range) simulator tests, one per instruction group
-//! from the P1 acceptance (docs/33 section 4): the shifts, MOVLB/MOVLP,
+//! from the P1 acceptance (docs/internals/design/33 section 4): the shifts, MOVLB/MOVLP,
 //! the branches (BRA/BRW/CALLW), the FSR machinery (ADDFSR + the four
 //! MOVIW/MOVWI modifier forms + indexed), OPTION/TRIS, and the negative
 //! STATUS test (bits 7-5 read as 0 and BCF/BSF against them is inert).

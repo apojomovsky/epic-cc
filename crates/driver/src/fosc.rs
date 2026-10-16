@@ -1,5 +1,5 @@
 //! The build clock, one value from whichever source the code gives
-//! (docs/46 D-4): a clock derivable from the config (an internal
+//! (docs/internals/design/46 D-4): a clock derivable from the config (an internal
 //! oscillator, or `EPIC_CONFIG` carrying `xtal_hz`), the code's
 //! `_XTAL_FREQ`, or the board's `--f-cpu`. The first source present wins;
 //! every other source present must agree with it, or the build fails

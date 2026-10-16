@@ -25,7 +25,7 @@ fn epic_side_compiles_and_runs_corpus() {
             }
             match run_epic(&prog, device) {
                 Ok(r) => {
-                    // Conformance (docs/35 section 5 item 1): the run must
+                    // Conformance (docs/internals/design/35 section 5 item 1): the run must
                     // land on the hand-computed value, independent of what
                     // SDCC does.
                     let out = prog.outputs.first();
@@ -65,7 +65,7 @@ fn epic_side_compiles_and_runs_corpus() {
             }
         }
     }
-    // Conformance (docs/35 section 5 item 1) is a hard gate here; the
+    // Conformance (docs/internals/design/35 section 5 item 1) is a hard gate here; the
     // other failures are surface gaps (a capability epic-cc cannot
     // compile yet, tracked by a sub-epic) and harness crashes.
     let harness_failures: Vec<_> = failures

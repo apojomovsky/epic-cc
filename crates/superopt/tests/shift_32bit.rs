@@ -169,7 +169,7 @@ fn left_shift_32bit_by_5_is_correct_and_also_loses() {
 // amount-7 byte-move form is unsound (the byte move drops bits 24-25 of x);
 // the sound construction is the 4-lane generalisation of the landed 16-bit
 // amount-6 family. Full derivation and measured word counts are in
-// docs/41-superopt-spike-findings.md, Target 3; the tests below are the
+// docs/internals/design/41-superopt-spike-findings.md, Target 3; the tests below are the
 // gate that keeps those claims honest.
 
 /// `swept_words`, the 4-lane family, and their derivation notes moved to

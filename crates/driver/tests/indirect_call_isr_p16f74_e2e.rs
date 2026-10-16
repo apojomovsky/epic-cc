@@ -2,7 +2,7 @@
 // indirect_call_isr_e2e.rs (a callback stored in a struct, invoked through a
 // pointer, from inside an interrupt handler -- exercising a genuine
 // function-call return value, an SFR write, and a struct field store/load),
-// this time compiled for PIC16F74 (docs/39 D-2: two non-aliased GPR regions,
+// this time compiled for PIC16F74 (docs/internals/design/39 D-2: two non-aliased GPR regions,
 // no common_ram, isr_w_shadow + isr_home_window instead). This is the actual
 // proof the mechanism works end to end through the real compiler, not just
 // the hand-assembled shadow-slot sequence crates/sim/tests/

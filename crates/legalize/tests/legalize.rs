@@ -1967,7 +1967,7 @@ fn lowers_umin_umax_to_icmp_select() {
     assert!(text.contains("%y = select i1 %c1 i16 %x i16 %b"), "{text}");
 }
 
-/// Lane D fixpoint idempotence (docs/36): a pass meant to reach a fixpoint
+/// Lane D fixpoint idempotence (docs/internals/design/36): a pass meant to reach a fixpoint
 /// must be a no-op the second time it runs on its own output. Legalize
 /// lowers mul/div/shift/float ops to runtime calls and injects the routine
 /// defs; running it again on its own output must not change anything (a

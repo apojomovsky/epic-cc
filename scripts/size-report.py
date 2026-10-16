@@ -309,7 +309,7 @@ def render(args, sizes, density, baseline, xc8):
                 f"({menu['flash_words'] / sim['xc8']:.2f}x). "
                 f"Folded single-caller callees are rolled into their caller "
                 f"via `scripts/inline-map.py` ({folded} functions, the "
-                f"same merge `docs/43-menu-triage-findings.md` does by hand)."
+                f"same merge `docs/internals/design/43-menu-triage-findings.md` does by hand)."
             )
             out.append("")
         if xc8 is not None:

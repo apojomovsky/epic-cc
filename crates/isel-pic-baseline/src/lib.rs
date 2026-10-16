@@ -1,7 +1,7 @@
 //! `isel-pic-baseline`: instruction selection for the PIC baseline
 //! (12-bit-word) integer spine.
 //!
-//! Baseline's ISA is a strict subset of classic PIC14's (docs/37 §1): the
+//! Baseline's ISA is a strict subset of classic PIC14's (docs/internals/design/37 §1): the
 //! same byte/bit/literal three-way field vocabulary, missing exactly
 //! `SUBLW` and `RETURN`. So this crate forks classic `isel`'s integer-spine
 //! structure (the `Gen` struct, `emit_inst`/`emit_terminator`/
@@ -24,7 +24,7 @@
 //! `emit_bank_select` emits `BCF`/`BSF FSR,5` before every direct access
 //! to a non-zero bank and before every `INDF` touch, unconditionally, the
 //! same way classic PIC14 re-emits IRP inside `isel` rather than tracking
-//! state in `crates/banking` (docs/37 §2 D-2). There is no banking pass
+//! state in `crates/banking` (docs/internals/design/37 §2 D-2). There is no banking pass
 //! for this core.
 //!
 //! No PCLATH: baseline's PC<9> comes from STATUS PA0 (bit 5), and
@@ -213,7 +213,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    ADDWF {}, W", self.fop(self.scratch2)));
     }
 
-    /// D-2's unconditional `FSR` bank-bit reassertion (docs/37 §2 D-2):
+    /// D-2's unconditional `FSR` bank-bit reassertion (docs/internals/design/37 §2 D-2):
     /// on baseline, `FSR`'s high bits select the bank for both direct
     /// and indirect addressing. A direct operand whose physical address
     /// is a banked GPR needs those bits set to its bank before the

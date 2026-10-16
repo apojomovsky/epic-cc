@@ -1,10 +1,10 @@
 //! `isel-pic18`: instruction selection for the PIC18 integer spine,
 //! extended by the pointer lowering (pointers, arrays, structs) and
-//! the flash const (`const` in flash via `TBLRD`). See docs/29 §4
+//! the flash const (`const` in flash via `TBLRD`). See docs/internals/design/29 §4
 //! for phasing, ADR-009, and ADR-010. `const` globals read via
 //! `TBLRD`: the 511-byte `RETLW` ceiling of PIC14 is gone, and
 //! stores through a `const` base panic: ROM is not writable.
-//! A separate crate from `isel` per docs/29 §2: the instruction sets
+//! A separate crate from `isel` per docs/internals/design/29 §2: the instruction sets
 //! differ enough that sharing leaks an abstraction and risks PIC14.
 
 use std::collections::{HashMap, HashSet};
@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use device::Device;
 use ir::{Block, Func, Icmp, Inst, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    add_flash_walks, flash_provenance, flash_slot_spaces, resolve_pointers, ssa_key, Base,
-    FlashProvenance, PtrResolution, Slot,
+    add_flash_laundering, add_flash_walks, flash_provenance, flash_slot_spaces_ex,
+    resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot,
 };
 
 /// The high Access Bank segment's start: every classic-mode PIC18's SFRs
@@ -10623,7 +10623,7 @@ impl<'m> Gen<'m> {
                     }
                     let active = n16 - m;
                     // Nibble-boundary shifts have shorter, sim-verified
-                    // forms than the per-bit unroll (crates/superopt, docs/41):
+                    // forms than the per-bit unroll (crates/superopt, docs/internals/design/41):
                     // one lane shifts by 4-7 as SWAPF+mask plus one seeded
                     // rotate per extra bit (epic-cc#573), an in-place 16-bit
                     // pair has a canned construction per amount 4-7 (left) or
@@ -11109,6 +11109,17 @@ impl<'m> Gen<'m> {
                 assert!(
                     !matches!(p.val, Val::Const(_)),
                     "isel-pic18: const source IntToPtr not yet supported"
+                );
+                // A flash table address copied through integers would be
+                // dereferenced as RAM: refuse (epic-cc#1284).
+                let launders = match &p.val {
+                    Val::Reg(r) => self.prov.int_flash.contains(&ssa_key(self.cur_func, r)),
+                    Val::Global(_) | Val::Const(_) => false,
+                };
+                assert!(
+                    !launders,
+                    "isel-pic18: inttoptr of %{} is derived from a flash address that passed through integers (ptrtoint or an integer copy of a pointer); a dereference would read RAM, not program memory (epic-cc#1284, epic-cc#1119)",
+                    p.dst
                 );
                 let src = self.val_addr(&p.val).direct();
                 let dst = self.slot_addr(self.cur_func, &p.dst).direct();
@@ -16940,7 +16951,13 @@ pub fn select_with_opts(
     // whose writers are all flash addresses or null lowers its loads
     // through `TBLPTR` seeded from the slot bytes. Same flash predicate
     // as the walks above, so both proofs agree on what lives in flash.
-    let slot_flash = flash_slot_spaces(m, &resolved, &prov, |n| {
+    let (slot_flash, slot_mixed) = flash_slot_spaces_ex(m, &resolved, &prov, |n| {
+        !n.starts_with("_ZTV") && is_flash_const_global(m, addrs, n)
+    });
+    // Flash addresses laundered through integers or read back from
+    // maybe-flash slots (epic-cc#1284): marked so the backend refuses
+    // rather than dereferencing a table address as RAM.
+    add_flash_laundering(&mut prov, m, &resolved, &slot_flash, &slot_mixed, |n| {
         !n.starts_with("_ZTV") && is_flash_const_global(m, addrs, n)
     });
     // Priority ISRs (epic-cc#346): at most one handler per vector. A lone

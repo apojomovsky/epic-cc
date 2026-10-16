@@ -229,7 +229,7 @@ fn compare_pic14(dev: &Device, lkr: &LkrRam) -> Vec<String> {
 fn compare_pic14_with(dev: &Device, lkr: &LkrRam, markers: &[Divergence]) -> Vec<String> {
     let mut problems = Vec::new();
     // Reserved spans: the fixed common window, the D-2 home window, and
-    // the W-shadow byte once per region (docs/39 D-2's reconstruction).
+    // the W-shadow byte once per region (docs/internals/design/39 D-2's reconstruction).
     let mut reserved: Vec<(u16, u16)> = Vec::new();
     reserved.extend(dev.common_ram);
     reserved.extend(dev.isr_home_window);
@@ -655,7 +655,7 @@ fn widening_access_bank_past_0x5f_fails_the_gate() {
 
 #[test]
 fn single_region_split_passes_when_the_union_matches_gputils() {
-    // ADR-034 (docs/39 D-1): PIC16F84's exact shape -- gputils declares the
+    // ADR-034 (docs/internals/design/39 D-1): PIC16F84's exact shape -- gputils declares the
     // whole GPR as one SHAREBANK (no DATABANK at all), our TOML carves the
     // top 16 bytes into common_ram and leaves the rest as ram_banks.
     let lkr = LkrRam {

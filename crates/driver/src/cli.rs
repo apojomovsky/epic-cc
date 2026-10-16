@@ -66,7 +66,7 @@ pub struct Cli {
     pub f_cpu: Option<u64>,
     /// Optimization profile (`-O0`/`-O1`/`-O2`/`-Os`); `-Os` default.
     pub opt_level: OptLevel,
-    /// PIC18 code factoring (docs/44); `--no-outline` turns it off.
+    /// PIC18 code factoring (docs/internals/design/44); `--no-outline` turns it off.
     pub outline: bool,
     /// PIC14 pooled flash string table (epic-cc#815, addresses and
     /// gating per epic-cc#816, default per epic-cc#1211): on by

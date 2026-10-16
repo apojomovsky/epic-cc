@@ -1,4 +1,4 @@
-//! The SDCC parity corpus (docs/35 section 4).
+//! The SDCC parity corpus (docs/internals/design/35 section 4).
 //!
 //! Tier 1: existing epic-cc e2e fixtures that compile under both compilers
 //! (plain C, volatile globals, `main`). Tier 2: one program per SDCC
@@ -7,7 +7,7 @@
 //! hand-computed expected result. Tier 3 (image-only SDCC regression suite)
 //! is run by the harness against both compilers, not committed here.
 //!
-//! Protocol (docs/35 section 4, comparison protocol): every program is
+//! Protocol (docs/internals/design/35 section 4, comparison protocol): every program is
 //! self-seeding, its input globals assigned at the top of `main`, because
 //! SDCC's PIC18 crt0 clears all of BSS before `main` and would wipe any
 //! value the harness wrote into RAM ahead of the run. Every program ends
@@ -189,7 +189,7 @@ pub fn tier2() -> Vec<CorpusProgram> {
         ),
         // Pointer traversal of a const table in flash: epic-cc reads the
         // cells through its TBLRD (PIC18) / RETLW (PIC14) const path,
-        // SDCC through its 3-byte generic pointers (docs/35 PIC18 table,
+        // SDCC through its 3-byte generic pointers (docs/internals/design/35 PIC18 table,
         // code/eeprom pointers row). table[2] + table[3] = 107 = 0x6B.
         prog(
             "constptr",
@@ -213,7 +213,7 @@ mod tests {
 
     /// The self-seeding contract: no program may declare inputs to seed;
     /// values live in the source. The `Input` import guards the type until
-    /// the harness's external seeding story (docs/35) fully goes away.
+    /// the harness's external seeding story (docs/internals/design/35) fully goes away.
     #[test]
     fn corpus_programs_are_named_and_have_outputs() {
         for p in corpus() {

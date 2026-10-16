@@ -157,7 +157,7 @@ fn eighty_byte_global_lands_in_ram_banks() {
     for dev in devices_under_test() {
         let mut m = ir::parse("global big i8\nfn main(void) ()\n  block entry:\n    ret void\n");
         // The probe scales to the device: 80 bytes covers the first PIC14
-        // bank on every device shipped before PIC16F84 (docs/39 D-1, whose
+        // bank on every device shipped before PIC16F84 (docs/internals/design/39 D-1, whose
         // ram_banks is only 52 bytes). A global never spans banks (the
         // 509's 32 GPR bytes sit in two 16-byte banks), so size also caps
         // at the largest single window. alloc aligns every 2+-byte value to

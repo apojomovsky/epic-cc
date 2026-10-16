@@ -1,5 +1,5 @@
 // Milestone-5 pointer/const probe: a runtime RAM pointer (FSR/INDF path) and
-// a const-table read (RETLW path) in one program (docs/11). `volatile`
+// a const-table read (RETLW path) in one program (docs/internals/design/11). `volatile`
 // everywhere keeps -O1 from folding the pointer away: the RAM GEP survives as
 // a separate SSA value because the index comes from volatile input and the
 // memory is volatile. `in` is a 16-bit volatile so clang keeps the index mask

@@ -11,7 +11,7 @@
 //! formatter treats it as a plain `char` argument.
 //!
 //! `__interrupt(...)` is SDCC's interrupt-handler keyword widened to the
-//! XC8 spellings (docs/46 D-3): empty, `high_priority`/`low_priority`
+//! XC8 spellings (docs/internals/design/46 D-3): empty, `high_priority`/`low_priority`
 //! and numeric all reach `__attribute__((interrupt(...)))`, whose value
 //! clang preserves in the `.ll` `"interrupt"` function attribute for
 //! irparse (0 = compatibility single-vector, 1 = high, 2 = low). Empty

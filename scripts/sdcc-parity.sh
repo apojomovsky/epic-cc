@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SDCC parity runner (docs/35, P0): runs the committed corpus through both
+# SDCC parity runner (docs/internals/design/35, P0): runs the committed corpus through both
 # compilers, writes the per-program table plus aggregate ratios to the step
 # summary, and fails on a ratio regression or arbitration change against the
 # committed baseline.toml (regression_gate test). SDCC is GPL, an external
@@ -28,7 +28,7 @@ out="$(cargo test -p sdcc-parity -- --nocapture --test-threads=1 2>&1)" || {
 echo "$out"
 
 # Write the tool versions, per-program table and aggregate ratios to the
-# step summary (the versions line stamps the table, docs/35 section 7).
+# step summary (the versions line stamps the table, docs/internals/design/35 section 7).
 # GITHUB_STEP_SUMMARY is a runner-host path not mounted into the
 # container, so write to a file in the bind-mounted /workspace and let
 # the host step append it.

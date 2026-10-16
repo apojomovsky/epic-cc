@@ -1,7 +1,7 @@
 [toolchain]
 # Pinned explicitly: the docker dev image installs exactly this version, and
 # rustup honors this file on first `cargo` use. Bumping is a deliberate
-# migration (see docs/09-build-environment.md).
+# migration (see docs/internals/design/09-build-environment.md).
 channel = "1.97.1"
 components = ["rustfmt", "clippy", "rust-src"]
 profile = "default"

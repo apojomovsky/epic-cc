@@ -3,7 +3,7 @@
 //! real PIC14E pipeline (clang -> irparse -> wholeprog -> legalize ->
 //! callgraph -> alloc -> isel-pic14e -> banking -> peephole -> asm) and
 //! executed in the real `Pic14e` simulator. Mirrors the driver's PIC14E
-//! pipeline (docs/33 section 4 P2): the integer spine's 14-bit instructions
+//! pipeline (docs/internals/design/33 section 4 P2): the integer spine's 14-bit instructions
 //! are bit-identical to classic PIC14, so `isel-pic14e` is isel's emitter,
 //! and the divergence is banking, which banks the same physical addresses
 //! via `MOVLB`/`BSR` on this core.
@@ -170,14 +170,14 @@ fn banked_c_runs_correctly() {
     assert!(p.halted());
 }
 
-/// P2's skip-idiom acceptance (docs/33 section 4): a routine-recipe-shaped
+/// P2's skip-idiom acceptance (docs/internals/design/33 section 4): a routine-recipe-shaped
 /// program whose `__mul_u16` DECFSZ loops are skip-sensitive, compiled for
 /// PIC14E, must neither straddle the routine's bank-switch demand across a
 /// skip pair nor land a `MOVLB` right after a skip op. `banked_routine.c`
 /// (issue #6): its noinline `mul30` pushes `__mul_u16`'s frame into a
 /// non-zero bank, so the banking pass emits `MOVLB`s around the recipe
 /// call; the DECFSZ loops inside the recipe body are the skip-window
-/// hazard docs/33 section 1 names. Assert both (a) the emitted asm DOES
+/// hazard docs/internals/design/33 section 1 names. Assert both (a) the emitted asm DOES
 /// contain `MOVLB` (banking ran for real) and (b) no `MOVLB` is the
 /// immediately-following instruction of any skip op.
 #[test]
@@ -231,7 +231,7 @@ fn skip_idioms_never_land_a_movlb_inside_a_recipe_skip_pair() {
         split_pairs, 0,
         "a MOVLB landed inside a skip pair; the recipe frame straddles banks:\n{asm}"
     );
-    // The single-GPR-bank frame constraint (issue #6, docs/33 section 1):
+    // The single-GPR-bank frame constraint (issue #6, docs/internals/design/33 section 1):
     // assert the whole `__mul_u16` frame (params + scratch) lies inside ONE
     // bank, so no MOVLB was ever needed inside its skip-sensitive body.
     let scr = *layout
@@ -270,7 +270,7 @@ fn banked_routine_c_runs_correctly() {
     assert!(p.halted());
 }
 
-// P3/P4 end-to-end acceptance (docs/33 section 4): pointers, arrays and
+// P3/P4 end-to-end acceptance (docs/internals/design/33 section 4): pointers, arrays and
 // structs via FSR0/1, plus linear addressing (D-2) for objects that
 // straddle a bank. The fixtures are byte-identical to the PIC18 ones of
 // the same C source (crates/isel-pic18/tests/fixtures/), so the expected
@@ -297,7 +297,7 @@ fn ptr_probe_c_runs_correctly() {
     assert!(p.halted());
 }
 
-/// P4 acceptance (docs/33 section 4, D-5): a 300-byte const (flash) table
+/// P4 acceptance (docs/internals/design/33 section 4, D-5): a 300-byte const (flash) table
 /// read through the two-entry chunked RETLW readers. Mirrors
 /// crates/driver/tests/const_table_e2e.rs: in == 290 (0x0122) -> out =
 /// (0x33 + 0x02 + 0x3C + 0x11) & 0xFF = 0x82, the four reads exercising
@@ -472,7 +472,7 @@ fn span_memcpy_c_into_straddling_destination_uses_linear_base() {
     assert!(p.halted());
 }
 
-/// P3's linear-addressing acceptance (docs/33 section 4): a bank-straddling
+/// P3's linear-addressing acceptance (docs/internals/design/33 section 4): a bank-straddling
 /// array must be addressed through the linear region (FSR base in
 /// 0x2000-0x29AF) so one FSR walks across banks, while a single-bank array
 /// is addressed through the physical (banked) FSR base. The `.asm` is
@@ -555,7 +555,7 @@ fn span_c_uses_linear_for_straddling_and_banked_otherwise() {
     assert!(p.halted());
 }
 
-// P5 end-to-end acceptance (docs/33 section 4, D-4): interrupts. The
+// P5 end-to-end acceptance (docs/internals/design/33 section 4, D-4): interrupts. The
 // fixtures are byte-identical to PIC14's except for the SFR addresses
 // (PORTB 0x06 -> 0x0D on the 1937; INTCON stays 0x0B), so the expected
 // values come from the PIC14 e2e tests of the same C source
@@ -618,7 +618,7 @@ fn interrupt_c_runs_correctly() {
     assert!(p.halted());
 }
 
-/// P5 acceptance (docs/33 section 4, D-4): the ISR must be emitted with NO
+/// P5 acceptance (docs/internals/design/33 section 4, D-4): the ISR must be emitted with NO
 /// manual save/restore prologue, because the hardware shadow registers save
 /// W, STATUS, BSR, FSR0, FSR1 and PCLATH on entry and restore them on
 /// RETFIE. A simulation pass alone cannot distinguish "the hardware saved
@@ -661,7 +661,7 @@ fn interrupt_c_emits_no_manual_context_save() {
     );
 }
 
-/// P5 acceptance (docs/33 section 4, D-4), the gating path: a request made
+/// P5 acceptance (docs/internals/design/33 section 4, D-4), the gating path: a request made
 /// while GIE is clear stays pending; it is taken only once main unmasks,
 /// and exactly once. Mirrors crates/driver/tests/interrupt_gate_e2e.rs.
 #[test]
@@ -704,7 +704,7 @@ fn interrupt_gate_c_runs_correctly() {
     assert!(p.halted());
 }
 
-// P6 end-to-end acceptance (docs/33 section 4): i32 (`long`) arithmetic,
+// P6 end-to-end acceptance (docs/internals/design/33 section 4): i32 (`long`) arithmetic,
 // hardware-multiply routine recipes, and the ISR-context routine
 // duplication. Fixtures are byte-identical to PIC14's; expected values come
 // from the PIC14 e2e tests of the same C source
@@ -822,7 +822,7 @@ fn interrupt_mul_c_runs_correctly() {
     assert!(p.halted());
 }
 
-// P7 end-to-end acceptance (docs/33 section 4): soft-float f32 routines,
+// P7 end-to-end acceptance (docs/internals/design/33 section 4): soft-float f32 routines,
 // a third copy per D-1 (1:1 port of the verified PIC14 bodies). The
 // fixture is byte-identical to pic18's float.c; expected values come from
 // the PIC14 e2e test of the same C source (crates/driver/tests/float_e2e.rs).

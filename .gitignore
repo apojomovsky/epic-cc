@@ -7,7 +7,7 @@
 /vendor/*
 !/vendor/README.md
 
-# Reference PDFs must never be committed — copyrighted, see docs/06-environment.md
+# Reference PDFs must never be committed — copyrighted, see docs/internals/design/06-environment.md
 *.pdf
 
 # Build / test artifacts
@@ -26,7 +26,7 @@ __pycache__/
 # Claude Code placeholder, conventions live in AGENTS.md
 /CLAUDE.md
 
-# Throwaway feasibility spike (docs/10-spike-findings.md). Not part of the product.
+# Throwaway feasibility spike (docs/internals/design/10-spike-findings.md). Not part of the product.
 /spike/
 
 # Agent worktrees

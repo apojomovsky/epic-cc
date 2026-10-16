@@ -1,4 +1,4 @@
-//! SDCC parity differential harness (docs/35, P0).
+//! SDCC parity differential harness (docs/internals/design/35, P0).
 //!
 //! Compiles each corpus program with both epic-cc and SDCC, runs both
 //! images in our simulator to the program's explicit `sleep` halt, and
@@ -10,7 +10,7 @@
 //! place everything differently. Never compares the whole RAM image.
 //!
 //! SDCC is GPL and lives in the image as an external oracle only (ADR-006
-//! boundary, docs/35 section 2). This crate never links or commits SDCC
+//! boundary, docs/internals/design/35 section 2). This crate never links or commits SDCC
 //! code; it invokes `sdcc`/`gplink` as external processes.
 
 use std::collections::HashMap;
@@ -32,7 +32,7 @@ pub struct CorpusProgram {
     pub source: String,
     /// Volatile output globals, compared by name after the run.
     pub outputs: Vec<String>,
-    /// The hand-computed value of the first output (docs/35 section 5
+    /// The hand-computed value of the first output (docs/internals/design/35 section 5
     /// item 2): the arbiter on a differential mismatch and the
     /// conformance target epic-cc must hit even where SDCC cannot run.
     /// Every corpus output is one byte by construction.
@@ -192,11 +192,11 @@ fn compile_sdcc(
         device::Core::Pic14 => ("pic14", device.name.to_lowercase()),
         device::Core::Pic18 => ("pic16", device.name.to_lowercase()),
         // SDCC's pic14 port covers the Enhanced core (16F193x) via the
-        // `libsdcce` library (docs/35 section 3 PIC14E table). The device
+        // `libsdcce` library (docs/internals/design/35 section 3 PIC14E table). The device
         // libs live in the non-free dir as `pic16<rest>.lib`, same naming
         // as classic pic14.
         device::Core::Pic14e => ("pic14", device.name.to_lowercase()),
-        // SDCC has no baseline PIC support at all (docs/35 / docs/37), so a
+        // SDCC has no baseline PIC support at all (docs/internals/design/35 / docs/internals/design/37), so a
         // baseline device never reaches the SDCC runner.
         device::Core::PicBaseline => panic!(
             "sdcc-parity: {} is pic-baseline; SDCC cannot target this core",
@@ -259,7 +259,7 @@ fn compile_sdcc(
     let lib_dir = format!("/usr/local/share/sdcc/lib/{port}");
     let nonfree_dir = format!("/usr/local/share/sdcc/non-free/lib/{port}");
     // SDCC's pic14 port links `libsdcc.lib` for classic parts and
-    // `libsdcce.lib` for the Enhanced core (16F193x, docs/35 section 3
+    // `libsdcce.lib` for the Enhanced core (16F193x, docs/internals/design/35 section 3
     // PIC14E table); pic16 always uses `libsdcc.lib`.
     let lib = match device.core {
         device::Core::Pic14e => "libsdcce.lib".to_string(),
@@ -387,7 +387,7 @@ fn ihex_record(line: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Tool versions stamped into every output so a baseline row is
-/// reproducible (docs/35 section 7, pinning).
+/// reproducible (docs/internals/design/35 section 7, pinning).
 pub fn tool_versions() -> String {
     let epic = Command::new(epic_cc_binary())
         .arg("--version")
@@ -495,7 +495,7 @@ fn run_sim(
 
     // Live RAM bytes at the halt: the only RAM measure computable
     // identically for two allocators that place globals and locals at
-    // different addresses (docs/35 section 4 comparison protocol).
+    // different addresses (docs/internals/design/35 section 4 comparison protocol).
     let ram_bytes = ram.iter().filter(|b| **b != 0).count();
 
     let mut outputs = HashMap::new();

@@ -2,14 +2,14 @@
 //! integer spine.
 //!
 //! The classic ISA families (byte, bit, literal) match classic PIC14
-//! (docs/33 §D-1), so this forks the classic emitter mnemonic for
+//! (docs/internals/design/33 §D-1), so this forks the classic emitter mnemonic for
 //! mnemonic. The integer spine covers `add`/`sub`/`and`/`or`/`xor`
 //! (i8/i16), the ten `icmp` predicates, `call`/`ret`, and `phi`
 //! elimination. The shared banking pass banks output via `MOVLB`/`BSR`.
 //!
 //! The divergent FSR machinery (16-bit FSR0/FSR1, `MOVIW`/`MOVWI`,
 //! linear addressing) lives in the pointer section below. PIC14E keeps
-//! one 0x0004 vector with hardware context save (docs/33 §D-4).
+//! one 0x0004 vector with hardware context save (docs/internals/design/33 §D-4).
 //! `verify_page_fit` keeps the 2K-word page model: PCLATH is 7 bits
 //! and `MOVLP` loads it in one instruction.
 //!
@@ -83,7 +83,7 @@ fn literal_ptr_addr(ptr: &str) -> u16 {
         .unwrap_or_else(|_| panic!("isel: malformed literal pointer {ptr:?}"))
 }
 
-/// Reports whether an object crosses a GPR bank boundary (docs/33 §D-2).
+/// Reports whether an object crosses a GPR bank boundary (docs/internals/design/33 §D-2).
 /// PIC14E routes such objects through the linear region so one FSR spans
 /// banks. Other cores lack this shape, and the allocator avoids it there.
 fn object_straddles(device: &Device, base_addr: u16, span: u16) -> bool {
@@ -94,7 +94,7 @@ fn object_straddles(device: &Device, base_addr: u16, span: u16) -> bool {
 }
 
 /// Returns the FSR base for an object: the physical address inside one
-/// bank, else the linear alias for a straddling object (docs/33 §D-2).
+/// bank, else the linear alias for a straddling object (docs/internals/design/33 §D-2).
 /// The alias adds the bank stride to the within-bank offset. PIC14E
 /// loads the 16-bit base into FSR0L and FSR0H, so one FSR spans banks.
 fn fsr_base(device: &Device, base_addr: u16, span: u16) -> u16 {
@@ -329,7 +329,7 @@ impl<'m> Gen<'m> {
 
     /// Substitutes `$0`/`%0` placeholders with allocated operand addresses.
     /// Accepts direct globals and locals. Rejects GEP-derived pointers:
-    /// only direct locals name a stable slot (docs/33 §D-3).
+    /// only direct locals name a stable slot (docs/internals/design/33 §D-3).
     fn substitute_asm(&self, template: &str, operands: &[ir::AsmOperand]) -> String {
         // Detect GEP-derived operand pointers: any `%reg` that resolves to a
         // GEP with non-zero offset or dynamic terms is not a direct local.
@@ -457,7 +457,7 @@ impl<'m> Gen<'m> {
     }
 
     /// Returns the runtime pointer value for a global at offset `k`.
-    /// Uses the linear alias for straddling objects (docs/33 §D-2), else
+    /// Uses the linear alias for straddling objects (docs/internals/design/33 §D-2), else
     /// the physical address. The linear base keeps later FSR derefs clear
     /// of the common-RAM hole.
     fn ptr_value_addr(&self, name: &str, k: u16) -> u16 {
@@ -635,7 +635,7 @@ impl<'m> Gen<'m> {
                 let span = self.global_size(g);
                 if object_straddles(self.device, self.global_addr(g), span) {
                     // Routes a straddling global through FSR0 with the linear
-                    // base, so one FSR spans banks (docs/33 §D-2). A direct
+                    // base, so one FSR spans banks (docs/internals/design/33 §D-2). A direct
                     // access would cross into the common-RAM hole.
                     self.emit_fsr_to(self.global_addr(g), 0, &[], byte_off, span);
                     Addr::Indirect
@@ -663,7 +663,7 @@ impl<'m> Gen<'m> {
                             )
                         } else {
                             // Uses FSR0 with the linear base for dynamic terms
-                            // or straddling objects (docs/33 §D-2), so one FSR
+                            // or straddling objects (docs/internals/design/33 §D-2), so one FSR
                             // spans banks.
                             self.emit_fsr_to(self.global_addr(name), k, &terms, byte_off, span);
                             Addr::Indirect
@@ -934,7 +934,7 @@ impl<'m> Gen<'m> {
     }
 
     /// Sets FSR0 to `base + k + offset + scaled terms` for a spanned object.
-    /// Loads the physical or linear base (docs/33 §D-2) into FSR0L and H,
+    /// Loads the physical or linear base (docs/internals/design/33 §D-2) into FSR0L and H,
     /// then adds the offset with carry. One scale-1 term keeps the fast
     /// register shape. General sums accumulate in W first. The offset
     /// stays in one byte, so one carry suffices.
@@ -1448,7 +1448,7 @@ impl<'m> Gen<'m> {
                 } else {
                     // Materializes a data global as its address literals,
                     // never the pointee contents. Straddling globals use the
-                    // linear alias (docs/33 §D-2) (epic-cc#155).
+                    // linear alias (docs/internals/design/33 §D-2) (epic-cc#155).
                     let a = self.ptr_value_addr(g, 0);
                     let b = ((a >> (idx as u32 * 8)) & 0xFF) as u8;
                     self.emit(format!("    MOVLW 0x{b:02X}"));
@@ -2589,7 +2589,7 @@ impl<'m> Gen<'m> {
                                     [(1, reg)] => {
                                         // Uses the linear alias for straddling
                                         // bases, so the offset walks the
-                                        // linear region (docs/33 §D-2).
+                                        // linear region (docs/internals/design/33 §D-2).
                                         let base_addr = self.ptr_value_addr(name, 0);
                                         let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                                         self.emit(format!("    MOVLW 0x{:02X}", (base_addr & 0xFF) as u8));
@@ -3014,7 +3014,7 @@ impl<'m> Gen<'m> {
                 MemLen::Const(n) => {
                     // Loops bytes through the pointer machinery, re-resolving
                     // each side per byte. Parks the byte when FSR setup
-                    // clobbers W (docs/33 §D-2). Direct sides need no park.
+                    // clobbers W (docs/internals/design/33 §D-2). Direct sides need no park.
                     let hold: u16 = 0x7F;
                     for i in 0..*n {
                         self.emit_ptr_load_byte(&m.src, i, None);
@@ -6271,7 +6271,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
         if i == 0 && f.isr {
             // Saves no core registers in the ISR prologue: hardware preserves
             // them across RETFIE. Backs up ABI retval and scratch, then pins
-            // PCLATH to page 0 for intra-function branches (docs/33 §D-4).
+            // PCLATH to page 0 for intra-function branches (docs/internals/design/33 §D-4).
             g.emit("    MOVF 0x71, W");
             g.emit("    MOVWF 0x79");
             g.emit("    MOVF 0x72, W");
@@ -6389,7 +6389,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                     match t {
                         // Restores ABI state on ISR return: hardware reloads
                         // core registers from shadows, so only retval and
-                        // scratch need manual restore (docs/33 §D-4).
+                        // scratch need manual restore (docs/internals/design/33 §D-4).
                         Inst::Ret(None, _) => {
                             g.emit("    MOVF 0x79, W");
                             g.emit("    MOVWF 0x71");
@@ -7421,7 +7421,7 @@ pub fn select_with_locs(
     let has_isr = !isr_names.is_empty();
     // Pins scratch, retval, and ISR backup to disjoint common-RAM regions
     // with free tail bytes. Hardware shadows cover core registers here
-    // (docs/33 §D-4).
+    // (docs/internals/design/33 §D-4).
     let (common_lo, common_hi) = device
         .common_ram
         .expect("isel's fixed scratch/retval/ISR-save layout needs a common-RAM region");

@@ -2,7 +2,7 @@
 """
 device_names.py -- add pack names to an existing device TOML.
 
-Fills the two name surfaces the XC8 source conventions need (docs/46 D-3)
+Fills the two name surfaces the XC8 source conventions need (docs/internals/design/46 D-3)
 from a Microchip DFP `.PIC` (EDC) file, Apache-2.0 per ADR-029:
 
   * `[[sfrs]]`: every SFR's name, address, width and bitfields, one mode

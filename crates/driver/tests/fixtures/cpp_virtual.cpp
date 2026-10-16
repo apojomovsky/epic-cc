@@ -3,7 +3,7 @@
 #endif
 
 // Dispatch replays on hardware through the `tblrd-flash-ptr` superopt
-// spec (#832); per-fixture runs stay sim-only (docs/40 §5).
+// spec (#832); per-fixture runs stay sim-only (docs/internals/design/40 §5).
 
 class Base {
   public:

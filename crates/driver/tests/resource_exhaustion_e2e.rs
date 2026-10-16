@@ -1,4 +1,4 @@
-//! Lane F of docs/36 (approved design, #290): resource-exhaustion boundary
+//! Lane F of docs/internals/design/36 (approved design, #290): resource-exhaustion boundary
 //! tests (the graceful-failure contract). A program that uses only
 //! supported constructs but genuinely does not fit the target's RAM,
 //! hardware call-stack depth, or flash must fail loudly with a specific,

@@ -110,7 +110,7 @@ fn check_interrupt_vectors(path: &str, core: &str, vectors: &[u16]) {
     );
 }
 
-/// isr_w_shadow/isr_home_window (docs/39 D-2): paired, substituting for
+/// isr_w_shadow/isr_home_window (docs/internals/design/39 D-2): paired, substituting for
 /// common_ram on a device with none.
 fn check_isr_shadow(
     path: &str,
@@ -159,7 +159,7 @@ fn check_isr_shadow(
     }
 }
 
-/// FSR carries bank-select bits on baseline and nowhere else (docs/37
+/// FSR carries bank-select bits on baseline and nowhere else (docs/internals/design/37
 /// D-2/D-3); at most two, in FSR<7:5> of the baseline ISA.
 fn check_fsr_bank_bits(path: &str, core: &str, bits: u8) {
     let legal = match core {
@@ -268,7 +268,7 @@ fn main() {
         match dev.core.as_str() {
             "pic14" | "pic14e" | "pic-baseline" => {
                 // common_ram is Option, not required: a device with no
-                // bank-independent byte at all (docs/39 D-2, PIC16F74's
+                // bank-independent byte at all (docs/internals/design/39 D-2, PIC16F74's
                 // shape) is a real, valid schema state -- isel's/
                 // isel-pic14e's own `.expect(...)` is the enforcement point
                 // for devices that actually reach codegen needing one
@@ -361,7 +361,7 @@ fn main() {
         }
         // isel pages CALL/GOTO in 0x800-word blocks; a partial last page
         // leaves dead space it doesn't avoid. A device under one page
-        // (PIC16F84, docs/39 D-1) has no boundary to misalign.
+        // (PIC16F84, docs/internals/design/39 D-1) has no boundary to misalign.
         if matches!(dev.core.as_str(), "pic14" | "pic14e")
             && dev.flash_words > 0x800
             && dev.flash_words % 0x800 != 0

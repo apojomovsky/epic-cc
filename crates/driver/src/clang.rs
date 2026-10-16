@@ -2,7 +2,7 @@
 //!
 //! The PIC front end is always `clang -target msp430 -O1 -S -emit-llvm
 //! -ffreestanding -nostdinc -g -resource-dir <resdir>`,
-//! that list is the input-format contract (docs/01 §-target, AGENTS.md).
+//! that list is the input-format contract (docs/internals/design/01 §-target, AGENTS.md).
 //! Duplicating it across `main.rs` and two dozen e2e tests is how a flag
 //! drift goes unnoticed. This module is the single source for those flags.
 //!

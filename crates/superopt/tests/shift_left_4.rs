@@ -6,7 +6,7 @@
 //! pattern is 4 steps of `BCF`+`RLCF`, 8 words, and the nibble-swap trick
 //! below is a byte-local operation, so it is the natural first slice to
 //! verify before claiming anything about the 16-bit generalization (left
-//! as follow-up, see docs/41).
+//! as follow-up, see docs/internals/design/41).
 //!
 //! Destination/source register: 0x020 (arbitrary access-bank GPR, shifted
 //! in place, matching how `x <<= n` compiles: same address in and out).
@@ -32,7 +32,7 @@ fn cases() -> Vec<Case> {
 
 /// Curated alphabet: the nibble-swap family (`SWAPF`) plus mask literals
 /// relevant to isolating a nibble, not the full PIC18 opcode/literal space.
-/// See docs/41 for why this is a deliberate scoping choice, not an
+/// See docs/internals/design/41 for why this is a deliberate scoping choice, not an
 /// oversight: masks for nibble/byte-boundary bit operations are naturally
 /// power-of-two shaped, so a handful of curated literals covers the
 /// plausible solutions without enumerating all 256.
