@@ -2724,6 +2724,13 @@ pub fn add_flash_laundering(
         }
     };
     let mut t: HashSet<String> = HashSet::new();
+    // Address fragments: single bytes (or scaled bytes) of a tainted
+    // address, via `and 0xFF` or `lshr 8`. One fragment cannot name a
+    // 16-bit table address, but `or`/`add` of two rebuilds it, so the
+    // Bin arm re-taints reassembled pairs. Register-only: a fragment
+    // parked in memory or passed through a call goes clean (residual
+    // gap, same class as the context-insensitive call taint).
+    let mut frag: HashSet<String> = HashSet::new();
     let mut mt = MemTaint::default();
     // Flash references in a global's initializer are flash addresses.
     for g in &m.globals {
@@ -2755,6 +2762,9 @@ pub fn add_flash_laundering(
             ir::Val::Const(_) => false,
         }
     };
+    let fv = |frag: &HashSet<String>, func: &str, v: &ir::Val| -> bool {
+        matches!(v, ir::Val::Reg(r) if frag.contains(&ssa_key(func, r)))
+    };
     // Whether a binary op over a tainted operand can still be an address.
     let bin_taints = |x: &ir::Bin, ta: bool, tb: bool| -> bool {
         if !(ta || tb) {
@@ -2764,21 +2774,21 @@ pub fn add_flash_laundering(
         match x.op {
             // A difference of two addresses is a length.
             ir::BinOp::Sub => !(ta && tb),
-            // Masking to a byte cannot leave a 16-bit address. Known gap: an
-            // address split into bytes (and/lshr) and reassembled (shl/or)
-            // escapes the taint (epic-cc#1299).
+            // Masking to a byte leaves a fragment, not an address; the Bin
+            // arm tracks it so a later `or`/`add` reassembly re-taints.
             ir::BinOp::And => !(small(&x.a) || small(&x.b)),
-            // Shifting right by a byte or more drops the address.
+            // Shifting right by a byte or more drops the address the same way.
             ir::BinOp::LShr | ir::BinOp::AShr => !matches!(&x.b, ir::Val::Const(c) if *c >= 8),
             _ => true,
         }
     };
     loop {
-        let before = (t.len(), mt.size());
+        let before = (t.len(), frag.len(), mt.size());
         for f in &m.funcs {
             for b in &f.blocks {
                 for i in &b.insts {
                     let mut add: Vec<String> = Vec::new();
+                    let mut add_frag: Vec<String> = Vec::new();
                     match i {
                         Inst::Zext(z) if tv(&t, prov, &f.name, &z.val) => {
                             add.push(ssa_key(&f.name, &z.dst))
@@ -2792,11 +2802,50 @@ pub fn add_flash_laundering(
                         Inst::Freeze(z) if tv(&t, prov, &f.name, &z.val) => {
                             add.push(ssa_key(&f.name, &z.dst))
                         }
+                        Inst::Zext(z) if fv(&frag, &f.name, &z.val) => {
+                            // A cast of one address byte is still one byte.
+                            add_frag.push(ssa_key(&f.name, &z.dst))
+                        }
+                        Inst::Sext(z) if fv(&frag, &f.name, &z.val) => {
+                            add_frag.push(ssa_key(&f.name, &z.dst))
+                        }
+                        Inst::Trunc(z) if fv(&frag, &f.name, &z.val) => {
+                            add_frag.push(ssa_key(&f.name, &z.dst))
+                        }
+                        Inst::Freeze(z) if fv(&frag, &f.name, &z.val) => {
+                            add_frag.push(ssa_key(&f.name, &z.dst))
+                        }
                         Inst::Bin(x) => {
                             let ta = tv(&t, prov, &f.name, &x.a);
                             let tb = tv(&t, prov, &f.name, &x.b);
+                            let fa = fv(&frag, &f.name, &x.a);
+                            let fb = fv(&frag, &f.name, &x.b);
                             if bin_taints(x, ta, tb) {
                                 add.push(ssa_key(&f.name, &x.dst));
+                            } else if matches!(
+                                x.op,
+                                ir::BinOp::Or | ir::BinOp::Xor | ir::BinOp::Add
+                            ) && fa
+                                && fb
+                            {
+                                // Two fragments joined rebuild the address.
+                                add.push(ssa_key(&f.name, &x.dst));
+                            } else if matches!(
+                                x.op,
+                                ir::BinOp::And
+                                    | ir::BinOp::Shl
+                                    | ir::BinOp::LShr
+                                    | ir::BinOp::AShr
+                                    | ir::BinOp::Mul
+                                    | ir::BinOp::Or
+                                    | ir::BinOp::Xor
+                                    | ir::BinOp::Add
+                            ) && (ta || tb || fa || fb)
+                            {
+                                // Taking, scaling, or byte-identity ALU over an
+                                // address (or a fragment) stays a fragment; a
+                                // two-fragment join taints in the arm above.
+                                add_frag.push(ssa_key(&f.name, &x.dst));
                             }
                         }
                         Inst::Select(s)
@@ -2805,11 +2854,21 @@ pub fn add_flash_laundering(
                         {
                             add.push(ssa_key(&f.name, &s.dst))
                         }
+                        Inst::Select(s)
+                            if !s.ptr && (fv(&frag, &f.name, &s.a) || fv(&frag, &f.name, &s.b)) =>
+                        {
+                            add_frag.push(ssa_key(&f.name, &s.dst))
+                        }
                         Inst::Phi(p)
                             if !p.ptr
                                 && p.incoming.iter().any(|(v, _)| tv(&t, prov, &f.name, v)) =>
                         {
                             add.push(ssa_key(&f.name, &p.dst))
+                        }
+                        Inst::Phi(p)
+                            if !p.ptr && p.incoming.iter().any(|(v, _)| fv(&frag, &f.name, v)) =>
+                        {
+                            add_frag.push(ssa_key(&f.name, &p.dst))
                         }
                         Inst::Load(l) if !l.ptr_ty => {
                             if let Some((slot, off, _)) = loc(&f.name, &l.ptr) {
@@ -2890,10 +2949,11 @@ pub fn add_flash_laundering(
                         _ => {}
                     }
                     t.extend(add);
+                    frag.extend(add_frag);
                 }
             }
         }
-        if before == (t.len(), mt.size()) {
+        if before == (t.len(), frag.len(), mt.size()) {
             break;
         }
     }
