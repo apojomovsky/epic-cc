@@ -14,7 +14,7 @@
 /**
  * @brief Initialize tick, serial, ADC, I2C, expander handle, and map.
  *
- * Call once before spawning any epic-taskmgr task below. Issues no I2C
+ * Call once before spawning any lib/taskmgr task below. Issues no I2C
  * transaction itself; the first bridge task run programs the expander.
  */
 void bridge_demo_init(void);

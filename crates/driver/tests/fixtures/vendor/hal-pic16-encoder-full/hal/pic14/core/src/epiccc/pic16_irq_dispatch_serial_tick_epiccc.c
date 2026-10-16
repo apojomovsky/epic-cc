@@ -1,4 +1,4 @@
-/* epic-cc dispatch, serial + scheduling tier (epic-modbus: serial plus
+/* epic-cc dispatch, serial + scheduling tier (lib/modbus: serial plus
  * the tick's Timer2 timebase): USART RX/TX and TIMER2 dispatch, the
  * rest cleared. */
 

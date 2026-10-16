@@ -43,7 +43,7 @@ static uint8_t reg_of(epic_mcp23x17_port_t port, uint8_t base)
 /**
  * @brief Read @p n bytes starting at register @p reg.
  *
- * Uses the injectable transport when set, else the built-in epic-bus
+ * Uses the injectable transport when set, else the built-in lib/bus
  * I2C mem read or the MCP23S17 SPI control-byte framing.
  *
  * @param h the expander handle
@@ -87,7 +87,7 @@ static int reg_read(epic_mcp23x17_handle_t *h, uint8_t reg,
 /**
  * @brief Write @p n bytes starting at register @p reg.
  *
- * Uses the injectable transport when set, else the built-in epic-bus
+ * Uses the injectable transport when set, else the built-in lib/bus
  * I2C mem write or the MCP23S17 SPI control-byte framing.
  *
  * @param h the expander handle

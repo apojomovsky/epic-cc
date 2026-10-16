@@ -230,14 +230,6 @@ void epic_bus_spi_init(uint32_t fosc_hz, uint32_t f_sclk_hz, uint8_t cs_port, ui
  */
 int epic_bus_i2c_mem_write(uint8_t dev, uint8_t reg, const uint8_t *data, int n)
 {
-#ifdef __EPIC_CC__
-    /* epic-cc iselcore cannot build the GEP chain for an indirect call
-     * through a RAM ops table (no gep for pointer, chain base missing);
-     * the ops seam is the host-test surface, so the epic-cc footprint
-     * probe links the module without it. XC8 keeps the real dispatch. */
-    (void)dev; (void)reg; (void)data;
-    return -1;
-#else
     const epic_bus_i2c_ops_t *o = g_i2c_ops;
     o->start();
     if (!o->write_byte((uint8_t)((dev << 1) | 0u)))
@@ -257,7 +249,6 @@ int epic_bus_i2c_mem_write(uint8_t dev, uint8_t reg, const uint8_t *data, int n)
     }
     o->stop();
     return n;
-#endif
 }
 
 /**
@@ -272,10 +263,6 @@ int epic_bus_i2c_mem_write(uint8_t dev, uint8_t reg, const uint8_t *data, int n)
  */
 int epic_bus_i2c_mem_read(uint8_t dev, uint8_t reg, uint8_t *buf, int n)
 {
-#ifdef __EPIC_CC__
-    (void)dev; (void)reg; (void)buf;
-    return -1;
-#else
     const epic_bus_i2c_ops_t *o = g_i2c_ops;
     o->start();
     if (!o->write_byte((uint8_t)((dev << 1) | 0u)))
@@ -297,7 +284,6 @@ int epic_bus_i2c_mem_read(uint8_t dev, uint8_t reg, uint8_t *buf, int n)
     }
     o->stop();
     return n;
-#endif
 }
 
 /**
@@ -311,10 +297,6 @@ int epic_bus_i2c_mem_read(uint8_t dev, uint8_t reg, uint8_t *buf, int n)
  */
 int epic_bus_spi_mem_write(uint8_t reg, const uint8_t *data, int n)
 {
-#ifdef __EPIC_CC__
-    (void)reg; (void)data;
-    return -1;
-#else
     const epic_bus_spi_ops_t *o = g_spi_ops;
     o->select();
     (void)o->exchange(reg);
@@ -324,7 +306,6 @@ int epic_bus_spi_mem_write(uint8_t reg, const uint8_t *data, int n)
     }
     o->deselect();
     return n;
-#endif
 }
 
 /**
@@ -338,10 +319,6 @@ int epic_bus_spi_mem_write(uint8_t reg, const uint8_t *data, int n)
  */
 int epic_bus_spi_mem_read(uint8_t reg, uint8_t *buf, int n)
 {
-#ifdef __EPIC_CC__
-    (void)reg; (void)buf;
-    return -1;
-#else
     const epic_bus_spi_ops_t *o = g_spi_ops;
     o->select();
     (void)o->exchange(reg);
@@ -351,5 +328,4 @@ int epic_bus_spi_mem_read(uint8_t reg, uint8_t *buf, int n)
     }
     o->deselect();
     return n;
-#endif
 }
