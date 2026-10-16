@@ -8,13 +8,20 @@
 
 # epic-cc
 
-A C compiler for 8-bit PIC microcontrollers, fully open source and MIT licensed, for hobbyists who want to write C and get a hex file.
+A C compiler for 8-bit PIC microcontrollers, open source under the MIT
+licence. Its front end is clang, so you write the same modern C and get the
+same clear error messages you'd get from a desktop compiler. Everything
+after clang, down to the hex file, lives in this repository, where you can
+read it.
+
+It also ships a simulator with a gdb server. On mid-range (PIC14) parts you
+can set breakpoints on C lines, step through your code and print variables
+in gdb, with no programmer or chip attached.
 
 [![CI](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml/badge.svg)](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/apojomovsky/epic-cc)](https://github.com/apojomovsky/epic-cc/releases)
 
 ## Why epic-cc
 
-- **Fully open source, MIT licensed.** After the clang front end, every stage that turns your C into a hex file lives in this repository, so you can read and audit it.
 - **One command from C to hex file.** epic-cc compiles your whole program in one step, with no separate assembler or linker to install.
 - **Checked against independent tools.** On a corpus of test programs, the output is compared byte for byte with the gpasm assembler, and by behavior with host clang and SDCC.
 
