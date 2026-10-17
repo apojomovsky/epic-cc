@@ -2723,14 +2723,44 @@ pub fn add_flash_laundering(
             ir::Val::Const(_) => None,
         }
     };
-    let mut t: HashSet<String> = HashSet::new();
+    // Integer-domain taint as caller-independent taint plus the callee
+    // params the value may depend on. `indep` covers flash constants,
+    // provenance sets, flash-kind slots, and tainted memory (which
+    // persists across calls, so loads are caller-independent). `deps`
+    // holds param keys (`{func}::{param}`); a call result substitutes
+    // each callee param with the site's actual argument state, so one
+    // tainted caller no longer taints every caller's result (epic-cc#1324).
+    #[derive(Clone, Default)]
+    struct TState {
+        indep: bool,
+        deps: HashSet<String>,
+    }
+    let ts_bool = |s: &TState| -> bool { s.indep || !s.deps.is_empty() };
+    let ts_union = |a: &mut TState, b: &TState| {
+        a.indep |= b.indep;
+        a.deps.extend(b.deps.iter().cloned());
+    };
+    let mut t: HashMap<String, TState> = HashMap::new();
     // Address fragments: single bytes (or scaled bytes) of a tainted
     // address, via `and 0xFF` or `lshr 8`. One fragment cannot name a
     // 16-bit table address, but `or`/`add` of two rebuilds it, so the
     // Bin arm re-taints reassembled pairs. Register-only: a fragment
-    // parked in memory or passed through a call goes clean (residual
-    // gap, same class as the context-insensitive call taint).
-    let mut frag: HashSet<String> = HashSet::new();
+    // parked in memory goes clean (residual gap). Calls substitute
+    // fragment states the same way `t` does, so reassembly across a
+    // call still re-taints.
+    let mut frag: HashMap<String, TState> = HashMap::new();
+    // Callee params (`{func}::{param}`) with a tainted actual at some
+    // call site. Inside-callee uses stay refused existentially, while
+    // each call result is gated on its own site's arguments.
+    let mut ptaint: HashSet<String> = HashSet::new();
+    let mut pfrag: HashSet<String> = HashSet::new();
+    // Every param key, so operand states always carry their own dep.
+    let mut param_keys: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for p in &f.params {
+            param_keys.insert(ssa_key(&f.name, &p.name));
+        }
+    }
     let mut mt = MemTaint::default();
     // Flash references in a global's initializer are flash addresses.
     for g in &m.globals {
@@ -2740,13 +2770,25 @@ pub fn add_flash_laundering(
             }
         }
     }
-    let tv = |t: &HashSet<String>, prov: &FlashProvenance, func: &str, v: &ir::Val| -> bool {
+    let tp = |t: &HashMap<String, TState>,
+              param_keys: &HashSet<String>,
+              prov: &FlashProvenance,
+              func: &str,
+              v: &ir::Val|
+     -> TState {
         match v {
-            ir::Val::Global(n) => is_flash_const(n),
+            ir::Val::Global(n) if is_flash_const(n) => TState {
+                indep: true,
+                deps: HashSet::new(),
+            },
+            ir::Val::Global(_) => TState::default(),
             ir::Val::Reg(r) => {
                 let k = ssa_key(func, r);
-                t.contains(&k)
-                    || prov.flash.contains(&k)
+                let mut s = t.get(&k).cloned().unwrap_or_default();
+                if param_keys.contains(&k) {
+                    s.deps.insert(k.clone());
+                }
+                let indep = prov.flash.contains(&k)
                     || prov.mixed.contains(&k)
                     || slot_flash.contains(&k)
                     || slot_mixed.contains(&k)
@@ -2757,14 +2799,41 @@ pub fn add_flash_laundering(
                             slot_flash.contains(&sk) || slot_mixed.contains(&sk)
                         }
                         None => false,
-                    }
+                    };
+                s.indep |= indep;
+                s
             }
-            ir::Val::Const(_) => false,
+            ir::Val::Const(_) => TState::default(),
         }
     };
-    let fv = |frag: &HashSet<String>, func: &str, v: &ir::Val| -> bool {
-        matches!(v, ir::Val::Reg(r) if frag.contains(&ssa_key(func, r)))
+    let tv = |t: &HashMap<String, TState>,
+              param_keys: &HashSet<String>,
+              prov: &FlashProvenance,
+              func: &str,
+              v: &ir::Val|
+     -> bool { ts_bool(&tp(t, param_keys, prov, func, v)) };
+    let fp = |frag: &HashMap<String, TState>,
+              param_keys: &HashSet<String>,
+              func: &str,
+              v: &ir::Val|
+     -> TState {
+        match v {
+            ir::Val::Reg(r) => {
+                let k = ssa_key(func, r);
+                let mut s = frag.get(&k).cloned().unwrap_or_default();
+                if param_keys.contains(&k) {
+                    s.deps.insert(k);
+                }
+                s
+            }
+            _ => TState::default(),
+        }
     };
+    let fv = |frag: &HashMap<String, TState>,
+              param_keys: &HashSet<String>,
+              func: &str,
+              v: &ir::Val|
+     -> bool { ts_bool(&fp(frag, param_keys, func, v)) };
     // Whether a binary op over a tainted operand can still be an address.
     let bin_taints = |x: &ir::Bin, ta: bool, tb: bool| -> bool {
         if !(ta || tb) {
@@ -2782,54 +2851,97 @@ pub fn add_flash_laundering(
             _ => true,
         }
     };
+    // Sizes of every growing set: `indep` flags, param deps, merged call
+    // taints, and tainted memory bytes. All grow monotonically, so equal
+    // sums mean the fixpoint is reached.
+    let state_sizes = |t: &HashMap<String, TState>,
+                       frag: &HashMap<String, TState>,
+                       ptaint: &HashSet<String>,
+                       pfrag: &HashSet<String>,
+                       mt: &MemTaint|
+     -> usize {
+        t.values()
+            .map(|s| s.deps.len() + usize::from(s.indep))
+            .sum::<usize>()
+            + frag
+                .values()
+                .map(|s| s.deps.len() + usize::from(s.indep))
+                .sum::<usize>()
+            + ptaint.len()
+            + pfrag.len()
+            + mt.size()
+    };
     loop {
-        let before = (t.len(), frag.len(), mt.size());
+        let before = state_sizes(&t, &frag, &ptaint, &pfrag, &mt);
         for f in &m.funcs {
             for b in &f.blocks {
                 for i in &b.insts {
-                    let mut add: Vec<String> = Vec::new();
-                    let mut add_frag: Vec<String> = Vec::new();
+                    let mut add: Vec<(String, TState)> = Vec::new();
+                    let mut add_frag: Vec<(String, TState)> = Vec::new();
                     match i {
-                        Inst::Zext(z) if tv(&t, prov, &f.name, &z.val) => {
-                            add.push(ssa_key(&f.name, &z.dst))
+                        Inst::Zext(z) if tv(&t, &param_keys, prov, &f.name, &z.val) => add.push((
+                            ssa_key(&f.name, &z.dst),
+                            tp(&t, &param_keys, prov, &f.name, &z.val),
+                        )),
+                        Inst::Sext(z) if tv(&t, &param_keys, prov, &f.name, &z.val) => add.push((
+                            ssa_key(&f.name, &z.dst),
+                            tp(&t, &param_keys, prov, &f.name, &z.val),
+                        )),
+                        Inst::Trunc(z) if tv(&t, &param_keys, prov, &f.name, &z.val) => add.push((
+                            ssa_key(&f.name, &z.dst),
+                            tp(&t, &param_keys, prov, &f.name, &z.val),
+                        )),
+                        Inst::Freeze(z) if tv(&t, &param_keys, prov, &f.name, &z.val) => {
+                            add.push((
+                                ssa_key(&f.name, &z.dst),
+                                tp(&t, &param_keys, prov, &f.name, &z.val),
+                            ))
                         }
-                        Inst::Sext(z) if tv(&t, prov, &f.name, &z.val) => {
-                            add.push(ssa_key(&f.name, &z.dst))
-                        }
-                        Inst::Trunc(z) if tv(&t, prov, &f.name, &z.val) => {
-                            add.push(ssa_key(&f.name, &z.dst))
-                        }
-                        Inst::Freeze(z) if tv(&t, prov, &f.name, &z.val) => {
-                            add.push(ssa_key(&f.name, &z.dst))
-                        }
-                        Inst::Zext(z) if fv(&frag, &f.name, &z.val) => {
+                        Inst::Zext(z) if fv(&frag, &param_keys, &f.name, &z.val) => {
                             // A cast of one address byte is still one byte.
-                            add_frag.push(ssa_key(&f.name, &z.dst))
+                            add_frag.push((
+                                ssa_key(&f.name, &z.dst),
+                                fp(&frag, &param_keys, &f.name, &z.val),
+                            ))
                         }
-                        Inst::Sext(z) if fv(&frag, &f.name, &z.val) => {
-                            add_frag.push(ssa_key(&f.name, &z.dst))
+                        Inst::Sext(z) if fv(&frag, &param_keys, &f.name, &z.val) => {
+                            add_frag.push((
+                                ssa_key(&f.name, &z.dst),
+                                fp(&frag, &param_keys, &f.name, &z.val),
+                            ))
                         }
-                        Inst::Trunc(z) if fv(&frag, &f.name, &z.val) => {
-                            add_frag.push(ssa_key(&f.name, &z.dst))
+                        Inst::Trunc(z) if fv(&frag, &param_keys, &f.name, &z.val) => {
+                            add_frag.push((
+                                ssa_key(&f.name, &z.dst),
+                                fp(&frag, &param_keys, &f.name, &z.val),
+                            ))
                         }
-                        Inst::Freeze(z) if fv(&frag, &f.name, &z.val) => {
-                            add_frag.push(ssa_key(&f.name, &z.dst))
-                        }
+                        Inst::Freeze(z) if fv(&frag, &param_keys, &f.name, &z.val) => add_frag
+                            .push((
+                                ssa_key(&f.name, &z.dst),
+                                fp(&frag, &param_keys, &f.name, &z.val),
+                            )),
                         Inst::Bin(x) => {
-                            let ta = tv(&t, prov, &f.name, &x.a);
-                            let tb = tv(&t, prov, &f.name, &x.b);
-                            let fa = fv(&frag, &f.name, &x.a);
-                            let fb = fv(&frag, &f.name, &x.b);
+                            let pa = tp(&t, &param_keys, prov, &f.name, &x.a);
+                            let pb = tp(&t, &param_keys, prov, &f.name, &x.b);
+                            let fa = fp(&frag, &param_keys, &f.name, &x.a);
+                            let fb = fp(&frag, &param_keys, &f.name, &x.b);
+                            let (ta, tb) = (ts_bool(&pa), ts_bool(&pb));
+                            let (fa_b, fb_b) = (ts_bool(&fa), ts_bool(&fb));
                             if bin_taints(x, ta, tb) {
-                                add.push(ssa_key(&f.name, &x.dst));
+                                let mut p = pa;
+                                ts_union(&mut p, &pb);
+                                add.push((ssa_key(&f.name, &x.dst), p));
                             } else if matches!(
                                 x.op,
                                 ir::BinOp::Or | ir::BinOp::Xor | ir::BinOp::Add
-                            ) && fa
-                                && fb
+                            ) && fa_b
+                                && fb_b
                             {
                                 // Two fragments joined rebuild the address.
-                                add.push(ssa_key(&f.name, &x.dst));
+                                let mut p = fa;
+                                ts_union(&mut p, &fb);
+                                add.push((ssa_key(&f.name, &x.dst), p));
                             } else if matches!(
                                 x.op,
                                 ir::BinOp::And
@@ -2840,44 +2952,76 @@ pub fn add_flash_laundering(
                                     | ir::BinOp::Or
                                     | ir::BinOp::Xor
                                     | ir::BinOp::Add
-                            ) && (ta || tb || fa || fb)
+                            ) && (ta || tb || fa_b || fb_b)
                             {
                                 // Taking, scaling, or byte-identity ALU over an
                                 // address (or a fragment) stays a fragment; a
                                 // two-fragment join taints in the arm above.
-                                add_frag.push(ssa_key(&f.name, &x.dst));
+                                let mut p = pa;
+                                ts_union(&mut p, &pb);
+                                ts_union(&mut p, &fa);
+                                ts_union(&mut p, &fb);
+                                add_frag.push((ssa_key(&f.name, &x.dst), p));
                             }
                         }
                         Inst::Select(s)
                             if !s.ptr
-                                && (tv(&t, prov, &f.name, &s.a) || tv(&t, prov, &f.name, &s.b)) =>
+                                && (tv(&t, &param_keys, prov, &f.name, &s.a)
+                                    || tv(&t, &param_keys, prov, &f.name, &s.b)) =>
                         {
-                            add.push(ssa_key(&f.name, &s.dst))
+                            let mut p = tp(&t, &param_keys, prov, &f.name, &s.a);
+                            ts_union(&mut p, &tp(&t, &param_keys, prov, &f.name, &s.b));
+                            add.push((ssa_key(&f.name, &s.dst), p))
                         }
                         Inst::Select(s)
-                            if !s.ptr && (fv(&frag, &f.name, &s.a) || fv(&frag, &f.name, &s.b)) =>
+                            if !s.ptr
+                                && (fv(&frag, &param_keys, &f.name, &s.a)
+                                    || fv(&frag, &param_keys, &f.name, &s.b)) =>
                         {
-                            add_frag.push(ssa_key(&f.name, &s.dst))
+                            let mut p = fp(&frag, &param_keys, &f.name, &s.a);
+                            ts_union(&mut p, &fp(&frag, &param_keys, &f.name, &s.b));
+                            add_frag.push((ssa_key(&f.name, &s.dst), p))
                         }
                         Inst::Phi(p)
                             if !p.ptr
-                                && p.incoming.iter().any(|(v, _)| tv(&t, prov, &f.name, v)) =>
+                                && p.incoming
+                                    .iter()
+                                    .any(|(v, _)| tv(&t, &param_keys, prov, &f.name, v)) =>
                         {
-                            add.push(ssa_key(&f.name, &p.dst))
+                            let mut ps = TState::default();
+                            for (v, _) in p.incoming.iter() {
+                                ts_union(&mut ps, &tp(&t, &param_keys, prov, &f.name, v));
+                            }
+                            add.push((ssa_key(&f.name, &p.dst), ps))
                         }
                         Inst::Phi(p)
-                            if !p.ptr && p.incoming.iter().any(|(v, _)| fv(&frag, &f.name, v)) =>
+                            if !p.ptr
+                                && p.incoming
+                                    .iter()
+                                    .any(|(v, _)| fv(&frag, &param_keys, &f.name, v)) =>
                         {
-                            add_frag.push(ssa_key(&f.name, &p.dst))
+                            let mut ps = TState::default();
+                            for (v, _) in p.incoming.iter() {
+                                ts_union(&mut ps, &fp(&frag, &param_keys, &f.name, v));
+                            }
+                            add_frag.push((ssa_key(&f.name, &p.dst), ps))
                         }
                         Inst::Load(l) if !l.ptr_ty => {
                             if let Some((slot, off, _)) = loc(&f.name, &l.ptr) {
                                 if mt.query(&slot, off, u32::from(l.ty.bytes())) {
-                                    add.push(ssa_key(&f.name, &l.dst));
+                                    // Memory persists across calls, so a
+                                    // tainted load may reach any caller.
+                                    add.push((
+                                        ssa_key(&f.name, &l.dst),
+                                        TState {
+                                            indep: true,
+                                            deps: HashSet::new(),
+                                        },
+                                    ));
                                 }
                             }
                         }
-                        Inst::Store(s) if tv(&t, prov, &f.name, &s.val) => {
+                        Inst::Store(s) if tv(&t, &param_keys, prov, &f.name, &s.val) => {
                             if let Some((slot, off, fake)) = loc(&f.name, &s.ptr) {
                                 mt.mark(&slot, off, u32::from(s.ty.bytes()));
                                 if fake {
@@ -2917,8 +3061,12 @@ pub fn add_flash_laundering(
                             }
                         }
                         Inst::Call(c) => {
-                            // Context-insensitive: one tainted call site taints
-                            // the callee param for every caller (conservative).
+                            // Context-sensitive (epic-cc#1324): each result
+                            // substitutes the callee params it depends on
+                            // with this site's actual argument states, so a
+                            // tainted caller no longer taints every
+                            // caller's result. Param taints stay merged:
+                            // uses inside the callee refuse existentially.
                             let targets: Vec<&String> = if c.callees.is_empty() {
                                 vec![&c.func]
                             } else {
@@ -2929,35 +3077,111 @@ pub fn add_flash_laundering(
                                     continue;
                                 };
                                 for (p, a) in callee.params.iter().zip(c.args.iter()) {
-                                    if tv(&t, prov, &f.name, &a.val) {
-                                        add.push(ssa_key(name, &p.name));
+                                    // The actual's own taint, or a taint
+                                    // through one of the caller's params.
+                                    let sa = tp(&t, &param_keys, prov, &f.name, &a.val);
+                                    if sa.indep || sa.deps.iter().any(|d| ptaint.contains(d)) {
+                                        ptaint.insert(ssa_key(name, &p.name));
+                                    }
+                                    let fa = fp(&frag, &param_keys, &f.name, &a.val);
+                                    if fa.indep || fa.deps.iter().any(|d| pfrag.contains(d)) {
+                                        pfrag.insert(ssa_key(name, &p.name));
                                     }
                                 }
                                 if let Some(d) = &c.dst {
-                                    let ret_taint = callee.blocks.iter().any(|bb| {
-                                        bb.insts.iter().any(|ri| {
-                                            matches!(ri, Inst::Ret(Some((_, v)), _)
-                                                if tv(&t, prov, name, v))
-                                        })
-                                    });
-                                    if ret_taint {
-                                        add.push(ssa_key(&f.name, d));
+                                    let mut rs = TState::default();
+                                    let mut rfs = TState::default();
+                                    for bb in &callee.blocks {
+                                        for ri in &bb.insts {
+                                            if let Inst::Ret(Some((_, v)), _) = ri {
+                                                ts_union(
+                                                    &mut rs,
+                                                    &tp(&t, &param_keys, prov, name, v),
+                                                );
+                                                ts_union(
+                                                    &mut rfs,
+                                                    &fp(&frag, &param_keys, name, v),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    let mut ds = TState {
+                                        indep: rs.indep,
+                                        deps: HashSet::new(),
+                                    };
+                                    for q in &rs.deps {
+                                        let qi = callee
+                                            .params
+                                            .iter()
+                                            .position(|p| ssa_key(name, &p.name) == *q);
+                                        match qi.and_then(|qi| c.args.get(qi)) {
+                                            Some(a) => {
+                                                let sa = tp(&t, &param_keys, prov, &f.name, &a.val);
+                                                ds.indep |= sa.indep;
+                                                ds.deps.extend(sa.deps.iter().cloned());
+                                            }
+                                            // Unknown arity: stay refused.
+                                            None => ds.indep = true,
+                                        }
+                                    }
+                                    if ts_bool(&ds) {
+                                        add.push((ssa_key(&f.name, d), ds));
+                                    }
+                                    let mut dfs = TState {
+                                        indep: rfs.indep,
+                                        deps: HashSet::new(),
+                                    };
+                                    for q in &rfs.deps {
+                                        let qi = callee
+                                            .params
+                                            .iter()
+                                            .position(|p| ssa_key(name, &p.name) == *q);
+                                        match qi.and_then(|qi| c.args.get(qi)) {
+                                            Some(a) => {
+                                                let fa = fp(&frag, &param_keys, &f.name, &a.val);
+                                                dfs.indep |= fa.indep;
+                                                dfs.deps.extend(fa.deps.iter().cloned());
+                                            }
+                                            None => dfs.indep = true,
+                                        }
+                                    }
+                                    if ts_bool(&dfs) {
+                                        add_frag.push((ssa_key(&f.name, d), dfs));
                                     }
                                 }
                             }
                         }
                         _ => {}
                     }
-                    t.extend(add);
-                    frag.extend(add_frag);
+                    for (k, ps) in add {
+                        if ts_bool(&ps) {
+                            let e = t.entry(k).or_default();
+                            ts_union(e, &ps);
+                        }
+                    }
+                    for (k, ps) in add_frag {
+                        if ts_bool(&ps) {
+                            let e = frag.entry(k).or_default();
+                            ts_union(e, &ps);
+                        }
+                    }
                 }
             }
         }
-        if before == (t.len(), frag.len(), mt.size()) {
+        let after = state_sizes(&t, &frag, &ptaint, &pfrag, &mt);
+        if before == after {
             break;
         }
     }
-    prov.int_flash = t;
+    // Deferred existential evaluation: a value depending on params is
+    // dangerous exactly when some call site passed a tainted actual.
+    // Deps hold param keys, which `ptaint` keys the same way, so no
+    // function lookup is needed.
+    prov.int_flash = t
+        .iter()
+        .filter(|(_, s)| s.indep || s.deps.iter().any(|d| ptaint.contains(d)))
+        .map(|(k, _)| k.clone())
+        .collect();
 }
 
 /// Global names an address value may carry, following pointer

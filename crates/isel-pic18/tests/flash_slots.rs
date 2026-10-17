@@ -732,6 +732,33 @@ fn tainted_store_through_param_pointer_reaches_the_caller_slot() {
 }
 
 #[test]
+fn untainted_caller_of_int_passthrough_callee_compiles() {
+    // epic-cc#1324: one tainted call site must not taint every caller's
+    // result. `id` returns its argument; the tainted results die unused
+    // (storing one to RAM is its own refusal, epic-cc#1101), so the
+    // clean caller's `inttoptr` compiles.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn id(i16) (x=i16)\n  block entry:\n    ret i16 %x\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %t = load i16 @g\n    %r1 = call i16 @id(i16 %t)\n    %r3 = call i16 @id(i16 %r1)\n    %r2 = call i16 @id(i16 0)\n    %p = inttoptr i16 %r2 to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn tainted_result_through_int_passthrough_callee_is_refused() {
+    // The tainted site's own result still carries the address: the
+    // per-site result taint must survive the epic-cc#1324 tightening.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn id(i16) (x=i16)\n  block entry:\n    ret i16 %x\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %t = load i16 @g\n    %r1 = call i16 @id(i16 %t)\n    %p = inttoptr i16 %r1 to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
 #[should_panic(expected = "flash address that passed through integers")]
 fn split_address_reassembled_with_or_is_refused() {
     // epic-cc#1299: `and 0xFF`/`lshr 8` split the address into bytes and
