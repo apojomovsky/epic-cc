@@ -1613,6 +1613,83 @@ impl<'a> PicBaseline<'a> {
     pub fn option(&self) -> u8 {
         self.option
     }
+    /// STATUS, the flag register at 0x03. Bit 5 (PA0) pages program
+    /// memory; TO/PD are read-only on hardware (DS41236E section 4.4).
+    pub fn status(&self) -> u8 {
+        self.ram[0x03]
+    }
+    /// The active GPR bank, from the FSR bank bit (DS41236E Figure 4-4).
+    pub fn bank(&self) -> u8 {
+        self.fsr_bank() as u8
+    }
+    /// FSR, the bank-select and indirect-address register at 0x04.
+    pub fn fsr(&self) -> u8 {
+        self.ram[0x04]
+    }
+    /// PCL, the readable low byte of the program counter (0x02).
+    pub fn pcl(&self) -> u8 {
+        (self.pc & 0xFF) as u8
+    }
+    /// Write PCL with machine semantics: PC<7:0> = v, PC<8> = 0,
+    /// PC<9> = PA0 (DS41236E section 4.7).
+    pub fn set_pcl(&mut self, v: u8) {
+        self.write_f(0x02, v);
+    }
+    /// Set the working register.
+    pub fn set_w(&mut self, v: u8) {
+        self.w = v;
+    }
+    /// Set the program counter. The halted flag tracks it, so writing
+    /// an in-range address resumes a program that ran off its end.
+    pub fn set_pc(&mut self, addr: u16) {
+        self.pc = addr;
+        self.halted = addr as usize >= self.prog.len();
+    }
+    /// Run until `pc` reaches `target`, the program halts, or
+    /// `max_steps` instructions have executed. The breakpoint primitive:
+    /// the adapter owns the breakpoint set and calls this per stop, so
+    /// the sim keeps no breakpoint state of its own.
+    pub fn run_until(&mut self, target: u16, max_steps: usize) -> StopReason {
+        let mut steps = 0;
+        loop {
+            if self.pc == target {
+                return StopReason::Reached;
+            }
+            if self.halted {
+                return StopReason::Halted;
+            }
+            if steps >= max_steps {
+                return StopReason::Capped;
+            }
+            self.step();
+            steps += 1;
+        }
+    }
+    /// Read `len` bytes of the data file from physical address `addr`.
+    /// DWARF addresses name GPR storage directly, so no bank resolution
+    /// applies; reads are raw (no INDF side effects, no PCL view).
+    pub fn read_mem(&self, addr: u8, len: usize) -> Vec<u8> {
+        self.check_phys_range(addr, len);
+        (0..len).map(|i| self.ram[addr as usize + i]).collect()
+    }
+    /// Write bytes into the data file, resolved like `read_mem`.
+    pub fn write_mem(&mut self, addr: u8, bytes: &[u8]) {
+        self.check_phys_range(addr, bytes.len());
+        for (i, &b) in bytes.iter().enumerate() {
+            self.ram[addr as usize + i] = b;
+        }
+    }
+    /// A debugger span must stay inside the 8-bit file.
+    fn check_phys_range(&self, addr: u8, len: usize) {
+        assert!(
+            (addr as usize + len) <= 0x100,
+            "read_mem/write_mem: {addr:#04X}+{len} leaves the 8-bit file"
+        );
+    }
+    /// Read one program-flash word by word index.
+    pub fn read_prog_word(&self, addr: u16) -> Option<u16> {
+        self.prog.get(addr as usize).copied()
+    }
     pub fn run(&mut self, max_steps: usize) -> usize {
         let mut steps = 0;
         while !self.halted && steps < max_steps {

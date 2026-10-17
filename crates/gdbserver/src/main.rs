@@ -45,5 +45,6 @@ fn main() {
         }
     };
     eprintln!("epic-cc-gdbserver: debugger connected");
-    serve_stream(stream, prog, core);
+    let device = args.device.as_deref().and_then(device::resolve);
+    serve_stream(stream, prog, core, device);
 }
