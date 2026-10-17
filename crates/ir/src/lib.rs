@@ -157,7 +157,7 @@ pub struct Select {
 /// construct a panic refers to. Resolves in `irparse` from clang `-g`
 /// metadata; `col` is 1 for line-level scopes that carry no column
 /// (a define `!dbg` subprogram).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SrcLoc {
     pub file: String,
     pub line: u32,
