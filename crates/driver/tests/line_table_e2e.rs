@@ -124,3 +124,62 @@ fn bank_switched_sfr_setup_keeps_later_lines() {
         );
     }
 }
+
+/// Words one PIC18 instruction occupies, from its first word:
+/// `GOTO` (0xEFxx), `CALL` (0xECxx/0xEDxx), `LFSR` (0xEExx) and `MOVFF`
+/// (0xCxxx) carry a second word.
+fn pic18_words(word: u16) -> u32 {
+    match word >> 8 {
+        0xEF | 0xEC | 0xED | 0xEE | 0xC0..=0xCF => 2,
+        _ => 1,
+    }
+}
+
+#[test]
+fn pic18_rows_follow_two_word_instructions() {
+    // `org 0; goto __start` already takes bytes 0-3, and bump()/main()
+    // hold MOVFF and CALL: a one-word-per-line walk drifts low at the
+    // first of them (epic-cc#1318).
+    let dir = std::env::temp_dir().join(format!("lt_pic18_two_word_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let hex_path = dir.join("out.hex");
+    let table_path = dir.join("out.txt");
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .arg("tests/fixtures/line_table_pic18.c")
+        .arg("-o")
+        .arg(&hex_path)
+        .arg("--device")
+        .arg("p18f4550")
+        .arg("--line-table")
+        .arg(&table_path)
+        .output()
+        .expect("run driver");
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let words = pic14_sim::parse_hex_pic18(&std::fs::read_to_string(&hex_path).unwrap());
+    let table = std::fs::read_to_string(&table_path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let addrs: Vec<u32> = table
+        .lines()
+        .filter(|l| !l.starts_with(';'))
+        .map(|l| u32::from_str_radix(&l.split_whitespace().nth(1).unwrap()[2..], 16).unwrap())
+        .collect();
+    assert_eq!(addrs[0], 4, "first row follows the 2-word goto:\n{table}");
+    // Every instruction in this fixture is mapped, so each row is the
+    // previous row plus the real width of the instruction there.
+    for w in addrs.windows(2) {
+        let width = pic18_words(words[(w[0] / 2) as usize]) * 2;
+        assert_eq!(
+            w[1],
+            w[0] + width,
+            "rows must follow the final layout:\n{table}"
+        );
+    }
+    assert!(
+        addrs.windows(2).any(|w| w[1] - w[0] == 4),
+        "fixture must exercise a two-word instruction:\n{table}"
+    );
+}
