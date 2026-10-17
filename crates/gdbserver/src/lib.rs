@@ -1,4 +1,5 @@
-//! The debugger adapter (epic-cc#259, extended to PIC18 in epic-cc#1312):
+//! The debugger adapter (epic-cc#259, extended to PIC18 in epic-cc#1312
+//! and to PIC14E in epic-cc#1311):
 //! a long-lived RSP server that drives a simulator control surface.
 //! Loads the compiler's HEX (program words) and serves gdb over TCP;
 //! the ELF+DWARF sidecar (`--sidecar` at compile time) stays on the
@@ -6,7 +7,7 @@
 //!
 //! Register convention (docs/internals/design/34 §3): gdb sees an i386
 //! architecture, so PIC state is mapped onto the x86 core registers:
-//! `eip` <- PC (a word address on PIC14, a byte address on PIC18),
+//! `eip` <- PC (a word address on PIC14/PIC14E, a byte address on PIC18),
 //! `eax` <- W, `ecx` <- STATUS, `edx` <- FSR/FSR0, `ebx` <- PCLATH/BSR.
 //! Memory reads/writes address the RAM image physically below the
 //! flash base and program flash as byte offsets above it.
@@ -27,7 +28,7 @@ use gdbstub::target::Target;
 use gdbstub::target::{TargetError, TargetResult};
 use gdbstub_arch::x86::reg::X86CoreRegs;
 use gdbstub_arch::x86::X86_SSE;
-use pic14_sim::{Pic14, Pic18};
+use pic14_sim::{Pic14, Pic14e, Pic18};
 
 /// Parsed `epic-cc-gdbserver <hex> <sidecar.elf> --port <port>`
 /// arguments. `--device` selects the core (a PIC14 part is the
@@ -87,7 +88,7 @@ pub fn core_of(device: Option<&str>) -> Result<Core, String> {
     let dev =
         device::resolve(name).ok_or_else(|| format!("epic-cc-gdbserver: unknown device {name}"))?;
     match dev.core {
-        Core::Pic14 | Core::Pic18 => Ok(dev.core),
+        Core::Pic14 | Core::Pic14e | Core::Pic18 => Ok(dev.core),
         other => Err(format!(
             "epic-cc-gdbserver: no simulator target for {other:?} (device {name})"
         )),
@@ -101,6 +102,7 @@ pub fn load_program(hex_path: &str, sidecar_path: &str, core: Core) -> Result<Ve
     std::fs::metadata(sidecar_path).map_err(|e| format!("sidecar {sidecar_path}: {e}"))?;
     Ok(match core {
         Core::Pic14 => pic14_sim::parse_hex(&hex),
+        Core::Pic14e => pic14_sim::parse_hex_pic14e(&hex),
         Core::Pic18 => pic14_sim::parse_hex_pic18(&hex),
         other => {
             return Err(format!(
@@ -122,6 +124,14 @@ pub fn serve_stream(stream: std::net::TcpStream, prog: Vec<u16>, core: Core) {
                 stepped: false,
             };
             GdbStub::new(connection).run_blocking::<EventLoop<Pic14Target>>(&mut target)
+        }
+        Core::Pic14e => {
+            let mut target = Pic14eTarget {
+                sim: Pic14e::new(prog),
+                breakpoints: HashSet::new(),
+                stepped: false,
+            };
+            GdbStub::new(connection).run_blocking::<EventLoop<Pic14eTarget>>(&mut target)
         }
         Core::Pic18 => {
             let mut target = Pic18Target {
@@ -165,6 +175,7 @@ pub fn serve_once(
 
 const RAM_SIZE: u32 = 0x200;
 const PIC18_RAM_SIZE: u32 = 0x1000;
+const PIC14E_RAM_SIZE: u32 = 0x1000;
 
 pub struct Pic14Target {
     sim: Pic14,
@@ -176,6 +187,13 @@ pub struct Pic14Target {
 
 pub struct Pic18Target {
     sim: Pic18,
+    breakpoints: HashSet<u32>,
+    /// Same `step()`/`DoneStep` contract as `Pic14Target::stepped`.
+    stepped: bool,
+}
+
+pub struct Pic14eTarget {
+    sim: Pic14e,
     breakpoints: HashSet<u32>,
     /// Same `step()`/`DoneStep` contract as `Pic14Target::stepped`.
     stepped: bool,
@@ -216,7 +234,24 @@ impl Pic18Target {
     }
 }
 
-/// The core operations the RSP event loop drives. Both targets share
+impl Pic14eTarget {
+    fn read_mem_byte(&self, addr: u32) -> u8 {
+        if addr < PIC14E_RAM_SIZE {
+            self.sim.ram()[addr as usize]
+        } else {
+            // Same flash byte space as PIC18, above the 4 KiB RAM.
+            let off = (addr - PIC14E_RAM_SIZE) as usize;
+            let word = self.sim.read_prog_word((off / 2) as u16).unwrap_or(0);
+            if off % 2 == 0 {
+                (word & 0xFF) as u8
+            } else {
+                (word >> 8) as u8
+            }
+        }
+    }
+}
+
+/// The core operations the RSP event loop drives. All targets share
 /// the i386 register file and the breakpoint-watch run loop; only the
 /// simulator underneath differs.
 trait AdapterTarget: Target<Arch = X86_SSE, Error = &'static str> {
@@ -277,6 +312,24 @@ impl AdapterTarget for Pic18Target {
     }
     fn pc_addr(&self) -> u32 {
         self.sim.pc()
+    }
+    fn at_breakpoint(&self) -> bool {
+        self.breakpoints.contains(&self.pc_addr())
+    }
+    fn take_stepped(&mut self) -> bool {
+        std::mem::replace(&mut self.stepped, false)
+    }
+}
+
+impl AdapterTarget for Pic14eTarget {
+    fn halted(&self) -> bool {
+        self.sim.halted()
+    }
+    fn step_one(&mut self) {
+        self.sim.step();
+    }
+    fn pc_addr(&self) -> u32 {
+        self.sim.pc() as u32
     }
     fn at_breakpoint(&self) -> bool {
         self.breakpoints.contains(&self.pc_addr())
@@ -391,6 +444,58 @@ impl gdbstub::target::ext::breakpoints::SwBreakpoint for Pic18Target {
     }
 }
 
+impl Target for Pic14eTarget {
+    type Arch = X86_SSE;
+    type Error = &'static str;
+
+    #[inline(always)]
+    fn base_ops(&mut self) -> gdbstub::target::ext::base::BaseOps<'_, Self::Arch, Self::Error> {
+        gdbstub::target::ext::base::BaseOps::SingleThread(self)
+    }
+
+    // Same implicit-breakpoint contract as `Pic14Target`: the pc set
+    // is watched, no flash words are patched.
+    #[inline(always)]
+    fn guard_rail_implicit_sw_breakpoints(&self) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    fn support_breakpoints(
+        &mut self,
+    ) -> Option<gdbstub::target::ext::breakpoints::BreakpointsOps<'_, Self>> {
+        Some(self)
+    }
+}
+
+impl gdbstub::target::ext::breakpoints::Breakpoints for Pic14eTarget {
+    #[inline(always)]
+    fn support_sw_breakpoint(
+        &mut self,
+    ) -> Option<gdbstub::target::ext::breakpoints::SwBreakpointOps<'_, Self>> {
+        Some(self)
+    }
+}
+
+impl gdbstub::target::ext::breakpoints::SwBreakpoint for Pic14eTarget {
+    fn add_sw_breakpoint(
+        &mut self,
+        addr: u32,
+        _kind: <Self::Arch as gdbstub::arch::Arch>::BreakpointKind,
+    ) -> TargetResult<bool, Self> {
+        self.breakpoints.insert(addr);
+        Ok(true)
+    }
+
+    fn remove_sw_breakpoint(
+        &mut self,
+        addr: u32,
+        _kind: <Self::Arch as gdbstub::arch::Arch>::BreakpointKind,
+    ) -> TargetResult<bool, Self> {
+        Ok(self.breakpoints.remove(&addr))
+    }
+}
+
 impl SingleThreadBase for Pic14Target {
     fn read_registers(&mut self, regs: &mut X86CoreRegs) -> TargetResult<(), Self> {
         regs.eax = self.sim.w() as u32;
@@ -486,6 +591,55 @@ impl SingleThreadBase for Pic18Target {
     }
 }
 
+impl SingleThreadBase for Pic14eTarget {
+    fn read_registers(&mut self, regs: &mut X86CoreRegs) -> TargetResult<(), Self> {
+        regs.eax = self.sim.w() as u32;
+        regs.ecx = self.sim.status() as u32;
+        regs.edx = self.sim.fsr0() as u32;
+        regs.ebx = self.sim.bsr() as u32;
+        regs.eip = self.sim.pc() as u32;
+        Ok(())
+    }
+
+    fn write_registers(&mut self, regs: &X86CoreRegs) -> TargetResult<(), Self> {
+        // Same round-trip contract as PIC18, on PIC14E SFR addresses:
+        // W, word PC, STATUS at 0x03, the FSR0 pair at 0x04/0x05,
+        // and BSR at 0x08.
+        self.sim.set_w(regs.eax as u8);
+        self.sim.set_pc(regs.eip as u16);
+        self.sim.ram_mut()[0x03] = regs.ecx as u8;
+        self.sim.ram_mut()[0x04] = (regs.edx & 0xFF) as u8;
+        self.sim.ram_mut()[0x05] = ((regs.edx >> 8) & 0xFF) as u8;
+        self.sim.ram_mut()[0x08] = regs.ebx as u8;
+        Ok(())
+    }
+
+    fn read_addrs(&mut self, start_addr: u32, data: &mut [u8]) -> TargetResult<usize, Self> {
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = self.read_mem_byte(start_addr + i as u32);
+        }
+        Ok(data.len())
+    }
+
+    fn write_addrs(&mut self, start_addr: u32, data: &[u8]) -> TargetResult<(), Self> {
+        let base = start_addr as usize;
+        let end = base + data.len();
+        // Flash is read-only through this surface; a write crossing
+        // the RAM boundary fails instead of dropping its tail.
+        if start_addr >= PIC14E_RAM_SIZE || end > PIC14E_RAM_SIZE as usize {
+            return Err(TargetError::NonFatal);
+        }
+        self.sim.ram_mut()[base..end].copy_from_slice(data);
+        Ok(())
+    }
+
+    fn support_resume(
+        &mut self,
+    ) -> Option<gdbstub::target::ext::base::singlethread::SingleThreadResumeOps<'_, Self>> {
+        Some(self)
+    }
+}
+
 impl SingleThreadResume for Pic14Target {
     fn resume(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
         Ok(())
@@ -510,6 +664,18 @@ impl SingleThreadResume for Pic18Target {
     }
 }
 
+impl SingleThreadResume for Pic14eTarget {
+    fn resume(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn support_single_step(
+        &mut self,
+    ) -> Option<gdbstub::target::ext::base::singlethread::SingleThreadSingleStepOps<'_, Self>> {
+        Some(self)
+    }
+}
+
 impl SingleThreadSingleStep for Pic14Target {
     fn step(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
         self.sim.step();
@@ -519,6 +685,14 @@ impl SingleThreadSingleStep for Pic14Target {
 }
 
 impl SingleThreadSingleStep for Pic18Target {
+    fn step(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
+        self.sim.step();
+        self.stepped = true;
+        Ok(())
+    }
+}
+
+impl SingleThreadSingleStep for Pic14eTarget {
     fn step(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
         self.sim.step();
         self.stepped = true;
