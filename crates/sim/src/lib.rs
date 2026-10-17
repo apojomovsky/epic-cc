@@ -2162,6 +2162,71 @@ impl Pic18 {
     pub fn pc(&self) -> u32 {
         self.pc
     }
+    /// STATUS, the flag register at 0xFD8.
+    pub fn status(&self) -> u8 {
+        self.ram[0xFD8]
+    }
+    /// BSR, the bank-select register at 0xFE0.
+    pub fn bsr(&self) -> u8 {
+        self.ram[0xFE0]
+    }
+    /// FSR0, the 12-bit indirect pointer (FSR0H:FSR0L).
+    pub fn fsr0(&self) -> u16 {
+        ((self.ram[0xFEA] as u16) << 8) | self.ram[0xFE9] as u16
+    }
+    /// Set the program counter (a byte address). The halted flag
+    /// tracks it, so writing an in-range address resumes a program
+    /// that ran off its end.
+    pub fn set_pc(&mut self, addr: u32) {
+        self.pc = addr;
+        self.halted = (addr / 2) as usize >= self.prog.len();
+    }
+    /// Run until `pc` reaches `target`, the program halts, or
+    /// `max_steps` instructions have executed. The breakpoint primitive:
+    /// the adapter owns the breakpoint set and calls this per stop, so
+    /// the sim keeps no breakpoint state of its own.
+    pub fn run_until(&mut self, target: u32, max_steps: usize) -> StopReason {
+        let mut steps = 0;
+        loop {
+            if self.pc == target {
+                return StopReason::Reached;
+            }
+            if self.halted {
+                return StopReason::Halted;
+            }
+            if steps >= max_steps {
+                return StopReason::Capped;
+            }
+            self.step();
+            steps += 1;
+        }
+    }
+    /// Read `len` bytes of data RAM starting at physical address
+    /// `addr`. The space is flat, so no bank resolution applies; reads
+    /// are raw (no INDF side effects, no PCL/WREG views): DWARF
+    /// variable addresses name GPR storage, never pseudo-registers.
+    pub fn read_mem(&self, addr: u16, len: usize) -> Vec<u8> {
+        self.check_phys_range(addr, len);
+        (0..len).map(|i| self.ram[addr as usize + i]).collect()
+    }
+    /// Write bytes into data RAM, resolved like `read_mem`.
+    pub fn write_mem(&mut self, addr: u16, bytes: &[u8]) {
+        self.check_phys_range(addr, bytes.len());
+        for (i, &b) in bytes.iter().enumerate() {
+            self.ram[addr as usize + i] = b;
+        }
+    }
+    /// A debugger span must stay inside the 12-bit data space.
+    fn check_phys_range(&self, addr: u16, len: usize) {
+        assert!(
+            (addr as usize + len) <= 0x1000,
+            "read_mem/write_mem: {addr:#06X}+{len} leaves the 12-bit data space"
+        );
+    }
+    /// Read one program-flash word by word index.
+    pub fn read_prog_word(&self, addr: u16) -> Option<u16> {
+        self.prog.get(addr as usize).copied()
+    }
     pub fn halted(&self) -> bool {
         self.halted
     }

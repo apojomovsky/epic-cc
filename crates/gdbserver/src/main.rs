@@ -3,7 +3,7 @@
 //! Thin entry over the library: parse the command line, load the HEX,
 //! serve one gdb session on the requested port.
 
-use epic_cc_gdbserver::{load_program, parse_args, serve_stream};
+use epic_cc_gdbserver::{core_of, load_program, parse_args, serve_stream};
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -14,7 +14,14 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let prog = match load_program(&args.hex_path, &args.sidecar_path) {
+    let core = match core_of(args.device.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    let prog = match load_program(&args.hex_path, &args.sidecar_path, core) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("epic-cc-gdbserver: {e}");
@@ -38,5 +45,5 @@ fn main() {
         }
     };
     eprintln!("epic-cc-gdbserver: debugger connected");
-    serve_stream(stream, prog);
+    serve_stream(stream, prog, core);
 }
