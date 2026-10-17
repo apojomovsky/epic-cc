@@ -40,7 +40,8 @@ fn compile(src: &str, dir: &std::path::Path) -> (String, String, String) {
 /// Run one gdb batch session against `serve_once(prog)` and return the
 /// combined output.
 fn gdb_session(elf: &str, prog: Vec<u16>, cmds: &[String]) -> String {
-    let (addr, server) = epic_cc_gdbserver::serve_once(prog, Core::Pic18).expect("bind server");
+    let (addr, server) =
+        epic_cc_gdbserver::serve_once(prog, Core::Pic18, None).expect("bind server");
     let mut args = vec![
         "-batch".to_string(),
         "-ex".to_string(),
