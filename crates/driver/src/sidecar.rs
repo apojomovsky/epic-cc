@@ -8,18 +8,19 @@
 //! architecture gdb uses).
 
 use alloc::AllocLayout;
-use ir::SrcLoc;
-use irparse::{DebugVars, DiTypeNode, DiVar};
-use iselcore::is_directive;
-
+use device::Core;
 use gimli::write::{
     Address, AttributeValue, Dwarf, EndianVec, Expression, FileId, LineProgram, LineString,
     Sections, StringTable, Unit, UnitEntryId,
 };
 use gimli::{constants, Encoding, Format, RunTimeEndian, SectionId};
+use ir::SrcLoc;
+use irparse::{DebugVars, DiTypeNode, DiVar};
+use iselcore::is_directive;
 
 /// One source row of the phase-1 line table: the C location and the
-/// program word address it compiled to.
+/// program address it compiled to (a word address on PIC14-family
+/// cores, a byte address on PIC18, matching each core's PC).
 pub type LineRow = (SrcLoc, u16);
 
 /// Where the join placed a variable.
@@ -144,8 +145,14 @@ fn location_expr(loc: &VarLoc, size: Option<u32>) -> Expression {
 
 /// The line rows the phase-1 table walks out of the final asm text,
 /// shared with the textual `--line-table` artifact so the sidecar's
-/// `.debug_line` is its DWARF encoding by construction.
-pub fn line_rows(asm: &str, locs: &[Option<SrcLoc>]) -> Vec<LineRow> {
+/// `.debug_line` is its DWARF encoding by construction. PIC14-family
+/// cores walk the raw text (their assemblers never move code); PIC18
+/// rows come from the assembler's final layout, so far-branch
+/// expansion and PCL table padding land on true byte addresses.
+pub fn line_rows(asm: &str, locs: &[Option<SrcLoc>], core: Core) -> Vec<LineRow> {
+    if core == Core::Pic18 {
+        return pic18_rows(asm, locs);
+    }
     let mut rows = Vec::new();
     let mut org = 0usize;
     let mut li = 0usize;
@@ -179,7 +186,29 @@ pub fn line_rows(asm: &str, locs: &[Option<SrcLoc>]) -> Vec<LineRow> {
     rows
 }
 
-/// The entry-level attribute setter; gimli keeps attrs on the entry.
+/// PIC18 rows in byte addresses from the assembler's final layout.
+/// Distinct source locs get dense ids (the assembler only passes
+/// them through), mapped back on return.
+fn pic18_rows(asm: &str, locs: &[Option<SrcLoc>]) -> Vec<LineRow> {
+    let mut table: Vec<SrcLoc> = Vec::new();
+    let ids: Vec<Option<u32>> = locs
+        .iter()
+        .map(|loc| {
+            loc.as_ref().map(|l| {
+                if let Some(i) = table.iter().position(|t| t == l) {
+                    return i as u32;
+                }
+                table.push(l.clone());
+                table.len() as u32 - 1
+            })
+        })
+        .collect();
+    asm::assemble_pic18_with_locs(asm, &ids)
+        .1
+        .into_iter()
+        .map(|(id, addr)| (table[id as usize].clone(), addr))
+        .collect()
+}
 fn set(unit: &mut Unit, id: UnitEntryId, name: gimli::DwAt, value: AttributeValue) {
     unit.get_mut(id).set(name, value);
 }

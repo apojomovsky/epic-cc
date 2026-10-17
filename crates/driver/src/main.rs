@@ -743,7 +743,7 @@ fn main() {
         .expect("write line table");
     }
     if let Some(sc_path) = &cli.sidecar {
-        let rows = driver::sidecar::line_rows(&asm, &locs);
+        let rows = driver::sidecar::line_rows(&asm, &locs, device.core);
         let dbg_vars = irparse::parse_debug_vars(&ll_text);
         std::fs::write(sc_path, driver::sidecar::encode(&rows, &layout, &dbg_vars))
             .expect("write sidecar");

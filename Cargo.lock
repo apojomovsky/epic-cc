@@ -106,6 +106,7 @@ dependencies = [
 name = "epic-cc-gdbserver"
 version = "0.1.0"
 dependencies = [
+ "device",
  "gdbstub",
  "gdbstub_arch",
  "pic14-sim",

@@ -13,6 +13,7 @@ name = "epic_cc_gdbserver"
 path = "src/lib.rs"
 
 [dependencies]
+device = { path = "../device" }
 pic14-sim = { path = "../sim" }
 gdbstub = "0.7.10"
 gdbstub_arch = "0.3.0"

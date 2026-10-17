@@ -156,6 +156,18 @@ fn instruction_words_pic18(line: &str) -> usize {
 }
 
 /// Assemble PIC18 assembly source into 16-bit words indexed by word
+/// address, plus the debug rows: `(loc id, byte address)` per mapped
+/// instruction in the FINAL layout, after far-branch expansion and PCL
+/// table padding. `locs` runs parallel to the raw source lines (one
+/// entry per `src.lines()`, `None` for generated lines); the ids are
+/// opaque here, assigned by the caller. The rows let the debugger map
+/// a source line to the byte addresses the assembler actually emitted,
+/// which a raw-text walk cannot once the fixpoint splices lines.
+pub fn assemble_pic18_with_locs(src: &str, locs: &[Option<u32>]) -> (Vec<u16>, Vec<(u32, u16)>) {
+    assemble_pic18_impl(src, locs)
+}
+
+/// Assemble PIC18 assembly source into 16-bit words indexed by word
 /// address. Two-pass like `assemble`: pass 1 resolves labels/`org`/`equ`
 /// and measures each line's size; pass 2 encodes. `DB <hex> [, <hex>]*`
 /// (case-insensitive) is a byte-data directive packing bytes into words
@@ -174,13 +186,21 @@ fn instruction_words_pic18(line: &str) -> usize {
 /// by 2 wherever the ISA's `k`/`n` fields need a *word* address/offset
 /// (`GOTO`/`CALL`'s absolute target, every relative branch's offset).
 pub fn assemble_pic18(src: &str) -> Vec<u16> {
+    assemble_pic18_impl(src, &[]).0
+}
+
+fn assemble_pic18_impl(src: &str, locs: &[Option<u32>]) -> (Vec<u16>, Vec<(u32, u16)>) {
     // Every meaningful source line becomes one entry in the stream, in
     // order: `org ...`, `label:`, `db ...`, or an instruction. The far-
     // branch expansion below splices between entries, and every layout
     // decision (label addresses, instruction addresses, db addresses)
     // re-walks this stream, so the passes agree by construction.
     let mut lines: Vec<String> = Vec::new();
-    for raw in src.lines() {
+    // Opaque caller loc ids parallel to `lines`: label entries carry
+    // none, every other entry the raw line's. Spliced expansion lines
+    // below inherit the replaced line's id, pads carry none.
+    let mut llocs: Vec<Option<u32>> = Vec::new();
+    for (ri, raw) in src.lines().enumerate() {
         let line = raw.split(';').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
@@ -191,10 +211,12 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
         if is_directive(line, "end") {
             break;
         }
+        let loc = locs.get(ri).copied().flatten();
         if let Some(eq) = line.find(" equ ") {
             let (name, val) = line.split_at(eq);
             let val_txt = val[" equ ".len()..].trim().to_string();
             lines.push(format!("equ {name} {val_txt}"));
+            llocs.push(loc);
             continue;
         }
         // A `label: instruction` line splits into a label entry and an
@@ -204,13 +226,16 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
             let rest = line[colon + 1..].trim();
             if !label.is_empty() && !label.contains(' ') && !label.contains('\t') {
                 lines.push(format!("{label}:"));
+                llocs.push(None);
                 if !rest.is_empty() {
                     lines.push(rest.to_string());
+                    llocs.push(loc);
                 }
                 continue;
             }
         }
         lines.push(line.to_string());
+        llocs.push(loc);
     }
 
     /// The inverted form of each conditional branch mnemonic.
@@ -381,9 +406,12 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
                 let inv = invert_cond(&mne).to_string();
                 let skip = format!("__far_skip{serial}");
                 serial += 1;
+                let bloc = llocs[li];
                 lines[li] = format!("{inv} {skip}");
                 lines.insert(li + 1, format!("BRA {target_label}"));
+                llocs.insert(li + 1, bloc);
                 lines.insert(li + 2, format!("{skip}:"));
+                llocs.insert(li + 2, None);
             }
             expanded = true;
             break;
@@ -491,6 +519,7 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
             if let Some((ai, pad)) = fix {
                 for _ in 0..pad {
                     lines.insert(ai + 1, "NOP".to_string());
+                    llocs.insert(ai + 1, None);
                 }
                 expanded = true;
             }
@@ -516,7 +545,46 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
         let b = (parse_lit(&tok, &symbols_final) & 0xFF) as u8;
         out[addr / 2] |= (u16::from(b)) << ((addr % 2) * 8);
     }
-    out
+    // Debug rows from the final stream, so expansion pads inherit the
+    // replaced line's id and everything after lands on its true byte
+    // address. Re-walks the same address rules as `layout_addrs`.
+    let mut rows: Vec<(u32, u16)> = Vec::new();
+    {
+        let mut org = 0usize;
+        for (line, loc) in lines.iter().zip(llocs.iter()) {
+            if line.strip_suffix(':').is_some() {
+                continue;
+            }
+            if line.starts_with("equ ") {
+                continue;
+            }
+            if line.starts_with(".pcltbl ") {
+                continue;
+            }
+            if line.starts_with(".pclalign") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("org ") {
+                org = parse_num(rest.trim());
+                continue;
+            }
+            if line.to_ascii_lowercase().starts_with("db ") {
+                if let Some(id) = loc {
+                    rows.push((*id, org as u16));
+                }
+                org += line[3..]
+                    .split(',')
+                    .filter(|t| !t.trim().is_empty())
+                    .count();
+                continue;
+            }
+            if let Some(id) = loc {
+                rows.push((*id, org as u16));
+            }
+            org += instruction_words_pic18(line) * 2;
+        }
+    }
+    (out, rows)
 }
 
 /// Parse a PIC18 byte/bit-oriented operand's `f` field (the first

@@ -21,15 +21,16 @@ use irparse::DebugVars;
 /// text with the same pass-1 semantics `asm::assemble` uses (tracking
 /// `org`, labels, `.align`, `.table`, `end`), pairing each word address
 /// with the parallel per-line `locs` vector the backend threads through.
-/// The table is the debugger artifact: a breakpoint on a C line
-/// resolves to the word addresses that line produced.
+/// PIC18 rows are byte addresses from the assembler's final layout
+/// (see `sidecar::line_rows`). The table is the debugger artifact:
+/// a breakpoint on a C line resolves to the addresses that line produced.
 pub fn line_table_text(device: &Device, asm: &str, locs: &[Option<SrcLoc>]) -> String {
     let mut out = String::new();
     out.push_str(&format!("; epic-cc line table for {}\n", device.name));
     // The rows are the sidecar's `.debug_line` source by construction:
     // both artifacts walk out of `sidecar::line_rows`, so they cannot
     // drift apart.
-    for (loc, addr) in sidecar::line_rows(asm, locs) {
+    for (loc, addr) in sidecar::line_rows(asm, locs, device.core) {
         out.push_str(&format!("{loc} 0x{addr:04X}\n"));
     }
     out

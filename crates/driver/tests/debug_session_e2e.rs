@@ -16,6 +16,7 @@
 use std::io::Write;
 use std::process::Command;
 
+use device::Core;
 use epic_cc_gdbserver::load_program;
 
 /// Compile `src` to HEX plus the debugger artifacts, all under `dir`.
@@ -48,7 +49,7 @@ fn compile(src: &str, dir: &std::path::Path) -> (String, String, String) {
 /// Run one gdb batch session against `serve_once(prog)` and return the
 /// combined output.
 fn gdb_session(elf: &str, prog: Vec<u16>, cmds: &[String]) -> String {
-    let (addr, server) = epic_cc_gdbserver::serve_once(prog).expect("bind server");
+    let (addr, server) = epic_cc_gdbserver::serve_once(prog, Core::Pic14).expect("bind server");
     let mut args = vec![
         "-batch".to_string(),
         "-ex".to_string(),
@@ -95,7 +96,7 @@ fn typed_session_break_print_step() {
     let dir = scratch("session");
     let src = "tests/fixtures/debug_session.c";
     let (hex, elf, lt) = compile(src, &dir);
-    let prog = load_program(&hex, &elf).expect("load program");
+    let prog = load_program(&hex, &elf, Core::Pic14).expect("load program");
 
     // The sidecar's .debug_line must agree with --line-table on every
     // mapped word: ask gdb for each address in one session.
@@ -173,7 +174,7 @@ fn banksel_words_step_inside_their_line() {
         .write_all(src.as_bytes())
         .unwrap();
     let (hex, elf, _) = compile(&c_path.to_string_lossy(), &dir);
-    let prog = load_program(&hex, &elf).expect("load program");
+    let prog = load_program(&hex, &elf, Core::Pic14).expect("load program");
 
     let text = gdb_session(
         &elf,

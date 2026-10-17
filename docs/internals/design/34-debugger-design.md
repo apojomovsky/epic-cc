@@ -242,13 +242,27 @@ sidecar's `.debug_line` itself). gdb joined the dev/ci image as an
 apt package for the acceptance sessions; the release bundle carries
 the `epic-cc-gdbserver` binary but no gdb.
 
-## 5. Non-goals for this document
+## 5. PIC18 extension (epic-cc#1312, ADR-055)
+
+The PIC14 path above now runs on PIC18 (`p18f4550` proven): the
+var-table join is reused unchanged, and three pieces are
+core-specific. Line rows are byte addresses from the assembler's
+final layout (far-branch expansion and PCL pads move code after
+isel, so a raw-text walk misreports). `Pic18` grew the phase-3
+control surface (`run_until` on the byte PC, flat `read/write_mem`,
+`STATUS`/`BSR`/`FSR0` views). `epic-cc-gdbserver` serves a
+`Pic18Target` behind `--device` with the same i386 session mapping
+(byte PC in `eip`). One limit carries over and is sharper here:
+gdb decodes target bytes as x86 to step over calls, so `next` over
+an outlined `RCALL` site steps into no-line-info code; filed as a
+follow-up, shared with PIC14.
+
+## 6. Non-goals for this document
 
 - Real hardware debugging (ICSP + Microchip's debug-executive protocol,
   PICkit/ICD-class tools). Materially different problem, largely
   undocumented outside Microchip's own tooling; a separate proposal if ever
   pursued.
-- PIC18. Land the PIC14 path and prove the pattern first.
 - Any variable-location form beyond constant addresses (frame-relative
   locations, register-allocated locals), not needed given section 1, and
   not planned.
