@@ -2,9 +2,323 @@
 
 All notable changes to this project are documented here, generated from
 Conventional Commits. Dates are UTC.
-## [0.4.0] - 2026-09-28
+## [0.5.0] - 2026-10-17
+ 
+### Breaking
 
-### Bug Fixes
+- Make pooled const table the default on PIC14 (#1216)
+
+### Features
+
+- Carry bank state across prefix roots and page-select regions (#735)
+- Borrow MPLAB SIM as PIC18 execution oracle (#742)
+- Accept .cpp inputs and map _Z4mainv to main (#823)
+- Accept C++ IR shapes, volatile flag, subset panics (#824)
+- Run global ctors, erase atexit, trivialize guards, ISR check (#826)
+- Vtable const decode into flash tables, address-taken feed (#833)
+- Bank-0-pinned _delay loop for no-common-RAM parts (#800) (#828)
+- Pooled flash string table for address-taken consts (#815) (#845)
+- Optimization profiles -O0/-O1/-O2/-Os (#866)
+- Place functions past one page across linked chunks (#881)
+- Wire policy titles, version truth and notes template (#885)
+- Flash-resident vtables with runtime TBLRD dispatch (#907)
+- Pool addresses and RAM-copy gating for pooled consts (#914)
+- Pool-reader log loop and sim proof (#924)
+- Model PIC18 Timer2 match path (#925)
+- Opcode-level sim-vs-MPLAB SIM sweep in four shards (#1002)
+- No-flag opcode sweep shards for PIC18 and PIC14 (#1005)
+- Stage FSR seeds out of sfr-context-save bucket (#1016)
+- Home trunc and sext call args into callee params (#1019)
+- Place functions past one page across linked chunks (#1046)
+- Serve runtime-indexed flash walks, refuse store-through (#1120)
+- Retain global linkage for whole-program passes (#1175)
+- Narrow proven-range u16 globals; outline stability canary (#1234)
+- Second data oracle for parts gputils does not know (#1264)
+- Onboard PIC16F13145 on pic14e core (#1270)
+- Bare bit names as section-placed entities on PIC14 (#1283)
+- Generate device matrix, CLI reference, rendered README (#1282)
+- Static flash address spaces for pointer slots (#1285)
+- Check the vendored epic-docs include against its recorded checksum (#1295)
+- Predefine __EPIC_CC_FLASH_PARAMS__ on PIC18 (#1307)
+- Source-level debugging for PIC18 parts (#1328)
+
+### Fixes
+
+- Create the hex staging dir in a fresh epic-hal checkout (#762)
+- Content-address dev image tag per Dockerfile hash (#760)
+- Resolve dev image tag from script path, fail without Dockerfile (#766)
+- Skip missing dirs in mdb-oracle ownership cleanup (#786)
+- Match end list radix directives exactly, not by prefix (#797)
+- Teach skip_trivia about char literals (#798)
+- Use SUBWFB for borrow chains, decode SUBFWB correctly in sim (#813)
+- Close EC++ filename bypass and classify subset panics (#905)
+- Exact-match target cache keys, drop prefix fallback (#922)
+- Model staged routine lengths in const section layout (#935)
+- Order menu-demo ladder inputs like the manifest sim build (#936)
+- Model staged routine lengths in const section layout (#945)
+- Reload W after loop drain under live w_holds belief (#946)
+- Track callbacks through uninlined Init handle memcpy (#947)
+- Repair page-fit from measured final-context sizes (#948)
+- Report unresolved extern data as undefined symbols (#951)
+- Seed nonzero-offset GEP select arms across distinct bases (#953)
+- Pin both input sides in planted-bug reducer test (#952)
+- Refuse staged consts over 255 bytes at emission (#949)
+- Record runtime recipe exit banks for call carry (#959)
+- Charge taken PIC18 branches landing on next word 2 cycles (#957)
+- Forward baseline scope env vars into dev container (#1040)
+- Match list/radix directives on a word boundary (#1044)
+- Keep RAM copy of pooled literals a callee reads (#1058)
+- Match bare directives as whole words, not prefixes (#1064)
+- Split peripheral SFR MOVFF runs out of sfr-context-save (#1086)
+- Recover clang rem idiom so divmod fusion fires from C (#1083)
+- Shrink __mul_u8/__mul_u16 scratch to 1 and 2 bytes (#1071)
+- Give every size baseline row a unique name (#1102)
+- Read flash string walks via TBLRD, panic on unsupported walk loads (#1103)
+- Panic on pointer phi joining flash and RAM walks (#1108)
+- Read flash walk memcpy via TBLRD, guard ROM destinations (#1100) (#1113)
+- Name the 255-byte limit for a mixed flash literal (#1114)
+- Refuse ROM store before the literal-pointer branch (#1124)
+- Add every runtime index to flash walk TBLPTR (#1125)
+- Match 429 retry check against final build log line (#1129)
+- Asm operand over-255-byte flash const errors; cover chain walk (#1134)
+- Hoist constexpr GEP phi arms to predecessor blocks (#1142)
+- Break pointer phi copy cycles with a 2-byte temp (#1143)
+- Reject live calls to unreachable-placeholder bodies (#1153)
+- Post-peephole const-table window repair; land encoder-sim ladder row (#1136)
+- Set sdiv_prescale in the counted-copy test options (#1172)
+- Dead extension-copy stores and pcl prologue pads (#1184)
+- Stage RAM copies for asm-named small flash consts (#1186)
+- Close page-fit repair oscillation and table-base drift (#1195)
+- Temp for pointer phi copy cycles on PIC14 family (#1207)
+- Honest spill sizes and placement slack for page tails (#1218)
+- Unmark PLUSW index terms on slotless stores (#1243)
+- Gate push on suite result, isolate flaky e2e scratch paths (#1247)
+- Describe SROA-split locals per fragment in var table and sidecar DWARF (#1248)
+- Copy phi-reached consts to RAM, refuse unbacked flash walks (#1249)
+- RAM copies for stored consts; pad odd data before far bodies (#1250)
+- Isolate line_table_e2e scratch paths per test (#1259)
+- Keep phi-folded counters staged under post-loop dereference (#1277)
+- Drop valueless llvm.assume instead of rejecting it (#1279)
+- Materialize escaped GEPs at the last index under phi-folded counters (#1275)
+- Follow epic-hal module id rename to repo-relative paths (#1288)
+- Call epic-hal's relocated scripts/sim/mdb-hex-run.sh (#1304)
+- Drop XC8 trace values from ADR-044 and lint for XC8 figures (#1300)
+- Refuse int-laundered flash addresses (#1284) (#1302)
+- Push one loc per inserted BANKSEL line, not its byte count (#1319)
+- Re-taint split flash addresses reassembled from bytes (#1325)
+
+### Performance
+
+- Coalesce phi-edge copies with disjoint live ranges (#741)
+- Forward const loads and table flash-ref store runs (#746)
+- Fuse bitmask lanes into skip-over-BSF (#764)
+- Read fused compare chains in place (#770)
+- Thread W through ALU mask and combine lanes (#772)
+- Coalesce dead-after freeze and cast sources into shared slots (#771)
+- Share TBLPTR seeds across adjacent const reads (#776)
+- Seed W-tracking from call return values (#785)
+- Fold single-use load/binop results into direct stores (#796)
+- Drop dead main-context twin after ISR copy rewrite (#802)
+- Collapse single-bit test lanes to direct bit tests (#807)
+- Stage const call args through one shared buffer on small cores (#809)
+- Signed compares via sign check plus borrow chain (#846)
+- Compute single-use scalar call args into callee param slots (#852)
+- Count fixed-region RAM by use instead of reservation (#867)
+- Keep single-use operand copies in W instead of overlay temps (#877)
+- Keep single-use operand copies in W instead of overlay temps (#903)
+- Drain staged copies straight under -O2 (#888)
+- Price PIC14 bank selects in arg homing (#915)
+- W-preserving SFR stores after slot staging (#911)
+- Share MOVLB across __start init bank runs (#920)
+- Shared tails for the decimal engine (#930)
+- Count the PIC14 scratch byte by use like retval (#929)
+- Home single-use call results into the retval region (#939)
+- Share accumulator slots across dead-after bitmask lanes (#940)
+- Combined 16/32-bit literal lanes in place (#943)
+- Fuse matching div+mod pairs into combined routines (#988)
+- Narrow u8/u16 multiply to result width, exit on zero (#979)
+- Share TBLPTR seeds across dynamic const runs (#960)
+- Normalized divide loops behind -O2 (#996)
+- Inline narrow u8/u16 multiplies at call sites (#984)
+- Fuse single-byte ordering compares (#966)
+- Fold divmod loop tail on -O2 (#987)
+- Move bus default ops tables to flash const (#992)
+- Narrow ISR context save to reachable clobber set (#965)
+- Small idiom folds bundle (#971)
+- Fold multi-use induction increments in place (#990)
+- Extend in-place RMW producers to INDF-destination stores (#1012)
+- Forward TABLAT-staged bytes directly to dynamic stores (#1014)
+- Fuse signed div+mod pairs (#1009)
+- Collapse single-use MOVFF chains through temps (#1013)
+- Fuse matching divmod pairs into combined routines (#1007)
+- Drop dead reloads after div-mod fusion (#1011)
+- Backport truncated early-exit multiply to pic14e and baseline (#1020)
+- Read pooled consts via chunk readers, drop gated tables (#1033)
+- Sharpen PIC14E const-memcpy hold to indirect destinations (#1038)
+- Path-aware arg-homing clobber check for loop writers (#1031)
+- Narrow dead 16-bit index arithmetic on byte-indexed walks (#1045)
+- Store const-table byte before PCLATH restore (#1024)
+- Share the LSR-mangled u16 decimal loops in menu redraw (#1052)
+- Store const-table byte before PCLATH restore (#1070)
+- Fold inline mul operand loads and dst store (#1084)
+- Drop dead PCLATH set pairs before next set (#1072)
+- Early-exit __mul_u32 on pic14e and baseline (#1089)
+- Unroll O2 __mul_u8 to four bits per loop group (#1093)
+- Unroll O2 __mul_u8 to eight straight-line passes (#1121)
+- Co-fold gapped loads into the same ALU op (#1130)
+- Skip dead pass-7 shift in O2 __mul_u8; regen SIZE_REPORT.md (#1131)
+- Drop non-adjacent dead PCLATH sets; split on repair deadlock (#1140)
+- Lower counted byte loops as FSR walks (#1148)
+- Emit const pool table only with a routed reader (#1154)
+- Sign-zero fold and capped -O2 const-copy unroll (#1158)
+- Dip callees into dead caller-frame prefixes per call site (#1161)
+- Prescale signed divide loops at O2 (#1133)
+- Lower counted byte loops with down-counter walks (#1176)
+- Narrow zext-fed snapshots to demanded width (#1177)
+- Transfer single-use load folds from PIC14 (#1178)
+- Narrow shift count copy, fuse mask zero-test (#1182)
+- Size __mul_u32 scratch per core (#1187)
+- Pin diamond-touch phi dsts into dead-after arms (#1190)
+- NUL, pointer, and strided FSR walks (#1193)
+- Fold single-bit test selects to BTFSC/BTFSS (crc16 diamond) (#1200)
+- Drop dead multiplicand clears in classic __mul_u32 (#1199)
+- Remove 0x70 parks for const folds, eq chains, table readers (#1194)
+- Fuse sign-zero icmp into value select (#1208)
+- Drop unreferenced internal globals (#1205)
+- Byte-granular variable shifts under O2 (#1206)
+- Narrow pid-step widening multiplies (#1210)
+- Port 0x70 park removals (1078/1079/1080) (#1213)
+- Multi-block, strided, and NUL-terminated loop walks (#1209)
+- Fold all-constant compute_period search at compile time (#1219)
+- Fold sub const bytes and remove 0xFF const parks (#1220)
+- Fold constant-table callees at constant call sites (#1217)
+- Break a RAM tie toward the smaller ISR region (#1222)
+- Fold signed i8 const compare into ADDLW (#1225)
+- Retval-product __mul_u32, add 12F509 ladder row (#1228)
+- Narrow counted 16-bit latch increments and checks (#1230)
+- Pack flag bytes with fused bit access (#1231)
+- Caller-side inline budget for bank-crossing frames (#1233)
+- Lay out blocks in textual order (#1229)
+- Accumulate scaled GEP index terms in W (#1235)
+- Drop overlay slots isel keeps in W and never addresses (#1241)
+- Precise alloca and va intervals with callee retention (#1147) (#1244)
+- Treat narrowed zext index terms as non-wide (#1261)
+- Park-free fold for reg-reg sub borrow bytes (#1260)
+- Fold high-byte xor into the carried home (#1265)
+- Park-free fold for reg-reg add carry bytes (#1267)
+- Compute single-byte Bin-into-store in place on PIC14 (#1268)
+- Walk two-block outer loops over nested counters (#1278)
+- Fuse volatile single-bit SFR read-modify-write to BSF/BCF (#1292)
+
+### Documentation
+
+- RAM overlay audit findings for menu-demo (#728) (#761)
+- Never post to third-party repositories (#773)
+- Add embedded C++ subset design for #456 (#801)
+- Price density on the packed image, not the listing (#820)
+- Audit RAM across four HAL demos with priced levers (#858)
+- Correct bridge fallback cause and rescope ranges lever (#868)
+- Scope byval zero citation to menu plus direct grep (#869)
+- Per-demo RAM gap attribution (#904)
+- Point the review-gate summary at the PR Review record (#921)
+- Exact-text outline matching under frame renumbering (#972)
+- Human-friendly CONTRIBUTING and lean current README (#998)
+- Note float width arms are reached only on raw IR (#1039)
+- Record that dead defs reaching alloc are effectful (#1043)
+- Explain PCL page-fixup pads behind menu-demo Os +10 (#1066)
+- Survey residual 0x70 scratch park sites (#1027) (#1076)
+- Use per-ticket mktemp for PR body files (#1111)
+- Regenerate SIZE_REPORT.md and speed-bench provenance at refresh (#1269)
+- Rewrite the README for the first major release (#1290)
+- Push through epic-tasks push (#1251) (#1298)
+- Hub pages for the device matrix, device families and CLI flags (#1305)
+- Move design history under docs/internals with a migration map (#1294)
+- Update stale docs/NN paths in Dockerfile comments (#1309)
+- Rewrite opening with approved copy (#1315)
+- Move XC8 size-parity spec to private epic-benchmarks repo (#1321)
+- Point to external-contributions rule (#1323)
+
+### Miscellaneous
+
+- Pull epic-hal-ci only in mdb-oracle (#941)
+- Serialize shared target cache and guard main-clone builds (#944)
+- Share one target dir for check-warnings (#958)
+- Run PR tier on oracle inputs only, keep nightly sweep (#1000)
+- Keep ssh push connection alive through pre-push hook (#1003)
+- Retry warm build on Docker Hub 429 (#1057)
+- Route every ci and release image build through the 429 retry (#1106)
+- Retry transient registry 502/503/504 alongside 429 (#1112)
+- Judge PR deltas from measure-only ladders (#1097)
+- Judge head against base measurement, retire regen push (#1163)
+- Refresh committed TOMLs after cc#1163 (#1166)
+- Allow O2 speed trades past the flash cap when cycles win (#1236)
+- Re-pin speed-shift-16f877a@O2 after #1206 (#1258)
+- Key overridden target cache per worktree (#1262)
+- Re-pin drifted memcpy-32 and control-pass cycle rows (#1266)
+- Pin missing speed-mul-u32-12f509 cycle rows (#1272)
+- Stamp the pre-push suite so push retries skip it (#1322)
+- Re-pin scen-control-pass-18f4550 cycle rows (#1327)
+
+### Refactor
+
+- Share PIC chunk placement leaf helpers via iselcore (#1273)
+
+### Testing
+
+- Pin const-to-RAM surviving set for pointer-arg consts (#779)
+- Read e2e addresses from the binary map output (#803)
+- Pin SUBWFB borrow chains for sub and udiv (#821)
+- Pin volatile access count and order on both cores (#812) (#822)
+- Pin cleanup-call preservation on every exit path (#829)
+- E2e corpus and oracle for the EC++ subset (#834)
+- Expose alloc scalars in --map so the last e2e tests convert (#847)
+- Re-vendor HAL fixtures from epic-hal origin/master, add bridge row (#861)
+- Cycle-count bench ladder with Os and O2 baselines (#874)
+- Differential gate under -O2 for float/signed/IR and full corpora (#887)
+- Pin dispatch-lane polarity end to end (#908)
+- Add hal-pic14e-blink-16f1937 size ladder row (#912)
+- Add control-loop-pass scenario to cycle ladder (#932)
+- Committed, tested size-probe scripts for density triage (#964)
+- Source size-probe fixtures from 826e77c listings (#967)
+- Pin cycle ladder result values for arithmetic kernels (#1004)
+- Run ticket two-function program in simulator (#1060)
+- Pin pointer phi swap refusal and record ADR-050 (#1128)
+- Re-vendor bridge sim TU at epic-hal ac43c99 and re-pin row (#1144)
+- Bench the shared rj5 tails, pin the serial singleton gate (#1138)
+- Share iselcore is_directive across helpers and tests (#1180)
+- Add __mul_u32 ladder rows for pic14e and baseline (#1181)
+- Pin ISR divmod decline and rem-idiom reader coverage (#1183)
+- Pin the zext high lane under constant byte-index stores (#1246)
+- Pin address-divergent tails never share a body (#1256)
+- Re-vendor HAL fixtures, plain put_str on PIC18 (#1317)
+## [0.4.0] - 2026-09-28
+ 
+### Features
+
+- --resolve-device CLI flag, exposing device::resolve() externally (#430)
+- Ship a devices.json manifest in the release bundle (#432)
+- Rank flash-word density sinks from an --emit asm listing (#507)
+- Exhaustive-search superoptimizer verified against Pic18 sim (#515)
+- Support globals over 255 bytes with u16 offsets (#611)
+- Top-down menu-demo triage benches and profiler rules (#617) (#619)
+- Callgraph-aware cluster attribution for density-profile (#618) (#620)
+- Second-wave triage benches for remaining clusters (#624) (#627)
+- Add generated ladder report via make size-report (#655)
+- Factor repeated PIC18 code on the final listing (#663)
+- Categorize the other bucket in density-profile (#673)
+- Ladder rows for control, pid sim variants (#680)
+- Share one HAL snapshot across PIC18 demo fixtures (#681)
+- SFR tables and pack config aliases for the beta parts (#696)
+- --report writes the build facts as JSON (#698)
+- Internal-error presentation and file:line:col diagnostics (#701)
+- Cycle-exact _delay(cycles) intrinsic on every core (#704)
+- Ship include/ on disk and resolve it exe-relative (#705)
+- Lower #pragma config into config resolution (#703)
+- Generated device headers and a real xc.h (#708)
+- Pragma omitted fields fall back to erased (#709)
+- Resolve the build clock from config, define, or board flag (#730)
+
+### Fixes
 
 - Select upper banks per FSR bit and model them in sim (#431)
 - Give p16f54 its real flat 25-byte GPR geometry (#438)
@@ -54,56 +368,6 @@ Conventional Commits. Dates are UTC.
 - Scope size baseline updates to named rows (#716)
 - Drop store-then-test reload before PIC14 flag branches (#717)
 
-### Documentation
-
-- Prove p16f74 bank1 keeps its full extent (#427)
-- Density-ceiling findings for structural sinks on menu-demo (#536)
-- Record where XC8 actually lives and correct the oracle claims (#540)
-- Dispatch-storage frame policy, no foreign frames on priority sites (#583)
-- Record XC8 snapshot rows for microbenches (#593)
-- Record XC8 whole-program rows for menu-demo and encoder-full (#595) (#598)
-- PIC14 keeps globals-first, closes #600 (#612)
-- Amend ADR-006 with idea sourcing and benchmark publication (#657)
-- Price code factoring on the menu-demo listing (#661)
-- Price copy coalescing of MOVFF slot-to-slot moves (#670)
-- Public beta through PlatformIO (46) (#695)
-
-### Features
-
-- --resolve-device CLI flag, exposing device::resolve() externally (#430)
-- Ship a devices.json manifest in the release bundle (#432)
-- Rank flash-word density sinks from an --emit asm listing (#507)
-- Exhaustive-search superoptimizer verified against Pic18 sim (#515)
-- Support globals over 255 bytes with u16 offsets (#611)
-- Top-down menu-demo triage benches and profiler rules (#617) (#619)
-- Callgraph-aware cluster attribution for density-profile (#618) (#620)
-- Second-wave triage benches for remaining clusters (#624) (#627)
-- Add generated ladder report via make size-report (#655)
-- Factor repeated PIC18 code on the final listing (#663)
-- Categorize the other bucket in density-profile (#673)
-- Ladder rows for control, pid sim variants (#680)
-- Share one HAL snapshot across PIC18 demo fixtures (#681)
-- SFR tables and pack config aliases for the beta parts (#696)
-- --report writes the build facts as JSON (#698)
-- Internal-error presentation and file:line:col diagnostics (#701)
-- Cycle-exact _delay(cycles) intrinsic on every core (#704)
-- Ship include/ on disk and resolve it exe-relative (#705)
-- Lower #pragma config into config resolution (#703)
-- Generated device headers and a real xc.h (#708)
-- Pragma omitted fields fall back to erased (#709)
-- Resolve the build clock from config, define, or board flag (#730)
-
-### Miscellaneous
-
-- Remove the rolling ci-<sha> prerelease machinery (#436)
-- Stamp the commit sha into the driver so consumers can detect a stale binary (#541)
-- Resolve the ref hint path and share docker args (#543)
-- Route check-warnings through the shared docker invocation (#547)
-- Re-baseline three stale size rows and fail on the drift (#629) (#634)
-- Move XC8 benchmark data to the private epic-benchmarks repo (#659)
-- Move the XC8 oracle image to the private epic-benchmarks repo (#683)
-- Rename epic8-tools to epic-tools (#710)
-
 ### Performance
 
 - Scale big GEP strides with a shift-add chain (#485)
@@ -136,6 +400,31 @@ Conventional Commits. Dates are UTC.
 - Index static arrays via LFSR and PLUSW (#671)
 - Store all-ones const lanes with SETF (#672)
 
+### Documentation
+
+- Prove p16f74 bank1 keeps its full extent (#427)
+- Density-ceiling findings for structural sinks on menu-demo (#536)
+- Record where XC8 actually lives and correct the oracle claims (#540)
+- Dispatch-storage frame policy, no foreign frames on priority sites (#583)
+- Record XC8 snapshot rows for microbenches (#593)
+- Record XC8 whole-program rows for menu-demo and encoder-full (#595) (#598)
+- PIC14 keeps globals-first, closes #600 (#612)
+- Amend ADR-006 with idea sourcing and benchmark publication (#657)
+- Price code factoring on the menu-demo listing (#661)
+- Price copy coalescing of MOVFF slot-to-slot moves (#670)
+- Public beta through PlatformIO (46) (#695)
+
+### Miscellaneous
+
+- Remove the rolling ci-<sha> prerelease machinery (#436)
+- Stamp the commit sha into the driver so consumers can detect a stale binary (#541)
+- Resolve the ref hint path and share docker args (#543)
+- Route check-warnings through the shared docker invocation (#547)
+- Re-baseline three stale size rows and fail on the drift (#629) (#634)
+- Move XC8 benchmark data to the private epic-benchmarks repo (#659)
+- Move the XC8 oracle image to the private epic-benchmarks repo (#683)
+- Rename epic8-tools to epic-tools (#710)
+
 ### Refactor
 
 - Share the ref-byte decision in ref_byte_operand (#566)
@@ -150,8 +439,27 @@ Conventional Commits. Dates are UTC.
 - XC8 size-parity microbench ladder (#572)
 - Pin struct-copy loop threshold at 5 straight and 6 looped (#588)
 ## [0.3.0] - 2026-09-13
+ 
+### Features
 
-### Bug Fixes
+- P6 32-bit long add/sub/shift/compare plus mul/div routines (#382)
+- Freestanding malloc/free plus honest Tier-2 probe (#392)
+- Math.h library and honest Tier-2 probe (#389)
+- Onboard 15 catalog-selected high-tier devices (#394)
+- Add p12f683 (PIC12F683) (#396)
+- Implement ADR-034 single-region common_ram split (#399)
+- PIC16F74 full interrupt support (docs/39 D-2) (#401)
+- Pic-baseline differential fuzz gate and PicBaseline arm in run_pic (#402)
+- Git-cliff changelog and automated release-cutting workflow (#404)
+- Mid-range groundwork, exemplar parts and the ISR carve-out widening fix (#412)
+- Add p16f54 (#413)
+- Add the nine PIC18 exemplar parts (#415)
+- Gputils crosscheck reconciliation for ini-sourced small parts (#418)
+- Onboard the remaining classic PIC16 mid-range parts (#421)
+- Onboard the remaining 16F5x baseline parts (#424)
+- Onboard the remaining requested PIC18 parts (#425)
+
+### Fixes
 
 - Scope release artifact download and move artifact actions off node20 (#379)
 - Sweep PIC14 and PIC14E DFP packs, map baseline arch names (#380)
@@ -169,28 +477,51 @@ Conventional Commits. Dates are UTC.
 - Non-goal rationales plus landed-state table refresh (#388)
 - Conclude printf putchar-sink probe as SDCC limitation (#390)
 - Common_ram classification design for the 6 excluded PIC14 devices (#397)
-
+## [0.2.0] - 2026-09-10
+ 
 ### Features
 
-- P6 32-bit long add/sub/shift/compare plus mul/div routines (#382)
-- Freestanding malloc/free plus honest Tier-2 probe (#392)
-- Math.h library and honest Tier-2 probe (#389)
-- Onboard 15 catalog-selected high-tier devices (#394)
-- Add p12f683 (PIC12F683) (#396)
-- Implement ADR-034 single-region common_ram split (#399)
-- PIC16F74 full interrupt support (docs/internals/design/39 D-2) (#401)
-- Pic-baseline differential fuzz gate and PicBaseline arm in run_pic (#402)
-- Git-cliff changelog and automated release-cutting workflow (#404)
-- Mid-range groundwork, exemplar parts and the ISR carve-out widening fix (#412)
-- Add p16f54 (#413)
-- Add the nine PIC18 exemplar parts (#415)
-- Gputils crosscheck reconciliation for ini-sourced small parts (#418)
-- Onboard the remaining classic PIC16 mid-range parts (#421)
-- Onboard the remaining 16F5x baseline parts (#424)
-- Onboard the remaining requested PIC18 parts (#425)
-## [0.2.0] - 2026-09-10
+- Add the crates/schedule skeleton as an identity transform (#221)
+- Implement the phase-1 singleton-excursion swap (#222)
+- Implement the phase-2 dead-W bundle hoist (#223)
+- Add PIC18F2550 as a second PIC18 device (#232)
+- Address-to-line table via --line-table (#240)
+- PIC14E 193x device TOMLs and config hex-path fix (#245) (#255)
+- PIC14E encoder and sim core (pic14e P1) (#261)
+- Integer spine and BSR/MOVLB banking (pic14e P2) (#264)
+- P3 pointers/arrays/structs via FSR0/1 + linear addressing (#272)
+- Typed variable table via full -g debug metadata (#274)
+- PIC14 debugger control surface: run_until, registers, memory (#275)
+- SDCC 4.6.0 oracle + differential harness + baseline (P0) (#276)
+- Support double as f32 on msp430 (PIC18 parity) (#277)
+- P4 const in flash via RETLW (#278)
+- Thread double through call/param/return/binop (#279)
+- Interrupts with hardware context save (P5) (#283)
+- P6 32-bit long and mul/div routines (#284)
+- Gdbstub adapter plus ELF-DWARF sidecar as epic-cc-gdbserver (#282)
+- Pin PIC18 float routines into the access-bank window; ship %f printf (#295)
+- P7 soft-float f32 routines (#297)
+- PIC14E differential fuzz gate (P8) (#298)
+- PIC14E differential parity on 16F1938 (#302)
+- Coverage-guided fuzz target for irparse parser (Lane B) (#311)
+- Arbitration gate with sdcc-known-bugs.toml (docs/35 5.2) (#313)
+- Valid comparison protocol, ratio gate, P0 closure (#319)
+- Wire w_holds into const-table index and i8 add stores (#320)
+- SDCC regression-suite pass rate as nightly context (Tier 3) (#322)
+- Pic-baseline core variant and p12f509 TOML, firewall-only (#340)
+- Real %f, EEPROM and const-pointer probes with oracle hardening (#353)
+- PIC8 flash-generation part catalog with popularity tiers (#355)
+- Gen-device.py --sweep breadth-proofing mode (#358)
+- PIC baseline P1 encoder and sim core (#359)
+- Two-vector priority interrupts (#360)
+- Add-device.sh one-command device onboarding wrapper (#364)
+- Integer spine with D-2 FSR bank-bit reassertion (#365)
+- P3 pointers, arrays, structs via FSR flat addressing (#368)
+- Per-context float frames with banked recipes (#370)
+- P4 const in flash via RETLW, 256-word ceiling (#374)
+- Add PIC16F628A and scattered config mask support (#373)
 
-### Bug Fixes
+### Fixes
 
 - Wire emit_commutative through the W-tracking cache (#218)
 - Gen-device.py mis-generates PIC18 config and RAM layout (#231)
@@ -217,63 +548,21 @@ Conventional Commits. Dates are UTC.
 ### Documentation
 
 - ADR-027, a bank-aware instruction scheduler pass (#219)
-- Write docs/internals/design/32-adding-a-device.md, the same-core device runbook (#235)
+- Write docs/32-adding-a-device.md, the same-core device runbook (#235)
 - PIC14E (Enhanced Mid-range) backend port design (#236)
-- Land the phase 2-4 design doc as docs/internals/design/34 (#241)
+- Land the phase 2-4 design doc as docs/34 (#241)
 - Revise the port design per independent review (#243)
 - Require a separate code review before takeoff (#254)
 - Track PIC baseline core as a future backend candidate (#256)
 - Record settled phase 2-4 scope, fix full -g mechanism (#260)
 - Board-track every filed issue (#262)
-- SDCC parity epic design (docs/internals/design/35) (#271)
+- SDCC parity epic design (docs/35) (#271)
 - PIC18 float-routine access-bank frame allocation (design) (#285)
-- Robustness test strategy beyond differential fuzzing (docs/internals/design/36) (#292)
-- PIC baseline core port design (docs/internals/design/37) (#321)
-- Device onboarding hardening design (docs/internals/design/38) (#332)
+- Robustness test strategy beyond differential fuzzing (docs/36) (#292)
+- PIC baseline core port design (docs/37) (#321)
+- Device onboarding hardening design (docs/38) (#332)
 - State peripheral-blindness and four-core scope decisions (#341)
 - Rewrite as a two-speed pitch instead of a design doc (#377)
-
-### Features
-
-- Add the crates/schedule skeleton as an identity transform (#221)
-- Implement the phase-1 singleton-excursion swap (#222)
-- Implement the phase-2 dead-W bundle hoist (#223)
-- Add PIC18F2550 as a second PIC18 device (#232)
-- Address-to-line table via --line-table (#240)
-- PIC14E 193x device TOMLs and config hex-path fix (#245) (#255)
-- PIC14E encoder and sim core (pic14e P1) (#261)
-- Integer spine and BSR/MOVLB banking (pic14e P2) (#264)
-- P3 pointers/arrays/structs via FSR0/1 + linear addressing (#272)
-- Typed variable table via full -g debug metadata (#274)
-- PIC14 debugger control surface: run_until, registers, memory (#275)
-- SDCC 4.6.0 oracle + differential harness + baseline (P0) (#276)
-- Support double as f32 on msp430 (PIC18 parity) (#277)
-- P4 const in flash via RETLW (#278)
-- Thread double through call/param/return/binop (#279)
-- Interrupts with hardware context save (P5) (#283)
-- P6 32-bit long and mul/div routines (#284)
-- Gdbstub adapter plus ELF-DWARF sidecar as epic-cc-gdbserver (#282)
-- Pin PIC18 float routines into the access-bank window; ship %f printf (#295)
-- P7 soft-float f32 routines (#297)
-- PIC14E differential fuzz gate (P8) (#298)
-- PIC14E differential parity on 16F1938 (#302)
-- Coverage-guided fuzz target for irparse parser (Lane B) (#311)
-- Arbitration gate with sdcc-known-bugs.toml (docs/internals/design/35 5.2) (#313)
-- Valid comparison protocol, ratio gate, P0 closure (#319)
-- Wire w_holds into const-table index and i8 add stores (#320)
-- SDCC regression-suite pass rate as nightly context (Tier 3) (#322)
-- Pic-baseline core variant and p12f509 TOML, firewall-only (#340)
-- Real %f, EEPROM and const-pointer probes with oracle hardening (#353)
-- PIC8 flash-generation part catalog with popularity tiers (#355)
-- Gen-device.py --sweep breadth-proofing mode (#358)
-- PIC baseline P1 encoder and sim core (#359)
-- Two-vector priority interrupts (#360)
-- Add-device.sh one-command device onboarding wrapper (#364)
-- Integer spine with D-2 FSR bank-bit reassertion (#365)
-- P3 pointers, arrays, structs via FSR flat addressing (#368)
-- Per-context float frames with banked recipes (#370)
-- P4 const in flash via RETLW, 256-word ceiling (#374)
-- Add PIC16F628A and scattered config mask support (#373)
 
 ### Miscellaneous
 
@@ -288,11 +577,21 @@ Conventional Commits. Dates are UTC.
 - Lane D idempotence, fixpoint, and determinism checks (#288) (#305)
 - Compile-time bound for adversarial BANKSEL dataflow (Lane G) (#306)
 - Resource-exhaustion boundary tests (Lane F) (#309)
-- Pin volatile store ordering and count (docs/internals/design/36 lane E) (#316)
+- Pin volatile store ordering and count (docs/36 lane E) (#316)
 - Lane C mutants-killing tests and triage checklist (#317)
 ## [0.1.0] - 2026-09-03
+ 
+### Features
 
-### Bug Fixes
+- Support cross-context stored callbacks (#142)
+- Size and map reporting (#156)
+- Predefine the XC8 toolchain and part macros (#168)
+- Source-accurate C locations for backend panics (#176)
+- Decode const structs with function-pointer fields (#187)
+- Variadic printf/stdio path (epic-cc#131) (#195)
+- Elide a label's redundant BANKSEL when every path agrees (#213)
+
+### Fixes
 
 - 256-align single-entry const tables that cross their window (#141)
 - Correct the size report's bank counts and ISR fixed region (#157)
@@ -330,16 +629,6 @@ Conventional Commits. Dates are UTC.
 - Record the epic-hal#97 literal printf shim and staged put_str (#174)
 - Correct the XC8 optimization-tier caveat (#202)
 
-### Features
-
-- Support cross-context stored callbacks (#142)
-- Size and map reporting (#156)
-- Predefine the XC8 toolchain and part macros (#168)
-- Source-accurate C locations for backend panics (#176)
-- Decode const structs with function-pointer fields (#187)
-- Variadic printf/stdio path (epic-cc#131) (#195)
-- Elide a label's redundant BANKSEL when every path agrees (#213)
-
 ### Miscellaneous
 
 - Remove root scratch asm dumps and CLAUDE.md placeholder
@@ -359,18 +648,125 @@ Conventional Commits. Dates are UTC.
 - Pin the config table crossing its 256-byte window (#191)
 - Add a flash/RAM size-regression suite (#201)
 ## [0.0.3] - 2026-08-25
-
+ 
 ### Miscellaneous
 
 - Checkout the repo before creating the GitHub release (#140)
 ## [0.0.2] - 2026-08-25
-
+ 
 ### Miscellaneous
 
 - Fetch clang license from source tag for the Windows bundle (#139)
 ## [0.0.1] - 2026-08-25
+ 
+### Features
 
-### Bug Fixes
+- Decode Intel HEX into 14-bit words
+- Core state and byte-oriented instructions
+- Bit, literal, and control instructions
+- INDF/FSR and PCL/PCLATH indirect addressing
+- Define canonical IR text format with round-trip
+- Parse LLVM IR text into canonical IR
+- Single-module merge validation
+- Type-width validation boundary
+- Call graph and stack-depth check boundary
+- Assign bank-0 addresses to globals
+- Straight-line 8-bit instruction selection
+- Bank-0 validation boundary
+- Pass-through boundary
+- Two-pass assembler to Intel HEX
+- Chain the ten-stage pipeline end-to-end
+- Control-flow, call, and cast instruction variants
+- Parse control flow, calls, and casts
+- Real edges, recursion detection, depth check
+- 16-bit arithmetic, casts, and phi elimination
+- Branches, compares, and select
+- Calls and returns with arg/ret slots
+- Emit parseable edge list
+- Overlay local frames from the call graph
+- Consume the complete overlay address map
+- Bank-aware memory model
+- Assign addresses across all four banks
+- Insert BANKSEL across banks
+- Gep instruction and sized globals
+- Parse getelementptr and array globals
+- Size arrays and keep const globals out of RAM
+- Pointers via FSR/INDF and const tables via RETLW
+- Resolve LOW/HIGH label operands
+- All icmp predicates and sext
+- Sub, or, xor and i8 and
+- All comparison predicates
+- Sign extension
+- Struct types, alloca, memcpy and reworked gep
+- Size alloca, byval and sret slots
+- Pointer bases, chains, indirect and memcpy
+- Byval and sret call abi
+- Mul, div, rem, shift binops and freeze
+- Lower mul, div, rem and shifts to runtime calls
+- Mul, div and rem runtime routines
+- Shift lowerings (inline const, runtime variable)
+- Multi-bank FSR via IRP
+- Sret targets in any bank via IRP
+- 16-bit const table sizes
+- Pclath const readers and page-0 bound
+- Resolve PAGE() and bound to device flash
+- Multi-page functions with pclath call discipline
+- Elide redundant pclath writes
+- Skip same-page pclath restores
+- 32-bit type
+- 32-bit arithmetic, compares, casts and shifts
+- 32-bit mul, div, rem and shift routines
+- Interrupt marker and inttoptr pointers
+- Interrupt entry, prologue and sfr access
+- Interrupt fire hook
+- Duplicate interrupt-shared functions
+- Encode swapf and retfie
+- Seeded generator and differential harness
+- Full generation surface and seed corpus
+- Greedy differential reducer
+- Float type and instructions
+- Lower float ops to runtime calls
+- Soft-float runtime routines
+- Model GIE and interrupt enables; fix the return address (#23)
+- Signed and IR-level differential fuzzing (#14) (#29)
+- P0 — device crate and de-hardcode the 877A from alloc/isel/banking/asm (#32)
+- Bin-pack functions into code pages (#12) (#33)
+- P1 — PIC18 encoder and simulator core (#34)
+- Const tables of i16/i32/float elements (issue #3) (#37)
+- P2 — PIC18 integer-spine codegen (#38)
+- Const tables beyond 511 bytes (issue #8) (#39)
+- Dynamic-length memcpy (issue #4) (#40)
+- Support const structs in flash (issue #5) (#42)
+- Distribution — bundled clang, docker toolchain, release pipeline (#43)
+- Lift bank-0 routine-slot restriction (#6) (#47)
+- P3 — pointers, arrays, structs (issue #26) (#48)
+- P4 - const via TBLRD (issue #26) (#50)
+- Multi-file compilation via llvm-link (#51)
+- Silicon-real codegen — EPIC_AT, EPIC_CONFIG, EPIC_FOSC_HZ (#56)
+- P5 - interrupts (single-vector compat mode) (#52)
+- P6 - long + hardware MUL (#53)
+- P7 - soft-float via PIC18 recipes (#54)
+- P8 - fuzz gate (device-threaded differential runner) (#58)
+- Inline assembly — naked, module asm, opaque blocks (rungs 1-3) (#60)
+- Freestanding libc subset (stdint, stdbool, stddef, string) (#61)
+- Inline assembly rung 4 — memory operands (*m) (#65)
+- Implement memchr/strchr/strrchr/strstr (#62) (#69)
+- Unblock HAL C idioms for epic-cc variant (#70)
+- Unified takeoff and worktree workflow (#81)
+- File-per-device TOML registry with build.rs codegen and --target (#89)
+- Add PIC16F887 as file-per-device exemplar (#90)
+- Validate pic14e data, enforce fuse mask shape, expose sfrs (#96)
+- Resolve device names in every spelling the toolchain uses (#97)
+- Support epic-cc HAL build backend for HAL-2 (#88)
+- Add DFP -> TOML generator with ATDF ingestion (#103)
+- Provenance stanza and an always-on gputils cross-check (#106)
+- Support calls through a function pointer (#128)
+- Lint gate replaces the PROSE=1 attestation (#134)
+- Lower inttoptr on a runtime address via slot-indirect (#132)
+- Lower smax/smin/abs intrinsics and i1 immargs for #133 (#136)
+- Publish rolling per-commit bundles for downstream CI (#135)
+
+### Fixes
 
 - Honor PCLATH paging and INDF aliasing in bit ops
 - Strip operand commas and carry global types
@@ -482,113 +878,6 @@ Conventional Commits. Dates are UTC.
 - Record the 2026-08-24 epic amendments and refresh the status map (#120)
 - State default task base is latest origin/master (#123)
 
-### Features
-
-- Decode Intel HEX into 14-bit words
-- Core state and byte-oriented instructions
-- Bit, literal, and control instructions
-- INDF/FSR and PCL/PCLATH indirect addressing
-- Define canonical IR text format with round-trip
-- Parse LLVM IR text into canonical IR
-- Single-module merge validation
-- Type-width validation boundary
-- Call graph and stack-depth check boundary
-- Assign bank-0 addresses to globals
-- Straight-line 8-bit instruction selection
-- Bank-0 validation boundary
-- Pass-through boundary
-- Two-pass assembler to Intel HEX
-- Chain the ten-stage pipeline end-to-end
-- Control-flow, call, and cast instruction variants
-- Parse control flow, calls, and casts
-- Real edges, recursion detection, depth check
-- 16-bit arithmetic, casts, and phi elimination
-- Branches, compares, and select
-- Calls and returns with arg/ret slots
-- Emit parseable edge list
-- Overlay local frames from the call graph
-- Consume the complete overlay address map
-- Bank-aware memory model
-- Assign addresses across all four banks
-- Insert BANKSEL across banks
-- Gep instruction and sized globals
-- Parse getelementptr and array globals
-- Size arrays and keep const globals out of RAM
-- Pointers via FSR/INDF and const tables via RETLW
-- Resolve LOW/HIGH label operands
-- All icmp predicates and sext
-- Sub, or, xor and i8 and
-- All comparison predicates
-- Sign extension
-- Struct types, alloca, memcpy and reworked gep
-- Size alloca, byval and sret slots
-- Pointer bases, chains, indirect and memcpy
-- Byval and sret call abi
-- Mul, div, rem, shift binops and freeze
-- Lower mul, div, rem and shifts to runtime calls
-- Mul, div and rem runtime routines
-- Shift lowerings (inline const, runtime variable)
-- Multi-bank FSR via IRP
-- Sret targets in any bank via IRP
-- 16-bit const table sizes
-- Pclath const readers and page-0 bound
-- Resolve PAGE() and bound to device flash
-- Multi-page functions with pclath call discipline
-- Elide redundant pclath writes
-- Skip same-page pclath restores
-- 32-bit type
-- 32-bit arithmetic, compares, casts and shifts
-- 32-bit mul, div, rem and shift routines
-- Interrupt marker and inttoptr pointers
-- Interrupt entry, prologue and sfr access
-- Interrupt fire hook
-- Duplicate interrupt-shared functions
-- Encode swapf and retfie
-- Seeded generator and differential harness
-- Full generation surface and seed corpus
-- Greedy differential reducer
-- Float type and instructions
-- Lower float ops to runtime calls
-- Soft-float runtime routines
-- Model GIE and interrupt enables; fix the return address (#23)
-- Signed and IR-level differential fuzzing (#14) (#29)
-- P0 — device crate and de-hardcode the 877A from alloc/isel/banking/asm (#32)
-- Bin-pack functions into code pages (#12) (#33)
-- P1 — PIC18 encoder and simulator core (#34)
-- Const tables of i16/i32/float elements (issue #3) (#37)
-- P2 — PIC18 integer-spine codegen (#38)
-- Const tables beyond 511 bytes (issue #8) (#39)
-- Dynamic-length memcpy (issue #4) (#40)
-- Support const structs in flash (issue #5) (#42)
-- Distribution — bundled clang, docker toolchain, release pipeline (#43)
-- Lift bank-0 routine-slot restriction (#6) (#47)
-- P3 — pointers, arrays, structs (issue #26) (#48)
-- P4 - const via TBLRD (issue #26) (#50)
-- Multi-file compilation via llvm-link (#51)
-- Silicon-real codegen — EPIC_AT, EPIC_CONFIG, EPIC_FOSC_HZ (#56)
-- P5 - interrupts (single-vector compat mode) (#52)
-- P6 - long + hardware MUL (#53)
-- P7 - soft-float via PIC18 recipes (#54)
-- P8 - fuzz gate (device-threaded differential runner) (#58)
-- Inline assembly — naked, module asm, opaque blocks (rungs 1-3) (#60)
-- Freestanding libc subset (stdint, stdbool, stddef, string) (#61)
-- Inline assembly rung 4 — memory operands (*m) (#65)
-- Implement memchr/strchr/strrchr/strstr (#62) (#69)
-- Unblock HAL C idioms for epic-cc variant (#70)
-- Unified takeoff and worktree workflow (#81)
-- File-per-device TOML registry with build.rs codegen and --target (#89)
-- Add PIC16F887 as file-per-device exemplar (#90)
-- Validate pic14e data, enforce fuse mask shape, expose sfrs (#96)
-- Resolve device names in every spelling the toolchain uses (#97)
-- Support epic-cc HAL build backend for HAL-2 (#88)
-- Add DFP -> TOML generator with ATDF ingestion (#103)
-- Provenance stanza and an always-on gputils cross-check (#106)
-- Support calls through a function pointer (#128)
-- Lint gate replaces the PROSE=1 attestation (#134)
-- Lower inttoptr on a runtime address via slot-indirect (#132)
-- Lower smax/smin/abs intrinsics and i1 immargs for #133 (#136)
-- Publish rolling per-commit bundles for downstream CI (#135)
-
 ### Miscellaneous
 
 - Add nix flake dev shell with pinned clang 20.1.8 and vendor layout
@@ -631,7 +920,7 @@ outside the 0x4000-word flash window (config words are not flash).
 
 * test(driver): PIC18 4550 HAL slice smoke (blink + epic-tick)
 
-The amendment recorded in docs/internals/design/31 section 4: once CC-1 and CC-3 landed,
+The amendment recorded in docs/31 section 4: once CC-1 and CC-3 landed,
 run a thin PIC18 smoke slice so the PIC18 path cannot drift silently
 while PIC14 integration proceeds. Two programs compiled through the real
 epic-cc binary (--target 18F4550, with the config-word TU exercising
