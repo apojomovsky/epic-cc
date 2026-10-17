@@ -170,7 +170,8 @@ fn pic12_server_arg_parsing() {
     assert_eq!(args.device.as_deref(), Some("p12f509"));
     assert_eq!(core_of(args.device.as_deref()), Ok(Core::PicBaseline));
     assert_eq!(core_of(None), Ok(Core::Pic14));
-    assert!(core_of(Some("p16f1939")).is_err());
+    assert_eq!(core_of(Some("p16f1939")), Ok(Core::Pic14e));
+    assert!(core_of(Some("nosuchpart")).is_err());
     assert!(parse_args(&["a.hex".to_string()]).is_err());
     assert!(parse_args(&["a.hex".to_string(), "a.elf".to_string()]).is_err());
 }

@@ -885,6 +885,13 @@ pub struct Pic14e {
 }
 
 impl Pic14e {
+    /// A simulator on the canonical PIC14E geometry (`PIC16F1938`), for
+    /// callers that only execute instructions without depending on GPR
+    /// placement in a bank. Use [`Pic14e::with_device`] for anything
+    /// that does: a part whose banks differ models wrongly here, silently.
+    pub fn new(prog: Vec<u16>) -> Self {
+        Self::with_device(&device::PIC16F1938, prog)
+    }
     /// A simulator on `device`'s memory map. The bank map, the linear
     /// region and the flash window are per-core constants on this core
     /// (docs/internals/design/33 §D-2), so only the `Core::Pic14e` contract is checked, not
@@ -948,6 +955,83 @@ impl Pic14e {
     }
     pub fn cycles(&self) -> u64 {
         self.cycles
+    }
+    /// STATUS, the flag register at 0x03.
+    pub fn status(&self) -> u8 {
+        self.ram[3]
+    }
+    /// BSR, the bank-select register at 0x08 (DS41364E section 3.4).
+    pub fn bsr(&self) -> u8 {
+        self.ram[8]
+    }
+    /// Select the GPR bank (writes BSR's low 5 bits, 32 banks).
+    pub fn set_bank(&mut self, bank: u8) {
+        self.ram[8] = bank & 0x1F;
+    }
+    /// FSR0, the 16-bit indirect pointer (FSR0H:FSR0L at 0x05:0x04).
+    pub fn fsr0(&self) -> u16 {
+        ((self.ram[5] as u16) << 8) | self.ram[4] as u16
+    }
+    /// PCLATH, the PC latch at 0x0A.
+    pub fn pclath(&self) -> u8 {
+        self.ram[0x0A]
+    }
+    /// Set the working register.
+    pub fn set_w(&mut self, v: u8) {
+        self.w = v;
+    }
+    /// Set the program counter (a word address). The halted flag
+    /// tracks it, so writing an in-range address resumes a program
+    /// that ran off its end.
+    pub fn set_pc(&mut self, addr: u16) {
+        self.pc = addr;
+        self.halted = addr as usize >= self.prog.len();
+    }
+    /// Run until `pc` reaches `target`, the program halts, or
+    /// `max_steps` instructions have executed. The breakpoint primitive:
+    /// the adapter owns the breakpoint set and calls this per stop, so
+    /// the sim keeps no breakpoint state of its own.
+    pub fn run_until(&mut self, target: u16, max_steps: usize) -> StopReason {
+        let mut steps = 0;
+        loop {
+            if self.pc == target {
+                return StopReason::Reached;
+            }
+            if self.halted {
+                return StopReason::Halted;
+            }
+            if steps >= max_steps {
+                return StopReason::Capped;
+            }
+            self.step();
+            steps += 1;
+        }
+    }
+    /// Read `len` bytes of data RAM starting at physical address
+    /// `addr`. The space is flat, so no bank resolution applies; reads
+    /// are raw (no INDF side effects): DWARF variable addresses name
+    /// GPR storage, never pseudo-registers.
+    pub fn read_mem(&self, addr: u16, len: usize) -> Vec<u8> {
+        self.check_phys_range(addr, len);
+        (0..len).map(|i| self.ram[addr as usize + i]).collect()
+    }
+    /// Write bytes into data RAM, resolved like `read_mem`.
+    pub fn write_mem(&mut self, addr: u16, bytes: &[u8]) {
+        self.check_phys_range(addr, bytes.len());
+        for (i, &b) in bytes.iter().enumerate() {
+            self.ram[addr as usize + i] = b;
+        }
+    }
+    /// A debugger span must stay inside the 12-bit data space.
+    fn check_phys_range(&self, addr: u16, len: usize) {
+        assert!(
+            (addr as usize + len) <= 0x1000,
+            "read_mem/write_mem: {addr:#06X}+{len} leaves the 12-bit data space"
+        );
+    }
+    /// Read one program-flash word by word index.
+    pub fn read_prog_word(&self, addr: u16) -> Option<u16> {
+        self.prog.get(addr as usize).copied()
     }
     pub fn fire_interrupt(&mut self) {
         self.enter_isr();

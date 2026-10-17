@@ -2,8 +2,10 @@
 
 docs/snippets/ways-to-use-epic8.md is copied from apojomovsky/epic-docs;
 docs/snippets/SHARED-INCLUDES records the hub commit and the sha256 of the
-copy. These tests run check() against temporary repos, so no network is
-touched: the fetch used by sync() is injected.
+copy. shared_includes.HUB_SHA256 pins the hub bytes, so a recomputed record
+cannot hide a local edit. These tests run check() against temporary repos,
+so no network is touched: the fetch used by sync() is injected, and the pin
+rewrite targets a scratch script file.
 """
 
 import pathlib
@@ -18,6 +20,7 @@ import shared_includes  # noqa: E402
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 COMMIT = "2ad7d851c1d39888dda84adcbf9fa8d0667453c8"
 HUB_TEXT = b"## Ways to use epic8\n\n- **Command line:** one line.\n"
+PIN = shared_includes.sha256_hex(HUB_TEXT)
 
 
 def _write(root, rel, data):
@@ -26,8 +29,16 @@ def _write(root, rel, data):
     path.write_bytes(data)
 
 
+def _script(root):
+    path = root / "shared_includes_under_test.py"
+    path.write_text('HUB_SHA256 = "' + "0" * 64 + '"\n')
+    return path
+
+
 def _synced_root(root):
-    shared_includes.sync(root, COMMIT, fetch=lambda commit: HUB_TEXT)
+    shared_includes.sync(
+        root, COMMIT, fetch=lambda commit: HUB_TEXT, script_path=_script(root)
+    )
     return root
 
 
@@ -35,26 +46,48 @@ class TestCheckedInCopy(unittest.TestCase):
     def test_checked_in_copy_matches_record(self):
         self.assertEqual(shared_includes.check(REPO_ROOT), [])
 
+    def test_pin_matches_recorded_digest(self):
+        record = REPO_ROOT / shared_includes.RECORD
+        fields = shared_includes.parse_record(record.read_text())
+        self.assertEqual(fields["sha256"], shared_includes.HUB_SHA256)
+
 
 class TestCheck(unittest.TestCase):
     def test_synced_copy_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _synced_root(pathlib.Path(tmp))
-            self.assertEqual(shared_includes.check(root), [])
+            self.assertEqual(shared_includes.check(root, pin=PIN), [])
 
     def test_local_edit_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _synced_root(pathlib.Path(tmp))
             _write(root, shared_includes.COPY, HUB_TEXT + b"edited here\n")
-            problems = shared_includes.check(root)
+            problems = shared_includes.check(root, pin=PIN)
+            self.assertEqual(len(problems), 2)
+            self.assertTrue(any("edited here" in p for p in problems))
+            self.assertTrue(any("hub pin" in p for p in problems))
+
+    def test_recomputed_record_still_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _synced_root(pathlib.Path(tmp))
+            edited = HUB_TEXT + b"edited here\n"
+            _write(root, shared_includes.COPY, edited)
+            _write(
+                root,
+                shared_includes.RECORD,
+                shared_includes.render_record(
+                    COMMIT, shared_includes.sha256_hex(edited)
+                ).encode(),
+            )
+            problems = shared_includes.check(root, pin=PIN)
             self.assertEqual(len(problems), 1)
-            self.assertIn("edited here", problems[0])
+            self.assertIn("hub pin", problems[0])
 
     def test_missing_copy_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _synced_root(pathlib.Path(tmp))
             (root / shared_includes.COPY).unlink()
-            problems = shared_includes.check(root)
+            problems = shared_includes.check(root, pin=PIN)
             self.assertEqual(len(problems), 1)
             self.assertIn("missing", problems[0])
 
@@ -62,7 +95,7 @@ class TestCheck(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             _write(root, shared_includes.COPY, HUB_TEXT)
-            problems = shared_includes.check(root)
+            problems = shared_includes.check(root, pin=PIN)
             self.assertEqual(len(problems), 1)
             self.assertIn(shared_includes.RECORD, problems[0])
 
@@ -76,7 +109,7 @@ class TestCheck(unittest.TestCase):
                     "2ad7d85", shared_includes.sha256_hex(HUB_TEXT)
                 ).encode(),
             )
-            problems = shared_includes.check(root)
+            problems = shared_includes.check(root, pin=PIN)
             self.assertTrue(any("40-character" in p for p in problems))
 
     def test_wrong_source_fails(self):
@@ -88,14 +121,14 @@ class TestCheck(unittest.TestCase):
                 shared_includes.RECORD,
                 text.replace("source = ", "source = other/", 1).encode(),
             )
-            problems = shared_includes.check(root)
+            problems = shared_includes.check(root, pin=PIN)
             self.assertTrue(any("source must be" in p for p in problems))
 
     def test_malformed_record_line_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _synced_root(pathlib.Path(tmp))
             _write(root, shared_includes.RECORD, b"not a key value line\n")
-            problems = shared_includes.check(root)
+            problems = shared_includes.check(root, pin=PIN)
             self.assertEqual(len(problems), 1)
             self.assertIn("malformed", problems[0])
 
@@ -104,7 +137,10 @@ class TestSync(unittest.TestCase):
     def test_sync_writes_copy_and_record(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            digest = shared_includes.sync(root, COMMIT, fetch=lambda commit: HUB_TEXT)
+            script = _script(root)
+            digest = shared_includes.sync(
+                root, COMMIT, fetch=lambda commit: HUB_TEXT, script_path=script
+            )
             self.assertEqual(digest, shared_includes.sha256_hex(HUB_TEXT))
             self.assertEqual((root / shared_includes.COPY).read_bytes(), HUB_TEXT)
             fields = shared_includes.parse_record(
@@ -112,13 +148,29 @@ class TestSync(unittest.TestCase):
             )
             self.assertEqual(fields["commit"], COMMIT)
             self.assertEqual(fields["sha256"], digest)
+            self.assertIn(f'HUB_SHA256 = "{digest}"', script.read_text())
+            self.assertEqual(shared_includes.check(root, pin=digest), [])
 
     def test_sync_rewrites_an_edited_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _synced_root(pathlib.Path(tmp))
             _write(root, shared_includes.COPY, b"edited\n")
-            shared_includes.sync(root, COMMIT, fetch=lambda commit: HUB_TEXT)
-            self.assertEqual(shared_includes.check(root), [])
+            shared_includes.sync(
+                root, COMMIT, fetch=lambda commit: HUB_TEXT, script_path=_script(root)
+            )
+            self.assertEqual(shared_includes.check(root, pin=PIN), [])
+
+    def test_sync_refreshes_the_pin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            script = _script(root)
+            newer = HUB_TEXT + b"new hub bytes\n"
+            digest = shared_includes.sync(
+                root, COMMIT, fetch=lambda commit: newer, script_path=script
+            )
+            self.assertIn(f'HUB_SHA256 = "{digest}"', script.read_text())
+            self.assertEqual(shared_includes.check(root, pin=digest), [])
+            self.assertTrue(shared_includes.check(root, pin=PIN))
 
     def test_sync_rejects_a_branch_name_without_fetching(self):
         def no_fetch(commit):

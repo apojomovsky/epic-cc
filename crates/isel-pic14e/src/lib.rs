@@ -7463,7 +7463,9 @@ pub fn select_with_locs(
         "    goto __start".to_string(),
         "".to_string(),
     ]);
-    locs.extend(std::iter::repeat(None).take(12));
+    // Sized from the header just emitted, not a literal: the doubled
+    // FSR/INDF equ lines outgrew the copied PIC14 count (epic-cc#1311).
+    locs.extend(std::iter::repeat(None).take(out.len()));
     if !m.module_asm.is_empty() {
         out.push("; module asm".to_string());
         locs.push(None);
