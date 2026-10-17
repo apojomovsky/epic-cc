@@ -1631,9 +1631,12 @@ impl<'a> PicBaseline<'a> {
         (self.pc & 0xFF) as u8
     }
     /// Write PCL with machine semantics: PC<7:0> = v, PC<8> = 0,
-    /// PC<9> = PA0 (DS41236E section 4.7).
+    /// PC<9> = PA0 (DS41236E section 4.7). The halted flag tracks the
+    /// move, as in `set_pc`: without it a debugger write could step
+    /// off the end of `prog` or strand a halted session.
     pub fn set_pcl(&mut self, v: u8) {
         self.write_f(0x02, v);
+        self.halted = self.pc as usize >= self.prog.len();
     }
     /// Set the working register.
     pub fn set_w(&mut self, v: u8) {

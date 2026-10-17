@@ -87,3 +87,16 @@ fn program_flash_reads_by_word_index() {
     assert_eq!(p.read_prog_word(2), Some(0x000));
     assert_eq!(p.read_prog_word(3), None);
 }
+
+#[test]
+fn set_pcl_tracks_the_halted_flag() {
+    let mut p = sim(short_program());
+    // A PCL write out of range halts, like running off the end.
+    p.set_pcl(0xFF);
+    assert!(p.halted());
+    assert_eq!(p.run_until(0, 10), StopReason::Halted);
+    // Writing back in range resumes.
+    p.set_pcl(0x01);
+    assert!(!p.halted());
+    assert_eq!(p.run_until(1, 10), StopReason::Reached);
+}

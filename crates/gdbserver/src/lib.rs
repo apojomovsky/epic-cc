@@ -617,13 +617,14 @@ impl SingleThreadBase for PicBaselineTarget {
     fn write_registers(&mut self, regs: &X86CoreRegs) -> TargetResult<(), Self> {
         // W and the word PC round-trip; STATUS and FSR write the file
         // directly, the way the PIC14 target bypasses their
-        // read-only bits. PCL carries machine semantics, so a write
-        // pages the PC instead of storing a dead byte.
+        // read-only bits. PCL has no storage of its own (reads derive
+        // from the PC), so the word PC in `eip` is applied last and
+        // wins over the paging `ebx` write, keeping bit 8 intact.
         self.sim.set_w(regs.eax as u8);
-        self.sim.set_pc(regs.eip as u16);
         self.sim.ram_mut()[0x03] = regs.ecx as u8;
         self.sim.ram_mut()[0x04] = regs.edx as u8;
         self.sim.set_pcl(regs.ebx as u8);
+        self.sim.set_pc(regs.eip as u16);
         Ok(())
     }
 
