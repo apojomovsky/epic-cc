@@ -1,5 +1,6 @@
 //! The debugger adapter (epic-cc#259, extended to PIC18 in epic-cc#1312
-//! and to PIC14E in epic-cc#1311):
+//! The debugger adapter (epic-cc#259, extended to PIC18 in epic-cc#1312,
+//! to PIC14E in epic-cc#1311, and to PIC12 baseline in epic-cc#1313):
 //! a long-lived RSP server that drives a simulator control surface.
 //! Loads the compiler's HEX (program words) and serves gdb over TCP;
 //! the ELF+DWARF sidecar (`--sidecar` at compile time) stays on the
@@ -7,10 +8,11 @@
 //!
 //! Register convention (docs/internals/design/34 §3): gdb sees an i386
 //! architecture, so PIC state is mapped onto the x86 core registers:
-//! `eip` <- PC (a word address on PIC14/PIC14E, a byte address on PIC18),
-//! `eax` <- W, `ecx` <- STATUS, `edx` <- FSR/FSR0, `ebx` <- PCLATH/BSR.
-//! Memory reads/writes address the RAM image physically below the
-//! flash base and program flash as byte offsets above it.
+//! `eip` <- PC (a word address on PIC14/PIC14E/baseline, a byte address
+//! on PIC18), `eax` <- W, `ecx` <- STATUS, `edx` <- FSR/FSR0,
+//! `ebx` <- PCLATH/BSR/PCL. Memory reads/writes address the RAM image
+//! physically below the flash base and program flash as byte offsets
+//! above it.
 
 use std::collections::HashSet;
 use std::net::TcpListener;
@@ -28,7 +30,7 @@ use gdbstub::target::Target;
 use gdbstub::target::{TargetError, TargetResult};
 use gdbstub_arch::x86::reg::X86CoreRegs;
 use gdbstub_arch::x86::X86_SSE;
-use pic14_sim::{Pic14, Pic14e, Pic18};
+use pic14_sim::{Pic14, Pic14e, Pic18, PicBaseline};
 
 /// Parsed `epic-cc-gdbserver <hex> <sidecar.elf> --port <port>`
 /// arguments. `--device` selects the core (a PIC14 part is the
@@ -80,19 +82,14 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
 
 /// The simulator core `--device` names. Absent means PIC14, the
 /// original single-core behavior; any other spelling resolves through
-/// the device registry, and cores without a control surface are refused.
+/// the device registry. Every registry core has a simulator target.
 pub fn core_of(device: Option<&str>) -> Result<Core, String> {
     let Some(name) = device else {
         return Ok(Core::Pic14);
     };
     let dev =
         device::resolve(name).ok_or_else(|| format!("epic-cc-gdbserver: unknown device {name}"))?;
-    match dev.core {
-        Core::Pic14 | Core::Pic14e | Core::Pic18 => Ok(dev.core),
-        other => Err(format!(
-            "epic-cc-gdbserver: no simulator target for {other:?} (device {name})"
-        )),
-    }
+    Ok(dev.core)
 }
 
 /// Load the HEX program, validating the sidecar path the way `main`
@@ -101,19 +98,23 @@ pub fn load_program(hex_path: &str, sidecar_path: &str, core: Core) -> Result<Ve
     let hex = std::fs::read_to_string(hex_path).map_err(|e| format!("read {hex_path}: {e}"))?;
     std::fs::metadata(sidecar_path).map_err(|e| format!("sidecar {sidecar_path}: {e}"))?;
     Ok(match core {
-        Core::Pic14 => pic14_sim::parse_hex(&hex),
+        // Baseline words are 12-bit records in the same Intel HEX text,
+        // so the shared parser covers them (device_flag proves it).
+        Core::Pic14 | Core::PicBaseline => pic14_sim::parse_hex(&hex),
         Core::Pic14e => pic14_sim::parse_hex_pic14e(&hex),
         Core::Pic18 => pic14_sim::parse_hex_pic18(&hex),
-        other => {
-            return Err(format!(
-                "epic-cc-gdbserver: no simulator target for {other:?}"
-            ))
-        }
     })
 }
 
 /// Serve one gdb session for `prog` over an already-accepted `stream`.
-pub fn serve_stream(stream: std::net::TcpStream, prog: Vec<u16>, core: Core) {
+/// `device` is the baseline part (its file map backs the sim); other
+/// cores ignore it. Absent means the P1 baseline part, p12f509.
+pub fn serve_stream(
+    stream: std::net::TcpStream,
+    prog: Vec<u16>,
+    core: Core,
+    device: Option<&'static device::Device>,
+) {
     let connection: Box<dyn ConnectionExt<Error = std::io::Error>> = Box::new(stream);
     // `GdbStub` is typed over its target, so each core builds its own.
     let outcome = match core {
@@ -141,9 +142,16 @@ pub fn serve_stream(stream: std::net::TcpStream, prog: Vec<u16>, core: Core) {
             };
             GdbStub::new(connection).run_blocking::<EventLoop<Pic18Target>>(&mut target)
         }
-        other => {
-            eprintln!("epic-cc-gdbserver: no simulator target for {other:?}");
-            return;
+        Core::PicBaseline => {
+            let dev = device
+                .or_else(|| device::resolve("p12f509"))
+                .expect("baseline target needs a device");
+            let mut target = PicBaselineTarget {
+                sim: PicBaseline::with_device(dev, prog),
+                breakpoints: HashSet::new(),
+                stepped: false,
+            };
+            GdbStub::new(connection).run_blocking::<EventLoop<PicBaselineTarget>>(&mut target)
         }
     };
     match outcome {
@@ -161,6 +169,7 @@ pub fn serve_stream(stream: std::net::TcpStream, prog: Vec<u16>, core: Core) {
 pub fn serve_once(
     prog: Vec<u16>,
     core: Core,
+    device: Option<&'static device::Device>,
 ) -> std::io::Result<(std::net::SocketAddr, std::thread::JoinHandle<()>)> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
@@ -168,13 +177,14 @@ pub fn serve_once(
         let Ok((stream, _)) = listener.accept() else {
             return;
         };
-        serve_stream(stream, prog, core);
+        serve_stream(stream, prog, core, device);
     });
     Ok((addr, handle))
 }
 
 const RAM_SIZE: u32 = 0x200;
 const PIC18_RAM_SIZE: u32 = 0x1000;
+const BASELINE_RAM_SIZE: u32 = 0x100;
 const PIC14E_RAM_SIZE: u32 = 0x1000;
 
 pub struct Pic14Target {
@@ -187,6 +197,13 @@ pub struct Pic14Target {
 
 pub struct Pic18Target {
     sim: Pic18,
+    breakpoints: HashSet<u32>,
+    /// Same `step()`/`DoneStep` contract as `Pic14Target::stepped`.
+    stepped: bool,
+}
+
+pub struct PicBaselineTarget {
+    sim: PicBaseline<'static>,
     breakpoints: HashSet<u32>,
     /// Same `step()`/`DoneStep` contract as `Pic14Target::stepped`.
     stepped: bool,
@@ -224,6 +241,23 @@ impl Pic18Target {
         } else {
             // Same flash byte space as PIC14, above the 4 KiB RAM.
             let off = (addr - PIC18_RAM_SIZE) as usize;
+            let word = self.sim.read_prog_word((off / 2) as u16).unwrap_or(0);
+            if off % 2 == 0 {
+                (word & 0xFF) as u8
+            } else {
+                (word >> 8) as u8
+            }
+        }
+    }
+}
+
+impl PicBaselineTarget {
+    fn read_mem_byte(&self, addr: u32) -> u8 {
+        if addr < BASELINE_RAM_SIZE {
+            self.sim.ram()[addr as usize]
+        } else {
+            // Same flash byte space as PIC14, above the 256-byte file.
+            let off = (addr - BASELINE_RAM_SIZE) as usize;
             let word = self.sim.read_prog_word((off / 2) as u16).unwrap_or(0);
             if off % 2 == 0 {
                 (word & 0xFF) as u8
@@ -312,6 +346,24 @@ impl AdapterTarget for Pic18Target {
     }
     fn pc_addr(&self) -> u32 {
         self.sim.pc()
+    }
+    fn at_breakpoint(&self) -> bool {
+        self.breakpoints.contains(&self.pc_addr())
+    }
+    fn take_stepped(&mut self) -> bool {
+        std::mem::replace(&mut self.stepped, false)
+    }
+}
+
+impl AdapterTarget for PicBaselineTarget {
+    fn halted(&self) -> bool {
+        self.sim.halted()
+    }
+    fn step_one(&mut self) {
+        self.sim.step();
+    }
+    fn pc_addr(&self) -> u32 {
+        self.sim.pc() as u32
     }
     fn at_breakpoint(&self) -> bool {
         self.breakpoints.contains(&self.pc_addr())
@@ -444,6 +496,30 @@ impl gdbstub::target::ext::breakpoints::SwBreakpoint for Pic18Target {
     }
 }
 
+impl Target for PicBaselineTarget {
+    type Arch = X86_SSE;
+    type Error = &'static str;
+
+    #[inline(always)]
+    fn base_ops(&mut self) -> gdbstub::target::ext::base::BaseOps<'_, Self::Arch, Self::Error> {
+        gdbstub::target::ext::base::BaseOps::SingleThread(self)
+    }
+
+    // Same implicit-breakpoint contract as `Pic14Target`: the pc set
+    // is watched, no flash words are patched.
+    #[inline(always)]
+    fn guard_rail_implicit_sw_breakpoints(&self) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    fn support_breakpoints(
+        &mut self,
+    ) -> Option<gdbstub::target::ext::breakpoints::BreakpointsOps<'_, Self>> {
+        Some(self)
+    }
+}
+
 impl Target for Pic14eTarget {
     type Arch = X86_SSE;
     type Error = &'static str;
@@ -468,12 +544,40 @@ impl Target for Pic14eTarget {
     }
 }
 
+impl gdbstub::target::ext::breakpoints::Breakpoints for PicBaselineTarget {
+    #[inline(always)]
+    fn support_sw_breakpoint(
+        &mut self,
+    ) -> Option<gdbstub::target::ext::breakpoints::SwBreakpointOps<'_, Self>> {
+        Some(self)
+    }
+}
+
 impl gdbstub::target::ext::breakpoints::Breakpoints for Pic14eTarget {
     #[inline(always)]
     fn support_sw_breakpoint(
         &mut self,
     ) -> Option<gdbstub::target::ext::breakpoints::SwBreakpointOps<'_, Self>> {
         Some(self)
+    }
+}
+
+impl gdbstub::target::ext::breakpoints::SwBreakpoint for PicBaselineTarget {
+    fn add_sw_breakpoint(
+        &mut self,
+        addr: u32,
+        _kind: <Self::Arch as gdbstub::arch::Arch>::BreakpointKind,
+    ) -> TargetResult<bool, Self> {
+        self.breakpoints.insert(addr);
+        Ok(true)
+    }
+
+    fn remove_sw_breakpoint(
+        &mut self,
+        addr: u32,
+        _kind: <Self::Arch as gdbstub::arch::Arch>::BreakpointKind,
+    ) -> TargetResult<bool, Self> {
+        Ok(self.breakpoints.remove(&addr))
     }
 }
 
@@ -591,6 +695,56 @@ impl SingleThreadBase for Pic18Target {
     }
 }
 
+impl SingleThreadBase for PicBaselineTarget {
+    fn read_registers(&mut self, regs: &mut X86CoreRegs) -> TargetResult<(), Self> {
+        regs.eax = self.sim.w() as u32;
+        regs.ecx = self.sim.status() as u32;
+        regs.edx = self.sim.fsr() as u32;
+        regs.ebx = self.sim.pcl() as u32;
+        regs.eip = self.sim.pc() as u32;
+        Ok(())
+    }
+
+    fn write_registers(&mut self, regs: &X86CoreRegs) -> TargetResult<(), Self> {
+        // W and the word PC round-trip; STATUS and FSR write the file
+        // directly, the way the PIC14 target bypasses their
+        // read-only bits. PCL has no storage of its own (reads derive
+        // from the PC), so the word PC in `eip` is applied last and
+        // wins over the paging `ebx` write, keeping bit 8 intact.
+        self.sim.set_w(regs.eax as u8);
+        self.sim.ram_mut()[0x03] = regs.ecx as u8;
+        self.sim.ram_mut()[0x04] = regs.edx as u8;
+        self.sim.set_pcl(regs.ebx as u8);
+        self.sim.set_pc(regs.eip as u16);
+        Ok(())
+    }
+
+    fn read_addrs(&mut self, start_addr: u32, data: &mut [u8]) -> TargetResult<usize, Self> {
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = self.read_mem_byte(start_addr + i as u32);
+        }
+        Ok(data.len())
+    }
+
+    fn write_addrs(&mut self, start_addr: u32, data: &[u8]) -> TargetResult<(), Self> {
+        let base = start_addr as usize;
+        let end = base + data.len();
+        // Flash is read-only through this surface; a write crossing
+        // the RAM boundary fails instead of dropping its tail.
+        if start_addr >= BASELINE_RAM_SIZE || end > BASELINE_RAM_SIZE as usize {
+            return Err(TargetError::NonFatal);
+        }
+        self.sim.ram_mut()[base..end].copy_from_slice(data);
+        Ok(())
+    }
+
+    fn support_resume(
+        &mut self,
+    ) -> Option<gdbstub::target::ext::base::singlethread::SingleThreadResumeOps<'_, Self>> {
+        Some(self)
+    }
+}
+
 impl SingleThreadBase for Pic14eTarget {
     fn read_registers(&mut self, regs: &mut X86CoreRegs) -> TargetResult<(), Self> {
         regs.eax = self.sim.w() as u32;
@@ -685,6 +839,26 @@ impl SingleThreadSingleStep for Pic14Target {
 }
 
 impl SingleThreadSingleStep for Pic18Target {
+    fn step(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
+        self.sim.step();
+        self.stepped = true;
+        Ok(())
+    }
+}
+
+impl SingleThreadResume for PicBaselineTarget {
+    fn resume(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn support_single_step(
+        &mut self,
+    ) -> Option<gdbstub::target::ext::base::singlethread::SingleThreadSingleStepOps<'_, Self>> {
+        Some(self)
+    }
+}
+
+impl SingleThreadSingleStep for PicBaselineTarget {
     fn step(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
         self.sim.step();
         self.stepped = true;
