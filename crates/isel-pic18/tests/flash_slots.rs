@@ -759,6 +759,19 @@ fn tainted_result_through_int_passthrough_callee_is_refused() {
 }
 
 #[test]
+fn clean_param_stored_to_global_then_loaded_compiles() {
+    // epic-cc#1324: a store of a value that merely depends on a param
+    // must not taint memory while no site passes taint. Both callers
+    // pass clean values, so the loaded `inttoptr` compiles.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn put(void) (x=i16)\n  block entry:\n    store i16 %x @g\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    call void @put(i16 0)\n    call void @put(i16 1)\n    %y = load i16 @g\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
 #[should_panic(expected = "flash address that passed through integers")]
 fn split_address_reassembled_with_or_is_refused() {
     // epic-cc#1299: `and 0xFF`/`lshr 8` split the address into bytes and

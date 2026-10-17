@@ -3021,11 +3021,19 @@ pub fn add_flash_laundering(
                                 }
                             }
                         }
-                        Inst::Store(s) if tv(&t, &param_keys, prov, &f.name, &s.val) => {
-                            if let Some((slot, off, fake)) = loc(&f.name, &s.ptr) {
-                                mt.mark(&slot, off, u32::from(s.ty.bytes()));
-                                if fake {
-                                    mt.all = true;
+                        Inst::Store(s) => {
+                            // Existential taint only: a provisional dep is
+                            // not enough to taint memory, or clean-param
+                            // stores would mark every slot and every later
+                            // load would refuse (epic-cc#1324). The loop
+                            // re-fires this store when `ptaint` grows.
+                            let st = tp(&t, &param_keys, prov, &f.name, &s.val);
+                            if st.indep || st.deps.iter().any(|d| ptaint.contains(d)) {
+                                if let Some((slot, off, fake)) = loc(&f.name, &s.ptr) {
+                                    mt.mark(&slot, off, u32::from(s.ty.bytes()));
+                                    if fake {
+                                        mt.all = true;
+                                    }
                                 }
                             }
                         }
