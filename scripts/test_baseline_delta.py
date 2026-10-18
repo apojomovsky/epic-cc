@@ -217,6 +217,26 @@ class JudgeTests(unittest.TestCase):
         self.assertFalse(r["net_win"])
         self.assertEqual(r["verdict"], "hold")
 
+    def test_isr_rows_group_to_one_binary_under_o0_and_o1(self):
+        # The ISR suffix regex must see past every profile suffix, or the
+        # two readings of one O0/O1 binary count its flash twice.
+        for profile in ("O0", "O1"):
+            base = [
+                cycle_row("speed-isr-a-latency", 80, flash=100, profile=profile),
+                cycle_row("speed-isr-a-roundtrip", 21, flash=100, profile=profile),
+                cycle_row("k", 50, flash=100, profile=profile),
+            ]
+            head = [
+                cycle_row("speed-isr-a-latency", 80, flash=99, profile=profile),
+                cycle_row("speed-isr-a-roundtrip", 21, flash=99, profile=profile),
+                cycle_row("k", 50, flash=101, profile=profile),
+            ]
+            body = f"delta-ok: k@{profile}"
+            r = run(base_cycle=base, head_cycle=head, body=body)
+            self.assertEqual(r["totals"]["flash_words"], 0)
+            self.assertFalse(r["net_win"])
+            self.assertEqual(r["verdict"], "hold")
+
     def test_marker_does_not_match_across_a_line_break(self):
         self.assertFalse(bd.names_row("delta-ok:\nadd", "add"))
 
