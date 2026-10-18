@@ -52,9 +52,10 @@ use std::process::Command;
 struct BaselineEntry {
     name: String,
     device: String,
-    /// The `-O` profile these numbers were measured under (`"Os"` or
-    /// `"O2"`). Absent in older files, which are all `-Os`. Skipped on
-    /// serialize for `-Os` so re-baselining never rewrites those rows.
+    /// The `-O` profile these numbers were measured under (`"Os"`,
+    /// `"O0"`, `"O1"` or `"O2"`). Absent in older files, which are all
+    /// `-Os`. Skipped on serialize for `-Os` so re-baselining never
+    /// rewrites those rows.
     #[serde(default = "os_profile", skip_serializing_if = "is_os_profile")]
     profile: String,
     cycles: u64,

@@ -66,9 +66,10 @@ use std::process::Command;
 struct BaselineEntry {
     name: String,
     device: String,
-    /// The `-O` profile these numbers were measured under (`"Os"` or
-    /// `"O2"`). Absent in older files, which are all `-Os`. Skipped on
-    /// serialize for `-Os` so re-baselining never rewrites those rows.
+    /// The `-O` profile these numbers were measured under (`"Os"`,
+    /// `"O0"`, `"O1"` or `"O2"`). Absent in older files, which are all
+    /// `-Os`. Skipped on serialize for `-Os` so re-baselining never
+    /// rewrites those rows.
     #[serde(default = "os_profile", skip_serializing_if = "is_os_profile")]
     profile: String,
     flash_words: u32,
@@ -980,8 +981,20 @@ fn flash_and_ram_do_not_regress() {
     // `name@O0`, `name@O1` or `name@O2`, `-Os` rows as the bare name.
     let mut valid: Vec<String> = cases.iter().map(|c| c.name.to_string()).collect();
     for c in &cases {
-        for profile in ["O0", "O1", "O2"] {
-            valid.push(entry_key(c.name, profile));
+        valid.push(entry_key(c.name, "O2"));
+        // `-O0`/`-O1` compile only gated rows, so only those keys are
+        // valid filter targets: naming an unmeasured row must fail fast
+        // as a typo instead of measuring nothing.
+        for profile in ["O0", "O1"] {
+            let key = entry_key(c.name, profile);
+            if OPT_BASELINED.contains(&c.name)
+                || baseline
+                    .entry
+                    .iter()
+                    .any(|e| e.name == key && e.profile == profile)
+            {
+                valid.push(key);
+            }
         }
     }
     let filter = update.then(|| parse_only_filter(&valid)).flatten();
