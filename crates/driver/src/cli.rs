@@ -110,6 +110,9 @@ usage: epic-cc [options] <input.c|input.cpp>...
   --var-table <file>   write the typed variable table into <file>
                        (`global <name> 0xNN TYPE` / `local {func}::{name}
                        0xNN TYPE`, one flattened record per mapped var)
+  --sidecar <file>     write the ELF+DWARF sidecar into <file> for gdb
+                       (source lines and typed variables; never flashed,
+                       flash the HEX and load the sidecar with `file`)
   --version, -V        print the compiler identity (e.g. epic-cc 0.3.0, or
                        epic-cc 0.1.0+<sha> for a build from a git checkout)
   --help, -h           print this help and exit
@@ -124,6 +127,63 @@ usage: epic-cc [options] <input.c|input.cpp>...
                        tooling; the bundle carries exactly what the driver
                        would materialize)
 ";
+
+/// Every long flag `parse_args` and `main` accept, the candidate set for the
+/// unknown-option hint. Short flags are left out on purpose.
+const LONG_FLAGS: &[&str] = &[
+    "--device",
+    "--target",
+    "--mcu",
+    "--emit",
+    "--save-temps",
+    "--map",
+    "--line-table",
+    "--var-table",
+    "--sidecar",
+    "--report",
+    "--f-cpu",
+    "--no-outline",
+    "--const-pool",
+    "--no-const-pool",
+    "--version",
+    "--help",
+    "--resolve-device",
+    "--print-include-dir",
+    "--dump-include-dir",
+];
+
+const EMIT_STAGES: &[&str] = &["ll", "ir", "asm", "hex"];
+
+/// Farthest edit distance at which a candidate is still offered.
+const SUGGEST_MAX_DISTANCE: usize = 3;
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diag = row[0];
+        row[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let up = row[j + 1];
+            row[j + 1] = (diag + usize::from(ca != cb)).min(row[j] + 1).min(up + 1);
+            diag = up;
+        }
+    }
+    row[b.len()]
+}
+
+/// ` (did you mean X?)` for the nearest candidate within
+/// `SUGGEST_MAX_DISTANCE`, first listed wins a tie; empty when none is close.
+fn suggest(got: &str, candidates: &[&str]) -> String {
+    candidates
+        .iter()
+        .map(|c| (edit_distance(got, c), *c))
+        .filter(|(d, _)| *d <= SUGGEST_MAX_DISTANCE)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| format!(" (did you mean {c}?)"))
+        .unwrap_or_default()
+}
+
 /// Parse an argument list that does NOT include `argv[0]`.
 pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut inputs = Vec::new();
@@ -186,7 +246,10 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
                 "ir" => Emit::Ir,
                 "asm" => Emit::Asm,
                 "hex" => Emit::Hex,
-                other => return Err(format!("epic-cc: unknown --emit stage {other}")),
+                other => {
+                    let hint = suggest(other, EMIT_STAGES);
+                    return Err(format!("epic-cc: unknown --emit stage {other}{hint}"));
+                }
             };
         } else if a == "--save-temps" {
             i += 1;
@@ -257,7 +320,12 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
                     .ok_or("epic-cc: --var-table needs a value")?,
             );
         } else if a.starts_with('-') {
-            return Err(format!("epic-cc: unknown option {a}\n\n{USAGE}"));
+            let hint = if a.starts_with("--") {
+                suggest(a, LONG_FLAGS)
+            } else {
+                String::new()
+            };
+            return Err(format!("epic-cc: unknown option {a}{hint}\n\n{USAGE}"));
         } else {
             inputs.push(a.to_string());
         }
@@ -267,6 +335,41 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         return Err(format!("epic-cc: no input files\n\n{USAGE}"));
     }
     let device = device.ok_or_else(|| format!("epic-cc: --target is required\n\n{USAGE}"))?;
+    // Artifact files are written past the `--emit` early returns in main.rs
+    // (`--map`/`--var-table` after alloc, the rest after assemble), so a
+    // short build would exit 0 with the file silently missing. Reject those
+    // combinations here, where main.rs already maps Err to exit 2.
+    let stage = match emit {
+        Emit::Ll => "ll",
+        Emit::Ir => "ir",
+        Emit::Asm => "asm",
+        Emit::Hex => "hex",
+    };
+    if matches!(emit, Emit::Ll | Emit::Ir) {
+        for (flag, set) in [
+            ("--map", map.is_some()),
+            ("--var-table", var_table.is_some()),
+        ] {
+            if set {
+                return Err(format!(
+                    "epic-cc: {flag} is written after alloc, past --emit {stage}; drop --emit {stage}"
+                ));
+            }
+        }
+    }
+    if emit != Emit::Hex {
+        for (flag, set) in [
+            ("--line-table", line_table.is_some()),
+            ("--sidecar", sidecar.is_some()),
+            ("--report", report.is_some()),
+        ] {
+            if set {
+                return Err(format!(
+                    "epic-cc: {flag} needs a full hex build; drop --emit {stage}"
+                ));
+            }
+        }
+    }
 
     Ok(Cli {
         inputs,

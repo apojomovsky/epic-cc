@@ -168,6 +168,8 @@ above; `m`/`M` read and write the RAM image physically (DWARF variable
 addresses are physical byte addresses); `Z0`/`c` run via phase 3's
 `run_until` over word addresses; `s` steps one word and lets gdb do
 line granularity against the sidecar line table.
+`Z2` write watches poll the sim RAM image between stop bounds (the sim
+has no load trap, so `Z3`/`Z4` read and access watches stay refused).
 
 ## 4. Phase plan
 
@@ -295,3 +297,51 @@ print fresh values.
 - Any variable-location form beyond constant addresses (frame-relative
   locations, register-allocated locals), not needed given section 1, and
   not planned.
+
+## Appendix: debugging in VS Code
+
+The phase-4 session from the acceptance tests also runs under VS Code
+through the Microsoft C/C++ extension's `cppdbg` debugger. Build with
+the sidecar, then serve it from a terminal (`-O0` keeps one source
+line per word for stepping):
+
+```sh
+epic-cc main.c -o build/main.hex --target p16f877a --sidecar build/main.elf -O0
+epic-cc-gdbserver build/main.hex build/main.elf --port 3333
+```
+
+Other cores add `--device` with the same name used at compile time.
+`.vscode/launch.json` then attaches to that server. Both `program`
+and the `file` command point at the sidecar ELF: gdb reads lines and
+types from it, while the running bytes come from the HEX the server
+loaded:
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "epic-cc: attach to simulator",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/main.elf",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "miDebuggerServerAddress": "127.0.0.1:3333",
+      "setupCommands": [
+        {
+          "text": "file ${workspaceFolder}/build/main.elf"
+        },
+        {
+          "text": "target remote 127.0.0.1:3333"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Start the server first, then F5. Breakpoints set on `file:line`
+resolve through the sidecar `.debug_line`, and `print` uses the
+sidecar types, exactly like the batch session in
+`crates/driver/tests/debug_session_e2e.rs`.

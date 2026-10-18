@@ -152,6 +152,29 @@ jobs:
             }
           done
 
+      - name: Check pack names match DFP (device_names --check)
+        if: steps.noncode.outputs.non_code != 'true'
+        run: |
+          echo "Checking pack names against DFP source (skips if DFP not present)..."
+          names=$(grep -l '^\[\[sfrs\]\]$' crates/device/devices/*.toml || true)
+          if [ -z "$names" ]; then
+            echo "::warning::no device TOML carries pack names, nothing to check"
+            exit 0
+          fi
+          for f in $names; do
+            stem=$(basename "$f" .toml)
+            echo "  --check $stem"
+            python3 scripts/device_names.py "$stem" --check || {
+              ec=$?
+              if [ -d "/opt/microchip/xc8/v4.00/pic/packs" ]; then
+                echo "pack-names check failed for $stem with DFP present: failing"
+                exit $ec
+              else
+                echo "::warning::DFP absent, pack-names check SKIPPED for $stem. The always-on gate is crates/device/tests/gputils_crosscheck.rs"
+              fi
+            }
+          done
+
       - name: Test every workspace crate
         if: steps.noncode.outputs.non_code != 'true'
         run: |

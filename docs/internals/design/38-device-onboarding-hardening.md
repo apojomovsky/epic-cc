@@ -225,7 +225,6 @@ dsPIC/PIC24/PIC32 scope boundary already gets in `docs/internals/design/08`.
 4. The gputils cross-check re-verifies the entire `device::ALL`
    registry on every run (no per-device scoping exists today, see
    D-1 step 2). As D-2's sweeps grow the registry, `add-device.sh`'s
-   per-addition wall-clock cost grows too. Worth a per-device-scoped
-   cross-check mode once the registry is large enough for this to be
-   felt, but not blocking P1 — flagging so it isn't rediscovered as a
-   surprise later.
+   per-addition wall-clock cost grows too. Resolved (epic-cc#1377):
+   `PIC8_DEVICE_SCOPE=<stem>` scopes the cross-check to one device, and
+   `add-device.sh` passes it.

@@ -29,18 +29,20 @@
 //! Regenerate with `UPDATE_CYCLE_BASELINE=1 cargo test -p driver --test
 //! cycle_ladder_e2e` and diff before committing.
 //! `CYCLE_BASELINE_ONLY=a,b@O2` scopes the rewrite to named rows (`name`
-//! for `-Os`, `name@O2` for `-O2`). `STRICT_CYCLE_BASELINE=1` additionally
-//! fails headroom, like the size ladder's strict mode (local only: CI
-//! measures). `BASELINE_ARTIFACT_DIR` makes the run measure-only and write
-//! `cycle.json` there after the value pins pass (epic-cc#1087).
-//! `SPEED_REPORT_JSON=1` prints the machine-readable dump (one JSON array
-//! between marker lines, needs `-- --nocapture`) carrying cycles plus
-//! flash words per kernel for tooling, and returns before asserting, so
-//! a report never fails the gate and the gate never shapes the report.
+//! for `-Os`, `name@O0`, `name@O1` or `name@O2` for optimized profiles).
+//! `STRICT_CYCLE_BASELINE=1` additionally fails headroom, like the size
+//! ladder's strict mode (local only: CI measures). `BASELINE_ARTIFACT_DIR`
+//! makes the run measure-only and write `cycle.json` there after the value
+//! pins pass (epic-cc#1087). `SPEED_REPORT_JSON=1` prints the
+//! machine-readable dump (one JSON array between marker lines, needs `--
+//! --nocapture`) carrying cycles plus flash words per kernel for tooling,
+//! and returns before asserting, so a report never fails the gate and the
+//! gate never shapes the report.
 //!
-//! Every row is recorded under both `-Os` (default flags) and `-O2` (the
-//! speed profile from #839, passed as `-O2`): the coordination clause on
-//! #840. Baseline entries carry `profile`; rows without one are `-Os`.
+//! Every row is recorded under `-Os` (default flags), `-O0`, `-O1` and
+//! `-O2` (passed as `-O<profile>`): the coordination clause on #840 plus
+//! the O0/O1 pins from epic-cc#1343. Baseline entries carry `profile`;
+//! rows without one are `-Os`.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -50,9 +52,10 @@ use std::process::Command;
 struct BaselineEntry {
     name: String,
     device: String,
-    /// The `-O` profile these numbers were measured under (`"Os"` or
-    /// `"O2"`). Absent in older files, which are all `-Os`. Skipped on
-    /// serialize for `-Os` so re-baselining never rewrites those rows.
+    /// The `-O` profile these numbers were measured under (`"Os"`,
+    /// `"O0"`, `"O1"` or `"O2"`). Absent in older files, which are all
+    /// `-Os`. Skipped on serialize for `-Os` so re-baselining never
+    /// rewrites those rows.
     #[serde(default = "os_profile", skip_serializing_if = "is_os_profile")]
     profile: String,
     cycles: u64,
@@ -114,8 +117,8 @@ fn parse_only_filter(valid: &[String]) -> Option<std::collections::HashSet<Strin
 }
 
 /// Rows are keyed by `(name, profile)`: `-Os` rows keep the bare `name`
-/// key, `-O2` rows use `name@O2`, so the filter and the report tell the
-/// two profiles apart.
+/// key, optimized rows use `name@O0`, `name@O1` or `name@O2`, so the
+/// filter and the report tell the profiles apart.
 fn entry_key(name: &str, profile: &str) -> String {
     if profile == "Os" {
         name.to_string()
@@ -851,8 +854,8 @@ fn cycle_counts_do_not_regress() {
 
     let cases = cases();
     // Validate the filter before measuring: a typo must fail fast, not
-    // after minutes of compiling every case. `-O2` rows filter as
-    // `name@O2`, `-Os` rows as the bare name.
+    // after minutes of compiling every case. Optimized rows filter as
+    // `name@O0`, `name@O1` or `name@O2`, `-Os` rows as the bare name.
     let mut valid = Vec::new();
     for c in &cases {
         // ISR cases measure two rows each (`-latency`, `-roundtrip`),
@@ -862,16 +865,20 @@ fn cycle_counts_do_not_regress() {
             for suffix in ["-latency", "-roundtrip"] {
                 let n = format!("{}{suffix}", c.name);
                 valid.push(n.clone());
-                valid.push(entry_key(&n, "O2"));
+                for profile in ["O0", "O1", "O2"] {
+                    valid.push(entry_key(&n, profile));
+                }
             }
         } else {
             valid.push(c.name.clone());
-            valid.push(entry_key(&c.name, "O2"));
+            for profile in ["O0", "O1", "O2"] {
+                valid.push(entry_key(&c.name, profile));
+            }
         }
     }
     let filter = update.then(|| parse_only_filter(&valid)).flatten();
     for c in &cases {
-        for profile in ["Os", "O2"] {
+        for profile in ["Os", "O0", "O1", "O2"] {
             let (hex, map, report) = compile(c, profile);
             let flash_words = parse_after(&report, "flash: ");
             let ram_bytes = parse_after(&report, "RAM: ");

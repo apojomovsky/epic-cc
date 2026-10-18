@@ -86,7 +86,11 @@ not one.
 | `PIC8_ALLOW_NO_GPUTILS` | acknowledges the data root is absent. On its own the gate still **fails** |
 | `PIC8_UNVERIFIED_DEVICE_DATA` | set to `i-accept-unverified-device-data`, and only with the variable above, to run with no device verification at all |
 
-Both are read only when the data root is genuinely missing, so setting them
+`PIC8_DEVICE_SCOPE=<stem>` (for example `p12f509`) restricts the per-device
+loops to that registry device and fails when the stem names none. Unset, every
+device is checked. It narrows what is checked; it never relaxes the gate.
+
+Both opt-ins are read only when the data root is genuinely missing, so setting them
 cannot switch off a gate that could have run. With both set the tests print a
 `DEVICE DATA UNVERIFIED` banner and verify nothing; `scripts/ci-test.sh` also
 records the disabled gate in the CI step summary.
