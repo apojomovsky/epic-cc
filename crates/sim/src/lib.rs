@@ -98,6 +98,17 @@ pub const PIC18_TMR0IE: u8 = 1 << 5;
 pub const PIC18_INT0IE: u8 = 1 << 4;
 pub const PIC18_TMR0IF: u8 = 1 << 2;
 pub const PIC18_INT0IF: u8 = 1 << 1;
+/// PIC18 Timer0 (DS39632E section 11): T0CON selects on/off, 8/16-bit
+/// width, clock source and the prescaler; TMR0L/TMR0H hold the count.
+/// The 16-bit TMR0H read/write buffer is not modelled, so TMR0H is a
+/// live view of the high byte.
+pub const PIC18_T0CON: usize = 0xFD5;
+pub const PIC18_TMR0L: usize = 0xFD6;
+pub const PIC18_TMR0H: usize = 0xFD7;
+pub const PIC18_T0CON_TMR0ON: u8 = 1 << 7;
+pub const PIC18_T0CON_T08BIT: u8 = 1 << 6;
+pub const PIC18_T0CON_T0CS: u8 = 1 << 5;
+pub const PIC18_T0CON_PSA: u8 = 1 << 3;
 /// PIC18 Timer2 match path (DS39632E section 12, table 9-5/9-6): T2CON
 /// holds the on switch plus prescaler/postscaler, PR2 the period, PIR1
 /// the TMR2IF match flag and PIE1 its enable. IPR routing is not
@@ -2422,6 +2433,16 @@ pub struct Pic18 {
     /// Harness opt-in for the Timer2 model. Off unless enabled, so
     /// gates written before the model run exactly as before.
     timer2_enabled: bool,
+    /// Instruction cycles banked toward the next TMR0 tick (the T0CON
+    /// prescaler rate per tick). Reset while the model is off, T0CON
+    /// stops the timer or T0CS selects the external clock.
+    timer0_acc: u64,
+    /// Harness opt-in for the Timer0 model. Off unless enabled, so
+    /// gates written before the model run exactly as before.
+    timer0_enabled: bool,
+    /// A latched Timer0 overflow awaiting GIEH + TMR0IE. Separate from
+    /// `pending` so an INT0-only enable never vectors on a Timer0 event.
+    timer0_pending: bool,
 }
 impl Pic18 {
     pub fn new(prog: Vec<u16>) -> Self {
@@ -2444,12 +2465,20 @@ impl Pic18 {
             jump_target: None,
             timer2_acc: 0,
             timer2_enabled: false,
+            timer0_acc: 0,
+            timer0_enabled: false,
+            timer0_pending: false,
         }
     }
     /// Enable the Timer2 match model for this run. Off by default, so
     /// existing gates observe no timer unless they opt in.
     pub fn set_timer2_enabled(&mut self, enabled: bool) {
         self.timer2_enabled = enabled;
+    }
+    /// Enable the Timer0 counting model for this run. Off by default, so
+    /// existing gates observe no timer unless they opt in.
+    pub fn set_timer0_enabled(&mut self, enabled: bool) {
+        self.timer0_enabled = enabled;
     }
     pub fn ram(&self) -> &[u8; 4096] {
         &self.ram
@@ -2574,10 +2603,18 @@ impl Pic18 {
         // enabled request vectors instead of executing this instruction,
         // which then runs on return (mirrors `Pic14::step`).
         if self.interrupt_ready() {
-            self.pending = false;
+            // Consume only the latches whose source is enabled, so a
+            // pending request on the other source survives the entry.
+            if self.pending && self.pending_source_enabled() {
+                self.pending = false;
+            }
+            if self.timer0_pending && self.ram[PIC18_INTCON] & PIC18_TMR0IE != 0 {
+                self.timer0_pending = false;
+            }
             self.enter_isr();
             self.cycles += 2; // vector entry; the handler runs next
             self.tick_timer2(2);
+            self.tick_timer0(2);
             return;
         }
         // The low vector is checked second: a pending high request
@@ -2587,6 +2624,7 @@ impl Pic18 {
             self.enter_isr_low();
             self.cycles += 2; // vector entry; the handler runs next
             self.tick_timer2(2);
+            self.tick_timer0(2);
             return;
         }
         let word = self.prog[(self.pc / 2) as usize];
@@ -2681,6 +2719,7 @@ impl Pic18 {
         let delta = cost18(word, pc, next, jumped.is_some());
         self.cycles += delta;
         self.tick_timer2(delta);
+        self.tick_timer0(delta);
         self.pc = next;
         if (self.pc / 2) as usize >= self.prog.len() {
             self.halted = true;
@@ -3458,6 +3497,11 @@ impl Pic18 {
             _ => {
                 let v = self.ee_store(addr, v).unwrap_or(v);
                 self.ram[addr] = v;
+                // A firmware write to TMR0L/TMR0H clears the prescaler
+                // (DS39632E section 11.0).
+                if addr == PIC18_TMR0L || addr == PIC18_TMR0H {
+                    self.timer0_acc = 0;
+                }
             }
         }
     }
@@ -3558,6 +3602,44 @@ impl Pic18 {
             self.pending = true;
         }
     }
+    /// Bank `delta` instruction cycles into Timer0 while the harness has
+    /// enabled the model. Internal clock only (T0CS set idles: external
+    /// T0CKI edge counting stays out). The rate is live T0CON state: PSA
+    /// set bypasses the prescaler (1:1), else PS2:0 selects 2 to 256, and
+    /// T08BIT picks an 8-bit (TMR0L) or 16-bit (TMR0H:TMR0L) counter. An
+    /// overflow sets INTCON TMR0IF and latches the Timer0 request.
+    fn tick_timer0(&mut self, delta: u64) {
+        let t0con = self.ram[PIC18_T0CON];
+        if !self.timer0_enabled || t0con & PIC18_T0CON_TMR0ON == 0 || t0con & PIC18_T0CON_T0CS != 0
+        {
+            self.timer0_acc = 0;
+            return;
+        }
+        let rate = if t0con & PIC18_T0CON_PSA != 0 {
+            1
+        } else {
+            1u64 << ((t0con & 0x07) + 1)
+        };
+        self.timer0_acc += delta;
+        while self.timer0_acc >= rate {
+            self.timer0_acc -= rate;
+            let (lo, lo_carry) = self.ram[PIC18_TMR0L].overflowing_add(1);
+            self.ram[PIC18_TMR0L] = lo;
+            let overflowed = if t0con & PIC18_T0CON_T08BIT != 0 {
+                lo_carry
+            } else if lo_carry {
+                let (hi, hi_carry) = self.ram[PIC18_TMR0H].overflowing_add(1);
+                self.ram[PIC18_TMR0H] = hi;
+                hi_carry
+            } else {
+                false
+            };
+            if overflowed {
+                self.ram[PIC18_INTCON] |= PIC18_TMR0IF;
+                self.timer0_pending = true;
+            }
+        }
+    }
     /// A latched request with GIEH set and either modelled source enabled
     /// (INT0IE, TMR0IE, or PIE1 TMR2IE). Readiness keys off the enables,
     /// not the flag bits: firmware unmasks with wholesale INTCON writes
@@ -3565,11 +3647,13 @@ impl Pic18 {
     /// peripheral event.
     fn interrupt_ready(&self) -> bool {
         let intcon = self.ram[PIC18_INTCON];
-        self.pending
-            && intcon & PIC18_GIEH != 0
-            && (intcon & PIC18_INT0IE != 0
-                || intcon & PIC18_TMR0IE != 0
-                || self.ram[PIC18_PIE1] & PIC18_TMR2IE != 0)
+        intcon & PIC18_GIEH != 0
+            && ((self.pending && self.pending_source_enabled())
+                || (self.timer0_pending && intcon & PIC18_TMR0IE != 0))
+    }
+    fn pending_source_enabled(&self) -> bool {
+        self.ram[PIC18_INTCON] & (PIC18_INT0IE | PIC18_TMR0IE) != 0
+            || self.ram[PIC18_PIE1] & PIC18_TMR2IE != 0
     }
     /// A latched low request with GIEH and GIEL set and either modelled
     /// source enabled (GIEH gates everything when IPEN = 1).
