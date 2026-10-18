@@ -168,6 +168,8 @@ above; `m`/`M` read and write the RAM image physically (DWARF variable
 addresses are physical byte addresses); `Z0`/`c` run via phase 3's
 `run_until` over word addresses; `s` steps one word and lets gdb do
 line granularity against the sidecar line table.
+`Z2` write watches poll the sim RAM image between stop bounds (the sim
+has no load trap, so `Z3`/`Z4` read and access watches stay refused).
 
 ## 4. Phase plan
 
