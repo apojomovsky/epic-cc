@@ -270,6 +270,41 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         return Err(format!("epic-cc: no input files\n\n{USAGE}"));
     }
     let device = device.ok_or_else(|| format!("epic-cc: --target is required\n\n{USAGE}"))?;
+    // Artifact files are written past the `--emit` early returns in main.rs
+    // (`--map`/`--var-table` after alloc, the rest after assemble), so a
+    // short build would exit 0 with the file silently missing. Reject those
+    // combinations here, where main.rs already maps Err to exit 2.
+    let stage = match emit {
+        Emit::Ll => "ll",
+        Emit::Ir => "ir",
+        Emit::Asm => "asm",
+        Emit::Hex => "hex",
+    };
+    if matches!(emit, Emit::Ll | Emit::Ir) {
+        for (flag, set) in [
+            ("--map", map.is_some()),
+            ("--var-table", var_table.is_some()),
+        ] {
+            if set {
+                return Err(format!(
+                    "epic-cc: {flag} is written after alloc, past --emit {stage}; drop --emit {stage}"
+                ));
+            }
+        }
+    }
+    if emit != Emit::Hex {
+        for (flag, set) in [
+            ("--line-table", line_table.is_some()),
+            ("--sidecar", sidecar.is_some()),
+            ("--report", report.is_some()),
+        ] {
+            if set {
+                return Err(format!(
+                    "epic-cc: {flag} needs a full hex build; drop --emit {stage}"
+                ));
+            }
+        }
+    }
 
     Ok(Cli {
         inputs,

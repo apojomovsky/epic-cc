@@ -75,6 +75,18 @@ pub const INTE: u8 = 1 << 4;
 pub const INTF: u8 = 1 << 1;
 /// The 14-bit core's single interrupt vector.
 pub const VECTOR: u16 = 4;
+/// Timer0 on both 14-bit cores (DS39582C section 5, DS41364E section 21):
+/// INTCON T0IE on bit 5 with T0IF on bit 2 on both. Addresses differ:
+/// PIC14 (16F877A) has TMR0 at 0x01 with OPTION_REG at 0x81, while PIC14E
+/// (16F1938) has TMR0 at 0x15 with OPTION_REG at 0x95 (0x01 is INDF1
+/// there). OPTION bits match (T0CS bit 5, T0SE bit 4, PSA bit 3, PS2:0
+/// bits 2:0).
+pub const PIC14_TMR0: usize = 0x01;
+pub const PIC14_OPTION_REG: usize = 0x81;
+pub const PIC14E_TMR0: usize = 0x15;
+pub const PIC14E_OPTION_REG: usize = 0x95;
+pub const PIC14_T0IE: u8 = 1 << 5;
+pub const PIC14_T0IF: u8 = 1 << 2;
 /// PIC18 INTCON layout (DS39632E table 9-1): the register lives at 0xFF2,
 /// not at the PIC14 0x0B above, and the vectors are 0x0008/0x0018, not
 /// word 4. The enable/flag bit positions match the PIC14 names bit for
@@ -247,10 +259,7 @@ fn cost14_masked(word: u16, pc: u16, next: u16, mask: u16, cls: u16) -> u64 {
 /// branch, return, computed jump): always 2, even when it lands on the
 /// next instruction, where the delta alone would read fall-through 1.
 /// Fixed classes first: `SLEEP`/`RESET` cost 1,
-/// `PUSH`/`POP` cost 2, `TBLRD*` costs 2, `GOTO`/`CALL`/`LFSR` cost 2
-/// over two words. Anything else follows the delta: fall-through 1, a
-/// one-word skip or any redirect 2, a skip over a two-word form 3.
-/// `MOVFF` needs no arm: two words advance `pc` by 4, which the delta
+/// `PUSH`/`POP` cost 2, `TBLRD*`/`TBLWT*` cost 2, `GOTO`/`CALL`/`LFSR` cost 2
 /// already charges 2.
 fn cost18(word: u16, pc: u32, next: u32, jumped: bool) -> u64 {
     if jumped {
@@ -259,7 +268,7 @@ fn cost18(word: u16, pc: u32, next: u32, jumped: bool) -> u64 {
     match word {
         0x0003 | 0x00FF => 1,
         0x0005 | 0x0006 => 2,
-        0x0008..=0x000B => 2,
+        0x0008..=0x000F => 2,
         0xEC00..=0xEFFF => 2,
         _ if next == pc + 2 => 1,
         _ if next == pc + 4 => 2,
@@ -286,6 +295,17 @@ pub struct Pic14 {
     /// A latched interrupt request awaiting GIE + INTE. Set by
     /// `request_interrupt`, consumed when the interrupt is taken.
     pending: bool,
+    /// Instruction cycles banked toward the next TMR0 tick (the OPTION_REG
+    /// prescaler rate per tick). Reset while the model is off or T0CS
+    /// selects the external clock, so enabling never fires a stale burst.
+    timer0_acc: u64,
+    /// Harness opt-in for the Timer0 model. Off unless enabled, so
+    /// gates written before the model run exactly as before.
+    timer0_enabled: bool,
+    /// A latched Timer0 overflow awaiting GIE + T0IE. Separate from the
+    /// INT0 `pending` latch so one source never vectors on the other's
+    /// enable.
+    timer0_pending: bool,
     /// The data-EEPROM cell array behind the EEADR/EEDATA/EECON1/EECON2
     /// register file.
     eeprom: Eeprom,
@@ -312,8 +332,16 @@ impl Pic14 {
             halted: false,
             cycles: 0,
             pending: false,
+            timer0_acc: 0,
+            timer0_enabled: false,
+            timer0_pending: false,
             eeprom: Eeprom::new(),
         }
+    }
+    /// Enable the Timer0 model for this run. Off by default, so
+    /// existing gates observe no timer unless they opt in.
+    pub fn set_timer0_enabled(&mut self, enabled: bool) {
+        self.timer0_enabled = enabled;
     }
     pub fn ram(&self) -> &[u8; 512] {
         &self.ram
@@ -377,9 +405,10 @@ impl Pic14 {
         self.ram[INTCON] |= INTF;
         self.pending = true;
     }
-    /// Whether a requested interrupt remains latched and untaken.
+    /// Whether a requested interrupt remains latched and untaken, from
+    /// either the INT0 or the Timer0 source.
     pub fn interrupt_pending(&self) -> bool {
-        self.pending
+        self.pending || self.timer0_pending
     }
     /// Push the return address, clear GIE (hardware does this on entry so
     /// the handler is not immediately re-entered) and vector.
@@ -388,9 +417,14 @@ impl Pic14 {
         self.ram[INTCON] &= !GIE;
         self.pc = VECTOR;
     }
-    /// A latched request whose source and global enables are both set.
+    /// A latched request whose source and global enables are both set: INT0
+    /// on INTE, Timer0 overflows on T0IE. Each latch keys off its own
+    /// enable, so one source never vectors on the other's.
     fn interrupt_ready(&self) -> bool {
-        self.pending && self.ram[INTCON] & GIE != 0 && self.ram[INTCON] & INTE != 0
+        let intcon = self.ram[INTCON];
+        intcon & GIE != 0
+            && ((self.pending && intcon & INTE != 0)
+                || (self.timer0_pending && intcon & PIC14_T0IE != 0))
     }
     pub fn run(&mut self, max_steps: usize) -> usize {
         let mut steps = 0;
@@ -405,9 +439,19 @@ impl Pic14 {
         // enabled request vectors instead of executing this instruction,
         // which then runs on return.
         if self.interrupt_ready() {
-            self.pending = false;
+            // Consume only the latches whose source is enabled: a pending
+            // request on the other source survives and vectors after RETFIE
+            // re-enables.
+            let intcon = self.ram[INTCON];
+            if self.pending && intcon & INTE != 0 {
+                self.pending = false;
+            }
+            if self.timer0_pending && intcon & PIC14_T0IE != 0 {
+                self.timer0_pending = false;
+            }
             self.enter_isr();
             self.cycles += 2; // vector entry; the handler runs next
+            self.tick_timer0(2);
             return;
         }
         let word = self.prog[self.pc as usize];
@@ -419,10 +463,45 @@ impl Pic14 {
             3 => self.exec_literal(pc, word),
             _ => unreachable!(),
         };
-        self.cycles += cost14(word, pc, next);
+        let delta = cost14(word, pc, next);
+        self.cycles += delta;
+        self.tick_timer0(delta);
         self.pc = next;
         if self.pc as usize >= self.prog.len() {
             self.halted = true;
+        }
+    }
+
+    /// Bank `delta` instruction cycles into Timer0 while the harness has
+    /// enabled the model. Internal clock only (T0CS set idles: external
+    /// T0CKI edge counting stays out). The rate is live OPTION_REG state:
+    /// PSA set bypasses the prescaler (1:1), else PS2:0 selects 2 to 256.
+    /// An overflow sets INTCON T0IF and latches the Timer0 request; the
+    /// firmware handler clears the flag and vector entry consumes the latch.
+    fn tick_timer0(&mut self, delta: u64) {
+        if !self.timer0_enabled {
+            self.timer0_acc = 0;
+            return;
+        }
+        let option = self.ram[PIC14_OPTION_REG];
+        if option & 0x20 != 0 {
+            self.timer0_acc = 0;
+            return;
+        }
+        let rate = if option & 0x08 != 0 {
+            1
+        } else {
+            1u64 << ((option & 0x07) + 1)
+        };
+        self.timer0_acc += delta;
+        while self.timer0_acc >= rate {
+            self.timer0_acc -= rate;
+            let (v, overflowed) = self.ram[PIC14_TMR0].overflowing_add(1);
+            self.ram[PIC14_TMR0] = v;
+            if overflowed {
+                self.ram[INTCON] |= PIC14_T0IF;
+                self.timer0_pending = true;
+            }
         }
     }
 
@@ -505,11 +584,19 @@ impl Pic14 {
                 let addr = self.indirect_addr();
                 let v = self.ee_store(addr, v).unwrap_or(v);
                 self.ram[addr] = v; // INDF -> RAM[FSR] via IRP
+                if addr == PIC14_TMR0 {
+                    self.timer0_acc = 0;
+                }
             }
             _ => match self.banked_addr(f) {
                 Some(phys) => {
                     let v = self.ee_store(phys, v).unwrap_or(v);
                     self.ram[phys] = v;
+                    // A firmware write to TMR0 clears the prescaler
+                    // (DS39582C section 5.0).
+                    if phys == PIC14_TMR0 {
+                        self.timer0_acc = 0;
+                    }
                 }
                 // SFR 0x01-0x1F (bank-independent) and common 0x70-0x7F
                 None => self.ram[f] = v,
@@ -553,6 +640,13 @@ impl Pic14 {
             0x0009 => {
                 self.ram[INTCON] |= GIE; // RETFIE re-enables interrupts
                 return self.pop_return();
+            }
+            0x0062 => {
+                // OPTION: W -> OPTION_REG (0x81, bank 1). Write-only on
+                // silicon; the sim keeps it readable so the Timer0 model
+                // can consult the live prescaler.
+                self.ram[PIC14_OPTION_REG] = self.w;
+                return pc + 1;
             }
             0x0064 => return pc + 1, // CLRWDT
             0x0063 => {
@@ -869,6 +963,15 @@ pub struct Pic14e {
     cycles: u64,
     /// A latched interrupt request awaiting GIE + INTE, mirroring `Pic14`.
     pending: bool,
+    /// Instruction cycles banked toward the next TMR0 tick (same contract
+    /// as `Pic14::timer0_acc`, against this core's OPTION_REG at 0x95).
+    timer0_acc: u64,
+    /// Harness opt-in for the Timer0 model. Off unless enabled, so
+    /// gates written before the model run exactly as before.
+    timer0_enabled: bool,
+    /// A latched Timer0 overflow awaiting GIE + T0IE, separate from the
+    /// INT0 `pending` latch.
+    timer0_pending: bool,
     /// The hardware shadow-register context save (DS41364E section 7.5):
     /// W, STATUS (except TO/PD), BSR, FSR0L/H, FSR1L/H, PCLATH are
     /// snapshotted on interrupt entry and restored on RETFIE. The compiler
@@ -913,9 +1016,17 @@ impl Pic14e {
             cycles: 0,
             eeprom: Eeprom::new(),
             pending: false,
+            timer0_acc: 0,
+            timer0_enabled: false,
+            timer0_pending: false,
             shadow: [0; 8],
             cycle_debt: 0,
         }
+    }
+    /// Enable the Timer0 model for this run. Off by default, so
+    /// existing gates observe no timer unless they opt in.
+    pub fn set_timer0_enabled(&mut self, enabled: bool) {
+        self.timer0_enabled = enabled;
     }
     pub fn ram(&self) -> &[u8; 4096] {
         &self.ram
@@ -1041,7 +1152,7 @@ impl Pic14e {
         self.pending = true;
     }
     pub fn interrupt_pending(&self) -> bool {
-        self.pending
+        self.pending || self.timer0_pending
     }
     fn enter_isr(&mut self) {
         // Hardware shadow context save (DS41364E section 7.5): W,
@@ -1059,7 +1170,10 @@ impl Pic14e {
         self.pc = VECTOR;
     }
     fn interrupt_ready(&self) -> bool {
-        self.pending && self.ram[INTCON] & GIE != 0 && self.ram[INTCON] & INTE != 0
+        let intcon = self.ram[INTCON];
+        intcon & GIE != 0
+            && ((self.pending && intcon & INTE != 0)
+                || (self.timer0_pending && intcon & PIC14_T0IE != 0))
     }
     pub fn run(&mut self, max_steps: usize) -> usize {
         let mut steps = 0;
@@ -1075,12 +1189,22 @@ impl Pic14e {
         if self.cycle_debt > 0 {
             self.cycle_debt -= 1;
             self.cycles += 1;
+            self.tick_timer0(1);
             return;
         }
         if self.interrupt_ready() {
-            self.pending = false;
+            // Consume only the latches whose source is enabled, as in
+            // `Pic14::step`.
+            let intcon = self.ram[INTCON];
+            if self.pending && intcon & INTE != 0 {
+                self.pending = false;
+            }
+            if self.timer0_pending && intcon & PIC14_T0IE != 0 {
+                self.timer0_pending = false;
+            }
             self.enter_isr();
             self.cycles += 2; // vector entry; the handler runs next
+            self.tick_timer0(2);
             return;
         }
         let word = self.prog[self.pc as usize];
@@ -1092,10 +1216,42 @@ impl Pic14e {
             3 => self.exec_literal(pc, word),
             _ => unreachable!(),
         };
-        self.cycles += cost14(word, pc, next);
+        let delta = cost14(word, pc, next);
+        self.cycles += delta;
+        self.tick_timer0(delta);
         self.pc = next;
         if self.pc as usize >= self.prog.len() {
             self.halted = true;
+        }
+    }
+
+    /// Bank `delta` instruction cycles into Timer0 while the harness has
+    /// enabled the model. Same contract as `Pic14::tick_timer0`, against
+    /// this core's OPTION_REG (0x95) and TMR0 (0x15).
+    fn tick_timer0(&mut self, delta: u64) {
+        if !self.timer0_enabled {
+            self.timer0_acc = 0;
+            return;
+        }
+        let option = self.ram[PIC14E_OPTION_REG];
+        if option & 0x20 != 0 {
+            self.timer0_acc = 0;
+            return;
+        }
+        let rate = if option & 0x08 != 0 {
+            1
+        } else {
+            1u64 << ((option & 0x07) + 1)
+        };
+        self.timer0_acc += delta;
+        while self.timer0_acc >= rate {
+            self.timer0_acc -= rate;
+            let (v, overflowed) = self.ram[PIC14E_TMR0].overflowing_add(1);
+            self.ram[PIC14E_TMR0] = v;
+            if overflowed {
+                self.ram[INTCON] |= PIC14_T0IF;
+                self.timer0_pending = true;
+            }
         }
     }
 
@@ -1173,6 +1329,9 @@ impl Pic14e {
         let a = self.indirect_addr(fsr);
         let v = self.ee_store(a, v).unwrap_or(v);
         self.ram[a] = v;
+        if a == PIC14E_TMR0 {
+            self.timer0_acc = 0;
+        }
     }
     fn write_f(&mut self, f: usize, v: u8) {
         match f {
@@ -1193,6 +1352,11 @@ impl Pic14e {
                 let a = self.direct_addr(f);
                 let v = self.ee_store(a, v).unwrap_or(v);
                 self.ram[a] = v;
+                // A firmware write to TMR0 clears the prescaler
+                // (DS41364E section 21.0).
+                if a == PIC14E_TMR0 {
+                    self.timer0_acc = 0;
+                }
             }
         }
     }
@@ -1261,9 +1425,9 @@ impl Pic14e {
                 return pc + 1 + self.w as u16;
             }
             0x0062 => {
-                // OPTION: W -> OPTION_REG (0x095), written by its absolute
+                // OPTION: W -> OPTION_REG, written by its absolute
                 // address regardless of BSR.
-                self.ram[0x95] = self.w;
+                self.ram[PIC14E_OPTION_REG] = self.w;
                 return pc + 1;
             }
             0x0063 => {
@@ -2495,6 +2659,12 @@ impl Pic18 {
                 self.exec_tblrd(word);
                 pc + 2
             }
+            // TBLWT* / TBLWT*+ / TBLWT*- / TBLWT+*: the sim models no NVM
+            // write, only the TBLPTR side effect (see `exec_tblwt`).
+            0x000C | 0x000D | 0x000E | 0x000F => {
+                self.exec_tblwt(word);
+                pc + 2
+            }
             0x0100..=0x010F => {
                 self.ram[0xFE0] = (word & 0xF) as u8; // MOVLB: loads BSR
                 pc + 2
@@ -2935,6 +3105,20 @@ impl Pic18 {
         match opcode {
             0x0009 => self.set_tblptr(self.tblptr().wrapping_add(1) & 0x1F_FFFF), // TBLRD*+
             0x000A => self.set_tblptr(self.tblptr().wrapping_sub(1) & 0x1F_FFFF), // TBLRD*-
+            _ => {}
+        }
+    }
+    /// Apply one of the four `TBLWT*` forms to `TBLPTR` only: the sim
+    /// models no NVM unlock sequence and no holding-register write, so
+    /// flash and `TABLAT` stay unchanged. Pointer semantics mirror
+    /// `exec_tblrd` (`+*` pre-increments, the rest post-adjust).
+    fn exec_tblwt(&mut self, opcode: u16) {
+        if opcode == 0x000F {
+            self.set_tblptr(self.tblptr().wrapping_add(1) & 0x1F_FFFF); // TBLWT+*
+        }
+        match opcode {
+            0x000D => self.set_tblptr(self.tblptr().wrapping_add(1) & 0x1F_FFFF), // TBLWT*+
+            0x000E => self.set_tblptr(self.tblptr().wrapping_sub(1) & 0x1F_FFFF), // TBLWT*-
             _ => {}
         }
     }
