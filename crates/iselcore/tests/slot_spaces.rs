@@ -374,3 +374,83 @@ fn init_ref_to_flash_const_grounds_global() {
     assert!(s.contains("@g"), "init-ref global must be flash: {s:?}");
     assert!(s.contains("main::p"), "load out of it must be flash: {s:?}");
 }
+// epic-cc#1306: a call result used as a pointer joins its callee's
+// returns, and a function returning maybe-flash needs the fat form.
+#[test]
+fn call_result_of_mixed_return_is_maybe_flash() {
+    let m = parse(
+        "const s i8\n\
+         global buf i8\n\
+         global flag i8\n\
+         fn get(ptr) ()\n\
+           block entry:\n\
+             %c = load i8 @flag\n\
+             %m = select i1 %c, ptr @s, ptr @buf\n\
+             ret ptr %m\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %r = call ptr @get()\n\
+             %v = load i8 %r\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let prov = iselcore::flash_provenance(&m);
+    let (flash, mixed, fat) = iselcore::flash_slot_spaces_ex(&m, &r, &prov, |n| n == "s");
+    assert!(
+        !flash.contains("main::r"),
+        "joined return must not be flash"
+    );
+    assert!(
+        mixed.contains("get::m"),
+        "joined select must be maybe-flash"
+    );
+    assert!(
+        mixed.contains("main::r"),
+        "its caller slot must be maybe-flash"
+    );
+    assert!(fat.contains("get"), "its function must return fat");
+    assert!(!fat.contains("main"), "void main returns nothing fat");
+}
+
+// An integer call result never becomes a candidate: no tag, no width.
+#[test]
+fn integer_call_result_stays_out_of_maybe_flash() {
+    let m = parse(
+        "fn id(i16) (x=i16)\n\
+           block entry:\n\
+             ret i16 %x\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %r = call i16 @id(i16 1)\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let prov = iselcore::flash_provenance(&m);
+    let (_, mixed, fat) = iselcore::flash_slot_spaces_ex(&m, &r, &prov, |_| false);
+    assert!(
+        !mixed.contains("main::r"),
+        "integer result must not widen: {mixed:?}"
+    );
+    assert!(!fat.contains("id"), "integer return must not be fat");
+}
+
+// A freeze copies its operand whole, tag included.
+#[test]
+fn freeze_of_mixed_select_is_maybe_flash() {
+    let m = parse(
+        "const s i8\n\
+         global buf i8\n\
+         global flag i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %c = load i8 @flag\n\
+             %m = select i1 %c, ptr @s, ptr @buf\n\
+             %f = freeze ptr %m\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let prov = iselcore::flash_provenance(&m);
+    let (flash, mixed, _) = iselcore::flash_slot_spaces_ex(&m, &r, &prov, |n| n == "s");
+    assert!(!flash.contains("main::f"), "frozen join must not be flash");
+    assert!(mixed.contains("main::f"), "frozen join must be maybe-flash");
+}

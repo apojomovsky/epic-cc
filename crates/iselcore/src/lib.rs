@@ -2062,17 +2062,20 @@ pub fn flash_slot_spaces(
 /// `flash_slot_spaces` plus the maybe-flash slots: those that can hold a
 /// flash table address on some path and a RAM (or unknown) one on another,
 /// so no single space applies (epic-cc#1284). Loads of such a slot must
-/// never be dereferenced as RAM.
+/// never be dereferenced as RAM. The third set names the functions whose
+/// returns need the 3-byte fat form: any returned value may carry flash,
+/// so every pointer return there writes the tag (epic-cc#1306).
 pub fn flash_slot_spaces_ex(
     m: &Module,
     resolved: &PtrResolution,
     prov: &FlashProvenance,
     is_flash_const: impl Fn(&str) -> bool,
-) -> (HashSet<String>, HashSet<String>) {
+) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
     let is_func = |n: &str| m.funcs.iter().any(|f| f.name == n);
     // Candidate slots: plain ptr params plus every reg that can hold an
-    // address (ptr phis/selects, geps, ptr loads). byval/sret params hold
-    // caller copies, call results and inttoptr/va_arg/alloca slots hold
+    // address (ptr phis/selects, geps, ptr loads, freezes, call results
+    // used in pointer position). byval/sret params hold caller copies,
+    // integer-only call results and inttoptr/va_arg/alloca slots hold
     // RAM or runtime integers, so none of those are candidates.
     let mut cands: HashSet<String> = HashSet::new();
     for f in &m.funcs {
@@ -2096,6 +2099,9 @@ pub fn flash_slot_spaces_ex(
                     Inst::Load(l) if l.ptr_ty => {
                         cands.insert(ssa_key(&f.name, &l.dst));
                     }
+                    Inst::Freeze(fr) => {
+                        cands.insert(ssa_key(&f.name, &fr.dst));
+                    }
                     _ => {}
                 }
             }
@@ -2104,6 +2110,79 @@ pub fn flash_slot_spaces_ex(
     for g in &m.globals {
         if !g.is_const {
             cands.insert(format!("@{}", g.name));
+        }
+    }
+    // A call result used in pointer position holds an address on return
+    // (epic-cc#1306): a GEP base, a load/store address operand, a memcpy
+    // side, a pointer call argument, a returned value, or a ptr
+    // phi/select/freeze arm. Integer-only results stay out, so integer
+    // math never widens to a tagged slot.
+    for f in &m.funcs {
+        let mut ptr_used: HashSet<String> = HashSet::new();
+        let mark_many = |vs: Vec<&ir::Val>, set: &mut HashSet<String>| {
+            for v in vs {
+                if let ir::Val::Reg(r) = v {
+                    set.insert(r.clone());
+                }
+            }
+        };
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Gep(g) => {
+                        if let GepBase::Reg(r) = &g.base {
+                            ptr_used.insert(r.clone());
+                        }
+                    }
+                    Inst::Load(l) => {
+                        if let Some(r) = l.ptr.strip_prefix('%') {
+                            ptr_used.insert(r.to_string());
+                        }
+                    }
+                    Inst::Store(s) => {
+                        if let Some(r) = s.ptr.strip_prefix('%') {
+                            ptr_used.insert(r.to_string());
+                        }
+                    }
+                    Inst::Memcpy(mc) => {
+                        mark_many(vec![&mc.src, &mc.dst], &mut ptr_used);
+                    }
+                    Inst::Call(c) => {
+                        let vs: Vec<&ir::Val> = c
+                            .args
+                            .iter()
+                            .filter(|a| a.ty.is_none())
+                            .map(|a| &a.val)
+                            .collect();
+                        mark_many(vs, &mut ptr_used);
+                    }
+                    Inst::Ret(Some((_, v)), _) => {
+                        mark_many(vec![v], &mut ptr_used);
+                    }
+                    Inst::Phi(p) if p.ptr => {
+                        let vs: Vec<&ir::Val> = p.incoming.iter().map(|(v, _)| v).collect();
+                        mark_many(vs, &mut ptr_used);
+                    }
+                    Inst::Select(s) if s.ptr => {
+                        mark_many(vec![&s.a, &s.b], &mut ptr_used);
+                    }
+                    Inst::Freeze(fr) => {
+                        mark_many(vec![&fr.val], &mut ptr_used);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Call(c) = i {
+                    if let Some(d) = &c.dst {
+                        if ptr_used.contains(d) {
+                            cands.insert(ssa_key(&f.name, d));
+                        }
+                    }
+                }
+            }
         }
     }
     // Slots whose bytes ARE an object, never an address: stores through
@@ -2268,6 +2347,10 @@ pub fn flash_slot_spaces_ex(
                             }
                         }
                     }
+                    Inst::Freeze(fr) => {
+                        // A freeze copies its operand whole, tag included.
+                        push(ssa_key(&f.name, &fr.dst), val_writer(&fr.val, &f.name));
+                    }
                     Inst::Load(l) if l.ptr_ty => {
                         let key = ssa_key(&f.name, &l.dst);
                         if let Some(g) = l.ptr.strip_prefix('@') {
@@ -2407,6 +2490,49 @@ pub fn flash_slot_spaces_ex(
                                         }
                                     }
                                 }
+                                // A call result holds what the callee
+                                // returns: each returned value writes the
+                                // dst the same way an argument writes a
+                                // param (epic-cc#1306). Unknown callees
+                                // prune to RAM; non-pointer dsts never
+                                // became candidates, so gating on `cands`
+                                // keeps integer math out of the sets.
+                                if let Some(d) = &c.dst {
+                                    let key = ssa_key(&f.name, d);
+                                    if cands.contains(&key) {
+                                        for b in &callee.blocks {
+                                            for i in &b.insts {
+                                                if let Inst::Ret(Some((_, v)), _) = i {
+                                                    push(key.clone(), val_writer(v, &callee.name));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(d) = &c.dst {
+                                let key = ssa_key(&f.name, d);
+                                if cands.contains(&key) {
+                                    push(key, SlotWriter::Bad);
+                                }
+                            }
+                        } else if let Some(d) = &c.dst {
+                            // An indirect site may reach any candidate: the
+                            // dst joins every candidate's returns.
+                            let key = ssa_key(&f.name, d);
+                            if cands.contains(&key) {
+                                for cand in &c.callees {
+                                    if let Some(callee) = m.funcs.iter().find(|x| x.name == *cand) {
+                                        for b in &callee.blocks {
+                                            for i in &b.insts {
+                                                if let Inst::Ret(Some((_, v)), _) = i {
+                                                    push(key.clone(), val_writer(v, &callee.name));
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        push(key.clone(), SlotWriter::Bad);
+                                    }
+                                }
                             }
                         }
                     }
@@ -2538,7 +2664,57 @@ pub fn flash_slot_spaces_ex(
         }
     }
     let mixed: HashSet<String> = may.difference(&flash).cloned().collect();
-    (flash, mixed)
+    // Functions whose returns need the 3-byte fat form (epic-cc#1306):
+    // any returned value may carry flash, so every pointer return of
+    // such a function writes address bytes plus the tag. Seeding on a
+    // mixed return alone would leave a RAM return of the same function
+    // writing two bytes behind a stale tag, so the seed covers every
+    // may-flash return and every return of an indirectly co-reachable
+    // function shares it.
+    let val_may_flash = |v: &ir::Val, func: &str| -> bool {
+        match v {
+            ir::Val::Global(n) => !is_func(n) && is_flash_const(n),
+            ir::Val::Reg(r) => {
+                let key = ssa_key(func, r);
+                may.contains(&key) || prov.flash.contains(&key)
+            }
+            ir::Val::Const(_) => false,
+        }
+    };
+    let mut ret_fat: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        let fat = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Ret(Some((_, v)), _) if val_may_flash(v, &f.name)));
+        if fat {
+            ret_fat.insert(f.name.clone());
+        }
+    }
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for f in &m.funcs {
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let Inst::Call(c) = i {
+                        if c.dst.is_none() || c.callees.is_empty() {
+                            continue;
+                        }
+                        if c.callees.iter().any(|t| ret_fat.contains(t)) {
+                            for t in &c.callees {
+                                if ret_fat.insert(t.clone()) {
+                                    grew = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (flash, mixed, ret_fat)
 }
 
 /// Mark the results of pointer loads from maybe-flash slots as mixed

@@ -234,29 +234,42 @@ fn mixed_global_slot_store_is_refused() {
 }
 
 #[test]
-#[should_panic(expected = "maybe-flash address")]
-fn mixed_phi_load_is_refused() {
-    // A phi joining flash and RAM has no single address space: loads
-    // through it stay refused (epic-cc#1099).
+fn mixed_phi_load_reads_both_spaces() {
+    // A phi joining a table address and a RAM address carries its space
+    // in the tag: each incoming edge writes address bytes plus the tag,
+    // and the deref dispatches on it (epic-cc#1306).
     let m = with_bytes(
         parse(
-            "const c i8\nglobal buf i8\nglobal out i8\n\
-             fn main(void) ()\n  block entry:\n    %p = phi ptr @c entry @buf entry\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+            "const c i8\nglobal buf i8\nglobal flag i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %f = load i8 @flag\n    br i1 %f t f\n  block t:\n    br merge\n  block f:\n    br merge\n  block merge:\n    %p = phi ptr @c t @buf f\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
         ),
         "c",
         b"P",
     );
-    let _ = select(
+    let asm = select(
         &PIC18F4550,
         &m,
         &addrs(&[
             ("buf", 0x10),
-            ("out", 0x11),
-            ("main::p", 0x12),
-            ("main::v", 0x14),
+            ("flag", 0x11),
+            ("out", 0x12),
+            ("main::f", 0x13),
+            ("main::p", 0x14),
+            ("main::v", 0x17),
         ]),
         None,
     );
+    assert!(asm.contains("TBLRD*"), "flash arm must read flash:\n{asm}");
+    for (f, want) in [(0u8, b'B'), (1u8, b'P')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x11] = f;
+        p.ram_mut()[0x10] = b'B';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x12], want, "arm f={f} must read its space");
+    }
 }
 
 #[test]
@@ -336,10 +349,10 @@ fn flash_walk_reg_store_into_ram_is_refused() {
 }
 
 #[test]
-#[should_panic(expected = "maybe-flash address")]
-fn mixed_select_forwarded_to_ram_param_is_refused() {
-    // A select joining flash and RAM forwarded to a callee would read
-    // data memory at a flash address on one arm: refuse (epic-cc#1099).
+fn mixed_select_forwarded_to_mixed_param_reads_both_spaces() {
+    // A select joining flash and RAM forwarded to a callee: the call
+    // passes all three bytes, and the callee derefs through the tag
+    // (epic-cc#1306).
     let m = with_bytes(
         parse(
             "const s i8\nglobal buf i8\nglobal flag i8\nglobal out i8\n\
@@ -349,7 +362,7 @@ fn mixed_select_forwarded_to_ram_param_is_refused() {
         "s",
         b"S",
     );
-    let _ = select(
+    let asm = select(
         &PIC18F4550,
         &m,
         &addrs(&[
@@ -358,65 +371,105 @@ fn mixed_select_forwarded_to_ram_param_is_refused() {
             ("out", 0x12),
             ("main::c", 0x13),
             ("main::m", 0x14),
-            ("use::p", 0x16),
-            ("use::v", 0x18),
+            ("use::p", 0x17),
+            ("use::v", 0x1A),
         ]),
         None,
     );
+    assert!(asm.contains("TBLRD*"), "flash arm must read flash:\n{asm}");
+    for (f, want) in [(0u8, b'B'), (1u8, b'S')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x11] = f;
+        p.ram_mut()[0x10] = b'B';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x12], want, "arm f={f} must read its space");
+    }
 }
 
 #[test]
-#[should_panic(expected = "maybe-flash address")]
-fn mixed_select_stored_to_ram_is_refused() {
-    // Storing a flash-or-RAM address into a RAM slot leaves no single
-    // space for later reads: refuse (epic-cc#1099).
+fn mixed_select_stored_to_mixed_global_reads_both_spaces() {
+    // A select joining flash and RAM stored into a shared global slot:
+    // the store writes address bytes plus the tag, and the load back
+    // dispatches on it (epic-cc#1306).
     let m = with_bytes(
         parse(
-            "const s i8\nglobal buf i8\nglobal flag i8\nglobal g i16\n\
-             fn main(void) ()\n  block entry:\n    %c = load i8 @flag\n    %m = select i1 %c, ptr @s, ptr @buf\n    store ptr %m @g\n    ret void\n",
+            "const s i8\nglobal buf i8\nglobal flag i8\nglobal g i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %c = load i8 @flag\n    %m = select i1 %c, ptr @s, ptr @buf\n    store ptr %m @g\n    %p = load ptr @g\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
         ),
         "s",
         b"S",
     );
-    let _ = select(
+    let asm = select(
         &PIC18F4550,
         &m,
         &addrs(&[
             ("buf", 0x10),
             ("flag", 0x11),
             ("g", 0x12),
-            ("main::c", 0x14),
-            ("main::m", 0x15),
+            ("out", 0x15),
+            ("main::c", 0x16),
+            ("main::m", 0x17),
+            ("main::p", 0x1A),
+            ("main::v", 0x1D),
         ]),
         None,
     );
+    assert!(asm.contains("TBLRD*"), "flash arm must read flash:\n{asm}");
+    for (f, want) in [(0u8, b'B'), (1u8, b'S')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x11] = f;
+        p.ram_mut()[0x10] = b'B';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x15], want, "arm f={f} must read its space");
+    }
 }
 
 #[test]
-#[should_panic(expected = "maybe-flash address")]
-fn mixed_select_returned_is_refused() {
-    // A returned flash-or-RAM address would read back through the
-    // caller's RAM slot: refuse (epic-cc#1099).
+fn mixed_select_returned_reads_both_spaces() {
+    // A returned flash-or-RAM address travels fat: the callee writes
+    // address bytes plus the tag to the retval region, the caller
+    // copies all three into its slot, and the deref dispatches on the
+    // tag (epic-cc#1306).
     let m = with_bytes(
         parse(
-            "const s i8\nglobal buf i8\nglobal flag i8\n\
+            "const s i8\nglobal buf i8\nglobal flag i8\nglobal out i8\n\
              fn get(ptr) ()\n  block entry:\n    %c = load i8 @flag\n    %m = select i1 %c, ptr @s, ptr @buf\n    ret ptr %m\n\
-             fn main(void) ()\n  block entry:\n    ret void\n",
+             fn main(void) ()\n  block entry:\n    %r = call ptr @get()\n    %v = load i8 %r\n    store i8 %v @out\n    ret void\n",
         ),
         "s",
         b"S",
     );
-    let _ = select(
+    let asm = select(
         &PIC18F4550,
         &m,
         &addrs(&[
             ("buf", 0x10),
             ("flag", 0x11),
-            ("get::c", 0x12),
-            ("get::m", 0x13),
+            ("out", 0x12),
+            ("get::c", 0x13),
+            ("get::m", 0x14),
+            ("main::r", 0x17),
+            ("main::v", 0x1A),
         ]),
         None,
     );
+    assert!(asm.contains("TBLRD*"), "flash arm must read flash:\n{asm}");
+    for (f, want) in [(0u8, b'B'), (1u8, b'S')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x11] = f;
+        p.ram_mut()[0x10] = b'B';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x12], want, "arm f={f} must read its space");
+    }
 }
 
 #[test]
@@ -475,16 +528,15 @@ fn int_laundered_through_second_global_is_refused() {
 }
 
 #[test]
-#[should_panic(expected = "maybe-flash address")]
-fn mixed_global_pointer_load_is_refused() {
+fn mixed_global_pointer_load_reads_both_spaces() {
     // epic-cc#1284: `const char *g = "lit"; g = buf;` holds a flash
     // address (initializer) on one path and a RAM one on another. The
-    // loaded pointer has no single space: refuse the dereference instead
-    // of reading RAM at a table address.
+    // global slot carries the tag: the initializer sets flash, the RAM
+    // store sets RAM, and the load back dispatches on it (epic-cc#1306).
     let mut m = with_bytes(
         parse(
-            "const c i8\nglobal g i16\nglobal buf i8\nglobal out i8\n\
-             fn main(void) ()\n  block entry:\n    %q = gep @buf +0\n    store ptr %q @g\n    %p = load ptr @g\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+            "const c i8\nglobal g i16\nglobal buf i8\nglobal flag i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %f = load i8 @flag\n    br i1 %f ram join\n  block ram:\n    %q = gep @buf +0\n    store ptr %q @g\n    br join\n  block join:\n    %p = load ptr @g\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
         ),
         "c",
         b"P",
@@ -495,19 +547,32 @@ fn mixed_global_pointer_load_is_refused() {
             g.refs = vec![(0, "c".to_string(), 0)];
         }
     }
-    let _ = select(
+    let asm = select(
         &PIC18F4550,
         &m,
         &addrs(&[
             ("g", 0x10),
-            ("buf", 0x12),
-            ("out", 0x13),
-            ("main::q", 0x14),
-            ("main::p", 0x16),
-            ("main::v", 0x18),
+            ("buf", 0x13),
+            ("flag", 0x14),
+            ("out", 0x15),
+            ("main::f", 0x16),
+            ("main::q", 0x17),
+            ("main::p", 0x19),
+            ("main::v", 0x1C),
         ]),
         None,
     );
+    assert!(asm.contains("TBLRD*"), "flash arm must read flash:\n{asm}");
+    for (f, want) in [(0u8, b'P'), (1u8, b'B')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x14] = f;
+        p.ram_mut()[0x13] = b'B';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x15], want, "arm f={f} must read its space");
+    }
 }
 
 #[test]

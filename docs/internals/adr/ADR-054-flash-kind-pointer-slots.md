@@ -1,7 +1,8 @@
 # ADR-054 -- PIC18 pointer slots carry a static flash or RAM address space
 
-**Status:** Accepted 2026-10-14 (oracle decision on `epic-cc#1119`)<br>
-**Decides:** `epic-cc#1119`, `epic-cc#1092`<br>
+**Status:** Accepted 2026-10-14 (oracle decision on `epic-cc#1119`;
+amended 2026-10-17 by `epic-cc#1306`)<br>
+**Decides:** `epic-cc#1119`, `epic-cc#1092`, `epic-cc#1306`<br>
 **Evidence:** `crates/isel-pic18/tests/flash_slots.rs`,
 `crates/iselcore/tests/slot_spaces.rs`,
 `crates/driver/tests/flash_walk_e2e.rs`
@@ -74,3 +75,29 @@ into a RAM global did the same.
   flash saving; the staging measurements showed no win.
 - **Keeping the refusal.** Correct but rejects working programs: the
   menu-demo shape and the global-slot store shape both compile now.
+
+## Runtime-tagged fallback (epic-cc#1306)
+
+Static spaces stay the default: a pointer proven to one space keeps its
+2-byte slot with no per-deref branch. Only maybe-flash slots get the
+3-byte tagged form (tag plus 16-bit address, tag 0 for RAM and 1 for
+flash), so mixed cases refused before now compile on PIC18 only.
+Call results used as pointers and freezes join the slot proof, and a
+function returning maybe-flash on any path writes every pointer
+return fat, so no RAM return beside a mixed one leaves a stale tag.
+The tag is set at every join: stores into shared global slots
+(direct or folded, value plus tag), phi incoming edges, select arms,
+freezes, call arguments into mixed params, and mixed global
+initializers (flash when the initializer names a table). Dereference,
+store-through (whose flash arm traps: a ROM write has no lowering),
+memcpy source, and call argument and return paths dispatch on the tag
+with identical result bytes either way.
+A directly proven flash value into a mixed slot keeps its refusal on
+the store, call argument, return, and freeze paths: the fallback
+serves join values and initializers, not a statically known ROM store.
+Proven single-space pointers change neither size nor code: the size
+ladder measures byte-identical branch versus master on every bench,
+and benches carry no mixed pointer to widen. Deferred, each filed as
+an issue under epic-cc#1306: int-laundered addresses (no tag survives
+`ptrtoint`), PIC14 (no `TBLRD` path there), and memcpy into a
+maybe-flash destination (a raw byte copy has no tag source).
