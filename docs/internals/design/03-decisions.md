@@ -53,6 +53,7 @@ one-line index entry here, e.g.:
 - ADR-053: Bare bit names as section-placed `_Bool` entities (PIC14 headers emit `.epic.bit` declarations, backend lowers to BSF/BCF/BTFSC; PIC18 needs a binding rule first), 2026-10-14
 - ADR-054: PIC18 pointer slots carry a static flash or RAM address space (whole-program slot proof, TBLPTR slot-seed loads, RAM copies for mixed; decides #1119 and #1092), 2026-10-14
 - ADR-055: PIC18 debugger rows come from the assembler's final layout (opaque loc ids through far-branch splices and PCL pads; `--device` selects `Pic18Target`; step-over-call limit filed as follow-up), 2026-10-17
+- ADR-056: PIC12 baseline debugger reuses the PIC14 raw-text row walk (flat physical memory surface, `ebx` reads PCL with machine-semantics writes, volatile fixture keeps homes fresh; decides #1313), 2026-10-17
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 

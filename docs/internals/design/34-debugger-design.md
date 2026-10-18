@@ -257,7 +257,36 @@ gdb decodes target bytes as x86 to step over calls, so `next` over
 an outlined `RCALL` site steps into no-line-info code; filed as a
 follow-up, shared with PIC14.
 
-## 6. Non-goals for this document
+## 6. PIC14E extension (epic-cc#1311)
+
+The PIC14 path now runs on enhanced mid-range (`p16f1937` proven):
+the var-table join and the raw-text line-row walk are reused
+unchanged (word addresses, the assembler never moves code), and two
+pieces are core-specific. `Pic14e` grew the phase-3 control surface
+(`run_until` on the word PC, flat `read/write_mem` over the 4 KiB
+image, `STATUS`/`BSR`/`FSR0` views). `epic-cc-gdbserver` serves a
+`Pic14eTarget` behind `--device` with the same i386 session mapping
+(word PC in `eip`, BSR in `ebx`). One latent isel bug surfaced here:
+the header `None` count did not track the doubled FSR/INDF equ
+lines, shifting every line row five words early; the count now sizes
+from the emitted header. The `next`-over-call limit carries over.
+
+## 7. PIC12 baseline extension (epic-cc#1313, ADR-056)
+
+The PIC14 path runs on the baseline core (`p12f509` proven): the
+var-table join is reused unchanged, and the line rows come from the
+same raw-text walk, since the baseline assembler moves no code after
+isel (no PIC18-style final-layout threading needed). `PicBaseline`
+grew the phase-3 control surface (`run_until` on the word PC, flat
+physical `read/write_mem`, `STATUS`/`FSR`/`PCL` views, `set_pcl` with
+machine semantics). `epic-cc-gdbserver` serves a `PicBaselineTarget`
+behind `--device` with the same i386 session mapping (word PC in
+`eip`, PCL in `ebx`). One fixture lesson, shared with the other
+cores: the backend forwards a plain global past its home store, so the
+acceptance fixture keeps its globals volatile and stopped-at lines
+print fresh values.
+
+## 8. Non-goals for this document
 
 - Real hardware debugging (ICSP + Microchip's debug-executive protocol,
   PICkit/ICD-class tools). Materially different problem, largely
