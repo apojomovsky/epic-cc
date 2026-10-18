@@ -209,8 +209,8 @@ fn shadow_slot_technique_restores_w_status_and_bank_across_a_region_switch() {
     );
     assert_eq!(
         p.status(),
-        status_before,
-        "STATUS (bank bits + Z/C/DC) fully restored despite the ISR switching banks"
+        (status_before & !0x08) | 0x10,
+        "STATUS restored by the ISR, then the main-line SLEEP applied its own TO-set/PD-clear on top"
     );
     assert_eq!(
         p.bank(),
