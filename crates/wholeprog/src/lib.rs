@@ -1,11 +1,13 @@
-//! Whole-program validation and dead-global pruning for the PIC8 pipeline:
-//! checks what `llvm-link` lets through on the merged module, then drops
-//! `internal` globals nothing references so alloc never reserves RAM for
-//! them. Expects N translation units already merged into one `.ll` by
-//! `llvm-link` (docs/internals/design/31 §7); this stage does not link.
+//! Whole-program validation, dead-global pruning, and dead-home stripping
+//! for the PIC8 pipeline: checks what `llvm-link` lets through on the merged
+//! module, then drops `internal` globals nothing references so alloc never
+//! reserves RAM for them, then drops unread params and pure dead defs so
+//! uncalled homes never tile a frame. Expects N translation units already
+//! merged into one `.ll` by `llvm-link` (docs/internals/design/31 §7);
+//! this stage does not link.
 
 use ir::{collect_global_vals, GepBase, Inst, Module, SrcLoc, Val};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Validates the merged module and hands it on.
 ///
@@ -161,7 +163,7 @@ fn code_referenced_globals(m: &Module) -> BTreeSet<String> {
             for inst in &b.insts {
                 let mut vals = HashSet::new();
                 collect_global_vals(inst, &mut vals);
-                used.extend(vals.into_iter());
+                used.extend(vals);
                 // `collect_global_vals` skips these shapes (it is shared
                 // with legalize, whose view must not change); the Val and
                 // pointer-string operands are read here instead.
@@ -962,6 +964,185 @@ fn rename_reg_uses(f: &mut ir::Func, old: &str, new: &str) {
     }
 }
 
+/// Drops homes the backends never read (epic-cc#1338): unread callee
+/// params with their direct-site args, and pure defs with no uses.
+/// Fewer param slots lets a single-site callee dip into its caller
+/// frame, and fewer temp slots lowers the frame high-water mark.
+pub fn strip_dead(mut m: Module) -> Module {
+    let taken = address_taken(&m);
+    loop {
+        let params = strip_dead_params(&mut m, &taken);
+        let defs = strip_dead_defs(&mut m);
+        if !params && !defs {
+            return m;
+        }
+    }
+}
+
+/// Functions no indirect call can reach: every `Val::Global` naming a
+/// defined function (the `fill_indirect_callees` set), plus const refs
+/// and `module_asm` mentions. Computed once: later sweeps erase dead
+/// mentions, and a shrinking set would unprotect a taken function.
+fn address_taken(m: &Module) -> HashSet<String> {
+    let defined: HashSet<&str> = m.funcs.iter().map(|f| f.name.as_str()).collect();
+    let mut taken: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let mut vals = HashSet::new();
+                ir::collect_global_vals(inst, &mut vals);
+                taken.extend(vals.into_iter().filter(|v| defined.contains(v.as_str())));
+                // Indirect candidates legalize resolved (ISR `_isr` copies
+                // included): no `Val::Global` names them after the store
+                // rewrite, so the candidate lists protect them instead.
+                if let Inst::Call(c) = inst {
+                    taken.extend(
+                        c.callees
+                            .iter()
+                            .filter(|v| defined.contains(v.as_str()))
+                            .cloned(),
+                    );
+                }
+            }
+        }
+    }
+    for g in &m.globals {
+        for (_, target, _) in &g.refs {
+            if defined.contains(target.as_str()) {
+                taken.insert(target.clone());
+            }
+        }
+    }
+    let mut asm_taken = BTreeSet::new();
+    for entry in &m.module_asm {
+        mark_text_refs(&defined, &mut asm_taken, entry);
+    }
+    taken.extend(asm_taken);
+    taken
+}
+
+/// One dead-param sweep against a frozen taken set. A param strips when
+/// the body never reads it and the function has a body, is not
+/// `main`/ISR/naked, is not a runtime routine, and is not address-taken.
+/// Direct sites rewrite positionally; byval/sret params stay, and a site
+/// whose arity mismatches pins the function for this sweep.
+fn strip_dead_params(m: &mut Module, taken: &HashSet<String>) -> bool {
+    let mut changed = false;
+    for fi in 0..m.funcs.len() {
+        let (fname, named, variadic, dead) = {
+            let f = &m.funcs[fi];
+            if f.name == "main"
+                || f.isr
+                || f.naked
+                || f.blocks.is_empty()
+                || f.unreachable_body
+                || ir::is_runtime_routine(&f.name)
+                || taken.contains(&f.name)
+            {
+                continue;
+            }
+            let mut reads = HashSet::new();
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    reads.extend(ir::read_vals(inst));
+                }
+            }
+            let dead: Vec<usize> = f
+                .params
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.byval.is_none() && !p.sret && !reads.contains(&p.name))
+                .map(|(i, _)| i)
+                .collect();
+            if dead.is_empty() {
+                continue;
+            }
+            (f.name.clone(), f.params.len(), f.variadic, dead)
+        };
+        let pinned = m.funcs.iter().any(|g| {
+            g.blocks.iter().any(|b| {
+                b.insts.iter().any(|inst| match inst {
+                    Inst::Call(c) if c.callees.is_empty() && c.func == fname => {
+                        c.args.len() != named && !(variadic && c.args.len() > named)
+                    }
+                    _ => false,
+                })
+            })
+        });
+        if pinned {
+            continue;
+        }
+        m.funcs[fi].params = m.funcs[fi]
+            .params
+            .drain(..)
+            .enumerate()
+            .filter(|(i, _)| !dead.contains(i))
+            .map(|(_, p)| p)
+            .collect();
+        for g in &mut m.funcs {
+            for b in &mut g.blocks {
+                for inst in &mut b.insts {
+                    if let Inst::Call(c) = inst {
+                        if c.callees.is_empty() && c.func == fname {
+                            for &i in dead.iter().rev() {
+                                if i < c.args.len() {
+                                    c.args.remove(i);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// One dead-def sweep. A def strips when nothing reads it and it is
+/// pure ALU (`Bin`, `Trunc`, `Zext`, `Sext`, `Icmp`, `Select`,
+/// `Freeze`): no memory, control, or flag reader observes the missing
+/// write. Loads stay (banking pairs with their emission), as do calls,
+/// phis, allocas, and pointer makers.
+fn strip_dead_defs(m: &mut Module) -> bool {
+    let mut changed = false;
+    for f in &mut m.funcs {
+        loop {
+            let mut uses: HashMap<String, usize> = HashMap::new();
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    for v in ir::read_vals(inst) {
+                        *uses.entry(v).or_default() += 1;
+                    }
+                }
+            }
+            let mut struck = false;
+            for b in &mut f.blocks {
+                let before = b.insts.len();
+                b.insts.retain(|inst| {
+                    let dst = match inst {
+                        Inst::Bin(q) => Some(&q.dst),
+                        Inst::Trunc(t) => Some(&t.dst),
+                        Inst::Zext(z) => Some(&z.dst),
+                        Inst::Sext(x) => Some(&x.dst),
+                        Inst::Icmp(c) => Some(&c.dst),
+                        Inst::Select(s) => Some(&s.dst),
+                        Inst::Freeze(fr) => Some(&fr.dst),
+                        _ => None,
+                    };
+                    !dst.is_some_and(|d| uses.get(d).is_none_or(|&n| n == 0))
+                });
+                struck |= b.insts.len() != before;
+            }
+            if !struck {
+                break;
+            }
+            changed = true;
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1243,5 +1424,164 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(terms, vec![zext_dst]);
+    }
+
+    /// Unread params drop out of the signature and their args drop out
+    /// of every direct site: the memcpy shape (three dead params, one
+    /// direct caller) loses all six homes.
+    #[test]
+    fn dead_params_and_args_strip() {
+        let m = ir::parse(
+            "fn callee(void) (0=i16, 1=ptr, 2=i8)\n\
+             block 0:\n\
+             ret void\n\
+             fn main(void) ()\n\
+             block 0:\n\
+             call void @callee(i16 32, @g, i8 1)\n\
+             ret void\n",
+        );
+        let m = strip_dead(m);
+        let callee = m.funcs.iter().find(|f| f.name == "callee").unwrap();
+        assert!(callee.params.is_empty());
+        let site = m
+            .funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .find_map(|i| match i {
+                ir::Inst::Call(c) if c.func == "callee" => Some(c),
+                _ => None,
+            })
+            .expect("direct site survives");
+        assert!(site.args.is_empty());
+    }
+
+    /// A read param keeps its slot while a dead neighbor strips: the
+    /// surviving arg stays aligned with the surviving param.
+    #[test]
+    fn live_param_keeps_args_aligned() {
+        let m = ir::parse(
+            "fn callee(void) (0=i16, 1=i16)\n\
+             block 0:\n\
+             store volatile i16 %0 @g\n\
+             ret void\n\
+             fn main(void) ()\n\
+             block 0:\n\
+             call void @callee(i16 7, i16 9)\n\
+             ret void\n",
+        );
+        let m = strip_dead(m);
+        let callee = m.funcs.iter().find(|f| f.name == "callee").unwrap();
+        assert_eq!(callee.params.len(), 1);
+        assert_eq!(callee.params[0].name, "0");
+        let site = m
+            .funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .find_map(|i| match i {
+                ir::Inst::Call(c) if c.func == "callee" => Some(c),
+                _ => None,
+            })
+            .expect("direct site survives");
+        assert_eq!(site.args.len(), 1);
+        assert!(matches!(&site.args[0].val, ir::Val::Const(7)));
+    }
+
+    /// An address-taken function keeps unread params: an indirect site
+    /// still passes the full arity, so the signature must not narrow.
+    #[test]
+    fn address_taken_keeps_dead_params() {
+        let m = ir::parse(
+            "fn cb(void) (0=i16)\n\
+             block 0:\n\
+             ret void\n\
+             fn sink(void) (p=ptr)\n\
+             block 0:\n\
+             ret void\n\
+             fn main(void) ()\n\
+             block 0:\n\
+             call void @sink(@cb)\n\
+             ret void\n",
+        );
+        let m = strip_dead(m);
+        let cb = m.funcs.iter().find(|f| f.name == "cb").unwrap();
+        assert_eq!(cb.params.len(), 1);
+    }
+
+    /// An indirect candidate keeps unread params: the site passes full
+    /// arity, and only the candidate list names the copy once the store
+    /// rewrite leaves the original spelling behind.
+    #[test]
+    fn indirect_callee_keeps_dead_params() {
+        let mut m = ir::parse(
+            "fn f_isr(void) (0=i16, 1=i16)\n\
+             block 0:\n\
+             ret void\n\
+             fn main(void) ()\n\
+             block 0:\n\
+             call void @f_isr(i16 7, i16 9)\n\
+             ret void\n",
+        );
+        for f in &mut m.funcs {
+            for b in &mut f.blocks {
+                for inst in &mut b.insts {
+                    if let ir::Inst::Call(c) = inst {
+                        c.func = "0".to_string();
+                        c.callees = vec!["f_isr".to_string()];
+                    }
+                }
+            }
+        }
+        let m = strip_dead(m);
+        let copy = m.funcs.iter().find(|f| f.name == "f_isr").unwrap();
+        assert_eq!(copy.params.len(), 2);
+        let site = m
+            .funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .find_map(|i| match i {
+                ir::Inst::Call(c) => Some(c),
+                _ => None,
+            })
+            .expect("indirect site survives");
+        assert_eq!(site.args.len(), 2);
+    }
+
+    /// Pure defs with no uses strip and orphan their operands: the dead
+    /// chain collapses, while the fused loop latch compare stays (the
+    /// branch still reads it) along with the param it reads.
+    #[test]
+    fn dead_defs_cascade_and_fused_latch_stays() {
+        let m = ir::parse(
+            "global g i16\n\
+             fn f(void) (0=i16)\n\
+             block 0:\n\
+             %1 = add i16 %0 1\n\
+             %2 = add i16 %1 2\n\
+             %3 = icmp eq i16 %0 32\n\
+             br i1 %3 1 1\n\
+             block 1:\n\
+             store volatile i16 %0 @g\n\
+             ret void\n\
+             fn main(void) ()\n\
+             block 0:\n\
+             ret void\n",
+        );
+        let m = strip_dead(m);
+        let f = m.funcs.iter().find(|f| f.name == "f").unwrap();
+        let bins: Vec<_> = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, ir::Inst::Bin(_)))
+            .collect();
+        assert!(bins.is_empty());
+        assert!(f.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(
+            i,
+            ir::Inst::Icmp(c) if c.dst == "3"
+        )));
+        assert_eq!(f.params.len(), 1);
     }
 }

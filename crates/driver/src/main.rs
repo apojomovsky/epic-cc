@@ -525,6 +525,13 @@ fn main() {
     } else {
         legalize::legalize_for_core(m, device.core)
     };
+    // Drop unread params and pure dead defs while every caller is still
+    // visible: fewer homes lets alloc dip callees into caller frames
+    // (epic-cc#1338). PIC14 only: the pass re-tiles frames downstream,
+    // and other cores' rows are pinned by tickets that own their regen.
+    if device.core == device::Core::Pic14 {
+        m = wholeprog::strip_dead(m);
+    }
     let cg = callgraph::build(&m);
     // A too-deep call chain is the program's fault (recursion or nesting
     // past the silicon stack), so it reports as an error, not an ICE.
