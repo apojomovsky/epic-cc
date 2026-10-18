@@ -352,9 +352,11 @@ trait AdapterTarget: Target<Arch = X86_SSE, Error = &'static str> {
         }
     }
 
-    /// Compare each armed watch against the RAM image, refreshing the
-    /// snapshot on a hit. Returns the first fired address.
+    /// Compare each armed watch against the RAM image, refreshing every
+    /// snapshot. Returns the first fired address: one instruction can
+    /// trip overlapping watches, and the rest must not fire late.
     fn poll_write_watch(&mut self) -> Option<u32> {
+        let mut hit = None;
         let mut i = 0;
         while i < self.watch_slots().len() {
             let (addr, len) = {
@@ -363,12 +365,28 @@ trait AdapterTarget: Target<Arch = X86_SSE, Error = &'static str> {
             };
             let now = self.snapshot_watch(addr, len);
             if now != self.watch_slots()[i].last {
-                self.watch_slots_mut()[i].last = now;
-                return Some(addr);
+                hit = hit.or(Some(addr));
             }
+            self.watch_slots_mut()[i].last = now;
             i += 1;
         }
-        None
+        hit
+    }
+
+    /// Stop reason for a synchronous single step: a watch tripped by
+    /// the stepped instruction reports as a watch stop, else DoneStep.
+    /// Without the poll the snapshot would go stale and fire one stop
+    /// late on the next continue.
+    fn stepped_stop(&mut self) -> SingleThreadStopReason<u32> {
+        if let Some(addr) = self.poll_write_watch() {
+            SingleThreadStopReason::Watch {
+                tid: (),
+                kind: WatchKind::Write,
+                addr,
+            }
+        } else {
+            SingleThreadStopReason::DoneStep
+        }
     }
 
     /// Run at most `budget` instructions, reporting a stop reason when
@@ -1147,12 +1165,10 @@ impl<T: AdapterTarget> run_blocking::BlockingEventLoop for EventLoop<T> {
         run_blocking::WaitForStopReasonError<<T as Target>::Error, std::io::Error>,
     > {
         // A synchronous `step()` already advanced one instruction: report
-        // it without running. Otherwise this loop runs the target while
-        // polling the connection so an interrupt (^C) still lands.
+        // it without running, polling the watches first so a store the
+        // stepped instruction made reports now and not one stop late.
         if target.take_stepped() {
-            return Ok(run_blocking::Event::TargetStopped(
-                SingleThreadStopReason::DoneStep,
-            ));
+            return Ok(run_blocking::Event::TargetStopped(target.stepped_stop()));
         }
         let mut poll_incoming = || conn.peek().map(|b| b.is_some()).unwrap_or(true);
         loop {
@@ -1176,5 +1192,49 @@ impl<T: AdapterTarget> run_blocking::BlockingEventLoop for EventLoop<T> {
         _target: &mut T,
     ) -> Result<Option<SingleThreadStopReason<u32>>, <T as Target>::Error> {
         Ok(Some(SingleThreadStopReason::Signal(Signal::SIGINT)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(prog: Vec<u16>) -> Pic14Target {
+        Pic14Target {
+            sim: Pic14::new(prog),
+            breakpoints: HashSet::new(),
+            watchpoints: Vec::new(),
+            stepped: false,
+        }
+    }
+
+    #[test]
+    fn stepped_store_reports_watch() {
+        // MOVLW 0x2A then MOVWF 0x20: only the second step stores.
+        let mut t = target(vec![0x302A, 0x00A0]);
+        t.add_write_watch(0x20, 1);
+        t.step_one();
+        assert!(matches!(t.stepped_stop(), SingleThreadStopReason::DoneStep));
+        t.step_one();
+        match t.stepped_stop() {
+            SingleThreadStopReason::Watch { addr, kind, .. } => {
+                assert_eq!(addr, 0x20);
+                assert_eq!(kind, WatchKind::Write);
+            }
+            other => panic!("expected a watch stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlapping_watches_fire_once() {
+        // One store trips two windows; both refresh, so the second
+        // never fires late on the next stop bound.
+        let mut t = target(vec![0x302A, 0x00A0]);
+        t.add_write_watch(0x20, 1);
+        t.add_write_watch(0x20, 2);
+        t.step_one();
+        t.step_one();
+        assert_eq!(t.poll_write_watch(), Some(0x20));
+        assert_eq!(t.poll_write_watch(), None);
     }
 }
