@@ -602,12 +602,13 @@ fn is_unknown_processor(text: &str) -> bool {
 
 #[test]
 fn ram_map_matches_gputils_for_every_device() {
+    let devices = scoped_devices();
     let Some(share) = gputils_share() else { return };
     let mut checked: Vec<&str> = Vec::new();
     let mut oracle_checked: Vec<&str> = Vec::new();
     let mut uncovered: Vec<&str> = Vec::new();
     let mut problems: Vec<String> = Vec::new();
-    for dev in scoped_devices() {
+    for dev in devices {
         match lkr_for(&share, dev.name) {
             Some(text) => {
                 problems.extend(compare(dev, &ram_from_lkr(&text)));
@@ -1017,11 +1018,12 @@ const OVERFLOW: &str = "Address exceeds maximum range";
 
 #[test]
 fn flash_words_matches_gputils_for_every_device() {
+    let devices = scoped_devices();
     let Some(share) = gputils_share() else {
         return;
     };
     let mut oracle_checked: Vec<&str> = Vec::new();
-    for dev in scoped_devices() {
+    for dev in devices {
         // org counts words on PIC14 and bytes on PIC18, so the last valid
         // address and the first bad one differ per core.
         let (last, past) = match dev.core {
@@ -1103,10 +1105,11 @@ fn flash_words_matches_gputils_for_every_device() {
 /// in for the check there.
 #[test]
 fn sfr_tables_match_gputils_headers() {
+    let devices = scoped_devices();
     let Some(share) = gputils_share() else {
         return;
     };
-    for dev in scoped_devices().into_iter().filter(|d| !d.sfrs.is_empty()) {
+    for dev in devices.into_iter().filter(|d| !d.sfrs.is_empty()) {
         let stem = dev.name.strip_prefix('p').unwrap_or(dev.name);
         let path = share.join("header").join(format!("p{stem}.inc"));
         let Ok(text) = std::fs::read_to_string(&path) else {
