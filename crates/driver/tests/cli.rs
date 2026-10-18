@@ -179,3 +179,46 @@ fn rejects_an_unknown_opt_level() {
     let e = parse_args(&args(&["a.c", "--device", "p16f877a", "-O"])).unwrap_err();
     assert!(e.contains("-O"), "{e}");
 }
+
+#[test]
+fn parses_a_sidecar_file() {
+    let c = parse_args(&args(&[
+        "a.c",
+        "--device",
+        "p16f877a",
+        "--sidecar",
+        "t.elf",
+    ]))
+    .unwrap();
+    assert_eq!(c.sidecar.as_deref(), Some("t.elf"));
+    let c = parse_args(&args(&["a.c", "--device", "p16f877a"])).unwrap();
+    assert_eq!(c.sidecar, None);
+}
+
+#[test]
+fn usage_documents_every_long_flag() {
+    use driver::cli::USAGE;
+    for flag in [
+        "--target",
+        "--device",
+        "--mcu",
+        "--emit",
+        "--save-temps",
+        "--map",
+        "--line-table",
+        "--var-table",
+        "--sidecar",
+        "--report",
+        "--f-cpu",
+        "--no-outline",
+        "--const-pool",
+        "--no-const-pool",
+        "--version",
+        "--help",
+        "--resolve-device",
+        "--print-include-dir",
+        "--dump-include-dir",
+    ] {
+        assert!(USAGE.contains(flag), "USAGE omits {flag}");
+    }
+}
