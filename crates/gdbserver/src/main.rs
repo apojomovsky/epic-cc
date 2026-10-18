@@ -3,10 +3,18 @@
 //! Thin entry over the library: parse the command line, load the HEX,
 //! serve one gdb session on the requested port.
 
-use epic_cc_gdbserver::{core_of, load_program, parse_args, serve_stream};
+use epic_cc_gdbserver::{core_of, load_program, parse_args, serve_stream, USAGE};
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return;
+    }
+    if argv.iter().any(|a| a == "--version" || a == "-V") {
+        println!("epic-cc-gdbserver {}", env!("EPIC_CC_STAMP"));
+        return;
+    }
     let args = match parse_args(&argv) {
         Ok(a) => a,
         Err(e) => {
