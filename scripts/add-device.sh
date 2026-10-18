@@ -76,7 +76,7 @@ fi
 
 # --- step 3: gputils crosscheck ---
 echo "--- add-device $STEM: gputils crosscheck ---"
-if ! cargo test -p device --test gputils_crosscheck 2>&1 | tee "$TMP/crosscheck.out"; then
+if ! PIC8_DEVICE_SCOPE="$STEM" cargo test -p device --test gputils_crosscheck 2>&1 | tee "$TMP/crosscheck.out"; then
   step_fail "3 (gputils crosscheck)" "see output above"
 fi
 
