@@ -2748,6 +2748,45 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_end}:"));
     }
 
+    /// The `CrcFold` body: copy `%x` into the select dst, test its old
+    /// sign bit, shift the dst in place, and xor the poly on the taken
+    /// side only. The xor arm is the sign-set side under both `slt` and
+    /// `sge` (the mirror swaps arms, not outcomes), so the skip is
+    /// always `BTFSS`. The folded shl, xor, and icmp never emit, so
+    /// their slots hold stale values no one reads. The copy keeps `%x`
+    /// pristine for the test, so an overlaid dst stays safe. The first
+    /// `emit` flushes any other pending store.
+    fn emit_crc_fold(&mut self, s: &ir::Select, fold: &CrcFold) {
+        self.cur_loc = s.loc.clone();
+        let da = self.slot_addr(self.cur_func, &s.dst).direct();
+        let xv = Val::Reg(fold.x.clone());
+        let n = s.ty.bytes();
+        for i in 0..n {
+            self.emit_load_byte(&xv, i);
+            self.emit_w_store(da + u16::from(i));
+        }
+        let l_else = self.fresh_label();
+        let l_end = self.fresh_label();
+        self.emit(format!("    BTFSS 0x{:02X}, {}", fold.slot, fold.bit));
+        self.emit(format!("    GOTO {l_else}"));
+        self.emit(format!("    BCF STATUS, 0"));
+        for i in 0..n {
+            self.emit(format!("    RLF 0x{:02X}, F", da + u16::from(i)));
+        }
+        for i in 0..n {
+            let p = ((fold.poly >> (u32::from(i) * 8)) & 0xFF) as u8;
+            self.emit(format!("    MOVLW 0x{p:02X}"));
+            self.emit(format!("    XORWF 0x{:02X}, F", da + u16::from(i)));
+        }
+        self.emit(format!("    GOTO {l_end}"));
+        self.emit(format!("{l_else}:"));
+        self.emit(format!("    BCF STATUS, 0"));
+        for i in 0..n {
+            self.emit(format!("    RLF 0x{:02X}, F", da + u16::from(i)));
+        }
+        self.emit(format!("{l_end}:"));
+    }
+
     /// A fresh local label for intra-block jumps (select branches). The
     /// counter lives at module scope so labels are unique across functions.
     fn fresh_label(&mut self) -> String {
@@ -4077,47 +4116,66 @@ impl<'m> Gen<'m> {
                             (0..width).contains(&k),
                             "isel: const shift count {k} out of range [0, {width}) (LLVM poison)"
                         );
-                        // Copy the value into the dst slot, then rotate the
-                        // dst in place k times. shl: lo then hi (carry goes
-                        // up); lshr: hi then lo (bits come down); ashr: set C
-                        // from the sign bit before each rrf so the sign fills
-                        // every vacated bit.
-                        self.emit_move_val_to_slot(&b.a, b.ty, da);
-                        let n = b.ty.bytes();
-                        for _ in 0..k {
-                            match b.op {
-                                BinOp::Shl => {
-                                    self.emit("    BCF STATUS, 0");
-                                    for i in 0..n {
-                                        self.emit(format!(
-                                            "    RLF 0x{:02X}, F",
-                                            da + u16::from(i)
-                                        ));
+                        // A left slide by whole bytes moves bytes, never
+                        // bits: shl i16 by 8 is hi = lo, lo = 0 (the crc
+                        // outer loop's `buf << 8`), three words against
+                        // twenty eight rotates. Descending stores keep an
+                        // aliased source readable, each read below its
+                        // write; the CLRFs ride the plain emit like the
+                        // zext zero bytes above.
+                        if b.op == BinOp::Shl && k > 0 && k % 8 == 0 {
+                            let n = b.ty.bytes();
+                            let s = (k / 8) as u8;
+                            for i in (s..n).rev() {
+                                self.emit_load_byte(&b.a, i - s);
+                                self.emit_w_store(da + u16::from(i));
+                            }
+                            for i in 0..s {
+                                self.emit(format!("    CLRF 0x{:02X}", da + u16::from(i)));
+                            }
+                        } else {
+                            // Copy the value into the dst slot, then rotate the
+                            // dst in place k times. shl: lo then hi (carry goes
+                            // up); lshr: hi then lo (bits come down); ashr: set C
+                            // from the sign bit before each rrf so the sign fills
+                            // every vacated bit.
+                            self.emit_move_val_to_slot(&b.a, b.ty, da);
+                            let n = b.ty.bytes();
+                            for _ in 0..k {
+                                match b.op {
+                                    BinOp::Shl => {
+                                        self.emit("    BCF STATUS, 0");
+                                        for i in 0..n {
+                                            self.emit(format!(
+                                                "    RLF 0x{:02X}, F",
+                                                da + u16::from(i)
+                                            ));
+                                        }
                                     }
-                                }
-                                BinOp::LShr => {
-                                    self.emit("    BCF STATUS, 0");
-                                    for i in (0..n).rev() {
-                                        self.emit(format!(
-                                            "    RRF 0x{:02X}, F",
-                                            da + u16::from(i)
-                                        ));
+                                    BinOp::LShr => {
+                                        self.emit("    BCF STATUS, 0");
+                                        for i in (0..n).rev() {
+                                            self.emit(format!(
+                                                "    RRF 0x{:02X}, F",
+                                                da + u16::from(i)
+                                            ));
+                                        }
                                     }
-                                }
-                                BinOp::AShr => {
-                                    let hi = da + u16::from(n - 1);
-                                    self.emit(format!("    BTFSC 0x{hi:02X}, 7"));
-                                    self.emit("    BSF STATUS, 0");
-                                    self.emit(format!("    BTFSS 0x{hi:02X}, 7"));
-                                    self.emit("    BCF STATUS, 0");
-                                    for i in (0..n).rev() {
-                                        self.emit(format!(
-                                            "    RRF 0x{:02X}, F",
-                                            da + u16::from(i)
-                                        ));
+                                    BinOp::AShr => {
+                                        let hi = da + u16::from(n - 1);
+                                        self.emit(format!("    BTFSC 0x{hi:02X}, 7"));
+                                        self.emit("    BSF STATUS, 0");
+                                        self.emit(format!("    BTFSS 0x{hi:02X}, 7"));
+                                        self.emit("    BCF STATUS, 0");
+                                        for i in (0..n).rev() {
+                                            self.emit(format!(
+                                                "    RRF 0x{:02X}, F",
+                                                da + u16::from(i)
+                                            ));
+                                        }
                                     }
+                                    _ => unreachable!(),
                                 }
-                                _ => unreachable!(),
                             }
                         }
                     }
@@ -8081,6 +8139,144 @@ fn select_fold_at(
     })
 }
 
+/// A CRC feedback `select`: `select (slt x, 0), xor(shl(x, 1), C),
+/// shl(x, 1)` or the `sge` mirror. The diamond computes both arms and
+/// copies twice per bit; the fold tests the old sign bit, shifts the
+/// select dst in place, and xors the poly on one side only. The folded
+/// shl, xor, and icmp never emit. Keyed by the select's index in its
+/// block, like `SelectFold`.
+struct CrcFold {
+    shl_dst: String,
+    xor_dst: String,
+    icmp_dst: String,
+    x: String,
+    poly: i64,
+    slot: u16,
+    bit: u8,
+}
+
+/// A same-block `shl`, `xor`, or `icmp` definition a CRC fold consumes.
+enum CrcDef<'b> {
+    Shl(usize, &'b ir::Bin),
+    Xor(usize, &'b ir::Bin),
+    Cmp(usize, &'b ir::Icmp),
+}
+
+fn find_crc_folds(g: &Gen, func: &str, b: &ir::Block) -> HashMap<usize, CrcFold> {
+    let mut defs: HashMap<&str, CrcDef> = HashMap::new();
+    let mut folds = HashMap::new();
+    let uses = |name: &str| g.use_count.get(&ssa_key(func, name)).copied().unwrap_or(0);
+    for (idx, inst) in b.insts.iter().enumerate() {
+        match inst {
+            Inst::Bin(bin) if bin.op == BinOp::Shl => {
+                defs.insert(bin.dst.as_str(), CrcDef::Shl(idx, bin));
+            }
+            Inst::Bin(bin) if bin.op == BinOp::Xor => {
+                defs.insert(bin.dst.as_str(), CrcDef::Xor(idx, bin));
+            }
+            Inst::Icmp(ic) => {
+                defs.insert(ic.dst.as_str(), CrcDef::Cmp(idx, ic));
+            }
+            Inst::Select(s) if !s.ptr => {
+                if let Some(fold) = crc_fold_at(g, func, &defs, &uses, idx, s) {
+                    folds.insert(idx, fold);
+                }
+            }
+            _ => {}
+        }
+    }
+    folds
+}
+
+/// The fold for one `select`, or `None`: cond is a single-use `slt`/`sge`
+/// against zero over `%x`, one arm is the single-use `xor` of `%s` with a
+/// const, the other arm is `%s` itself, and `%s` is `shl %x, 1` read only
+/// by those two. All defs sit earlier in the same block; `%x` stays live
+/// in its slot (the phi that carries it has 2+ uses) so the bit test
+/// reads the pre-shift sign.
+fn crc_fold_at(
+    g: &Gen,
+    func: &str,
+    defs: &HashMap<&str, CrcDef>,
+    uses: &impl Fn(&str) -> u32,
+    idx: usize,
+    s: &ir::Select,
+) -> Option<CrcFold> {
+    let Val::Reg(c) = &s.cond else {
+        return None;
+    };
+    let (_, icmp) = match defs.get(c.as_str()) {
+        Some(CrcDef::Cmp(j, ic)) if *j < idx && uses(c) == 1 => (*j, *ic),
+        _ => return None,
+    };
+    if icmp.ty != s.ty {
+        return None;
+    }
+    let x_name = match icmp.pred.as_str() {
+        "slt" | "sge" => {
+            let Val::Reg(x) = &icmp.a else {
+                return None;
+            };
+            if !matches!(&icmp.b, Val::Const(0)) {
+                return None;
+            }
+            x
+        }
+        _ => return None,
+    };
+    // The xor arm is the sign-set side either way: `slt` takes it in
+    // `a`, `sge` in `b` (cond false when the bit is set).
+    let (xor_arm, shl_arm) = if icmp.pred == "slt" {
+        (&s.a, &s.b)
+    } else {
+        (&s.b, &s.a)
+    };
+    let Val::Reg(xor_dst) = xor_arm else {
+        return None;
+    };
+    let Val::Reg(shl_dst) = shl_arm else {
+        return None;
+    };
+    let (_, xorb) = match defs.get(xor_dst.as_str()) {
+        Some(CrcDef::Xor(k, xb)) if *k < idx && uses(xor_dst) == 1 => (*k, *xb),
+        _ => return None,
+    };
+    if xorb.ty != s.ty {
+        return None;
+    }
+    let (shl_name, poly) = match (&xorb.a, &xorb.b) {
+        (Val::Reg(r), Val::Const(p)) | (Val::Const(p), Val::Reg(r)) => (r, *p),
+        _ => return None,
+    };
+    if shl_name != shl_dst {
+        return None;
+    }
+    let (_, shlb) = match defs.get(shl_dst.as_str()) {
+        Some(CrcDef::Shl(k, sb)) if *k < idx && uses(shl_dst) == 2 => (*k, *sb),
+        _ => return None,
+    };
+    if shlb.ty != s.ty {
+        return None;
+    }
+    let Val::Reg(sx) = &shlb.a else {
+        return None;
+    };
+    if sx != x_name || !matches!(&shlb.b, Val::Const(1)) {
+        return None;
+    }
+    let width = s.ty.bytes();
+    let (slot, bit) = bit_test_slot(g, func, x_name, u32::from(width) * 8 - 1, width)?;
+    Some(CrcFold {
+        shl_dst: shl_dst.clone(),
+        xor_dst: xor_dst.clone(),
+        icmp_dst: c.clone(),
+        x: x_name.clone(),
+        poly,
+        slot,
+        bit,
+    })
+}
+
 /// `{func}::{reg}` slots holding (in-chunk index, chunk id) pairs in the
 /// log variant (epic-cc#817): the fmt param, closed over phi/gep/select
 /// derivations. Plain slots in the variant frame keep RAM semantics.
@@ -9772,6 +9968,7 @@ impl<'m> Gen<'m> {
         plan: &WalkLoop,
         b: &ir::Block,
         select_folds: &HashMap<usize, SelectFold>,
+        crc_folds: &HashMap<usize, CrcFold>,
     ) {
         self.call_follows = false;
         let ops = plan
@@ -9784,16 +9981,28 @@ impl<'m> Gen<'m> {
             match op {
                 WalkOp::Emit(ii) => {
                     if let Inst::Select(s) = &b.insts[*ii] {
+                        if let Some(fold) = crc_folds.get(ii) {
+                            self.emit_crc_fold(s, fold);
+                            continue;
+                        }
                         if let Some(fold) = select_folds.get(ii) {
                             self.emit_select_fold(s, fold);
                             continue;
                         }
                     }
                     let folded_tmp = match &b.insts[*ii] {
-                        Inst::Bin(bin) => select_folds
-                            .values()
-                            .any(|f| f.and_dst.as_deref() == Some(bin.dst.as_str())),
-                        Inst::Icmp(ic) => select_folds.values().any(|f| f.icmp_dst == ic.dst),
+                        Inst::Bin(bin) => {
+                            select_folds
+                                .values()
+                                .any(|f| f.and_dst.as_deref() == Some(bin.dst.as_str()))
+                                || crc_folds
+                                    .values()
+                                    .any(|f| f.shl_dst == bin.dst || f.xor_dst == bin.dst)
+                        }
+                        Inst::Icmp(ic) => {
+                            select_folds.values().any(|f| f.icmp_dst == ic.dst)
+                                || crc_folds.values().any(|f| f.icmp_dst == ic.dst)
+                        }
                         _ => false,
                     };
                     if !folded_tmp {
@@ -11068,12 +11277,21 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
         }
         let mut terminator = None;
         let collapse = find_bit_test_collapse(g, &f.name, b, &phi_copies);
-        let select_folds = find_select_folds(g, &f.name, b);
+        let mut select_folds = find_select_folds(g, &f.name, b);
+        let crc_folds = find_crc_folds(g, &f.name, b);
+        // A CRC feedback select matches both shapes: the crc fold owns
+        // it, so the diamond must not also claim it.
+        select_folds.retain(|idx, _| !crc_folds.contains_key(idx));
         let mut folded_tmps: HashSet<String> = HashSet::new();
         for f in select_folds.values() {
             if let Some(a) = &f.and_dst {
                 folded_tmps.insert(a.clone());
             }
+            folded_tmps.insert(f.icmp_dst.clone());
+        }
+        for f in crc_folds.values() {
+            folded_tmps.insert(f.shl_dst.clone());
+            folded_tmps.insert(f.xor_dst.clone());
             folded_tmps.insert(f.icmp_dst.clone());
         }
         // Same route as `emit_inst` into `emit_call` (`_delay` is inlined, an unresolved
@@ -11087,6 +11305,9 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
                 _ if region_of.contains_key(&b.label) => {}  // latch-out member: same
                 _ if nul_loops.contains_key(&b.label) => {}  // NUL body emits whole below
                 _ if nul_latch.contains_key(&b.label) => {}  // two-block NUL latch: same
+                Inst::Select(s) if crc_folds.contains_key(&idx) => {
+                    g.emit_crc_fold(s, &crc_folds[&idx]);
+                }
                 Inst::Select(s) if select_folds.contains_key(&idx) => {
                     g.emit_select_fold(s, &select_folds[&idx]);
                 }
@@ -11111,9 +11332,9 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
             }
         }
         if let Some(plan) = walk_loops.get(&b.label) {
-            g.emit_walk_body(plan, b, &select_folds);
+            g.emit_walk_body(plan, b, &select_folds, &crc_folds);
         } else if let Some(h) = region_of.get(&b.label) {
-            g.emit_walk_body(&walk_loops[h.as_str()], b, &select_folds);
+            g.emit_walk_body(&walk_loops[h.as_str()], b, &select_folds, &crc_folds);
         }
         if let Some(t) = terminator {
             match t {
