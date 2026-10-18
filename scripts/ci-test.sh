@@ -72,7 +72,7 @@ fi
 # cross-check does; the density profiler derives its word table from the
 # `asm` crate, so a change there has to keep it readable.
 echo "::group::python-tools"
-if python3 scripts/test_gen_device.py && python3 scripts/test_device_names.py && python3 scripts/test_add_device.py && python3 scripts/test_gen_devices_manifest.py && python3 scripts/test_density_profile.py && python3 scripts/test_inline_map.py && python3 scripts/test_size_report.py && python3 scripts/test_size_probe.py && python3 scripts/test_baseline_delta.py && python3 scripts/test_warm_toolchain_cache.py && python3 scripts/test_gen_docs_reference.py && python3 scripts/test_shared_includes.py && python3 scripts/test_no_xc8_figures.py && python3 scripts/test_pre_push_stamp.py && python3 scripts/test_check_release_bundle.py; then
+if python3 scripts/test_gen_device.py && python3 scripts/test_device_names.py && python3 scripts/test_add_device.py && python3 scripts/test_gen_devices_manifest.py && python3 scripts/test_density_profile.py && python3 scripts/test_inline_map.py && python3 scripts/test_size_report.py && python3 scripts/test_size_probe.py && python3 scripts/test_baseline_delta.py && python3 scripts/test_warm_toolchain_cache.py && python3 scripts/test_gen_docs_reference.py && python3 scripts/test_shared_includes.py && python3 scripts/test_no_xc8_figures.py && python3 scripts/test_pre_push_stamp.py && python3 scripts/test_check_release_bundle.py && python3 scripts/test_catalog.py && python3 scripts/test_ci_noncode_check.py && python3 scripts/test_hal_fixture_drift.py; then
   echo "PASS: python-tools"
   row="| python-tools | PASS |"
 else
