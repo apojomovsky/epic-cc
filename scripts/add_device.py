@@ -419,6 +419,13 @@ def sibling(toml_path, devices_dir):
     return best
 
 
+def names_source(atdf):
+    """The `--atdf` value for device_names.py: the path itself when it is an
+    EDC `.PIC` file (the only format that script reads), else "" so it
+    resolves the part from the local DFP packs."""
+    return str(atdf) if str(atdf).lower().endswith(".pic") else ""
+
+
 def main():
     cmd = sys.argv[1]
     if cmd == "stem":
@@ -436,6 +443,8 @@ def main():
     elif cmd == "field-diff":
         for line in field_diff(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])):
             print(line)
+    elif cmd == "names-source":
+        print(names_source(sys.argv[2]))
     elif cmd == "sibling":
         sib = sibling(pathlib.Path(sys.argv[2]), sys.argv[3])
         print(sib if sib else "")
