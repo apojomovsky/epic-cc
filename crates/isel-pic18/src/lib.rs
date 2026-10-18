@@ -7328,17 +7328,9 @@ impl<'m> Gen<'m> {
         }
         // single-loop ordering contract as the Load arm above,
         // epic-cc#471). Each source byte still materializes into
-        // W (literals directly, registers via MOVF) before the
-        // write.
-        // Byte-indexed small-array stores go through `PLUSW0` like
-        // the Load arm above: `MOVF idx,W` then
-        // `MOVFF value,PLUSW0`, which preserves `W` (the write
-        // collision ADR-009 item 4 feared). Only register values
-        // with a slot move directly; address-valued regs and
-        // constants keep the `INDF0` lowering. (epic-cc#665)
-        // An in-place RMW producer (epic-cc#825) accumulated
-        // into its load operand's slot: the store reads that
-        // slot, not the dead result temp.
+        // W first. Small-array stores go through `PLUSW0`
+        // (epic-cc#665); RMW producers read their load operand's
+        // slot (epic-cc#825).
         let val_slot = match self.rmw_reg(&s.val) {
             Val::Reg(r) => self.addrs.get(&ssa_key(self.cur_func, &r)).copied(),
             _ => None,
