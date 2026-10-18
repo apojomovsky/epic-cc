@@ -73,6 +73,14 @@ def run(path, *extra):
     )
 
 
+def run_no_atdf(path, *extra):
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "psyn02", "--toml", str(path), *extra],
+        capture_output=True,
+        text=True,
+    )
+
+
 class DeviceNames(unittest.TestCase):
     def setUp(self):
         self.dir = pathlib.Path(tempfile.mkdtemp())
@@ -128,6 +136,39 @@ class DeviceNames(unittest.TestCase):
     def test_check_flags_a_stale_file(self):
         self.path.write_text(TOML)
         self.assertEqual(run(self.path, "--check").returncode, 1)
+
+    def test_check_flags_a_hand_edited_alias(self):
+        text = self.path.read_text().replace(
+            'aliases = ["FOSC"]', 'aliases = ["BOGUS"]', 1
+        )
+        self.path.write_text(text)
+        self.assertEqual(run(self.path, "--check").returncode, 1)
+
+    def test_check_flags_a_hand_edited_sfr_tail(self):
+        text = self.path.read_text().replace('name = "PORTB"', 'name = "PORTX"', 1)
+        self.path.write_text(text)
+        self.assertEqual(run(self.path, "--check").returncode, 1)
+
+    def test_no_dfp_source_exits_2(self):
+        # psyn02 is a fixture stem no real pack ships, so auto-resolve
+        # misses in every environment; exit 2 is the soft-skip signal.
+        self.assertEqual(run_no_atdf(self.path, "--check").returncode, 2)
+        missing = self.dir / "PICMISSING.PIC"
+        r = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "psyn02",
+                "--atdf",
+                str(missing),
+                "--toml",
+                str(self.path),
+                "--check",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r.returncode, 2)
 
 
 if __name__ == "__main__":
