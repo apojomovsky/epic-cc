@@ -13,6 +13,30 @@ const ALLOW: &str = "PIC8_ALLOW_NO_GPUTILS";
 const ACCEPT: &str = "PIC8_UNVERIFIED_DEVICE_DATA";
 const ACCEPT_VALUE: &str = "i-accept-unverified-device-data";
 
+/// Restricts the per-device loops to one registry stem (`p12f509`). Unset
+/// checks every device; a stem naming no device fails rather than checking
+/// nothing.
+const SCOPE: &str = "PIC8_DEVICE_SCOPE";
+
+fn select_scope(
+    all: &[&'static Device],
+    scope: Option<&str>,
+) -> Result<Vec<&'static Device>, String> {
+    let Some(stem) = scope else {
+        return Ok(all.to_vec());
+    };
+    let hit: Vec<&'static Device> = all.iter().copied().filter(|d| d.name == stem).collect();
+    if hit.is_empty() {
+        return Err(format!("{SCOPE}={stem}: names no known device"));
+    }
+    Ok(hit)
+}
+
+fn scoped_devices() -> Vec<&'static Device> {
+    let scope = std::env::var(SCOPE).ok();
+    select_scope(device::ALL, scope.as_deref()).unwrap_or_else(|e| panic!("{e}"))
+}
+
 /// gputils data root, or `None` after both opt-ins and a banner on stderr.
 /// A missing tool with one opt-in, or none, fails: a gate that disappears
 /// with its tool is not a gate.
@@ -578,12 +602,13 @@ fn is_unknown_processor(text: &str) -> bool {
 
 #[test]
 fn ram_map_matches_gputils_for_every_device() {
+    let devices = scoped_devices();
     let Some(share) = gputils_share() else { return };
     let mut checked: Vec<&str> = Vec::new();
     let mut oracle_checked: Vec<&str> = Vec::new();
     let mut uncovered: Vec<&str> = Vec::new();
     let mut problems: Vec<String> = Vec::new();
-    for dev in device::ALL {
+    for dev in devices {
         match lkr_for(&share, dev.name) {
             Some(text) => {
                 problems.extend(compare(dev, &ram_from_lkr(&text)));
@@ -993,11 +1018,12 @@ const OVERFLOW: &str = "Address exceeds maximum range";
 
 #[test]
 fn flash_words_matches_gputils_for_every_device() {
+    let devices = scoped_devices();
     let Some(share) = gputils_share() else {
         return;
     };
     let mut oracle_checked: Vec<&str> = Vec::new();
-    for dev in device::ALL {
+    for dev in devices {
         // org counts words on PIC14 and bytes on PIC18, so the last valid
         // address and the first bad one differ per core.
         let (last, past) = match dev.core {
@@ -1079,10 +1105,11 @@ fn flash_words_matches_gputils_for_every_device() {
 /// in for the check there.
 #[test]
 fn sfr_tables_match_gputils_headers() {
+    let devices = scoped_devices();
     let Some(share) = gputils_share() else {
         return;
     };
-    for dev in device::ALL.iter().filter(|d| !d.sfrs.is_empty()) {
+    for dev in devices.into_iter().filter(|d| !d.sfrs.is_empty()) {
         let stem = dev.name.strip_prefix('p').unwrap_or(dev.name);
         let path = share.join("header").join(format!("p{stem}.inc"));
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -1270,4 +1297,17 @@ fn unknown_processor_matches_gpasm_verdict() {
     ));
     assert!(!is_unknown_processor("Address exceeds maximum range"));
     assert!(!is_unknown_processor(""));
+}
+
+#[test]
+fn scope_selects_exactly_the_named_stem_or_all_when_unset() {
+    let all = select_scope(device::ALL, None).unwrap();
+    assert_eq!(all.len(), device::ALL.len());
+
+    let one = select_scope(device::ALL, Some("p12f509")).unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].name, "p12f509");
+
+    let err = select_scope(device::ALL, Some("p9z9")).unwrap_err();
+    assert!(err.contains("p9z9") && err.contains("names no known device"));
 }
