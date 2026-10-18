@@ -164,11 +164,11 @@ jobs:
           pattern: '*-bundle'
           path: dist
 
-      - name: Check every bundle ships epic-cc and epic-cc-gdbserver
-        run: python3 scripts/check_release_bundle.py dist/*-bundle/*.zip
-
       - name: List bundle contents
         run: for z in dist/*-bundle/*.zip; do echo "== $z"; unzip -l "$z"; done
+
+      - name: Check every bundle ships epic-cc and epic-cc-gdbserver
+        run: python3 scripts/check_release_bundle.py dist/*-bundle/*.zip
 
       - uses: ./.github/actions/install-git-cliff
 
