@@ -2,7 +2,7 @@ name: release
 
 # Tag-triggered: builds the Linux bundle in the docker release stage and the
 # Windows bundle by slicing the official LLVM MSVC release, smoke-tests each
-# shipped binary, and attaches both zips + checksums to the GitHub release.
+# shipped binary, asserts every zip carries epic-cc and epic-cc-gdbserver, and attaches both zips + checksums to the GitHub release.
 # workflow_dispatch is enabled so the pipeline can be exercised before the
 # first real tag.
 
@@ -70,10 +70,10 @@ jobs:
         with:
           components: rustfmt, clippy, rust-src
 
-      - name: Build epic-cc
+      - name: Build epic-cc and epic-cc-gdbserver
         run: |
           $env:EPIC_CC_VERSION = $env:GITHUB_REF_NAME -replace '^v',''
-          cargo build --release -p driver
+          cargo build --release -p driver -p epic-cc-gdbserver
 
       - name: Download and extract LLVM 20.1.8 MSVC bundle
         run: |
@@ -93,6 +93,7 @@ jobs:
           Copy-Item "$src\bin\opt.exe" "$bundle\clang\bin\"
           Copy-Item -Recurse "$src\lib\clang" "$bundle\clang\lib\clang"
           Copy-Item "target\release\epic-cc.exe" "$bundle\"
+          Copy-Item "target\release\epic-cc-gdbserver.exe" "$bundle\"
           & ".\$bundle\epic-cc.exe" --dump-include-dir "$bundle\include"
           python scripts\gen_devices_manifest.py "$bundle\devices.json"
           # The MSVC archive does not ship LICENSE.TXT; fetch the pinned
@@ -121,6 +122,25 @@ jobs:
             throw "print-include-dir mismatch: $inc"
           }
 
+      - name: Smoke test gdbserver (listens, accepts a connection)
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME -replace '^v',''
+          $bundle = "epic-cc-$ver-x86_64-windows"
+          $p = Start-Process -PassThru -NoNewWindow -FilePath ".\$bundle\epic-cc-gdbserver.exe" `
+            -ArgumentList "bundled.hex", "bundled.hex", "--port", "38123"
+          try {
+            $client = $null
+            for ($i = 0; $i -lt 50 -and -not $client; $i++) {
+              try { $client = New-Object System.Net.Sockets.TcpClient("127.0.0.1", 38123) }
+              catch { Start-Sleep -Milliseconds 100 }
+            }
+            if (-not $client) { throw "epic-cc-gdbserver.exe never listened on 38123" }
+            $client.Close()
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          }
+
       - name: Zip
         shell: pwsh
         run: |
@@ -143,6 +163,12 @@ jobs:
         with:
           pattern: '*-bundle'
           path: dist
+
+      - name: Check every bundle ships epic-cc and epic-cc-gdbserver
+        run: python3 scripts/check_release_bundle.py dist/*-bundle/*.zip
+
+      - name: List bundle contents
+        run: for z in dist/*-bundle/*.zip; do echo "== $z"; unzip -l "$z"; done
 
       - uses: ./.github/actions/install-git-cliff
 
