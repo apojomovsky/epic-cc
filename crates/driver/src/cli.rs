@@ -127,6 +127,63 @@ usage: epic-cc [options] <input.c|input.cpp>...
                        tooling; the bundle carries exactly what the driver
                        would materialize)
 ";
+
+/// Every long flag `parse_args` and `main` accept, the candidate set for the
+/// unknown-option hint. Short flags are left out on purpose.
+const LONG_FLAGS: &[&str] = &[
+    "--device",
+    "--target",
+    "--mcu",
+    "--emit",
+    "--save-temps",
+    "--map",
+    "--line-table",
+    "--var-table",
+    "--sidecar",
+    "--report",
+    "--f-cpu",
+    "--no-outline",
+    "--const-pool",
+    "--no-const-pool",
+    "--version",
+    "--help",
+    "--resolve-device",
+    "--print-include-dir",
+    "--dump-include-dir",
+];
+
+const EMIT_STAGES: &[&str] = &["ll", "ir", "asm", "hex"];
+
+/// Farthest edit distance at which a candidate is still offered.
+const SUGGEST_MAX_DISTANCE: usize = 3;
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diag = row[0];
+        row[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let up = row[j + 1];
+            row[j + 1] = (diag + usize::from(ca != cb)).min(row[j] + 1).min(up + 1);
+            diag = up;
+        }
+    }
+    row[b.len()]
+}
+
+/// ` (did you mean X?)` for the nearest candidate within
+/// `SUGGEST_MAX_DISTANCE`, first listed wins a tie; empty when none is close.
+fn suggest(got: &str, candidates: &[&str]) -> String {
+    candidates
+        .iter()
+        .map(|c| (edit_distance(got, c), *c))
+        .filter(|(d, _)| *d <= SUGGEST_MAX_DISTANCE)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| format!(" (did you mean {c}?)"))
+        .unwrap_or_default()
+}
+
 /// Parse an argument list that does NOT include `argv[0]`.
 pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut inputs = Vec::new();
@@ -189,7 +246,10 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
                 "ir" => Emit::Ir,
                 "asm" => Emit::Asm,
                 "hex" => Emit::Hex,
-                other => return Err(format!("epic-cc: unknown --emit stage {other}")),
+                other => {
+                    let hint = suggest(other, EMIT_STAGES);
+                    return Err(format!("epic-cc: unknown --emit stage {other}{hint}"));
+                }
             };
         } else if a == "--save-temps" {
             i += 1;
@@ -260,7 +320,12 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
                     .ok_or("epic-cc: --var-table needs a value")?,
             );
         } else if a.starts_with('-') {
-            return Err(format!("epic-cc: unknown option {a}\n\n{USAGE}"));
+            let hint = if a.starts_with("--") {
+                suggest(a, LONG_FLAGS)
+            } else {
+                String::new()
+            };
+            return Err(format!("epic-cc: unknown option {a}{hint}\n\n{USAGE}"));
         } else {
             inputs.push(a.to_string());
         }

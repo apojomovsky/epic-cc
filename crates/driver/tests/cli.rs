@@ -105,6 +105,43 @@ fn rejects_an_unknown_emit_stage() {
 }
 
 #[test]
+fn unknown_flag_suggests_the_nearest_long_flag() {
+    let e = parse_args(&args(&["a.c", "--devce", "p16f877a"])).unwrap_err();
+    assert!(
+        e.starts_with("epic-cc: unknown option --devce (did you mean --device?)\n"),
+        "{e}"
+    );
+}
+
+#[test]
+fn unknown_flag_far_from_every_flag_gets_no_hint() {
+    let e = parse_args(&args(&["a.c", "--device", "p16f877a", "--zzzz"])).unwrap_err();
+    assert!(!e.contains("did you mean"), "{e}");
+    assert!(e.contains("unknown option --zzzz"), "{e}");
+}
+
+#[test]
+fn unknown_flag_hint_skips_short_flags() {
+    let e = parse_args(&args(&["a.c", "--device", "p16f877a", "-x"])).unwrap_err();
+    assert!(!e.contains("did you mean"), "{e}");
+}
+
+#[test]
+fn unknown_emit_stage_suggests_the_nearest_stage() {
+    let e = parse_args(&args(&["a.c", "--device", "p16f877a", "--emit", "hexs"])).unwrap_err();
+    assert_eq!(e, "epic-cc: unknown --emit stage hexs (did you mean hex?)");
+}
+
+#[test]
+fn unknown_emit_stage_far_from_every_stage_gets_no_hint() {
+    let e = parse_args(&args(&[
+        "a.c", "--device", "p16f877a", "--emit", "bytecode",
+    ]))
+    .unwrap_err();
+    assert!(!e.contains("did you mean"), "{e}");
+}
+
+#[test]
 fn rejects_a_flag_missing_its_value() {
     let e = parse_args(&args(&["a.c", "--device"])).unwrap_err();
     assert!(e.contains("--device"), "{e}");
