@@ -652,10 +652,11 @@ fn brcond_collapses_ne_triple_with_inverted_skip() {
 }
 
 #[test]
-fn select_folds_slt_sign_test() {
-    // The crc inner-loop shape: `icmp slt` over a shared i16 feeds a
-    // value select. The sign compare and the i1 materialize vanish,
-    // leaving a direct test of the source's top bit.
+fn crc_feedback_select_folds_shift_xor() {
+    // The crc inner-loop shape: `shl %c, 1` xored with a const on the
+    // taken side of an slt sign select. The diamond's arm copies and
+    // the shift/xor/compare temporaries vanish: copy %c to the dst,
+    // test the old sign bit, shift in place, xor the poly on one side.
     let m = parse(
         "global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %c = load i16 @in\n    %s = shl i16 %c 1\n    %x = xor i16 %s 4129\n    %t = icmp slt i16 %c 0\n    %n = select i1 %t i16 %x i16 %s\n    store i16 %n @out\n    ret void\n",
     );
@@ -671,15 +672,143 @@ fn select_folds_slt_sign_test() {
     let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("BTFSS 0x26, 7"), "sign test:\n{asm}");
     assert!(!asm.contains("SUBWF"), "slt compare gone:\n{asm}");
-    assert!(!asm.contains("MOVWF 0x2B"), "materialize gone:\n{asm}");
-    // Polarity: set bit means cond holds means the true arm (%x), so the
-    // fall-through copies land before the else label and the %s copies
-    // after it. Presence alone cannot catch an inverted diamond.
+    assert!(!asm.contains("XORLW"), "no diamond xor through W:\n{asm}");
+    assert!(asm.contains("XORWF 0x2D, F"), "poly lo into dst:\n{asm}");
+    assert!(asm.contains("XORWF 0x2E, F"), "poly hi into dst:\n{asm}");
+    // Polarity: set bit means cond holds means the xor side, so the
+    // poly words land before the else label and the bare shift after
+    // it. Presence alone cannot catch an inverted fold.
     let else_pos = asm.find("tmp0:").expect("else label:\n{asm}");
     let (head, tail) = asm.split_at(else_pos);
-    assert!(head.contains("MOVWF 0x2D"), "true arm first:\n{asm}");
-    assert!(head.contains("MOVF 0x2A, W"), "true arm copies %x:\n{asm}");
-    assert!(tail.contains("MOVF 0x27, W"), "false arm copies %s:\n{asm}");
+    assert!(head.contains("XORWF 0x2D, F"), "xor side first:\n{asm}");
+    assert!(!tail.contains("XORWF"), "else side is a bare shift:\n{asm}");
+    // Both sides simulate: sign set xors the poly, clear just shifts.
+    let words = asm::assemble(&asm);
+    {
+        use pic14_sim::Pic14;
+        let mut p = Pic14::new(words.clone());
+        p.ram_mut()[0x20] = 0x00;
+        p.ram_mut()[0x21] = 0x80;
+        p.run(200_000);
+        assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+        assert_eq!(p.ram()[0x22], 0x21, "poly lo xored:\n{asm}");
+        assert_eq!(p.ram()[0x23], 0x10, "poly hi xored:\n{asm}");
+    }
+    {
+        use pic14_sim::Pic14;
+        let mut p = Pic14::new(words);
+        p.ram_mut()[0x20] = 0x00;
+        p.ram_mut()[0x21] = 0x40;
+        p.run(200_000);
+        assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+        assert_eq!(p.ram()[0x22], 0x00, "shift lo:\n{asm}");
+        assert_eq!(p.ram()[0x23], 0x80, "shift hi:\n{asm}");
+    }
+}
+
+#[test]
+fn shl_i16_by_8_folds_to_byte_move() {
+    // The crc outer loop's `buf << 8`: hi = lo, lo = 0, with no rotate
+    // loop.
+    let m = parse(
+        "global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @in\n    %s = shl i16 %a, 8\n    store i16 %s @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x22),
+        ("main::a", 0x25),
+        ("main::s", 0x27),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(!asm.contains("RLF"), "no rotate loop:\n{asm}");
+    assert!(!asm.contains("BCF STATUS, 0"), "no carry setup:\n{asm}");
+    assert!(asm.contains("CLRF 0x27"), "lo byte clears:\n{asm}");
+    assert!(asm.contains("MOVWF 0x28"), "lo moves to hi:\n{asm}");
+}
+
+#[test]
+fn shl_i16_by_1_keeps_rotate_loop() {
+    // A non-byte count still copies then rotates in place.
+    let m = parse(
+        "global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @in\n    %s = shl i16 %a, 1\n    store i16 %s @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x22),
+        ("main::a", 0x25),
+        ("main::s", 0x27),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(asm.contains("RLF"), "rotate loop stays:\n{asm}");
+    assert!(!asm.contains("CLRF 0x22"), "no byte clear:\n{asm}");
+}
+
+#[test]
+fn crc_fold_mirrors_sge_arm_order() {
+    // `sge` takes the xor arm in `b` when the sign bit is set, so the
+    // skip stays BTFSS: the mirror swaps arms, not outcomes. Both
+    // sides simulate, since presence alone cannot catch inversion.
+    let m = parse(
+        "global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %c = load i16 @in\n    %s = shl i16 %c 1\n    %x = xor i16 %s 4129\n    %t = icmp sge i16 %c 0\n    %n = select i1 %t i16 %s i16 %x\n    store i16 %n @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x22),
+        ("main::c", 0x25),
+        ("main::s", 0x27),
+        ("main::x", 0x29),
+        ("main::t", 0x2B),
+        ("main::n", 0x2D),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(asm.contains("BTFSS 0x26, 7"), "sign test:\n{asm}");
+    assert!(!asm.contains("SUBWF"), "sge compare gone:\n{asm}");
+    assert!(asm.contains("XORWF 0x2D, F"), "poly still applied:\n{asm}");
+    let words = asm::assemble(&asm);
+    {
+        use pic14_sim::Pic14;
+        let mut p = Pic14::new(words.clone());
+        p.ram_mut()[0x20] = 0x00;
+        p.ram_mut()[0x21] = 0x80;
+        p.run(200_000);
+        assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+        assert_eq!(p.ram()[0x22], 0x21, "poly lo xored:\n{asm}");
+        assert_eq!(p.ram()[0x23], 0x10, "poly hi xored:\n{asm}");
+    }
+    {
+        use pic14_sim::Pic14;
+        let mut p = Pic14::new(words);
+        p.ram_mut()[0x20] = 0x00;
+        p.ram_mut()[0x21] = 0x40;
+        p.run(200_000);
+        assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+        assert_eq!(p.ram()[0x22], 0x00, "shift lo:\n{asm}");
+        assert_eq!(p.ram()[0x23], 0x80, "shift hi:\n{asm}");
+    }
+}
+
+#[test]
+fn crc_fold_refused_for_shift_by_2() {
+    // The shift must be by exactly 1: a wider shift keeps the diamond,
+    // whose xor runs through W.
+    let m = parse(
+        "global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %c = load i16 @in\n    %s = shl i16 %c 2\n    %x = xor i16 %s 4129\n    %t = icmp slt i16 %c 0\n    %n = select i1 %t i16 %x i16 %s\n    store i16 %n @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x22),
+        ("main::c", 0x25),
+        ("main::s", 0x27),
+        ("main::x", 0x29),
+        ("main::t", 0x2B),
+        ("main::n", 0x2D),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(asm.contains("XORLW"), "diamond xor through W stays:\n{asm}");
+    assert!(
+        !asm.contains("XORWF 0x2D, F"),
+        "no in-place poly xor:\n{asm}"
+    );
 }
 
 #[test]
@@ -778,6 +907,10 @@ fn walk_body_select_folds_sign_test() {
     assert!(asm.contains("DECFSZ 0x25, F"), "still a walk:\n{asm}");
     assert!(asm.contains("BTFSS 0x2B, 7"), "sign test:\n{asm}");
     assert!(!asm.contains("SUBWF"), "slt compare gone:\n{asm}");
+    assert!(
+        asm.contains("XORWF 0x31, F"),
+        "poly xors the select dst in place:\n{asm}"
+    );
 }
 #[test]
 fn select_labels_are_unique_across_functions() {
