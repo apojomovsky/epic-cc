@@ -41,6 +41,9 @@ usage: epic-cc [options] <input.c|input.cpp>...
   --var-table <file>   write the typed variable table into <file>
                        (`global <name> 0xNN TYPE` / `local {func}::{name}
                        0xNN TYPE`, one flattened record per mapped var)
+  --sidecar <file>     write the ELF+DWARF sidecar into <file> for gdb
+                       (source lines and typed variables; never flashed,
+                       flash the HEX and load the sidecar with `file`)
   --version, -V        print the compiler identity (e.g. epic-cc 0.3.0, or
                        epic-cc 0.1.0+<sha> for a build from a git checkout)
   --help, -h           print this help and exit
