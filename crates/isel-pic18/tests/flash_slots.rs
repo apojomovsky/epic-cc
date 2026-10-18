@@ -881,3 +881,95 @@ fn split_address_with_noop_on_one_leg_is_refused() {
         |_| {},
     );
 }
+
+#[test]
+#[should_panic(expected = "maybe-flash destination")]
+fn memcpy_into_mixed_global_is_refused() {
+    // A copy into a maybe-flash slot has no tag source: even with a
+    // tagged source the destination check must fire first (epic-cc#1306
+    // defers the destination side).
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i16\nglobal buf i8\n\
+             fn main(void) ()\n  block entry:\n    %b = gep @buf +0\n    store ptr %b @g\n    store ptr %b @h\n    %p = load ptr @g\n    memcpy @h %p 1\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" || g.name == "h" {
+            g.bytes = vec![1, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x13),
+            ("buf", 0x16),
+            ("main::b", 0x17),
+            ("main::p", 0x19),
+        ]),
+        None,
+    );
+}
+
+#[test]
+fn dynamic_walk_over_mixed_base_keeps_base_tag() {
+    // A runtime-indexed walk preserves its base's space: storing it
+    // into a shared slot must copy the base's tag, not tag 0, so the
+    // load back dispatches on the right space for every combination
+    // of base space and index (epic-cc#1306).
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal idx i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %f = load i8 @flag\n    br i1 %f ram join\n  block ram:\n    %b = gep @buf +0\n    store ptr %b @g\n    br join\n  block join:\n    %p = load ptr @g\n    %i = load i8 @idx\n    %w = gep %p +0 +1*%i\n    store ptr %w @g\n    %q = load ptr @g\n    %v = load i8 %q\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"PQ",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" {
+            g.bytes = vec![1, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("buf", 0x13),
+            ("flag", 0x15),
+            ("idx", 0x16),
+            ("out", 0x17),
+            ("main::f", 0x18),
+            ("main::b", 0x19),
+            ("main::p", 0x1B),
+            ("main::i", 0x1E),
+            ("main::q", 0x1F),
+            ("main::v", 0x22),
+        ]),
+        None,
+    );
+    assert!(asm.contains("TBLRD*"), "flash arm must read flash:\n{asm}");
+    for (f, i, want) in [
+        (0u8, 0u8, b'P'),
+        (0u8, 1u8, b'Q'),
+        (1u8, 0u8, b'B'),
+        (1u8, 1u8, b'R'),
+    ] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x15] = f;
+        p.ram_mut()[0x16] = i;
+        p.ram_mut()[0x13] = b'B';
+        p.ram_mut()[0x14] = b'R';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x17], want, "arm f={f} i={i} must read its space");
+    }
+}
