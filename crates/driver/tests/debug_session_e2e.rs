@@ -248,7 +248,7 @@ fn write_watchpoint_stops_with_value() {
 
 #[test]
 fn server_arg_parsing() {
-    use epic_cc_gdbserver::parse_args;
+    use epic_cc_gdbserver::{core_of, parse_args, USAGE};
     let args = parse_args(&[
         "a.hex".to_string(),
         "a.elf".to_string(),
@@ -259,4 +259,24 @@ fn server_arg_parsing() {
     assert_eq!(args.port, 1234);
     assert!(parse_args(&["a.hex".to_string()]).is_err());
     assert!(parse_args(&["a.hex".to_string(), "a.elf".to_string()]).is_err());
+    let err = parse_args(&["a.hex".to_string(), "a.elf".to_string()]).unwrap_err();
+    assert!(
+        err.contains(USAGE),
+        "missing --port must print usage: {err}"
+    );
+    let err = parse_args(&[
+        "a.hex".to_string(),
+        "a.elf".to_string(),
+        "--port".to_string(),
+        "1234".to_string(),
+        "--devce".to_string(),
+        "p16f877a".to_string(),
+    ])
+    .unwrap_err();
+    assert!(err.contains("--device"), "misspelling must hint: {err}");
+    let err = core_of(Some("no-such-part")).unwrap_err();
+    assert!(
+        err.contains("p16f877a"),
+        "unknown device must list devices: {err}"
+    );
 }

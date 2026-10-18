@@ -226,7 +226,7 @@ class GdbserverTests(unittest.TestCase):
         path.chmod(0o755)
         return str(path)
 
-    def test_gdbserver_help_captured_from_stderr(self):
+    def test_gdbserver_help_captured_from_stdout(self):
         with tempfile.TemporaryDirectory() as td:
             td = pathlib.Path(td)
             binary = self._stub(
@@ -235,7 +235,7 @@ class GdbserverTests(unittest.TestCase):
             )
             gdb = self._stub(
                 td / "epic-cc-gdbserver",
-                f'>&2 echo "{self.GDB_USAGE}"\nexit 2',
+                f'echo "{self.GDB_USAGE}"\nexit 0',
             )
             sections = gen_docs_reference.build_cli_sections(binary, gdb)
         self.assertEqual(
@@ -248,6 +248,13 @@ class GdbserverTests(unittest.TestCase):
         text = gen_docs_reference.render_cli(sections)
         self.assertIn("## `epic-cc-gdbserver --help`", text)
         self.assertIn(f"```text\n{self.GDB_USAGE}\n```", text)
+
+    def test_gdbserver_help_failure_raises(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = pathlib.Path(td)
+            gdb = self._stub(td / "epic-cc-gdbserver", "exit 2")
+            with self.assertRaises(RuntimeError):
+                gen_docs_reference.capture_gdbserver_help(str(gdb))
 
 
 class UserPageTests(unittest.TestCase):
