@@ -12,6 +12,8 @@
 //!   the sidecar (`info line *addr`).
 //! - a banked fixture's `BANKSEL` words (phase-1 inherits-a-line case)
 //!   step over inside their source line.
+//! - `watch` stops on the store with old/new values, `info break`
+//!   lists the watch, `rwatch`/`awatch` report cannot-insert text.
 
 use std::io::Write;
 use std::process::Command;
@@ -196,6 +198,52 @@ fn banksel_words_step_inside_their_line() {
         "next crossed the BANKSEL into line 88:\n{text}"
     );
     assert!(text.contains("$1 = 7"), "print b84:\n{text}");
+}
+
+#[test]
+fn write_watchpoint_stops_with_value() {
+    // `watch` over RSP `Z2` (epic-cc#1358): the adapter polls the sim
+    // RAM image, so the store to `g_cnt` stops the session with the
+    // old and new values, and `info break` lists the watch. Read and
+    // access watches have no sim load trap, so `rwatch`/`awatch` fail.
+    let dir = scratch("watch");
+    let (hex, elf, _) = compile("tests/fixtures/debug_session.c", &dir);
+    let prog = load_program(&hex, &elf, Core::Pic14).expect("load program");
+
+    let text = gdb_session(
+        &elf,
+        prog,
+        &[
+            "break debug_session.c:17".to_string(),
+            "continue".to_string(),
+            "watch g_cnt".to_string(),
+            "continue".to_string(),
+            "info break".to_string(),
+            "delete 2".to_string(),
+            "rwatch g_cnt".to_string(),
+            "awatch g_cnt".to_string(),
+            "continue".to_string(),
+            "quit".to_string(),
+        ],
+    );
+    assert!(text.contains("Breakpoint 1 at"), "breakpoint:\n{text}");
+    assert!(
+        text.contains("Hardware watchpoint 2: g_cnt"),
+        "watch armed:\n{text}"
+    );
+    for (frag, i) in [
+        ("Old value = 0", "watch old value"),
+        ("New value = 41", "watch new value"),
+        ("hw watchpoint  keep y", "info break lists the watch"),
+        ("Could not insert hardware watchpoint 3.", "rwatch refused"),
+        ("Could not insert hardware watchpoint 4.", "awatch refused"),
+        (
+            "You may have requested too many hardware breakpoints/watchpoints.",
+            "refusal reason",
+        ),
+    ] {
+        assert!(text.contains(frag), "{i}:\n{text}");
+    }
 }
 
 #[test]

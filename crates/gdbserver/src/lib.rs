@@ -26,6 +26,7 @@ use gdbstub::stub::{DisconnectReason, GdbStub};
 use gdbstub::target::ext::base::singlethread::SingleThreadBase;
 use gdbstub::target::ext::base::singlethread::SingleThreadResume;
 use gdbstub::target::ext::base::singlethread::SingleThreadSingleStep;
+use gdbstub::target::ext::breakpoints::WatchKind;
 use gdbstub::target::Target;
 use gdbstub::target::{TargetError, TargetResult};
 use gdbstub_arch::x86::reg::X86CoreRegs;
@@ -122,6 +123,7 @@ pub fn serve_stream(
             let mut target = Pic14Target {
                 sim: Pic14::new(prog),
                 breakpoints: HashSet::new(),
+                watchpoints: Vec::new(),
                 stepped: false,
             };
             GdbStub::new(connection).run_blocking::<EventLoop<Pic14Target>>(&mut target)
@@ -130,6 +132,7 @@ pub fn serve_stream(
             let mut target = Pic14eTarget {
                 sim: Pic14e::new(prog),
                 breakpoints: HashSet::new(),
+                watchpoints: Vec::new(),
                 stepped: false,
             };
             GdbStub::new(connection).run_blocking::<EventLoop<Pic14eTarget>>(&mut target)
@@ -138,6 +141,7 @@ pub fn serve_stream(
             let mut target = Pic18Target {
                 sim: Pic18::new(prog),
                 breakpoints: HashSet::new(),
+                watchpoints: Vec::new(),
                 stepped: false,
             };
             GdbStub::new(connection).run_blocking::<EventLoop<Pic18Target>>(&mut target)
@@ -149,6 +153,7 @@ pub fn serve_stream(
             let mut target = PicBaselineTarget {
                 sim: PicBaseline::with_device(dev, prog),
                 breakpoints: HashSet::new(),
+                watchpoints: Vec::new(),
                 stepped: false,
             };
             GdbStub::new(connection).run_blocking::<EventLoop<PicBaselineTarget>>(&mut target)
@@ -187,9 +192,19 @@ const PIC18_RAM_SIZE: u32 = 0x1000;
 const BASELINE_RAM_SIZE: u32 = 0x100;
 const PIC14E_RAM_SIZE: u32 = 0x1000;
 
+/// One polled write watchpoint (gdb `watch` over RSP `Z2`). The sim has
+/// no watch trap, so the run loop compares these bytes against the
+/// snapshot after each step and reports the first change.
+struct Watchpoint {
+    addr: u32,
+    len: u32,
+    last: Vec<u8>,
+}
+
 pub struct Pic14Target {
     sim: Pic14,
     breakpoints: HashSet<u32>,
+    watchpoints: Vec<Watchpoint>,
     /// Set by `step()`: the instruction already advanced synchronously,
     /// so the event loop must report `DoneStep` instead of running.
     stepped: bool,
@@ -198,6 +213,7 @@ pub struct Pic14Target {
 pub struct Pic18Target {
     sim: Pic18,
     breakpoints: HashSet<u32>,
+    watchpoints: Vec<Watchpoint>,
     /// Same `step()`/`DoneStep` contract as `Pic14Target::stepped`.
     stepped: bool,
 }
@@ -205,6 +221,7 @@ pub struct Pic18Target {
 pub struct PicBaselineTarget {
     sim: PicBaseline<'static>,
     breakpoints: HashSet<u32>,
+    watchpoints: Vec<Watchpoint>,
     /// Same `step()`/`DoneStep` contract as `Pic14Target::stepped`.
     stepped: bool,
 }
@@ -212,6 +229,7 @@ pub struct PicBaselineTarget {
 pub struct Pic14eTarget {
     sim: Pic14e,
     breakpoints: HashSet<u32>,
+    watchpoints: Vec<Watchpoint>,
     /// Same `step()`/`DoneStep` contract as `Pic14Target::stepped`.
     stepped: bool,
 }
@@ -294,6 +312,82 @@ trait AdapterTarget: Target<Arch = X86_SSE, Error = &'static str> {
     fn pc_addr(&self) -> u32;
     fn at_breakpoint(&self) -> bool;
     fn take_stepped(&mut self) -> bool;
+    fn watch_byte(&self, addr: u32) -> u8;
+    fn watch_slots(&self) -> &[Watchpoint];
+    fn watch_slots_mut(&mut self) -> &mut Vec<Watchpoint>;
+
+    /// Current bytes under a watch window.
+    fn snapshot_watch(&self, addr: u32, len: u32) -> Vec<u8> {
+        (0..len).map(|i| self.watch_byte(addr + i)).collect()
+    }
+
+    /// Arm (or re-arm) a write watch. The snapshot is the value gdb saw
+    /// when `watch` was issued, so only later stores fire.
+    fn add_write_watch(&mut self, addr: u32, len: u32) {
+        self.watch_slots_mut()
+            .retain(|w| w.addr != addr || w.len != len);
+        let last = self.snapshot_watch(addr, len);
+        self.watch_slots_mut().push(Watchpoint { addr, len, last });
+    }
+
+    fn remove_write_watch(&mut self, addr: u32, len: u32) -> bool {
+        let slots = self.watch_slots_mut();
+        let before = slots.len();
+        slots.retain(|w| w.addr != addr || w.len != len);
+        slots.len() != before
+    }
+
+    /// Re-snapshot after gdb's own writes (`M`/`G` packets): debugger
+    /// traffic, not target stores, so it must not fire the watch.
+    fn refresh_write_watches(&mut self) {
+        let mut i = 0;
+        while i < self.watch_slots().len() {
+            let (addr, len) = {
+                let w = &self.watch_slots()[i];
+                (w.addr, w.len)
+            };
+            let fresh = self.snapshot_watch(addr, len);
+            self.watch_slots_mut()[i].last = fresh;
+            i += 1;
+        }
+    }
+
+    /// Compare each armed watch against the RAM image, refreshing every
+    /// snapshot. Returns the first fired address: one instruction can
+    /// trip overlapping watches, and the rest must not fire late.
+    fn poll_write_watch(&mut self) -> Option<u32> {
+        let mut hit = None;
+        let mut i = 0;
+        while i < self.watch_slots().len() {
+            let (addr, len) = {
+                let w = &self.watch_slots()[i];
+                (w.addr, w.len)
+            };
+            let now = self.snapshot_watch(addr, len);
+            if now != self.watch_slots()[i].last {
+                hit = hit.or(Some(addr));
+            }
+            self.watch_slots_mut()[i].last = now;
+            i += 1;
+        }
+        hit
+    }
+
+    /// Stop reason for a synchronous single step: a watch tripped by
+    /// the stepped instruction reports as a watch stop, else DoneStep.
+    /// Without the poll the snapshot would go stale and fire one stop
+    /// late on the next continue.
+    fn stepped_stop(&mut self) -> SingleThreadStopReason<u32> {
+        if let Some(addr) = self.poll_write_watch() {
+            SingleThreadStopReason::Watch {
+                tid: (),
+                kind: WatchKind::Write,
+                addr,
+            }
+        } else {
+            SingleThreadStopReason::DoneStep
+        }
+    }
 
     /// Run at most `budget` instructions, reporting a stop reason when
     /// one lands, or `None` when the budget expired (the event loop
@@ -313,6 +407,13 @@ trait AdapterTarget: Target<Arch = X86_SSE, Error = &'static str> {
             }
             if self.at_breakpoint() {
                 return Some(SingleThreadStopReason::SwBreak(()));
+            }
+            if let Some(addr) = self.poll_write_watch() {
+                return Some(SingleThreadStopReason::Watch {
+                    tid: (),
+                    kind: WatchKind::Write,
+                    addr,
+                });
             }
         }
         None
@@ -335,6 +436,15 @@ impl AdapterTarget for Pic14Target {
     fn take_stepped(&mut self) -> bool {
         std::mem::replace(&mut self.stepped, false)
     }
+    fn watch_byte(&self, addr: u32) -> u8 {
+        self.read_mem_byte(addr)
+    }
+    fn watch_slots(&self) -> &[Watchpoint] {
+        &self.watchpoints
+    }
+    fn watch_slots_mut(&mut self) -> &mut Vec<Watchpoint> {
+        &mut self.watchpoints
+    }
 }
 
 impl AdapterTarget for Pic18Target {
@@ -352,6 +462,15 @@ impl AdapterTarget for Pic18Target {
     }
     fn take_stepped(&mut self) -> bool {
         std::mem::replace(&mut self.stepped, false)
+    }
+    fn watch_byte(&self, addr: u32) -> u8 {
+        self.read_mem_byte(addr)
+    }
+    fn watch_slots(&self) -> &[Watchpoint] {
+        &self.watchpoints
+    }
+    fn watch_slots_mut(&mut self) -> &mut Vec<Watchpoint> {
+        &mut self.watchpoints
     }
 }
 
@@ -371,6 +490,15 @@ impl AdapterTarget for PicBaselineTarget {
     fn take_stepped(&mut self) -> bool {
         std::mem::replace(&mut self.stepped, false)
     }
+    fn watch_byte(&self, addr: u32) -> u8 {
+        self.read_mem_byte(addr)
+    }
+    fn watch_slots(&self) -> &[Watchpoint] {
+        &self.watchpoints
+    }
+    fn watch_slots_mut(&mut self) -> &mut Vec<Watchpoint> {
+        &mut self.watchpoints
+    }
 }
 
 impl AdapterTarget for Pic14eTarget {
@@ -388,6 +516,15 @@ impl AdapterTarget for Pic14eTarget {
     }
     fn take_stepped(&mut self) -> bool {
         std::mem::replace(&mut self.stepped, false)
+    }
+    fn watch_byte(&self, addr: u32) -> u8 {
+        self.read_mem_byte(addr)
+    }
+    fn watch_slots(&self) -> &[Watchpoint] {
+        &self.watchpoints
+    }
+    fn watch_slots_mut(&mut self) -> &mut Vec<Watchpoint> {
+        &mut self.watchpoints
     }
 }
 
@@ -423,6 +560,13 @@ impl gdbstub::target::ext::breakpoints::Breakpoints for Pic14Target {
     ) -> Option<gdbstub::target::ext::breakpoints::SwBreakpointOps<'_, Self>> {
         Some(self)
     }
+
+    #[inline(always)]
+    fn support_hw_watchpoint(
+        &mut self,
+    ) -> Option<gdbstub::target::ext::breakpoints::HwWatchpointOps<'_, Self>> {
+        Some(self)
+    }
 }
 
 impl gdbstub::target::ext::breakpoints::SwBreakpoint for Pic14Target {
@@ -441,6 +585,32 @@ impl gdbstub::target::ext::breakpoints::SwBreakpoint for Pic14Target {
         _kind: <Self::Arch as gdbstub::arch::Arch>::BreakpointKind,
     ) -> TargetResult<bool, Self> {
         Ok(self.breakpoints.remove(&addr))
+    }
+}
+
+impl gdbstub::target::ext::breakpoints::HwWatchpoint for Pic14Target {
+    fn add_hw_watchpoint(
+        &mut self,
+        addr: u32,
+        len: u32,
+        kind: WatchKind,
+    ) -> TargetResult<bool, Self> {
+        // The sim never reports loads, so only stores trap: read and
+        // access watches stay refused.
+        if kind != WatchKind::Write || len == 0 {
+            return Ok(false);
+        }
+        self.add_write_watch(addr, len);
+        Ok(true)
+    }
+
+    fn remove_hw_watchpoint(
+        &mut self,
+        addr: u32,
+        len: u32,
+        _kind: WatchKind,
+    ) -> TargetResult<bool, Self> {
+        Ok(self.remove_write_watch(addr, len))
     }
 }
 
@@ -475,6 +645,13 @@ impl gdbstub::target::ext::breakpoints::Breakpoints for Pic18Target {
     ) -> Option<gdbstub::target::ext::breakpoints::SwBreakpointOps<'_, Self>> {
         Some(self)
     }
+
+    #[inline(always)]
+    fn support_hw_watchpoint(
+        &mut self,
+    ) -> Option<gdbstub::target::ext::breakpoints::HwWatchpointOps<'_, Self>> {
+        Some(self)
+    }
 }
 
 impl gdbstub::target::ext::breakpoints::SwBreakpoint for Pic18Target {
@@ -493,6 +670,32 @@ impl gdbstub::target::ext::breakpoints::SwBreakpoint for Pic18Target {
         _kind: <Self::Arch as gdbstub::arch::Arch>::BreakpointKind,
     ) -> TargetResult<bool, Self> {
         Ok(self.breakpoints.remove(&addr))
+    }
+}
+
+impl gdbstub::target::ext::breakpoints::HwWatchpoint for Pic18Target {
+    fn add_hw_watchpoint(
+        &mut self,
+        addr: u32,
+        len: u32,
+        kind: WatchKind,
+    ) -> TargetResult<bool, Self> {
+        // Same store-only contract as `Pic14Target`: the sim never
+        // reports loads, so read and access watches stay refused.
+        if kind != WatchKind::Write || len == 0 {
+            return Ok(false);
+        }
+        self.add_write_watch(addr, len);
+        Ok(true)
+    }
+
+    fn remove_hw_watchpoint(
+        &mut self,
+        addr: u32,
+        len: u32,
+        _kind: WatchKind,
+    ) -> TargetResult<bool, Self> {
+        Ok(self.remove_write_watch(addr, len))
     }
 }
 
@@ -551,6 +754,13 @@ impl gdbstub::target::ext::breakpoints::Breakpoints for PicBaselineTarget {
     ) -> Option<gdbstub::target::ext::breakpoints::SwBreakpointOps<'_, Self>> {
         Some(self)
     }
+
+    #[inline(always)]
+    fn support_hw_watchpoint(
+        &mut self,
+    ) -> Option<gdbstub::target::ext::breakpoints::HwWatchpointOps<'_, Self>> {
+        Some(self)
+    }
 }
 
 impl gdbstub::target::ext::breakpoints::Breakpoints for Pic14eTarget {
@@ -558,6 +768,13 @@ impl gdbstub::target::ext::breakpoints::Breakpoints for Pic14eTarget {
     fn support_sw_breakpoint(
         &mut self,
     ) -> Option<gdbstub::target::ext::breakpoints::SwBreakpointOps<'_, Self>> {
+        Some(self)
+    }
+
+    #[inline(always)]
+    fn support_hw_watchpoint(
+        &mut self,
+    ) -> Option<gdbstub::target::ext::breakpoints::HwWatchpointOps<'_, Self>> {
         Some(self)
     }
 }
@@ -581,6 +798,32 @@ impl gdbstub::target::ext::breakpoints::SwBreakpoint for PicBaselineTarget {
     }
 }
 
+impl gdbstub::target::ext::breakpoints::HwWatchpoint for PicBaselineTarget {
+    fn add_hw_watchpoint(
+        &mut self,
+        addr: u32,
+        len: u32,
+        kind: WatchKind,
+    ) -> TargetResult<bool, Self> {
+        // Same store-only contract as `Pic14Target`: the sim never
+        // reports loads, so read and access watches stay refused.
+        if kind != WatchKind::Write || len == 0 {
+            return Ok(false);
+        }
+        self.add_write_watch(addr, len);
+        Ok(true)
+    }
+
+    fn remove_hw_watchpoint(
+        &mut self,
+        addr: u32,
+        len: u32,
+        _kind: WatchKind,
+    ) -> TargetResult<bool, Self> {
+        Ok(self.remove_write_watch(addr, len))
+    }
+}
+
 impl gdbstub::target::ext::breakpoints::SwBreakpoint for Pic14eTarget {
     fn add_sw_breakpoint(
         &mut self,
@@ -600,6 +843,32 @@ impl gdbstub::target::ext::breakpoints::SwBreakpoint for Pic14eTarget {
     }
 }
 
+impl gdbstub::target::ext::breakpoints::HwWatchpoint for Pic14eTarget {
+    fn add_hw_watchpoint(
+        &mut self,
+        addr: u32,
+        len: u32,
+        kind: WatchKind,
+    ) -> TargetResult<bool, Self> {
+        // Same store-only contract as `Pic14Target`: the sim never
+        // reports loads, so read and access watches stay refused.
+        if kind != WatchKind::Write || len == 0 {
+            return Ok(false);
+        }
+        self.add_write_watch(addr, len);
+        Ok(true)
+    }
+
+    fn remove_hw_watchpoint(
+        &mut self,
+        addr: u32,
+        len: u32,
+        _kind: WatchKind,
+    ) -> TargetResult<bool, Self> {
+        Ok(self.remove_write_watch(addr, len))
+    }
+}
+
 impl SingleThreadBase for Pic14Target {
     fn read_registers(&mut self, regs: &mut X86CoreRegs) -> TargetResult<(), Self> {
         regs.eax = self.sim.w() as u32;
@@ -609,7 +878,6 @@ impl SingleThreadBase for Pic14Target {
         regs.eip = self.sim.pc() as u32;
         Ok(())
     }
-
     fn write_registers(&mut self, regs: &X86CoreRegs) -> TargetResult<(), Self> {
         // Every mapped register reads back what gdb wrote: W, PC, the
         // full STATUS byte (bank bits included), FSR, and PCLATH.
@@ -618,6 +886,7 @@ impl SingleThreadBase for Pic14Target {
         self.sim.ram_mut()[0x03] = regs.ecx as u8;
         self.sim.ram_mut()[0x04] = regs.edx as u8;
         self.sim.ram_mut()[0x0A] = regs.ebx as u8;
+        self.refresh_write_watches();
         Ok(())
     }
 
@@ -637,6 +906,7 @@ impl SingleThreadBase for Pic14Target {
             return Err(TargetError::NonFatal);
         }
         self.sim.ram_mut()[base..end].copy_from_slice(data);
+        self.refresh_write_watches();
         Ok(())
     }
 
@@ -666,6 +936,7 @@ impl SingleThreadBase for Pic18Target {
         self.sim.ram_mut()[0xFE9] = (regs.edx & 0xFF) as u8;
         self.sim.ram_mut()[0xFEA] = ((regs.edx >> 8) & 0xFF) as u8;
         self.sim.ram_mut()[0xFE0] = regs.ebx as u8;
+        self.refresh_write_watches();
         Ok(())
     }
 
@@ -685,6 +956,7 @@ impl SingleThreadBase for Pic18Target {
             return Err(TargetError::NonFatal);
         }
         self.sim.ram_mut()[base..end].copy_from_slice(data);
+        self.refresh_write_watches();
         Ok(())
     }
 
@@ -716,6 +988,7 @@ impl SingleThreadBase for PicBaselineTarget {
         self.sim.ram_mut()[0x04] = regs.edx as u8;
         self.sim.set_pcl(regs.ebx as u8);
         self.sim.set_pc(regs.eip as u16);
+        self.refresh_write_watches();
         Ok(())
     }
 
@@ -735,6 +1008,7 @@ impl SingleThreadBase for PicBaselineTarget {
             return Err(TargetError::NonFatal);
         }
         self.sim.ram_mut()[base..end].copy_from_slice(data);
+        self.refresh_write_watches();
         Ok(())
     }
 
@@ -765,6 +1039,7 @@ impl SingleThreadBase for Pic14eTarget {
         self.sim.ram_mut()[0x04] = (regs.edx & 0xFF) as u8;
         self.sim.ram_mut()[0x05] = ((regs.edx >> 8) & 0xFF) as u8;
         self.sim.ram_mut()[0x08] = regs.ebx as u8;
+        self.refresh_write_watches();
         Ok(())
     }
 
@@ -784,6 +1059,7 @@ impl SingleThreadBase for Pic14eTarget {
             return Err(TargetError::NonFatal);
         }
         self.sim.ram_mut()[base..end].copy_from_slice(data);
+        self.refresh_write_watches();
         Ok(())
     }
 
@@ -889,12 +1165,10 @@ impl<T: AdapterTarget> run_blocking::BlockingEventLoop for EventLoop<T> {
         run_blocking::WaitForStopReasonError<<T as Target>::Error, std::io::Error>,
     > {
         // A synchronous `step()` already advanced one instruction: report
-        // it without running. Otherwise this loop runs the target while
-        // polling the connection so an interrupt (^C) still lands.
+        // it without running, polling the watches first so a store the
+        // stepped instruction made reports now and not one stop late.
         if target.take_stepped() {
-            return Ok(run_blocking::Event::TargetStopped(
-                SingleThreadStopReason::DoneStep,
-            ));
+            return Ok(run_blocking::Event::TargetStopped(target.stepped_stop()));
         }
         let mut poll_incoming = || conn.peek().map(|b| b.is_some()).unwrap_or(true);
         loop {
@@ -918,5 +1192,49 @@ impl<T: AdapterTarget> run_blocking::BlockingEventLoop for EventLoop<T> {
         _target: &mut T,
     ) -> Result<Option<SingleThreadStopReason<u32>>, <T as Target>::Error> {
         Ok(Some(SingleThreadStopReason::Signal(Signal::SIGINT)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(prog: Vec<u16>) -> Pic14Target {
+        Pic14Target {
+            sim: Pic14::new(prog),
+            breakpoints: HashSet::new(),
+            watchpoints: Vec::new(),
+            stepped: false,
+        }
+    }
+
+    #[test]
+    fn stepped_store_reports_watch() {
+        // MOVLW 0x2A then MOVWF 0x20: only the second step stores.
+        let mut t = target(vec![0x302A, 0x00A0]);
+        t.add_write_watch(0x20, 1);
+        t.step_one();
+        assert!(matches!(t.stepped_stop(), SingleThreadStopReason::DoneStep));
+        t.step_one();
+        match t.stepped_stop() {
+            SingleThreadStopReason::Watch { addr, kind, .. } => {
+                assert_eq!(addr, 0x20);
+                assert_eq!(kind, WatchKind::Write);
+            }
+            other => panic!("expected a watch stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlapping_watches_fire_once() {
+        // One store trips two windows; both refresh, so the second
+        // never fires late on the next stop bound.
+        let mut t = target(vec![0x302A, 0x00A0]);
+        t.add_write_watch(0x20, 1);
+        t.add_write_watch(0x20, 2);
+        t.step_one();
+        t.step_one();
+        assert_eq!(t.poll_write_watch(), Some(0x20));
+        assert_eq!(t.poll_write_watch(), None);
     }
 }
