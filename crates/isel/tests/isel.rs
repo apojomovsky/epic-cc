@@ -5104,7 +5104,9 @@ fn default_shift_u32_simulates_half_word_stage() {
         for (i, b) in x.iter().enumerate() {
             seed.push((0x20 + i as u16, *b));
         }
-        seed.push((0x24, n));
+        // Dirty high count bytes: the call copies only the low byte, and
+        // the routine must not depend on the rest.
+        seed.extend([(0x24, n), (0x25, 0xFF), (0x26, 0xFF), (0x27, 0xFF)]);
         let got = sim_run_bytes(&ir, &map, &seed, 0x28, want.len());
         assert_eq!(&got[..], want, "{name}({x:?}, {n}) must be {want:?}");
     }
