@@ -149,6 +149,43 @@ fn pic14e_session_break_print_step() {
 }
 
 #[test]
+fn pic14e_write_watchpoint_stops_with_value() {
+    // `watch` over RSP `Z2`, mirrored from the PIC14 case: break at the
+    // line-12 store so the watch arms with the old value, `continue`
+    // stops on the store with old/new values, `info break` lists it.
+    let dir = scratch("watch");
+    let (hex, elf, _) = compile("tests/fixtures/debug_session_pic14e.c", &dir);
+    let prog = load_program(&hex, &elf, Core::Pic14e).expect("load program");
+
+    let text = gdb_session(
+        &elf,
+        prog,
+        &[
+            "break debug_session_pic14e.c:12".to_string(),
+            "continue".to_string(),
+            "watch g_cnt".to_string(),
+            "continue".to_string(),
+            "info break".to_string(),
+            "delete 2".to_string(),
+            "continue".to_string(),
+            "quit".to_string(),
+        ],
+    );
+    assert!(text.contains("Breakpoint 1 at"), "breakpoint:\n{text}");
+    assert!(
+        text.contains("Hardware watchpoint 2: g_cnt"),
+        "watch armed:\n{text}"
+    );
+    for (frag, i) in [
+        ("Old value = 0", "watch old value"),
+        ("New value = 41", "watch new value"),
+        ("hw watchpoint  keep y", "info break lists the watch"),
+    ] {
+        assert!(text.contains(frag), "{i}:\n{text}");
+    }
+}
+
+#[test]
 fn pic14e_server_arg_parsing() {
     use epic_cc_gdbserver::{core_of, parse_args};
     let args = parse_args(&[
