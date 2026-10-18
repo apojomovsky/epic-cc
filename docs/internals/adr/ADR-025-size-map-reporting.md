@@ -80,6 +80,16 @@ forces scratch alongside retval. The emitted code is byte-identical, so
 this stays version `2` by the #837 rule above: the same key, measured
 more precisely.
 
+## Amendment 2026-10-18: artifact flags rejected with short builds (epic-cc#1359)
+
+Artifact flags are written past the `--emit` early returns, so a short
+build would exit 0 with the file silently missing. `--map` and
+`--var-table` are written after alloc and rejected with `--emit ll/ir`;
+`--line-table`, `--sidecar` and `--report` are written after assemble
+and rejected with `--emit ll/ir/asm`. Rejection is exit 2 with stderr
+naming both flags. `--emit asm --map` keeps working: the map write runs
+before the asm return.
+
 ## Rationale
 
 * PlatformIO parses build output for size after every build (PIO-1's

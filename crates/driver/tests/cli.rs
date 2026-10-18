@@ -179,3 +179,177 @@ fn rejects_an_unknown_opt_level() {
     let e = parse_args(&args(&["a.c", "--device", "p16f877a", "-O"])).unwrap_err();
     assert!(e.contains("-O"), "{e}");
 }
+
+#[test]
+fn rejects_emit_asm_with_line_table() {
+    let e = parse_args(&args(&[
+        "a.c",
+        "--device",
+        "p16f877a",
+        "--emit",
+        "asm",
+        "--line-table",
+        "t.txt",
+    ]))
+    .unwrap_err();
+    assert!(e.contains("--line-table"), "{e}");
+    assert!(e.contains("--emit asm"), "{e}");
+}
+
+#[test]
+fn rejects_emit_ir_with_map() {
+    let e = parse_args(&args(&[
+        "a.c", "--device", "p16f877a", "--emit", "ir", "--map", "m.txt",
+    ]))
+    .unwrap_err();
+    assert!(e.contains("--map"), "{e}");
+    assert!(e.contains("--emit ir"), "{e}");
+}
+
+#[test]
+fn rejects_emit_ll_with_report() {
+    let e = parse_args(&args(&[
+        "a.c", "--device", "p16f877a", "--emit", "ll", "--report", "r.json",
+    ]))
+    .unwrap_err();
+    assert!(e.contains("--report"), "{e}");
+    assert!(e.contains("--emit ll"), "{e}");
+}
+
+#[test]
+fn rejects_emit_ll_with_var_table() {
+    let e = parse_args(&args(&[
+        "a.c",
+        "--device",
+        "p16f877a",
+        "--emit",
+        "ll",
+        "--var-table",
+        "v.txt",
+    ]))
+    .unwrap_err();
+    assert!(e.contains("--var-table"), "{e}");
+    assert!(e.contains("--emit ll"), "{e}");
+}
+
+#[test]
+fn allows_emit_asm_with_map() {
+    let c = parse_args(&args(&[
+        "a.c", "--device", "p16f877a", "--emit", "asm", "--map", "m.txt",
+    ]))
+    .unwrap();
+    assert!(c.map.is_some());
+}
+
+#[test]
+fn allows_emit_hex_with_every_artifact() {
+    parse_args(&args(&[
+        "a.c",
+        "--device",
+        "p16f877a",
+        "--emit",
+        "hex",
+        "--map",
+        "m.txt",
+        "--var-table",
+        "v.txt",
+        "--line-table",
+        "t.txt",
+        "--sidecar",
+        "s.bin",
+        "--report",
+        "r.json",
+    ]))
+    .unwrap();
+}
+
+// a.c need not exist below: the argument check runs before any file is read.
+fn rejected_invocation(emit: &str, flag: &str, path: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args(["a.c", "--device", "p16f877a", "--emit", emit, flag])
+        .arg(path)
+        .output()
+        .expect("run driver")
+}
+
+fn tmp_path(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("epic-cc-emit-reject-{}-{tag}", std::process::id()))
+}
+
+#[test]
+fn emit_asm_with_line_table_exits_2_naming_both_flags() {
+    let path = tmp_path("line-table.txt");
+    let out = rejected_invocation("asm", "--line-table", &path);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--line-table"), "{stderr}");
+    assert!(stderr.contains("--emit asm"), "{stderr}");
+    assert!(!path.exists(), "rejected build must not write the artifact");
+}
+
+#[test]
+fn emit_ir_with_map_exits_2_naming_both_flags() {
+    let path = tmp_path("map.txt");
+    let out = rejected_invocation("ir", "--map", &path);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--map"), "{stderr}");
+    assert!(stderr.contains("--emit ir"), "{stderr}");
+    assert!(!path.exists(), "rejected build must not write the artifact");
+}
+
+#[test]
+fn emit_ll_with_report_exits_2_naming_both_flags() {
+    let path = tmp_path("report.json");
+    let out = rejected_invocation("ll", "--report", &path);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--report"), "{stderr}");
+    assert!(stderr.contains("--emit ll"), "{stderr}");
+    assert!(!path.exists(), "rejected build must not write the artifact");
+}
+
+#[test]
+fn emit_hex_with_every_artifact_writes_each_file() {
+    let tag = format!("epic-cc-emit-hex-{}", std::process::id());
+    let dir = std::env::temp_dir();
+    let (hex, map, var_table, line_table, sidecar, report) = (
+        dir.join(format!("{tag}.hex")),
+        dir.join(format!("{tag}.map")),
+        dir.join(format!("{tag}.vars")),
+        dir.join(format!("{tag}.lines")),
+        dir.join(format!("{tag}.sidecar")),
+        dir.join(format!("{tag}.json")),
+    );
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            "tests/fixtures/add.c",
+            "--device",
+            "p16f877a",
+            "--emit",
+            "hex",
+            "-o",
+        ])
+        .arg(&hex)
+        .arg("--map")
+        .arg(&map)
+        .arg("--var-table")
+        .arg(&var_table)
+        .arg("--line-table")
+        .arg(&line_table)
+        .arg("--sidecar")
+        .arg(&sidecar)
+        .arg("--report")
+        .arg(&report)
+        .output()
+        .expect("run driver");
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for p in [&hex, &map, &var_table, &line_table, &sidecar, &report] {
+        assert!(p.exists(), "missing {}", p.display());
+        let _ = std::fs::remove_file(p);
+    }
+}
