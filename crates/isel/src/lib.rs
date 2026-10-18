@@ -3519,8 +3519,15 @@ impl<'m> Gen<'m> {
                 let homed = matches!(&arg.val, Val::Reg(_))
                     && aty.bytes() == callee.params[i].width
                     && matches!(self.val_addr(&arg.val), Slot::Direct(sa) if sa == pa);
+                // The shift routines mask and loop on the count's low byte
+                // alone, so the wider count bytes are never read: copy one.
+                let copy_ty = if i == 1 && Self::is_shift_routine(func) {
+                    Ty::I8
+                } else {
+                    aty
+                };
                 if !homed {
-                    self.emit_move_val_to_slot(&arg.val, aty, pa);
+                    self.emit_move_val_to_slot(&arg.val, copy_ty, pa);
                 }
                 // Conversion ABI: the four conversion routines take
                 // their value in a fixed 4-byte `val` slot, but i8/i16
@@ -3646,6 +3653,24 @@ impl<'m> Gen<'m> {
             self.emit("    NOP".to_string());
         }
     }
+    /// Whether `func` is one of the nine variable-count shift routines
+    /// (an `_isr` copy included).
+    fn is_shift_routine(func: &str) -> bool {
+        let base = func.strip_suffix("_isr").unwrap_or(func);
+        matches!(
+            base,
+            "__shl_u8"
+                | "__lshr_u8"
+                | "__ashr_i8"
+                | "__shl_u16"
+                | "__lshr_u16"
+                | "__ashr_i16"
+                | "__shl_u32"
+                | "__lshr_u32"
+                | "__ashr_i32"
+        )
+    }
+
     /// Whether a valued CALL to `func` returns with W holding the last
     /// declared retval byte. User functions (`Ret` stores low to high)
     /// and the integer runtime recipes (one trailing `store_retval` of
@@ -5639,8 +5664,9 @@ impl<'m> Gen<'m> {
     }
 
     /// The recipe body for the nine variable-count shift routines (i8/i16/
-    /// i32). The count arrives UNMASKED (a full i8/i16/i32, clang emits
-    /// it raw); LLVM says counts >= width are poison, so masking to
+    /// i32). The count arrives UNMASKED with only its low byte copied
+    /// (`emit_call`; clang emits it raw); LLVM says counts >= width are
+    /// poison, so masking to
     /// width-1 keeps the loop bounded (<= 7/15/31 iterations) and yields
     /// the defined-range result: deterministic, documented, never a hang.
     /// The value shifts **in place in the `val` param slot** (the caller's
@@ -5666,14 +5692,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVF 0x{cnt:02X}, W"));
         self.emit(format!("    ANDLW 0x{mask:02X}")); // count & (width-1)
         self.emit(format!("    MOVWF 0x{scr:02X}")); // __scr::cnt@0 = masked count
-        if bytes == 2 {
-            // __scr::cnt@1 (the high byte of the masked 2-byte cnt slot)
-            // stays 0: the masked count is < 16, so the DECFSZ loop counter
-            // lives entirely in the low byte. Clear it once so a stale high
-            // byte from an earlier call can't be misread as part of the count.
-            self.emit(format!("    CLRF 0x{:02X}", scr + 1));
-        }
-        if self.fast_shift && bytes > 1 {
+        if bytes > 1 && (self.fast_shift || (bytes == 4 && op != BinOp::AShr)) {
             self.emit_shift_byte_prefix(bytes, op, val, scr);
         }
         let l_loop = self.fresh_label();
@@ -5719,9 +5738,12 @@ impl<'m> Gen<'m> {
     /// each set high count bit moves whole bytes, then clears its bit so
     /// the bit loop below sees count % 8. Bit 3 selects one byte (u16 and
     /// u32); bit 4 selects two more bytes first (u32 only). A clear bit
-    /// costs one GOTO; each set bit saves eight bit-loop trips.
+    /// costs one GOTO; each set bit saves eight bit-loop trips. Without
+    /// `fast_shift` only the bit-4 stage of shl/lshr u32 is emitted: it
+    /// is nine words and saves sixteen trips of the widest loop, while
+    /// the bit-3 stages and the ashr sign fill cost more flash than the
+    /// size profile spends (epic-cc#1340).
     fn emit_shift_byte_prefix(&mut self, bytes: u16, op: BinOp, val: u16, scr: u16) {
-        let l_bits = self.fresh_label();
         if bytes == 4 {
             let l_chk8 = self.fresh_label();
             self.emit(format!("    BTFSS 0x{scr:02X}, 4")); // count >= 16?
@@ -5730,6 +5752,10 @@ impl<'m> Gen<'m> {
             self.emit(format!("    BCF 0x{scr:02X}, 4")); // remainder -= 16
             self.emit(format!("{l_chk8}:"));
         }
+        if !self.fast_shift {
+            return;
+        }
+        let l_bits = self.fresh_label();
         self.emit(format!("    BTFSS 0x{scr:02X}, 3")); // count >= 8?
         self.emit(format!("    GOTO {l_bits}"));
         self.emit_shift_byte_move(bytes, 1, op, val);

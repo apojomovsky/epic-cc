@@ -4792,7 +4792,6 @@ fn shift_routines_emit_recipe_bodies() {
             &[
                 "ANDLW 0x0F", // count & (16-1)
                 "MOVWF 0x44",
-                "CLRF 0x45",   // high byte of the masked count
                 "RLF 0x40, F", // val_lo
                 "RLF 0x41, F", // val_hi (shl: lo then hi)
                 "DECFSZ 0x44, F",
@@ -4990,7 +4989,7 @@ fn sim_run_bytes_shift(
 
 /// The fast-shift prefix emits where it should and nowhere else: the O2
 /// bodies carry the count-bit dispatch and the byte moves, the default
-/// bodies keep the pure bit loop (the -Os flash pin).
+/// bodies keep the pure bit loop except the u32 shl/lshr bit-4 stage.
 #[test]
 fn fast_shift_prefix_emits_only_under_o2() {
     let fast = Options {
@@ -5029,10 +5028,17 @@ fn fast_shift_prefix_emits_only_under_o2() {
         );
     }
     let (ir32, map32) = routine_module32("__shl_u32");
+    // The size profile keeps the 16-bit stage and nothing else (epic-cc#1340).
     let slow32 = emit(&ir32, &map32, Options::default());
     assert!(
-        !slow32.contains("BTFSS 0x48, 4"),
-        "default __shl_u32 keeps the bit loop:\n{slow32}"
+        slow32.contains("BTFSS 0x48, 4") && !slow32.contains("BTFSS 0x48, 3"),
+        "default __shl_u32 keeps only the bit-4 byte stage:\n{slow32}"
+    );
+    let (ira, mapa) = routine_module32("__ashr_i32");
+    let slow_ashr = emit(&ira, &mapa, Options::default());
+    assert!(
+        !slow_ashr.contains("BTFSS 0x48, 4"),
+        "default __ashr_i32 keeps the bit loop (sign fill costs flash):\n{slow_ashr}"
     );
     let fast32 = emit(&ir32, &map32, fast);
     for p in [
@@ -5052,6 +5058,75 @@ fn fast_shift_prefix_emits_only_under_o2() {
     assert!(
         !fast8.contains("BTFSS 0x32, 3"),
         "fast __shl_u8 must not grow a byte prefix:\n{fast8}"
+    );
+}
+
+/// The default (-Os) u32 shl/lshr bodies shift by 16 through byte moves
+/// and bit-loop the rest: exact on both sides of the bit-4 stage.
+#[test]
+fn default_shift_u32_simulates_half_word_stage() {
+    let cases: &[(&str, &[u8], u8, &[u8])] = &[
+        ("__shl_u32", &[1, 0, 0, 0], 19, &[0, 0, 8, 0]),
+        (
+            "__shl_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            16,
+            &[0, 0, 0x78, 0x56],
+        ),
+        ("__shl_u32", &[0x78, 0x56, 0x34, 0x12], 31, &[0, 0, 0, 0]),
+        ("__shl_u32", &[1, 0, 0, 0], 15, &[0, 0x80, 0, 0]),
+        ("__shl_u32", &[1, 0, 0, 0], 0, &[1, 0, 0, 0]),
+        ("__shl_u32", &[1, 0, 0, 0], 33, &[2, 0, 0, 0]),
+        (
+            "__lshr_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            19,
+            &[0x46, 0x02, 0, 0],
+        ),
+        (
+            "__lshr_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            16,
+            &[0x34, 0x12, 0, 0],
+        ),
+        ("__lshr_u32", &[0, 0, 0, 0x80], 31, &[1, 0, 0, 0]),
+        ("__lshr_u32", &[0, 0, 0, 0x80], 15, &[0, 0, 1, 0]),
+        (
+            "__lshr_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            0,
+            &[0x78, 0x56, 0x34, 0x12],
+        ),
+    ];
+    for &(name, x, n, want) in cases {
+        let (ir, map) = routine_module32(name);
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((0x20 + i as u16, *b));
+        }
+        seed.push((0x24, n));
+        let got = sim_run_bytes(&ir, &map, &seed, 0x28, want.len());
+        assert_eq!(&got[..], want, "{name}({x:?}, {n}) must be {want:?}");
+    }
+}
+
+/// A shift call copies the count's low byte only: the routine masks and
+/// loops on that byte, so the wider count bytes are dead stores.
+#[test]
+fn shift_call_copies_only_the_count_low_byte() {
+    let (ir, map) = routine_module("__shl_u16");
+    let asm = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));
+    let main = asm
+        .split("\nmain:")
+        .nth(1)
+        .expect("main body in the listing");
+    assert!(
+        main.contains("MOVWF 0x42"),
+        "main must store the count low byte:\n{asm}"
+    );
+    assert!(
+        !main.contains("MOVWF 0x43"),
+        "main must not store the count high byte:\n{asm}"
     );
 }
 
