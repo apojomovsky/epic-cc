@@ -500,7 +500,7 @@ jobs:
             [ -z "$f" ] && continue
             stem=$(basename "$f" .toml)
             echo "::group::sanity $stem ($f)"
-            docker run --rm -v "$PWD:/workspace" -w /workspace -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home epic-cc-ci:latest bash scripts/sanity.sh "$stem"
+            docker run --rm -v "$PWD:/workspace" -w /workspace -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home epic-cc-ci:latest bash -c 'set -euo pipefail; bash scripts/sanity.sh "$1"; PIC8_DEVICE_SCOPE="$1" cargo test -p device --test gputils_crosscheck' _ "$stem"
             echo "::endgroup::"
           done < /tmp/changed_devices.txt
 
