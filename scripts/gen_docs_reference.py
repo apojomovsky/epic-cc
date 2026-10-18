@@ -310,16 +310,9 @@ def capture_help(binary: str, args: list) -> str:
 
 
 def capture_gdbserver_help(binary: str) -> str:
-    # gdbserver has no --help flag: parse_args rejects it and main prints
-    # the usage contract on stderr with a nonzero exit, so stderr is the
-    # contract here and any exit code is fine while output is present.
-    proc = subprocess.run(
-        [binary, "--help"], capture_output=True, text=True, check=False
-    )
-    text = proc.stderr if proc.stderr.strip() else proc.stdout
-    if not text.strip():
-        raise RuntimeError(f"{binary} --help produced no output")
-    return text
+    # The server prints its usage contract on stdout with exit 0 like the
+    # compiler, so the strict capture covers it with no special case.
+    return capture_help(binary, ["--help"])
 
 
 def discover_subcommands(top_help: str) -> list:
