@@ -131,9 +131,9 @@ before. gputils ships in the dev image, so this cannot be skipped for
 want of a download (ADR-021); it fails loudly rather than passing quietly
 when the oracle is genuinely absent (`PIC8_ALLOW_NO_GPUTILS` +
 `PIC8_UNVERIFIED_DEVICE_DATA`, two variables, is the explicit, logged
-opt-out, never a silent skip). Note the cross-check loops the whole
-device registry, not just the new part, so its cost grows with the
-registry.
+opt-out, never a silent skip). Unscoped, the cross-check loops the whole
+device registry, so its cost grows with the registry; `add-device.sh`
+sets `PIC8_DEVICE_SCOPE=<stem>` so a new part pays for itself only.
 
 The gate compares coalesced span sets, not per-bank pairs (epic-cc#411).
 Two oracles disagreeing about the same silicon is a disclosed fact, not
