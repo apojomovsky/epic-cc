@@ -145,6 +145,48 @@ const PIC18_POR: &[(usize, u8)] = &[
     (0xF95, 0xFF), // TRISD: pins are inputs
     (0xF96, 0xFF), // TRISE: pins are inputs
 ];
+/// PIC14 ADC stub (16F877A register file, gputils `p16f877a.inc` EQU map):
+/// GO/DONE is ADCON0 bit 2, the result is ADRESH 0x1E / ADRESL 0x9E.
+const PIC14_ADCON0: usize = 0x1F;
+const PIC14_ADCON0_GO: u8 = 1 << 2;
+const PIC14_ADRESH: usize = 0x1E;
+const PIC14_ADRESL: usize = 0x9E;
+const PIC14_ADCON1: usize = 0x9F;
+/// CMCON 0x9C latches comparators off (0x07) at POR, as PIC18 does.
+const PIC14_CMCON: usize = 0x9C;
+const PIC14_CMCON_OFF: u8 = 0x07;
+/// PIC14 POR latches over the zero-filled RAM. The ADC registers reset to
+/// zero (ADC off, GO clear); only the comparator needs a nonzero latch.
+const PIC14_POR: &[(usize, u8)] = &[
+    (PIC14_ADCON0, 0x00),
+    (PIC14_ADCON1, 0x00),
+    (PIC14_CMCON, PIC14_CMCON_OFF),
+];
+/// PIC14E ADC stub (16F1938 register file, gputils `p16f1938.inc` EQU map):
+/// bank 1 result/control block, GO/DONE at ADCON0 bit 1, comparators in
+/// CMxCON0 (bank 2) with CxON at bit 7, off at POR.
+const PIC14E_ADCON0: usize = 0x9D;
+const PIC14E_ADCON0_GO: u8 = 1 << 1;
+const PIC14E_ADRESL: usize = 0x9B;
+const PIC14E_ADRESH: usize = 0x9C;
+const PIC14E_ADCON1: usize = 0x9E;
+const PIC14E_CM1CON0: usize = 0x111;
+const PIC14E_CM2CON0: usize = 0x113;
+/// PIC14E POR latches: every entry is zero (ADC off, GO clear, CxON
+/// clear), stated explicitly so the off-by-default contract has an
+/// address to test against rather than relying on the fill.
+const PIC14E_POR: &[(usize, u8)] = &[
+    (PIC14E_ADCON0, 0x00),
+    (PIC14E_ADCON1, 0x00),
+    (PIC14E_CM1CON0, 0x00),
+    (PIC14E_CM2CON0, 0x00),
+];
+/// Stub conversion latency in instruction cycles: fixed and deterministic,
+/// not silicon Tad. The result is mid-scale in the POR left-justified
+/// format, nonzero so firmware scaling the reading cannot divide by zero.
+const ADC_CONVERSION_CYCLES: u64 = 16;
+const ADC_RESULT_HI: u8 = 0x80;
+const ADC_RESULT_LO: u8 = 0x00;
 
 /// The 16F877A data-EEPROM register file (DS39582C chapter 4): EEDATA
 /// 0x10C and EEADR 0x10D in bank 2, EECON1 0x18C and EECON2 0x18D in
@@ -320,6 +362,10 @@ pub struct Pic14 {
     /// The data-EEPROM cell array behind the EEADR/EEDATA/EECON1/EECON2
     /// register file.
     eeprom: Eeprom,
+    /// ADC conversion countdown in instruction cycles, 0 when idle. Set
+    /// when firmware raises GO, banked down by each step until the stub
+    /// latches the result and clears GO.
+    adc_left: u64,
 }
 
 impl Pic14 {
@@ -333,7 +379,7 @@ impl Pic14 {
 
     /// A simulator on `device`'s real memory map.
     pub fn with_device(device: &'static Device, prog: Vec<u16>) -> Self {
-        Pic14 {
+        let mut sim = Pic14 {
             device,
             prog,
             ram: [0; 512],
@@ -347,7 +393,12 @@ impl Pic14 {
             timer0_enabled: false,
             timer0_pending: false,
             eeprom: Eeprom::new(),
+            adc_left: 0,
+        };
+        for &(addr, v) in PIC14_POR {
+            sim.ram[addr] = v;
         }
+        sim
     }
     /// Enable the Timer0 model for this run. Off by default, so
     /// existing gates observe no timer unless they opt in.
@@ -463,6 +514,7 @@ impl Pic14 {
             self.enter_isr();
             self.cycles += 2; // vector entry; the handler runs next
             self.tick_timer0(2);
+            self.tick_adc(2);
             return;
         }
         let word = self.prog[self.pc as usize];
@@ -477,6 +529,7 @@ impl Pic14 {
         let delta = cost14(word, pc, next);
         self.cycles += delta;
         self.tick_timer0(delta);
+        self.tick_adc(delta);
         self.pc = next;
         if self.pc as usize >= self.prog.len() {
             self.halted = true;
@@ -513,6 +566,27 @@ impl Pic14 {
                 self.ram[INTCON] |= PIC14_T0IF;
                 self.timer0_pending = true;
             }
+        }
+    }
+    /// Bank `delta` cycles into a live conversion. Expiry clears GO and
+    /// latches the deterministic result, so `while (GO)` polls terminate.
+    /// The stub completes even with ADON clear: hanging there is the bug.
+    fn tick_adc(&mut self, delta: u64) {
+        if self.adc_left == 0 {
+            return;
+        }
+        self.adc_left = self.adc_left.saturating_sub(delta);
+        if self.adc_left == 0 {
+            self.ram[PIC14_ADCON0] &= !PIC14_ADCON0_GO;
+            self.ram[PIC14_ADRESH] = ADC_RESULT_HI;
+            self.ram[PIC14_ADRESL] = ADC_RESULT_LO;
+        }
+    }
+    /// A store landing on ADCON0 starts a conversion when it raises GO.
+    /// CCP/TMR1 land in plain RAM: accepted, with no model behind them.
+    fn adc_store(&mut self, phys: usize, v: u8) {
+        if phys == PIC14_ADCON0 && v & PIC14_ADCON0_GO != 0 {
+            self.adc_left = ADC_CONVERSION_CYCLES;
         }
     }
 
@@ -598,6 +672,7 @@ impl Pic14 {
                 if addr == PIC14_TMR0 {
                     self.timer0_acc = 0;
                 }
+                self.adc_store(addr, v);
             }
             _ => match self.banked_addr(f) {
                 Some(phys) => {
@@ -608,6 +683,7 @@ impl Pic14 {
                     if phys == PIC14_TMR0 {
                         self.timer0_acc = 0;
                     }
+                    self.adc_store(phys, v);
                 }
                 // SFR 0x01-0x1F (bank-independent) and common 0x70-0x7F
                 None => self.ram[f] = v,
@@ -996,6 +1072,9 @@ pub struct Pic14e {
     /// The data-EEPROM cell array behind the EEADR/EEDAT/EECON1/EECON2
     /// register file.
     eeprom: Eeprom,
+    /// ADC conversion countdown in instruction cycles, 0 when idle. Same
+    /// contract as `Pic14::adc_left`, against this core's ADCON0 at 0x9D.
+    adc_left: u64,
 }
 
 impl Pic14e {
@@ -1017,7 +1096,7 @@ impl Pic14e {
             "sim(pic14e): {} is not a pic14e device",
             device.name
         );
-        Pic14e {
+        let mut sim = Pic14e {
             prog,
             ram: [0; 4096],
             w: 0,
@@ -1032,7 +1111,12 @@ impl Pic14e {
             timer0_pending: false,
             shadow: [0; 8],
             cycle_debt: 0,
+            adc_left: 0,
+        };
+        for &(addr, v) in PIC14E_POR {
+            sim.ram[addr] = v;
         }
+        sim
     }
     /// Enable the Timer0 model for this run. Off by default, so
     /// existing gates observe no timer unless they opt in.
@@ -1201,6 +1285,7 @@ impl Pic14e {
             self.cycle_debt -= 1;
             self.cycles += 1;
             self.tick_timer0(1);
+            self.tick_adc(1);
             return;
         }
         if self.interrupt_ready() {
@@ -1216,6 +1301,7 @@ impl Pic14e {
             self.enter_isr();
             self.cycles += 2; // vector entry; the handler runs next
             self.tick_timer0(2);
+            self.tick_adc(2);
             return;
         }
         let word = self.prog[self.pc as usize];
@@ -1230,6 +1316,7 @@ impl Pic14e {
         let delta = cost14(word, pc, next);
         self.cycles += delta;
         self.tick_timer0(delta);
+        self.tick_adc(delta);
         self.pc = next;
         if self.pc as usize >= self.prog.len() {
             self.halted = true;
@@ -1263,6 +1350,25 @@ impl Pic14e {
                 self.ram[INTCON] |= PIC14_T0IF;
                 self.timer0_pending = true;
             }
+        }
+    }
+    /// Bank `delta` cycles into a live conversion. Same contract as
+    /// `Pic14::tick_adc`, against this core's ADCON0 at 0x9D.
+    fn tick_adc(&mut self, delta: u64) {
+        if self.adc_left == 0 {
+            return;
+        }
+        self.adc_left = self.adc_left.saturating_sub(delta);
+        if self.adc_left == 0 {
+            self.ram[PIC14E_ADCON0] &= !PIC14E_ADCON0_GO;
+            self.ram[PIC14E_ADRESH] = ADC_RESULT_HI;
+            self.ram[PIC14E_ADRESL] = ADC_RESULT_LO;
+        }
+    }
+    /// A store landing on ADCON0 starts a conversion when it raises GO.
+    fn adc_store(&mut self, a: usize, v: u8) {
+        if a == PIC14E_ADCON0 && v & PIC14E_ADCON0_GO != 0 {
+            self.adc_left = ADC_CONVERSION_CYCLES;
         }
     }
 
@@ -1343,6 +1449,7 @@ impl Pic14e {
         if a == PIC14E_TMR0 {
             self.timer0_acc = 0;
         }
+        self.adc_store(a, v);
     }
     fn write_f(&mut self, f: usize, v: u8) {
         match f {
@@ -1368,6 +1475,7 @@ impl Pic14e {
                 if a == PIC14E_TMR0 {
                     self.timer0_acc = 0;
                 }
+                self.adc_store(a, v);
             }
         }
     }
