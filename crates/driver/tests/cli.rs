@@ -101,7 +101,7 @@ fn rejects_an_unknown_emit_stage() {
         "a.c", "--device", "p16f877a", "--emit", "bytecode",
     ]))
     .unwrap_err();
-    assert!(e.contains("bytecode"), "{e}");
+    assert_eq!(e, "epic-cc: unknown --emit stage bytecode");
 }
 
 #[test]
@@ -130,15 +130,6 @@ fn unknown_flag_hint_skips_short_flags() {
 fn unknown_emit_stage_suggests_the_nearest_stage() {
     let e = parse_args(&args(&["a.c", "--device", "p16f877a", "--emit", "hexs"])).unwrap_err();
     assert_eq!(e, "epic-cc: unknown --emit stage hexs (did you mean hex?)");
-}
-
-#[test]
-fn unknown_emit_stage_far_from_every_stage_gets_no_hint() {
-    let e = parse_args(&args(&[
-        "a.c", "--device", "p16f877a", "--emit", "bytecode",
-    ]))
-    .unwrap_err();
-    assert!(!e.contains("did you mean"), "{e}");
 }
 
 #[test]
