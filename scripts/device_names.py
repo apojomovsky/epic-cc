@@ -18,7 +18,7 @@ the same bits, is reported, which is the cross-check between transcribed
 and pack config data.
 
   python3 scripts/device_names.py p16f877a --atdf <pack>/edc/PIC16F877A.PIC
-  python3 scripts/device_names.py p16f877a --atdf ... --check   # stale?
+  python3 scripts/device_names.py p16f877a --check   # resolves --atdf, exits 2 without a DFP
 
 Stdlib only, and runs on the dev container's Python 3.10: it reads TOML
 with add_device.py's subset parser, which is why every value it writes,
@@ -31,11 +31,22 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from add_device import parse_toml  # noqa: E402
+from add_device import normalize_stem, parse_toml  # noqa: E402
 
 NS = "{http://crownking/edc}"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _find_edc_pic(stem):
+    # Same lookup as gen-device.py's find_edc_pic: the local XC8 DFP packs
+    # carry the EDC source, which is never committed (ADR-020).
+    name = "PIC" + normalize_stem(stem)[1:].upper() + ".PIC"
+    base = pathlib.Path("/opt/microchip/xc8/v4.00/pic/packs")
+    if base.exists():
+        for p in base.rglob("edc/*.PIC"):
+            if p.name.upper() == name.upper():
+                return p
+    return None
 
 
 def attr(el, name, default=None):
@@ -278,7 +289,9 @@ def main():
     )
     ap.add_argument("device", help="registry stem, e.g. p16f877a")
     ap.add_argument(
-        "--atdf", type=pathlib.Path, required=True, help="the part's EDC .PIC file"
+        "--atdf",
+        type=pathlib.Path,
+        help="the part's EDC .PIC file (default: resolve under the local DFP packs)",
     )
     ap.add_argument(
         "--toml", type=pathlib.Path, help="default crates/device/devices/<device>.toml"
@@ -290,12 +303,24 @@ def main():
     )
     args = ap.parse_args()
 
+    atdf = args.atdf or _find_edc_pic(args.device)
+    if atdf is None or not atdf.exists():
+        # Exit 2, the same no-source signal gen-device.py uses, so callers
+        # soft-skip where the DFP is absent instead of failing the gate.
+        print(f"device_names: no DFP source found for {args.device}", file=sys.stderr)
+        print(
+            "  The .PIC itself is not committed; only the TOML it names is.",
+            file=sys.stderr,
+        )
+        print("  Alternatively pass --atdf /path/to/PART.PIC", file=sys.stderr)
+        sys.exit(2)
+
     path = args.toml or ROOT / "crates" / "device" / "devices" / f"{args.device}.toml"
     text = path.read_text()
     # Only the part this script does not own is read back, so a table
     # written in an older layout never has to parse.
     toml = parse_toml(text.split("\n[[sfrs]]\n", 1)[0])
-    root = ET.parse(args.atdf).getroot()
+    root = ET.parse(atdf).getroot()
     pack = parse_config(root, toml["core"], toml["config"]["base_byte_addr"])
     aliases, problems = config_aliases(toml, pack)
     for p in problems:
