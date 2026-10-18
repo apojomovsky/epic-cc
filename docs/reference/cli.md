@@ -58,3 +58,9 @@ usage: epic-cc [options] <input.c|input.cpp>...
                        tooling; the bundle carries exactly what the driver
                        would materialize)
 ```
+
+## `epic-cc-gdbserver --help`
+
+```text
+usage: epic-cc-gdbserver <hex> <sidecar.elf> --port <port> [--device <name>]
+```

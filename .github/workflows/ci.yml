@@ -558,7 +558,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/workspace" -w /workspace \
             -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
-            epic-cc-ci:latest bash -c 'cargo build -q -p driver && python3 scripts/gen_docs_reference.py --binary target/debug/epic-cc'
+            epic-cc-ci:latest bash -c 'cargo build -q -p driver -p epic-cc-gdbserver && python3 scripts/gen_docs_reference.py --binary target/debug/epic-cc'
 
       # See the same-named step in the canonical job: docker runs as root,
       # so without this the target dir cache above never actually saves.

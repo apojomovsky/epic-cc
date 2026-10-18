@@ -185,7 +185,7 @@ size-report: guard-main-clone image ## Regenerate crates/driver/tests/fixtures/S
 	@python3 scripts/size-report.py --sizes scratch/size-report/sizes.json --density scratch/size-report/density.json --baseline crates/driver/tests/fixtures/size_baseline.toml --sha $(EPIC_CC_GIT_SHA) --date $(REPORT_DATE) --asm-inputs scratch/size-report/asm-inputs.txt --out crates/driver/tests/fixtures/SIZE_REPORT.md && echo "wrote crates/driver/tests/fixtures/SIZE_REPORT.md"
 
 docs-gen: guard-main-clone image ## Regenerate docs/reference/{devices,cli}.md, docs/user/ and README.md from the tree
-	@$(DOCKER_RUN) bash -c 'cargo build -q -p driver && python3 scripts/gen_docs_reference.py --binary /tmp/cargo-target/debug/epic-cc'
+	@$(DOCKER_RUN) bash -c 'cargo build -q -p driver -p epic-cc-gdbserver && python3 scripts/gen_docs_reference.py --binary /tmp/cargo-target/debug/epic-cc'
 
 sync-shared-includes: ## Refresh docs/snippets/ways-to-use-epic8.md from apojomovsky/epic-docs at REF (a commit sha); needs the network
 	@python3 scripts/shared_includes.py sync --ref "$(REF)"

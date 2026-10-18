@@ -218,6 +218,38 @@ class SubcommandTests(unittest.TestCase):
         )
 
 
+class GdbserverTests(unittest.TestCase):
+    GDB_USAGE = "usage: epic-cc-gdbserver <hex> <sidecar.elf> --port <port>"
+
+    def _stub(self, path, body):
+        path.write_text(f"#!/bin/sh\n{body}\n")
+        path.chmod(0o755)
+        return str(path)
+
+    def test_gdbserver_help_captured_from_stderr(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = pathlib.Path(td)
+            binary = self._stub(
+                td / "epic-cc",
+                'echo "usage: epic-cc [options]"',
+            )
+            gdb = self._stub(
+                td / "epic-cc-gdbserver",
+                f'>&2 echo "{self.GDB_USAGE}"\nexit 2',
+            )
+            sections = gen_docs_reference.build_cli_sections(binary, gdb)
+        self.assertEqual(
+            sections,
+            [
+                ("epic-cc --help", "usage: epic-cc [options]\n"),
+                ("epic-cc-gdbserver --help", f"{self.GDB_USAGE}\n"),
+            ],
+        )
+        text = gen_docs_reference.render_cli(sections)
+        self.assertIn("## `epic-cc-gdbserver --help`", text)
+        self.assertIn(f"```text\n{self.GDB_USAGE}\n```", text)
+
+
 class UserPageTests(unittest.TestCase):
     ROWS = [
         {
