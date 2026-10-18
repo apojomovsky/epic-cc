@@ -83,6 +83,15 @@ enum Addr {
     Direct(u16),
     Indirect,
 }
+/// Where a maybe-flash join's space tag comes from (epic-cc#1306).
+/// `Ram` covers null and literal addresses; `Flash` a table address;
+/// `Slot` copies the tag byte of a mixed slot holding the same value.
+#[derive(Clone, Copy)]
+enum TagSrc {
+    Ram,
+    Flash,
+    Slot(u16),
+}
 /// One inline-multiply operand byte: RAM contents, or a literal the
 /// u8 form stages into W with MOVLW. A literal cannot ride MULWF
 /// directly, so the u16 form takes RAM operands only.
@@ -382,6 +391,15 @@ struct Gen<'m> {
     /// A member slot holds only flash table addresses or null, so loads
     /// through it seed `TBLPTR` from the slot bytes (epic-cc#1119).
     slot_flash: HashSet<String>,
+    /// Maybe-flash slots from the same proof: flash on some path, RAM on
+    /// another. These widen to 3 bytes (tag plus address) in `alloc`, and
+    /// every join writes the tag while every deref dispatches on it
+    /// (epic-cc#1306).
+    slot_mixed: HashSet<String>,
+    /// Functions whose pointer returns write the 3-byte fat form: any
+    /// returned value may carry flash, so every pointer return there
+    /// writes address bytes plus the tag (epic-cc#1306).
+    ret_fat: HashSet<String>,
     /// Fixed, `BSR`-independent return-value region (up to 4 bytes, from `device.fixed_retval`).
     /// Holds call results independent of the bank selection.
     retval_lo: u16,
@@ -7023,6 +7041,361 @@ impl<'m> Gen<'m> {
     fn global_slot_is_flash(&self, name: &str) -> bool {
         self.slot_flash.contains(&format!("@{name}"))
     }
+    /// Whether global `name` is a maybe-flash pointer slot: flash on some
+    /// path, RAM on another, widened to 3 bytes (tag plus address).
+    fn global_slot_is_mixed(&self, name: &str) -> bool {
+        self.slot_mixed.contains(&format!("@{name}"))
+    }
+
+    /// Whether slot `slot` of `func` is maybe-flash.
+    fn slot_is_mixed(&self, func: &str, slot: &str) -> bool {
+        self.slot_mixed.contains(&ssa_key(func, slot))
+    }
+
+    /// Where a pointer value's space tag comes from (epic-cc#1306): every
+    /// join into a maybe-flash slot writes the tag alongside the address
+    /// bytes, so a later deref can dispatch on it.
+    fn tag_src(&self, func: &str, v: &Val) -> TagSrc {
+        match v {
+            // Null and literal addresses are RAM-kind: the tag is 0.
+            Val::Const(_) => TagSrc::Ram,
+            Val::Global(g) => {
+                if !self.is_function(g) && self.global_is_const(g) {
+                    TagSrc::Flash
+                } else {
+                    TagSrc::Ram
+                }
+            }
+            Val::Reg(r) => {
+                let key = ssa_key(func, r);
+                if self.slot_mixed.contains(&key) {
+                    // A folded GEP or select has no home slot, and an
+                    // alias reads its base slot: either way the tag rides
+                    // the slot the address bytes come from.
+                    let same_slot = match self.resolved.get(&key) {
+                        Some((Base::Slot(sn, _), _, _)) => ssa_key(func, sn) == key,
+                        _ => true,
+                    };
+                    if same_slot {
+                        if let Some(sa) = self.addrs.get(&key).copied() {
+                            return TagSrc::Slot(sa + 2);
+                        }
+                    }
+                }
+                if self.flash_val(func, v) {
+                    return TagSrc::Flash;
+                }
+                // A static chain over a mixed slot (a GEP with no dynamic
+                // terms) shares its space: the tag rides the base slot.
+                match self.resolved.get(&key) {
+                    Some((Base::Slot(sname, _), _, terms)) if terms.is_empty() => {
+                        if self.slot_is_mixed(func, sname) {
+                            TagSrc::Slot(self.slot_addr(func, sname).direct() + 2)
+                        } else {
+                            TagSrc::Ram
+                        }
+                    }
+                    _ => TagSrc::Ram,
+                }
+            }
+        }
+    }
+
+    /// Write the tag byte at `dst_tag` from `src`: 0 for RAM, 1 for
+    /// flash, or a copy of a mixed slot's tag byte.
+    fn emit_tag_store(&mut self, src: TagSrc, dst_tag: u16) {
+        match src {
+            TagSrc::Ram => self.emit_banked("CLRF", dst_tag, ""),
+            TagSrc::Flash => {
+                self.emit("    MOVLW 0x01".to_string());
+                self.emit_w_store(dst_tag);
+            }
+            TagSrc::Slot(sa) => self.emit_copy_byte(sa, dst_tag),
+        }
+    }
+
+    /// The tag byte a dereference through `%r` must dispatch on: the tag
+    /// address, the slot holding the address bytes, the static offset to
+    /// add to both arms' seeds, and any dynamic terms the seeds must add.
+    /// `None` when no tag applies: the existing flash, RAM, and refusal
+    /// paths own the value. A dynamic walk over a mixed slot dispatches
+    /// like a whole one, seeding `TBLPTR` from the slot plus its terms.
+    fn mixed_tag(&self, func: &str, r: &str) -> Option<(u16, u16, u16, Vec<(u16, String)>)> {
+        let key = ssa_key(func, r);
+        if self.slot_mixed.contains(&key) {
+            // The home slot holds the value only for same-name seeds
+            // and plain value regs; an alias folds onto its base below.
+            let same_slot = match self.resolved.get(&key) {
+                Some((Base::Slot(sn, _), _, _)) => ssa_key(func, sn) == key,
+                _ => true,
+            };
+            if same_slot {
+                if let Some(slot) = self.addrs.get(&key).copied() {
+                    return Some((slot + 2, slot, 0, Vec::new()));
+                }
+            }
+        }
+        match self.resolved.get(&key) {
+            Some((Base::Slot(sname, _), k, terms)) => {
+                if self.slot_is_mixed(func, sname) {
+                    let slot = self.slot_addr(func, sname).direct();
+                    Some((slot + 2, slot, *k, terms.clone()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `v` is a maybe-flash value with no tag to carry: a provenance
+    /// join outside any slot (epic-cc#832 vtable shapes). Joins keep their
+    /// existing refusals for these; only slot-held joins go fat.
+    fn mixed_no_slot(&self, func: &str, v: &Val) -> bool {
+        match v {
+            Val::Reg(r) => {
+                let key = ssa_key(func, r);
+                self.prov.mixed.contains(&key) && !self.slot_mixed.contains(&key)
+            }
+            _ => false,
+        }
+    }
+    /// Whether a `load ptr` reads out of a maybe-flash slot: a direct
+    /// global slot, or a register operand folding to one (epic-cc#1306).
+    /// The loaded value carries the tag with the address bytes.
+    fn load_ptr_src_mixed(&self, ptr: &str) -> bool {
+        if let Some(g) = ptr.strip_prefix('@') {
+            return self.global_slot_is_mixed(g);
+        }
+        if let Some(r) = ptr.strip_prefix('%') {
+            match self.resolved.get(&ssa_key(self.cur_func, r)) {
+                Some((Base::Global(g), _, _)) => return self.global_slot_is_mixed(g),
+                Some((Base::Slot(sname, _), _, _)) => {
+                    return self.slot_is_mixed(self.cur_func, sname)
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    /// The RAM half of a dereference: byte-indexed small-array reads go
+    /// through `PLUSW0`, everything else seeds FSR0 once and walks
+    /// POSTINC0/INDF0 (epic-cc#471, epic-cc#665). Shared by the plain
+    /// load tail and the RAM arm of a tag dispatch.
+    fn emit_ram_load_tail(&mut self, ptr_val: &Val, dst: u16, n: u8) {
+        // Byte-indexed small-array reads go through `PLUSW0` (one
+        // `LFSR` per resident run, then `MOVF idx,W` +
+        // `MOVFF PLUSW0,dst` per byte) instead of the 16-bit FSR
+        // add around `INDF0`. Raw emission, never the staged copy
+        // path: a staged `PLUSW0` read would replay against a later
+        // `FSR0`/`W`. (epic-cc#665)
+        if let Some(shape) = self.plusw_shape(ptr_val) {
+            for k in 0..n {
+                // Later bytes reuse the index already in W:
+                // only `W`-preserving instructions sit between.
+                self.emit_plusw_setup(&shape, k, k != 0);
+                let d = dst + u16::from(k);
+                self.invalidate_fsr0_if_slot_written(d, 1);
+                self.emit(format!("    MOVFF 0xFEB, 0x{d:03X}"));
+            }
+        } else {
+            match self.emit_ptr_setup(ptr_val, 0) {
+                Addr::Direct(base_addr) => {
+                    for k in 0..n {
+                        self.emit_copy_byte(base_addr + u16::from(k), dst + u16::from(k));
+                    }
+                }
+                Addr::Indirect => {
+                    for k in 0..n {
+                        let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
+                        self.emit(format!(
+                            "    MOVFF 0x{reg:03X}, 0x{:03X}",
+                            dst + u16::from(k)
+                        ));
+                    }
+                    self.bump_fsr0_tracked_offset(n);
+                }
+            }
+        }
+    }
+
+    /// A dereference through a maybe-flash pointer: branch on the tag,
+    /// read flash through `TBLPTR` on one arm and RAM through FSR0 on
+    /// the other, joining with identical result bytes either way
+    /// (epic-cc#1306). `slot`/`k`/`terms` seed the flash arm exactly
+    /// like the flash-kind load path; the RAM arm reuses the plain
+    /// tail, which re-derives its own setup past the join labels.
+    fn emit_mixed_deref(
+        &mut self,
+        ptr_val: &Val,
+        dst: u16,
+        n: u8,
+        tag: u16,
+        slot: u16,
+        k: u16,
+        terms: &[(u16, String)],
+    ) {
+        let l_ram = self.fresh_label();
+        let l_end = self.fresh_label();
+        // `MOVF` sets Z, so a zero (RAM) tag falls into the RAM arm.
+        let (ta, tf) = self.operand(tag);
+        let bank = if ta == 0 { "A" } else { "B" };
+        self.emit(format!("    MOVF 0x{tf:03X},W,{bank}"));
+        self.emit(format!("    BZ {l_ram}"));
+        if terms.is_empty() {
+            for kk in 0..n {
+                self.emit_flash_ptr_load_byte(
+                    slot,
+                    k.wrapping_add(u16::from(kk)),
+                    dst + u16::from(kk),
+                );
+            }
+        } else {
+            for kk in 0..n {
+                self.emit_flash_tblptr_seed(slot, k.wrapping_add(u16::from(kk)));
+                self.add_dynamic_to_tblptr(terms, None);
+                self.emit("    TBLRD*".to_string());
+                self.emit_copy_byte(0xFF5, dst + u16::from(kk));
+            }
+        }
+        self.emit(format!("    BRA {l_end}"));
+        self.emit_label(&l_ram);
+        self.emit_ram_load_tail(ptr_val, dst, n);
+        self.emit_label(&l_end);
+    }
+    /// Store a joined or RAM pointer value into a maybe-flash slot: the
+    /// address bytes plus the tag (epic-cc#1306). Only whole
+    /// pointer-width stores join: partial writes never address a slot.
+    fn emit_ptr_join_store(&mut self, val: &Val, ty: Ty, dst: u16) {
+        assert_eq!(
+            ty.bytes(),
+            2,
+            "isel-pic18: fat join of a non-pointer-width value"
+        );
+        let tag = self.tag_src(self.cur_func, val);
+        // A directly proven flash value never reaches a join: every
+        // caller keeps its refusal (epic-cc#1101). Reaching this arm
+        // is a caller bug, not a lowering gap.
+        assert!(
+            !matches!(tag, TagSrc::Flash),
+            "isel-pic18: fat join of a directly proven flash address"
+        );
+        self.emit_move_val_to_slot(val, ty, dst);
+        self.emit_tag_store(tag, dst + 2);
+    }
+    /// The plain store tail: W-threaded and const-phis, TABLAT forwards,
+    /// `PLUSW0` small-array stores, and the direct/indirect split. Shared
+    /// by the Store arm and the RAM arm of a tag dispatch; early returns
+    /// below return from the tail, so dispatchers emit their join after.
+    fn emit_store_tail(&mut self, s: &ir::Store, ptr_val: &Val) {
+        // A W-threaded store (epic-cc#863): the folded load left
+        // the byte in W, so each store writes it back out with no
+        // slot read. The predicate allows only direct-global
+        // single-byte stores with a stores-only gap, which W
+        // survives (`MOVWF` preserves it; the ISR restores it).
+        if let Val::Reg(r) = &s.val {
+            if matches!(
+                self.w_folds.loads.get(r),
+                Some(iselcore::LoadFold::ThreadW(_, _))
+            ) {
+                let dst = s.ptr.strip_prefix('@').unwrap_or_else(|| {
+                    panic!("isel-pic18: ThreadW store through non-global {:?}", s.ptr)
+                });
+                let dst = self.global_addr(dst);
+                self.invalidate_fsr0_if_slot_written(dst, 1);
+                self.emit_w_store(dst);
+                return;
+            }
+        }
+        // A W-threaded const phi (epic-cc#825): every incoming
+        // edge left its byte in W with a `MOVLW`, so the store
+        // is one `MOVWF` to the direct global.
+        if let Val::Reg(r) = &s.val {
+            if self.const_w_phis.contains(r) {
+                let dst = s.ptr.strip_prefix('@').unwrap_or_else(|| {
+                    panic!(
+                        "isel-pic18: const-W phi store through non-global {:?}",
+                        s.ptr
+                    )
+                });
+                let dst = self.global_addr(dst);
+                self.invalidate_fsr0_if_slot_written(dst, 1);
+                self.emit_w_store(dst);
+                return;
+            }
+            // Direct values cover the whole slot through one setup.
+            // Indirect bytes seed FSR0 once and walk POSTINC0 (same
+        }
+        // single-loop ordering contract as the Load arm above,
+        // epic-cc#471). Each source byte still materializes into
+        // W (literals directly, registers via MOVF) before the
+        // write.
+        // Byte-indexed small-array stores go through `PLUSW0` like
+        // the Load arm above: `MOVF idx,W` then
+        // `MOVFF value,PLUSW0`, which preserves `W` (the write
+        // collision ADR-009 item 4 feared). Only register values
+        // with a slot move directly; address-valued regs and
+        // constants keep the `INDF0` lowering. (epic-cc#665)
+        // An in-place RMW producer (epic-cc#825) accumulated
+        // into its load operand's slot: the store reads that
+        // slot, not the dead result temp.
+        let val_slot = match self.rmw_reg(&s.val) {
+            Val::Reg(r) => self.addrs.get(&ssa_key(self.cur_func, &r)).copied(),
+            _ => None,
+        };
+        // A TABLAT-forwarded byte (epic-cc#977): the const-load
+        // arm left it in TABLAT, so read it directly once the
+        // setup below lands. The scan proves a single byte, a
+        // dynamic destination, and a span nothing disturbs.
+        if let Val::Reg(r) = &s.val {
+            if self.tablat_fwd.contains(r) {
+                assert_eq!(
+                    s.ty.bytes(),
+                    1,
+                    "isel-pic18: TABLAT forward is single-byte only"
+                );
+                if let (Some(shape), Some(_)) = (self.plusw_shape(&ptr_val), val_slot) {
+                    self.emit_plusw_setup(&shape, 0, false);
+                    self.emit("    MOVFF 0xFF5, 0xFEB".to_string());
+                    return;
+                }
+                match self.emit_ptr_setup(&ptr_val, 0) {
+                    Addr::Direct(_) => {
+                        panic!("isel-pic18: TABLAT-forwarded store has a static destination")
+                    }
+                    Addr::Indirect => {
+                        self.emit("    MOVFF 0xFF5, 0xFEF".to_string());
+                    }
+                }
+                return;
+            }
+        }
+        if let (Some(shape), Some(vslot)) = (self.plusw_shape(&ptr_val), val_slot) {
+            let n = s.ty.bytes();
+            for k in 0..n {
+                // Later bytes reuse the index already in W.
+                self.emit_plusw_setup(&shape, k, k != 0);
+                self.emit(format!("    MOVFF 0x{:03X}, 0xFEB", vslot + u16::from(k)));
+            }
+        } else {
+            match self.emit_ptr_setup(&ptr_val, 0) {
+                Addr::Direct(dst) => self.emit_move_val_to_slot(&s.val, s.ty, dst),
+                Addr::Indirect => {
+                    let n = s.ty.bytes();
+                    // An in-place RMW producer (epic-cc#969) lives
+                    // in its load operand's slot, not the dead
+                    // result temp the store names.
+                    let val = self.rmw_reg(&s.val);
+                    for k in 0..n {
+                        self.emit_load_w(&val, k, false);
+                        let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
+                        self.emit(format!("    MOVWF 0x{reg:03X},A"));
+                    }
+                    self.bump_fsr0_tracked_offset(n);
+                }
+            }
+        }
+    }
 
     /// Whether `v` evaluates to a flash address or null in `func`: a flash
     /// const global, a proven flash or flash-kind reg, a GEP over a flash
@@ -8221,9 +8594,24 @@ impl<'m> Gen<'m> {
                     "isel-pic18: ROM is not writable: memcpy into flash-derived address %{r} (epic-cc#1100)"
                 );
             }
+            // A memcpy into a maybe-flash destination stays refused: the
+            // tag the slot needs has no source in a raw byte copy
+            // (epic-cc#1306 defers it).
+            if self.slot_mixed.contains(&key) {
+                panic!(
+                    "isel-pic18: memcpy into a maybe-flash destination %{r} is not supported (epic-cc#1306)"
+                );
+            }
             if let Some(sname) = self.maybe_flash_slot_under_index(&key) {
                 panic!(
                     "isel-pic18: ROM is not writable: memcpy into runtime-indexed walk over flash or maybe-flash pointer %{sname} (epic-cc#1100, epic-cc#1099)"
+                );
+            }
+        }
+        if let Val::Global(g) = dst {
+            if self.global_slot_is_mixed(g) {
+                panic!(
+                    "isel-pic18: memcpy into a maybe-flash destination @{g} is not supported (epic-cc#1306)"
                 );
             }
         }
@@ -8242,6 +8630,7 @@ impl<'m> Gen<'m> {
                 self.prov.flash.contains(&key)
                     || self.prov.mixed.contains(&key)
                     || self.slot_flash.contains(&key)
+                    || self.slot_mixed.contains(&key)
                     || self.maybe_flash_slot_under_index(&key).is_some()
             }
             _ => false,
@@ -8371,6 +8760,52 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVFF 0xFF5, {d}"));
             }
         }
+    }
+    /// A constant-length memcpy whose source is a maybe-flash pointer:
+    /// branch on the tag, read flash through `TBLPTR` on one arm and
+    /// RAM through FSR1 on the other (epic-cc#1306). The flash arm
+    /// seeds once and walks `TBLRD*+`; each arm resolves its
+    /// destination side per byte like the plain driver.
+    fn emit_mixed_memcpy(
+        &mut self,
+        mc: &ir::Memcpy,
+        n: u8,
+        tag: u16,
+        slot: u16,
+        k: u16,
+        terms: &[(u16, String)],
+    ) {
+        let l_ram = self.fresh_label();
+        let l_end = self.fresh_label();
+        let (ta, tf) = self.operand(tag);
+        let bank = if ta == 0 { "A" } else { "B" };
+        self.emit(format!("    MOVF 0x{tf:03X},W,{bank}"));
+        self.emit(format!("    BZ {l_ram}"));
+        self.emit_flash_tblptr_seed(slot, k);
+        if !terms.is_empty() {
+            self.add_dynamic_to_tblptr(terms, None);
+        }
+        let dst0 = self.emit_ptr_setup(&mc.dst, 0);
+        let walk = n >= 2;
+        self.emit_memcpy_body(n == 1, &McSrc::Tblrd, &dst0, walk);
+        for i in 1..n {
+            let last = i + 1 == n;
+            let d = match dst0 {
+                Addr::Direct(d) => Addr::Direct(d.wrapping_add(u16::from(i))),
+                d => d,
+            };
+            self.emit_memcpy_body(last, &McSrc::Tblrd, &d, walk);
+        }
+        self.emit(format!("    BRA {l_end}"));
+        self.emit_label(&l_ram);
+        for i in 0..n {
+            let last = i + 1 == n;
+            let src = self.emit_memcpy_src_setup(&mc.src, i);
+            let d = self.emit_ptr_setup(&mc.dst, i);
+            let s = src.map_or(McSrc::Indirect, McSrc::Direct);
+            self.emit_memcpy_body(last, &s, &d, false);
+        }
+        self.emit_label(&l_end);
     }
 
     /// Try to reuse FSR0's currently tracked contents for a new access
@@ -9346,6 +9781,7 @@ impl<'m> Gen<'m> {
                     !arg.sret && arg.byval.is_none(),
                     "isel-pic18: plain ptr arg must be non-sret/non-byval"
                 );
+                let param_mixed = self.slot_is_mixed(func, &callee.params[i].name);
                 assert_eq!(
                     callee.params[i].width, 2,
                     "isel-pic18: callee ptr param must be 2 bytes"
@@ -9362,6 +9798,10 @@ impl<'m> Gen<'m> {
                         "    CLRF 0x{f1:03X},{}",
                         if a1 == 0 { "A" } else { "B" }
                     ));
+                    // Null is space-neutral: a mixed param takes it with a RAM tag.
+                    if param_mixed {
+                        self.emit_tag_store(TagSrc::Ram, pa + 2);
+                    }
                 } else if let Val::Global(g) = &arg.val {
                     if self.is_function(g) {
                         // A function's address is a link-time label literal:
@@ -9380,6 +9820,10 @@ impl<'m> Gen<'m> {
                             "    MOVWF 0x{f1:03X},{}",
                             if a1 == 0 { "A" } else { "B" }
                         ));
+                        // Function addresses are RAM-kind (epic-cc#1119).
+                        if param_mixed {
+                            self.emit_tag_store(TagSrc::Ram, pa + 2);
+                        }
                     } else if self.global_is_const(g) {
                         // A flash const with no RAM copy passes its table
                         // address: byte 0 = LOW(g), byte 1 = HIGH(g), the
@@ -9396,6 +9840,11 @@ impl<'m> Gen<'m> {
                                 .is_some_and(|gl| gl.size > 255);
                             if big {
                                 missing_global_addr(self.m, self.cur_func, g);
+                            }
+                            if param_mixed {
+                                panic!(
+                                    "isel-pic18: cannot pass flash address @{g} to a maybe-flash pointer param (a directly proven ROM address keeps its refusal; epic-cc#1101, epic-cc#1306)"
+                                );
                             }
                             panic!(
                                 "isel-pic18: cannot pass flash address @{g} to a RAM pointer param (epic-cc#1119)"
@@ -9427,23 +9876,35 @@ impl<'m> Gen<'m> {
                             "    MOVWF 0x{f1:03X},{}",
                             if a1 == 0 { "A" } else { "B" }
                         ));
+                        if param_mixed {
+                            self.emit_tag_store(TagSrc::Ram, pa + 2);
+                        }
                     }
                 } else if let Val::Reg(r) = &arg.val {
-                    // A flash address bound for a RAM param slot would read back
-                    // through FSR: refuse, and likewise a maybe-flash one
-                    // (epic-cc#1099). A flash-kind param takes the bytes
-                    // whole; slot-based values copy as before, a static flash
-                    // base materializes as LOW/HIGH, a dynamic one seeds
-                    // TBLPTR first (epic-cc#1119).
+                    // A flash address bound for a non-flash param slot would
+                    // read back through FSR: refuse, and likewise a
+                    // maybe-flash one bound for a single-space param
+                    // (epic-cc#1099). A flash-kind param takes flash bytes
+                    // whole; a mixed param takes a joined value whole plus
+                    // the tag, with slot-based values copying all three
+                    // bytes (epic-cc#1119, epic-cc#1306).
                     let vflash = self.flash_val(self.cur_func, &arg.val);
-                    let vmixed = self.prov.mixed.contains(&ssa_key(self.cur_func, r));
+                    let vmixed = {
+                        let key = ssa_key(self.cur_func, r);
+                        self.prov.mixed.contains(&key) || self.slot_mixed.contains(&key)
+                    };
                     let param_flash = self.slot_is_flash(func, &callee.params[i].name);
                     if vflash && !param_flash {
                         panic!(
                             "isel-pic18: cannot pass flash address %{r} to a RAM pointer param (epic-cc#1119)"
                         );
                     }
-                    if vmixed {
+                    if vmixed && !param_mixed {
+                        panic!(
+                            "isel-pic18: cannot pass maybe-flash address %{r} to a pointer param (a pointer joins flash and RAM; epic-cc#1099, epic-cc#1119)"
+                        );
+                    }
+                    if param_mixed && self.mixed_no_slot(self.cur_func, &arg.val) {
                         panic!(
                             "isel-pic18: cannot pass maybe-flash address %{r} to a pointer param (a pointer joins flash and RAM; epic-cc#1099, epic-cc#1119)"
                         );
@@ -9503,6 +9964,11 @@ impl<'m> Gen<'m> {
                                 self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> param slot hi
                             }
                         }
+                    }
+                    // A mixed param takes the tag with the address bytes.
+                    if param_mixed {
+                        let tag = self.tag_src(self.cur_func, &arg.val);
+                        self.emit_tag_store(tag, pa + 2);
                     }
                 } else {
                     match self.emit_ptr_setup(&arg.val, 0) {
@@ -10163,6 +10629,15 @@ impl<'m> Gen<'m> {
                         }
                         return;
                     }
+                    // A maybe-flash slot dispatches on its tag at runtime:
+                    // the flash arm reads through `TBLPTR` seeded from the
+                    // slot bytes, the RAM arm keeps the FSR path below
+                    // (epic-cc#1306). A join outside any slot keeps the
+                    // refusal: no tag exists to dispatch on.
+                    if let Some((tag, slot, k, terms)) = self.mixed_tag(self.cur_func, r) {
+                        self.emit_mixed_deref(&ptr_val, dst, l.ty.bytes(), tag, slot, k, &terms);
+                        return;
+                    }
                     if self.prov.mixed.contains(&key) {
                         panic!(
                             "isel-pic18: load through maybe-flash address %{r} is not supported (a pointer joins flash and RAM, or an unserved vtable dispatch shape; epic-cc#832, epic-cc#1099)"
@@ -10173,65 +10648,80 @@ impl<'m> Gen<'m> {
                 // POSTINC0 (this loop is the whole ordering contract
                 // ADR-009 needed, epic-cc#471). Direct addresses are
                 // linear in byte_off, so base_addr + k already matches
-                // re-resolving at byte_off = k.
-                let n = l.ty.bytes();
-                // Byte-indexed small-array reads go through `PLUSW0` (one
-                // `LFSR` per resident run, then `MOVF idx,W` +
-                // `MOVFF PLUSW0,dst` per byte) instead of the 16-bit FSR
-                // add around `INDF0`. Raw emission, never the staged copy
-                // path: a staged `PLUSW0` read would replay against a later
-                // `FSR0`/`W`. (epic-cc#665)
-                if let Some(shape) = self.plusw_shape(&ptr_val) {
-                    for k in 0..n {
-                        // Later bytes reuse the index already in W:
-                        // only `W`-preserving instructions sit between.
-                        self.emit_plusw_setup(&shape, k, k != 0);
-                        let d = dst + u16::from(k);
-                        self.invalidate_fsr0_if_slot_written(d, 1);
-                        self.emit(format!("    MOVFF 0xFEB, 0x{d:03X}"));
-                    }
+                // re-resolving at byte_off = k. A `load ptr` out of a
+                // maybe-flash slot reads all three bytes: the loaded
+                // value carries the tag with the address.
+                let n = if l.ptr_ty && self.load_ptr_src_mixed(&l.ptr) {
+                    3
                 } else {
-                    match self.emit_ptr_setup(&ptr_val, 0) {
-                        Addr::Direct(base_addr) => {
-                            for k in 0..n {
-                                self.emit_copy_byte(base_addr + u16::from(k), dst + u16::from(k));
-                            }
-                        }
-                        Addr::Indirect => {
-                            for k in 0..n {
-                                let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
-                                self.emit(format!(
-                                    "    MOVFF 0x{reg:03X}, 0x{:03X}",
-                                    dst + u16::from(k)
-                                ));
-                            }
-                            self.bump_fsr0_tracked_offset(n);
-                        }
-                    }
-                }
+                    l.ty.bytes()
+                };
+                self.emit_ram_load_tail(&ptr_val, dst, n);
             }
             Inst::Store(s) => {
+                // The destination slot when it is maybe-flash: a direct
+                // global slot, or a register operand folding to one with
+                // no offset (epic-cc#1306). Either takes the value whole
+                // plus the tag below.
+                let dst_mixed: Option<u16> = match s.ptr.strip_prefix('@') {
+                    Some(g) => self.global_slot_is_mixed(g).then(|| self.global_addr(g)),
+                    None => s.ptr.strip_prefix('%').and_then(|r| {
+                        match self.resolved.get(&ssa_key(self.cur_func, r)) {
+                            Some((Base::Global(g), k, terms))
+                                if *k == 0 && terms.is_empty() && self.global_slot_is_mixed(g) =>
+                            {
+                                Some(self.global_addr(g))
+                            }
+                            _ => None,
+                        }
+                    }),
+                };
                 // A folded store already emitted at its producer
                 // (epic-cc#723): the value sits in place, skip the copy.
+                // A mixed destination still needs its tag, so folded
+                // stores fall through to the join below.
                 if let Val::Reg(r) = &s.val {
-                    if self.store_consumed.contains(r) {
+                    if self.store_consumed.contains(r) && dst_mixed.is_none() {
                         return;
                     }
                 }
                 // A ROM address has no RAM form: a later load through the stored
                 // slot reads RAM at that address, silently wrong. A flash-kind
-                // slot takes it whole (epic-cc#1119); anything else still
-                // refuses (epic-cc#1101). A maybe-flash address has no single
-                // space either: storing it anywhere is refused (epic-cc#1099).
+                // slot takes it whole (epic-cc#1119); a maybe-flash slot
+                // takes a joined or RAM value whole plus the tag
+                // (epic-cc#1306). A directly proven flash address keeps
+                // today's refusal even into a mixed slot (epic-cc#1101):
+                // the fallback serves join values and initializers, not a
+                // statically known ROM store.
                 let stores_rom = match &s.val {
                     Val::Global(g) => self.global_is_const(g),
                     Val::Reg(_) => self.flash_val(self.cur_func, &s.val),
                     _ => false,
                 };
                 let stores_mixed = match &s.val {
-                    Val::Reg(r) => self.prov.mixed.contains(&ssa_key(self.cur_func, r)),
+                    Val::Reg(r) => {
+                        let key = ssa_key(self.cur_func, r);
+                        self.prov.mixed.contains(&key) || self.slot_mixed.contains(&key)
+                    }
                     _ => false,
                 };
+                if let Some(dst) = dst_mixed {
+                    if !stores_rom {
+                        if self.mixed_no_slot(self.cur_func, &s.val) {
+                            panic!(
+                                "isel-pic18: store of a maybe-flash address {:?} is not supported (a pointer joins flash and RAM; epic-cc#1099, epic-cc#1119)",
+                                s.val
+                            );
+                        }
+                        if s.ty.bytes() != 2 {
+                            panic!(
+                                "isel-pic18: store of a non-pointer-width value into a maybe-flash slot is not supported"
+                            );
+                        }
+                        self.emit_ptr_join_store(&s.val, s.ty, dst);
+                        return;
+                    }
+                }
                 // A const destination is a ROM write: leave it to the const-base refusal below.
                 let dst_is_const = s
                     .ptr
@@ -10324,6 +10814,26 @@ impl<'m> Gen<'m> {
                 // above, never emit it as a RAM write (epic-cc#832).
                 if let Val::Reg(r) = &ptr_val {
                     let key = ssa_key(self.cur_func, r);
+                    // A store through a maybe-flash pointer dispatches on
+                    // its tag: the RAM arm runs the plain tail below, the
+                    // flash arm traps (a write to ROM has no lowering, so
+                    // it must stay loud rather than become a RAM write).
+                    if let Some((tag, _, _, _)) = self.mixed_tag(self.cur_func, r) {
+                        let l_ram = self.fresh_label();
+                        let l_end = self.fresh_label();
+                        let (ta, tf) = self.operand(tag);
+                        let bank = if ta == 0 { "A" } else { "B" };
+                        self.emit(format!("    MOVF 0x{tf:03X},W,{bank}"));
+                        self.emit(format!("    BZ {l_ram}"));
+                        let l_trap = self.fresh_label();
+                        self.emit_label(&l_trap);
+                        self.emit(format!("    BRA {l_trap}"));
+                        self.emit(format!("    BRA {l_end}"));
+                        self.emit_label(&l_ram);
+                        self.emit_store_tail(s, &ptr_val);
+                        self.emit_label(&l_end);
+                        return;
+                    }
                     if self.prov.flash.contains(&key)
                         || self.prov.mixed.contains(&key)
                         || self.slot_flash.contains(&key)
@@ -10340,113 +10850,7 @@ impl<'m> Gen<'m> {
                         );
                     }
                 }
-                // A W-threaded store (epic-cc#863): the folded load left
-                // the byte in W, so each store writes it back out with no
-                // slot read. The predicate allows only direct-global
-                // single-byte stores with a stores-only gap, which W
-                // survives (`MOVWF` preserves it; the ISR restores it).
-                if let Val::Reg(r) = &s.val {
-                    if matches!(
-                        self.w_folds.loads.get(r),
-                        Some(iselcore::LoadFold::ThreadW(_, _))
-                    ) {
-                        let dst = s.ptr.strip_prefix('@').unwrap_or_else(|| {
-                            panic!("isel-pic18: ThreadW store through non-global {:?}", s.ptr)
-                        });
-                        let dst = self.global_addr(dst);
-                        self.invalidate_fsr0_if_slot_written(dst, 1);
-                        self.emit_w_store(dst);
-                        return;
-                    }
-                }
-                // A W-threaded const phi (epic-cc#825): every incoming
-                // edge left its byte in W with a `MOVLW`, so the store
-                // is one `MOVWF` to the direct global.
-                if let Val::Reg(r) = &s.val {
-                    if self.const_w_phis.contains(r) {
-                        let dst = s.ptr.strip_prefix('@').unwrap_or_else(|| {
-                            panic!(
-                                "isel-pic18: const-W phi store through non-global {:?}",
-                                s.ptr
-                            )
-                        });
-                        let dst = self.global_addr(dst);
-                        self.invalidate_fsr0_if_slot_written(dst, 1);
-                        self.emit_w_store(dst);
-                        return;
-                    }
-                    // Direct values cover the whole slot through one setup.
-                    // Indirect bytes seed FSR0 once and walk POSTINC0 (same
-                }
-                // single-loop ordering contract as the Load arm above,
-                // epic-cc#471). Each source byte still materializes into
-                // W (literals directly, registers via MOVF) before the
-                // write.
-                // Byte-indexed small-array stores go through `PLUSW0` like
-                // the Load arm above: `MOVF idx,W` then
-                // `MOVFF value,PLUSW0`, which preserves `W` (the write
-                // collision ADR-009 item 4 feared). Only register values
-                // with a slot move directly; address-valued regs and
-                // constants keep the `INDF0` lowering. (epic-cc#665)
-                // An in-place RMW producer (epic-cc#825) accumulated
-                // into its load operand's slot: the store reads that
-                // slot, not the dead result temp.
-                let val_slot = match self.rmw_reg(&s.val) {
-                    Val::Reg(r) => self.addrs.get(&ssa_key(self.cur_func, &r)).copied(),
-                    _ => None,
-                };
-                // A TABLAT-forwarded byte (epic-cc#977): the const-load
-                // arm left it in TABLAT, so read it directly once the
-                // setup below lands. The scan proves a single byte, a
-                // dynamic destination, and a span nothing disturbs.
-                if let Val::Reg(r) = &s.val {
-                    if self.tablat_fwd.contains(r) {
-                        assert_eq!(
-                            s.ty.bytes(),
-                            1,
-                            "isel-pic18: TABLAT forward is single-byte only"
-                        );
-                        if let (Some(shape), Some(_)) = (self.plusw_shape(&ptr_val), val_slot) {
-                            self.emit_plusw_setup(&shape, 0, false);
-                            self.emit("    MOVFF 0xFF5, 0xFEB".to_string());
-                            return;
-                        }
-                        match self.emit_ptr_setup(&ptr_val, 0) {
-                            Addr::Direct(_) => panic!(
-                                "isel-pic18: TABLAT-forwarded store has a static destination"
-                            ),
-                            Addr::Indirect => {
-                                self.emit("    MOVFF 0xFF5, 0xFEF".to_string());
-                            }
-                        }
-                        return;
-                    }
-                }
-                if let (Some(shape), Some(vslot)) = (self.plusw_shape(&ptr_val), val_slot) {
-                    let n = s.ty.bytes();
-                    for k in 0..n {
-                        // Later bytes reuse the index already in W.
-                        self.emit_plusw_setup(&shape, k, k != 0);
-                        self.emit(format!("    MOVFF 0x{:03X}, 0xFEB", vslot + u16::from(k)));
-                    }
-                } else {
-                    match self.emit_ptr_setup(&ptr_val, 0) {
-                        Addr::Direct(dst) => self.emit_move_val_to_slot(&s.val, s.ty, dst),
-                        Addr::Indirect => {
-                            let n = s.ty.bytes();
-                            // An in-place RMW producer (epic-cc#969) lives
-                            // in its load operand's slot, not the dead
-                            // result temp the store names.
-                            let val = self.rmw_reg(&s.val);
-                            for k in 0..n {
-                                self.emit_load_w(&val, k, false);
-                                let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
-                                self.emit(format!("    MOVWF 0x{reg:03X},A"));
-                            }
-                            self.bump_fsr0_tracked_offset(n);
-                        }
-                    }
-                }
+                self.emit_store_tail(s, &ptr_val);
             }
             Inst::Bin(b) => {
                 if self.lane_consumed.contains(&b.dst) {
@@ -11130,7 +11534,23 @@ impl<'m> Gen<'m> {
             Inst::Freeze(f) => {
                 // freeze is a no-op in the backend: copy `val` byte-for-byte
                 // into the dst slot (same shape as `Inst::Zext` at equal
-                // width, mirroring `isel`'s own Freeze arm).
+                // width, mirroring `isel`'s own Freeze arm). A maybe-flash
+                // dst takes the value whole plus the tag.
+                if self.slot_is_mixed(self.cur_func, &f.dst) {
+                    if self.flash_val(self.cur_func, &f.val) {
+                        panic!(
+                            "isel-pic18: freeze of a flash address into a maybe-flash slot is not supported (a directly proven ROM address keeps its refusal; epic-cc#1101, epic-cc#1306)"
+                        );
+                    }
+                    if self.mixed_no_slot(self.cur_func, &f.val) {
+                        panic!(
+                            "isel-pic18: freeze of a maybe-flash address is not supported (a pointer joins flash and RAM; epic-cc#1099)"
+                        );
+                    }
+                    let dst = self.slot_addr(self.cur_func, &f.dst).direct();
+                    self.emit_ptr_join_store(&f.val, f.ty, dst);
+                    return;
+                }
                 let src = self.val_addr(&f.val).direct();
                 let dst = self.slot_addr(self.cur_func, &f.dst).direct();
                 for i in 0..f.ty.bytes() {
@@ -11330,6 +11750,21 @@ impl<'m> Gen<'m> {
                         } else {
                             None
                         };
+                    // A maybe-flash dst takes each arm's tag with its bytes
+                    // (epic-cc#1306). A W-only arm writes no slot, so the
+                    // sentinel never carries a tag. A join outside any slot
+                    // has no tag to write: refuse rather than emit a
+                    // tagless copy.
+                    let dst_tag = (w_arms.is_none() && self.slot_is_mixed(self.cur_func, &s.dst))
+                        .then(|| dst + 2);
+                    if dst_tag.is_some()
+                        && (self.mixed_no_slot(self.cur_func, &s.a)
+                            || self.mixed_no_slot(self.cur_func, &s.b))
+                    {
+                        panic!(
+                            "isel-pic18: select of a maybe-flash address is not supported (a pointer joins flash and RAM; epic-cc#1099)"
+                        );
+                    }
                     // A fused sign-against-zero compare (epic-cc#1149): the
                     // scan proved `cond` is a single-use `slt`/`sge`
                     // against zero in the previous slot, so the sign bit
@@ -11359,10 +11794,24 @@ impl<'m> Gen<'m> {
                             self.emit(format!("    BTFSS 0x{af:03X},7,{bank}"));
                         }
                         self.emit(format!("    BRA {l_true}"));
-                        self.emit_select_arm(&s.b, s.ty, dst, addr_value, w_arms.map(|(_, bb)| bb));
+                        self.emit_select_arm(
+                            &s.b,
+                            s.ty,
+                            dst,
+                            addr_value,
+                            w_arms.map(|(_, bb)| bb),
+                            dst_tag,
+                        );
                         self.emit(format!("    BRA {l_end}"));
                         self.emit_label(&l_true);
-                        self.emit_select_arm(&s.a, s.ty, dst, addr_value, w_arms.map(|(ba, _)| ba));
+                        self.emit_select_arm(
+                            &s.a,
+                            s.ty,
+                            dst,
+                            addr_value,
+                            w_arms.map(|(ba, _)| ba),
+                            dst_tag,
+                        );
                         self.emit_label(&l_end);
                         return;
                     }
@@ -11376,10 +11825,24 @@ impl<'m> Gen<'m> {
                         self.emit_load_w(&s.cond, 0, true);
                     }
                     self.emit(format!("    BZ {l_else}")); // cond byte == 0 -> else
-                    self.emit_select_arm(&s.a, s.ty, dst, addr_value, w_arms.map(|(ba, _)| ba));
+                    self.emit_select_arm(
+                        &s.a,
+                        s.ty,
+                        dst,
+                        addr_value,
+                        w_arms.map(|(ba, _)| ba),
+                        dst_tag,
+                    );
                     self.emit(format!("    BRA {l_end}"));
                     self.emit_label(&l_else);
-                    self.emit_select_arm(&s.b, s.ty, dst, addr_value, w_arms.map(|(_, bb)| bb));
+                    self.emit_select_arm(
+                        &s.b,
+                        s.ty,
+                        dst,
+                        addr_value,
+                        w_arms.map(|(_, bb)| bb),
+                        dst_tag,
+                    );
                     self.emit_label(&l_end);
                 }
             }
@@ -11432,7 +11895,14 @@ impl<'m> Gen<'m> {
                     if let Some(d) = &c.dst {
                         let ty = c.ty.expect("isel-pic18: valued call must carry a type");
                         let dst = self.slot_addr(self.cur_func, d).direct();
-                        for i in 0..ty.bytes() {
+                        // A maybe-flash dst takes the callee's fat return
+                        // whole; anything else keeps its 2-byte copy.
+                        let n = if self.slot_is_mixed(self.cur_func, d) {
+                            3
+                        } else {
+                            ty.bytes()
+                        };
+                        for i in 0..n {
                             self.emit_copy_byte(self.retval_lo + u16::from(i), dst + u16::from(i));
                         }
                     }
@@ -11454,6 +11924,16 @@ impl<'m> Gen<'m> {
                     // epic-cc#486 review's drain-before-decision rule).
                     self.flush_copies();
                     if n >= 1 {
+                        // A maybe-flash source dispatches on its tag: the
+                        // flash arm reads through `TBLPTR`, the RAM arm
+                        // through FSR1 (epic-cc#1306). Anything without a
+                        // tag keeps the refusal inside the setups below.
+                        if let Val::Reg(r) = &mc.src {
+                            if let Some((tag, slot, k, terms)) = self.mixed_tag(self.cur_func, r) {
+                                self.emit_mixed_memcpy(mc, n, tag, slot, k, &terms);
+                                return;
+                            }
+                        }
                         // Byte 0's setups resolve the copy's kinds once;
                         // later bytes walk from those positions instead
                         // of re-seeding per byte. (epic-cc#492)
@@ -11588,7 +12068,12 @@ impl<'m> Gen<'m> {
         if let Some(d) = dst {
             let t = ty.expect("isel-pic18: valued call must carry a type");
             let da = self.slot_addr(self.cur_func, d).direct();
-            for i in 0..t.bytes() {
+            let n = if self.slot_is_mixed(self.cur_func, d) {
+                3
+            } else {
+                t.bytes()
+            };
+            for i in 0..n {
                 self.emit_copy_byte(self.retval_lo + u16::from(i), da + u16::from(i));
             }
         }
@@ -11890,13 +12375,27 @@ impl<'m> Gen<'m> {
     /// selects, `MOVLW` for a W-threaded const arm, the value move
     /// otherwise. Shared by the flag-tested and sign-fused diamonds so
     /// both spell the arms identically.
-    fn emit_select_arm(&mut self, val: &Val, ty: Ty, dst: u16, addr_value: bool, w: Option<u8>) {
+    fn emit_select_arm(
+        &mut self,
+        val: &Val,
+        ty: Ty,
+        dst: u16,
+        addr_value: bool,
+        w: Option<u8>,
+        dst_tag: Option<u16>,
+    ) {
         if addr_value {
             self.emit_move_addr_to_slot(val, dst);
         } else if let Some(b) = w {
             self.emit(format!("    MOVLW 0x{b:02X}"));
         } else {
             self.emit_move_val_to_slot(val, ty, dst);
+        }
+        // A maybe-flash dst takes the arm's tag with its bytes. A
+        // W-only arm writes no slot, so it takes no tag either.
+        if let (Some(t), None) = (dst_tag, w) {
+            let tag = self.tag_src(self.cur_func, val);
+            self.emit_tag_store(tag, t);
         }
     }
 
@@ -15832,6 +16331,8 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
         val: Val,
         w_only: bool,
         from_temp: bool,
+        dst_mixed: bool,
+        temp_flash: bool,
     }
     let mut pending: Vec<Pend> = copies
         .iter()
@@ -15872,6 +16373,11 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
                 val: val.clone(),
                 w_only,
                 from_temp: false,
+                // A maybe-flash dst takes each arm's tag with its bytes
+                // (epic-cc#1306). W-only arms write no slot, so the
+                // sentinel never carries a tag.
+                dst_mixed: !w_only && g.slot_is_mixed(g.cur_func, dst),
+                temp_flash: false,
             }
         })
         .collect();
@@ -15909,10 +16415,32 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
                             pending[i].da + u16::from(b),
                         );
                     }
+                    if pending[i].dst_mixed {
+                        let tag = if pending[i].temp_flash {
+                            TagSrc::Flash
+                        } else {
+                            TagSrc::Ram
+                        };
+                        g.emit_tag_store(tag, pending[i].da + 2);
+                    }
                     temp_live = false;
                 } else {
-                    let (val, ty, da) = (pending[i].val.clone(), pending[i].ty, pending[i].da);
+                    let (val, ty, da, dst_mixed) = (
+                        pending[i].val.clone(),
+                        pending[i].ty,
+                        pending[i].da,
+                        pending[i].dst_mixed,
+                    );
+                    if dst_mixed && g.mixed_no_slot(g.cur_func, &val) {
+                        panic!(
+                            "isel-pic18: phi of a maybe-flash address is not supported (a pointer joins flash and RAM; epic-cc#1099)"
+                        );
+                    }
                     g.emit_move_val_to_slot(&val, ty, da);
+                    if dst_mixed {
+                        let tag = g.tag_src(g.cur_func, &val);
+                        g.emit_tag_store(tag, da + 2);
+                    }
                 }
                 emitted[i] = true;
                 emitted_count += 1;
@@ -15936,6 +16464,20 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
             // staging it now captures the current value; the arm replays
             // from the temp once its destination is free.
             let (val, ty) = (pending[pick].val.clone(), pending[pick].ty);
+            // The PROD temp holds two bytes. A flash value cycles
+            // through it untouched and replays with a flash tag; only
+            // a mixed-slot value loses its tag there and stays loud.
+            match g.tag_src(g.cur_func, &val) {
+                TagSrc::Slot(_) if pending[pick].dst_mixed => {
+                    panic!(
+                        "isel-pic18: phi copy cycle of a maybe-flash address is not supported (epic-cc#1306)"
+                    );
+                }
+                TagSrc::Flash if pending[pick].dst_mixed => {
+                    pending[pick].temp_flash = true;
+                }
+                _ => {}
+            }
             g.emit_move_val_to_slot(&val, ty, PHI_COPY_TEMP_LO);
             pending[pick].src = Some(PHI_COPY_TEMP_LO);
             pending[pick].from_temp = true;
@@ -16951,7 +17493,7 @@ pub fn select_with_opts(
     // whose writers are all flash addresses or null lowers its loads
     // through `TBLPTR` seeded from the slot bytes. Same flash predicate
     // as the walks above, so both proofs agree on what lives in flash.
-    let (slot_flash, slot_mixed) = flash_slot_spaces_ex(m, &resolved, &prov, |n| {
+    let (slot_flash, slot_mixed, ret_fat) = flash_slot_spaces_ex(m, &resolved, &prov, |n| {
         !n.starts_with("_ZTV") && is_flash_const_global(m, addrs, n)
     });
     // Flash addresses laundered through integers or read back from
@@ -17042,6 +17584,8 @@ pub fn select_with_opts(
                 resolved: &resolved,
                 prov: prov.clone(),
                 slot_flash: slot_flash.clone(),
+                slot_mixed: slot_mixed.clone(),
+                ret_fat: ret_fat.clone(),
                 retval_lo: common_lo,
                 access_bank_hi,
                 bsr: None,
@@ -17131,6 +17675,8 @@ pub fn select_with_opts(
             resolved: &resolved,
             prov: prov.clone(),
             slot_flash: slot_flash.clone(),
+            slot_mixed: slot_mixed.clone(),
+            ret_fat: ret_fat.clone(),
             retval_lo: common_lo,
             access_bank_hi,
             bsr: None,
@@ -18147,7 +18693,11 @@ pub fn select_with_opts(
                     g.cur_loc = loc.clone();
                     // A flash address has no RAM form for the caller: its
                     // call-dst slot would read RAM at that address. Refuse,
-                    // and likewise a maybe-flash one (epic-cc#1099).
+                    // and likewise a maybe-flash one with no tag to carry
+                    // (epic-cc#1099). A function returning maybe-flash on
+                    // any path writes every pointer return fat (address
+                    // plus tag), so a RAM return beside a mixed one cannot
+                    // leave a stale tag behind (epic-cc#1306).
                     // (alloc copies returned consts to RAM, epic-cc#1119).
                     // A null constant is space-neutral and stays allowed.
                     if !matches!(v, Val::Const(_)) && g.flash_val(&f.name, v) {
@@ -18156,31 +18706,49 @@ pub fn select_with_opts(
                         );
                     }
                     if let Val::Reg(r) = v {
-                        if g.prov.mixed.contains(&ssa_key(&f.name, r)) {
+                        let key = ssa_key(&f.name, r);
+                        if g.prov.mixed.contains(&key) && !g.slot_mixed.contains(&key) {
                             panic!(
                                 "isel-pic18: cannot return maybe-flash address %{r} to a caller (a pointer joins flash and RAM; epic-cc#1099, epic-cc#1119)"
                             );
                         }
                     }
-                    let home = match v {
-                        Val::Reg(r) => g.addrs.get(&ssa_key(&f.name, r)).copied(),
-                        _ => None,
-                    };
-                    for i in 0..ty.bytes() {
-                        // A retval-homed zext (epic-cc#978) already wrote
-                        // these bytes: skipping keeps its MOVFF plus CLRF
-                        // instead of a W round trip through a dead temp.
-                        if home == Some(g.retval_lo)
-                            || matches!(v, Val::Reg(r) if g.zext_ret.contains(r))
-                        {
-                            continue;
+                    if g.ret_fat.contains(&f.name) {
+                        assert_eq!(
+                            ty.bytes(),
+                            2,
+                            "isel-pic18: fat return of a non-pointer-width value"
+                        );
+                        for i in 0..2 {
+                            g.emit_load_w(v, i, false);
+                            let (a, f2) = g.operand(g.retval_lo + u16::from(i));
+                            let bank = if a == 0 { "A" } else { "B" };
+                            g.emit(format!("    MOVWF 0x{f2:03X},{bank}"));
                         }
-                        g.emit_load_w(v, i, false);
-                        let (a, f2) = g.operand(g.retval_lo + u16::from(i));
-                        let bank = if a == 0 { "A" } else { "B" };
-                        g.emit(format!("    MOVWF 0x{f2:03X},{bank}"));
+                        let tag = g.tag_src(&f.name, v);
+                        g.emit_tag_store(tag, g.retval_lo + 2);
+                        g.emit("    RETURN".to_string());
+                    } else {
+                        let home = match v {
+                            Val::Reg(r) => g.addrs.get(&ssa_key(&f.name, r)).copied(),
+                            _ => None,
+                        };
+                        for i in 0..ty.bytes() {
+                            // A retval-homed zext (epic-cc#978) already wrote
+                            // these bytes: skipping keeps its MOVFF plus CLRF
+                            // instead of a W round trip through a dead temp.
+                            if home == Some(g.retval_lo)
+                                || matches!(v, Val::Reg(r) if g.zext_ret.contains(r))
+                            {
+                                continue;
+                            }
+                            g.emit_load_w(v, i, false);
+                            let (a, f2) = g.operand(g.retval_lo + u16::from(i));
+                            let bank = if a == 0 { "A" } else { "B" };
+                            g.emit(format!("    MOVWF 0x{f2:03X},{bank}"));
+                        }
+                        g.emit("    RETURN".to_string());
                     }
-                    g.emit("    RETURN".to_string());
                 }
                 _ => panic!("isel-pic18: block has no terminator"),
             }
@@ -18227,6 +18795,8 @@ pub fn select_with_opts(
             resolved: &resolved,
             prov: prov.clone(),
             slot_flash: slot_flash.clone(),
+            slot_mixed: slot_mixed.clone(),
+            ret_fat: ret_fat.clone(),
             retval_lo: common_lo,
             access_bank_hi,
             bsr: None,
@@ -18411,7 +18981,15 @@ pub fn select_with_opts(
                         .insert(addrs[&g.name])
                         .then_some((addrs[&g.name], 1))
                 } else {
-                    Some((addrs[&g.name], g.size as usize))
+                    // A maybe-flash slot is three bytes in RAM: clear
+                    // the tag with the address, or a zero-initialized
+                    // slot misreads null as flash (epic-cc#1306).
+                    let len = if slot_mixed.contains(&format!("@{}", g.name)) && g.size == 2 {
+                        3
+                    } else {
+                        g.size as usize
+                    };
+                    Some((addrs[&g.name], len))
                 }
             })
             .collect();
@@ -18489,6 +19067,29 @@ pub fn select_with_opts(
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
                     // Access-bank check mirrors Gen::operand.
+                    if addr <= access_bank_hi || addr >= PIC18_SFR_ACCESS_LO {
+                        init.push(format!("    MOVWF 0x{addr:03X},A"));
+                    } else {
+                        let bsr = (addr >> 8) as u8;
+                        if init_bsr != Some(bsr) {
+                            init.push(format!("    MOVLB 0x{bsr:02X}"));
+                            init_bsr = Some(bsr);
+                        }
+                        init.push(format!("    MOVWF 0x{addr:03X},B"));
+                    }
+                }
+                // A maybe-flash pointer global takes its tag with the
+                // initializer: flash when it names a table, RAM otherwise
+                // (epic-cc#1306). Zero-initialized globals emit nothing
+                // above and keep the cleared tag the startup clear left.
+                if slot_mixed.contains(&format!("@{}", g.name)) && g.size == 2 {
+                    let init_flash = g.refs.iter().any(|(_, t, _)| {
+                        !addrs.contains_key(t)
+                            && m.globals.iter().any(|gl| &gl.name == t && gl.is_const)
+                    });
+                    let byte = if init_flash { 1 } else { 0 };
+                    init.push(format!("    MOVLW 0x{byte:02X}"));
+                    let addr = base + 2;
                     if addr <= access_bank_hi || addr >= PIC18_SFR_ACCESS_LO {
                         init.push(format!("    MOVWF 0x{addr:03X},A"));
                     } else {
@@ -18661,6 +19262,8 @@ mod tests {
                 resolved: &resolved,
                 prov: FlashProvenance::default(),
                 slot_flash: HashSet::new(),
+                slot_mixed: HashSet::new(),
+                ret_fat: HashSet::new(),
                 retval_lo: 0,
                 access_bank_hi: 0x5F,
                 bsr: None,
@@ -18716,6 +19319,8 @@ mod tests {
                 resolved: &resolved,
                 prov: FlashProvenance::default(),
                 slot_flash: HashSet::new(),
+                slot_mixed: HashSet::new(),
+                ret_fat: HashSet::new(),
                 retval_lo: 0,
                 access_bank_hi: 0x5F,
                 bsr: None,
@@ -18865,6 +19470,8 @@ mod p3_gen_tests {
             resolved,
             prov: FlashProvenance::default(),
             slot_flash: HashSet::new(),
+            slot_mixed: HashSet::new(),
+            ret_fat: HashSet::new(),
             retval_lo: 0,
             access_bank_hi: 0x5F,
             bsr: None,
