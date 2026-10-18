@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use device::{Core, Device};
 use ir::{Inst, Module};
 use iselcore::{
-    add_flash_walks, const_fan_in, find_value_folds, flash_provenance, flash_slot_spaces,
+    add_flash_walks, const_fan_in, find_value_folds, flash_provenance, flash_slot_spaces_ex,
     resolve_pointers, ssa_key, Base, PtrResolution, ValueFolds,
 };
 use retain::Retention;
@@ -265,6 +265,17 @@ fn physical_end(device: &Device, start: u16, width: u16) -> u16 {
         cur = end + 1;
     }
     cur
+}
+/// The RAM bytes a global occupies: a maybe-flash pointer slot (epic-cc#1306)
+/// widens from 2 to 3 (tag plus address) on PIC18, where the backend
+/// lowers it as a fat value. Anything else keeps its declared size, so
+/// non-mixed layouts never see this function differ from `g.size`.
+fn gsize(fat: &HashSet<String>, g: &ir::Global) -> u16 {
+    if !g.is_const && g.size == 2 && fat.contains(&format!("@{}", g.name)) {
+        3
+    } else {
+        g.size
+    }
 }
 
 /// The start address for a `width`-byte value placed at the next free
@@ -637,6 +648,7 @@ fn first_fit(
 fn frame_layout(
     f: &ir::Func,
     resolved: &PtrResolution,
+    fat: &HashSet<String>,
     retention: &Retention,
     precise: bool,
     va_size: u16,
@@ -662,9 +674,17 @@ fn frame_layout(
     let mut defs: HashMap<String, (usize, u16, u8, usize, bool)> = HashMap::new();
     let mut order_idx = 0usize;
     for p in &f.params {
+        // A maybe-flash param slot carries the tag plus the address
+        // (epic-cc#1306); every other width is untouched, so non-mixed
+        // frames lay out bit for bit as before.
+        let w = if p.width == 2 && fat.contains(&ssa_key(&f.name, &p.name)) {
+            3
+        } else {
+            p.width
+        };
         defs.insert(
             p.name.clone(),
-            (0, 0, p.width, order_idx, p.byval.is_some() || p.sret),
+            (0, 0, w, order_idx, p.byval.is_some() || p.sret),
         );
         order_idx += 1;
     }
@@ -678,6 +698,11 @@ fn frame_layout(
     for (i, b) in order.iter().enumerate() {
         for (pos, inst) in b.insts.iter().enumerate() {
             if let Some((name, width)) = def_width(inst, resolved, &f.name) {
+                let width = if width == 2 && fat.contains(&ssa_key(&f.name, &name)) {
+                    3
+                } else {
+                    width
+                };
                 let mem = matches!(inst, ir::Inst::Alloca(_));
                 defs.insert(name, (i, pos as u16, width, order_idx, mem));
                 order_idx += 1;
@@ -1724,6 +1749,7 @@ fn bin_pack(
     device: &Device,
     fixed: &[(String, u16, u16)],
     floating: &[&ir::Global],
+    fat: &HashSet<String>,
     start: u16,
 ) -> Option<HashMap<String, u16>> {
     let mut cursors: Vec<BankCursor> = device
@@ -1742,10 +1768,10 @@ fn bin_pack(
         }
     }
     let mut order: Vec<&ir::Global> = floating.to_vec();
-    order.sort_by(|a, b| b.size.cmp(&a.size));
+    order.sort_by(|a, b| gsize(fat, b).cmp(&gsize(fat, a)));
     let mut out = HashMap::new();
     for g in order {
-        let width = g.size;
+        let width = gsize(fat, g);
         let align = width.min(2);
         let mut placed = None;
         for cursor in cursors.iter_mut() {
@@ -1779,10 +1805,10 @@ fn bin_pack(
 }
 
 /// The end address of a global arrangement: the highest `addr + size`.
-fn global_end(map: &HashMap<String, u16>, floating: &[&ir::Global]) -> u16 {
+fn global_end(map: &HashMap<String, u16>, floating: &[&ir::Global], fat: &HashSet<String>) -> u16 {
     floating
         .iter()
-        .filter_map(|g| map.get(&g.name).map(|a| a + u16::from(g.size)))
+        .filter_map(|g| map.get(&g.name).map(|a| a + gsize(fat, g)))
         .max()
         .unwrap_or(0)
 }
@@ -2926,11 +2952,11 @@ enum Dip {
 /// TBLPTR. Greatest fixpoint over the slot proof, dropping consts with a
 /// RAM-forcing use. Loads, derefs, and pure flash walks never force.
 /// Returns the resident set plus the final slot spaces for the
-/// initializer-ref rule below.
+/// initializer-ref rule below, and the maybe-flash slots both share.
 fn flash_resident_consts(
     m: &Module,
     resolved: &PtrResolution,
-) -> (HashSet<String>, HashSet<String>) {
+) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
     let mut live: HashSet<String> = m
         .globals
         .iter()
@@ -2938,10 +2964,13 @@ fn flash_resident_consts(
         .map(|g| g.name.clone())
         .collect();
     let mut spaces: HashSet<String>;
+    let mut mixed_spaces: HashSet<String>;
     loop {
         let mut prov = flash_provenance(m);
         add_flash_walks(&mut prov, m, |n| live.contains(n));
-        spaces = flash_slot_spaces(m, resolved, &prov, |n| live.contains(n));
+        let ex = flash_slot_spaces_ex(m, resolved, &prov, |n| live.contains(n));
+        spaces = ex.0;
+        mixed_spaces = ex.1;
         let mut bad: HashSet<String> = HashSet::new();
         // Every const an offending value may carry leaves. Values are
         // followed through GEP chains and select/phi arms, so a pure
@@ -3078,7 +3107,7 @@ fn flash_resident_consts(
             live.remove(&g);
         }
     }
-    (live, spaces)
+    (live, spaces, mixed_spaces)
 }
 
 /// Address allocation with a value-fold gate (epic-cc#863). `None`
@@ -3291,10 +3320,26 @@ fn allocate_inner(
     let mut live_map: HashMap<String, HashMap<String, (usize, (usize, u16), (usize, u16))>> =
         HashMap::new();
     let va_sizes = va_sizes(m);
+    // Maybe-flash slots (epic-cc#1306, PIC18 only): pointer slots that can
+    // hold a flash address on some path and RAM on another widen to 3
+    // bytes (tag plus address) in both frame layouts and the global
+    // placement below. Other cores keep every pointer slot 2 bytes: their
+    // backends still refuse these shapes. Hoisted ahead of the frame
+    // layouts, which size every slot they place.
+    let (flash_resident_early, flash_spaces_early, mixed_spaces): (
+        HashSet<String>,
+        HashSet<String>,
+        HashSet<String>,
+    ) = if device.core == Core::Pic18 {
+        flash_resident_consts(m, &resolved)
+    } else {
+        (HashSet::new(), HashSet::new(), HashSet::new())
+    };
     for f in &m.funcs {
         let fl = frame_layout(
             f,
             &resolved,
+            &mixed_spaces,
             &retention,
             precise,
             floored_va_size(f, &va_sizes),
@@ -3700,12 +3745,9 @@ fn allocate_inner(
     // a flash-proven position, so they keep no RAM copy and isel lowers
     // their walks through TBLPTR from the slot bytes. Other cores keep
     // every copy: their backends still address staged copies and pools.
-    let (flash_resident, flash_spaces): (HashSet<String>, HashSet<String>) =
-        if device.core == Core::Pic18 {
-            flash_resident_consts(m, &resolved)
-        } else {
-            (HashSet::new(), HashSet::new())
-        };
+    // Computed hoisted ahead of the frame layouts, which size fat slots.
+    let flash_resident = flash_resident_early;
+    let flash_spaces = flash_spaces_early;
     let stays_flash = |g: &str| device.core == Core::Pic18 && flash_resident.contains(g);
 
     let mut const_globals: HashSet<String> = HashSet::new();
@@ -4628,7 +4670,7 @@ fn allocate_inner(
         if g.is_const && !const_to_ram.contains(&g.name) {
             const_globals.insert(g.name.clone());
         } else if let Some(p) = g.addr {
-            fixed.push((g.name.clone(), p.byte, g.size));
+            fixed.push((g.name.clone(), p.byte, gsize(&mixed_spaces, g)));
         } else if packed_names.contains(&g.name) {
             // Its group's holder below reserves the shared byte.
         } else {
@@ -4692,7 +4734,7 @@ fn allocate_inner(
                 }
             }
             for g in &floating {
-                let width = g.size;
+                let width = gsize(&mixed_spaces, g);
                 // If the next placement would overlap a fixed region, bump
                 // past it before asking try_place_at.
                 let mut candidate = addr;
@@ -4769,9 +4811,12 @@ fn allocate_inner(
                 }
                 try_float(start)
             };
-            let bin = bin_pack(device, &fixed, &floating, start);
+            let bin = bin_pack(device, &fixed, &floating, &mixed_spaces, start);
             match (&seq, &bin) {
-                (Some(s), Some(b)) if global_end(b, &floating) < global_end(s, &floating) => {
+                (Some(s), Some(b))
+                    if global_end(b, &floating, &mixed_spaces)
+                        < global_end(s, &floating, &mixed_spaces) =>
+                {
                     Some(b.clone())
                 }
                 (Some(s), _) => Some(s.clone()),
@@ -4780,7 +4825,10 @@ fn allocate_inner(
             }
         };
         let no_fit = |start: u16| -> String {
-            let demand: u32 = floating.iter().map(|g| u32::from(g.size)).sum::<u32>()
+            let demand: u32 = floating
+                .iter()
+                .map(|g| u32::from(gsize(&mixed_spaces, g)))
+                .sum::<u32>()
                 + fixed.iter().map(|(_, _, s)| u32::from(*s)).sum::<u32>();
             let capacity: u32 = device
                 .ram_banks
@@ -4883,7 +4931,7 @@ fn allocate_inner(
     let end_of_globals = m.globals.iter().chain(stage_holder.iter()).fold(
         device.gpr_start(),
         |end, g| match globals.get(&g.name) {
-            Some(&a) => end.max(physical_end(device, a, u16::from(g.size))),
+            Some(&a) => end.max(physical_end(device, a, gsize(&mixed_spaces, g))),
             None => end,
         },
     );
@@ -4931,6 +4979,7 @@ fn allocate_inner(
         let fl = frame_layout(
             f,
             &resolved,
+            &mixed_spaces,
             &retention,
             precise,
             floored_va_size(f, &va_sizes),
@@ -5059,7 +5108,7 @@ fn allocate_inner(
                 // physical_end, not a + size (which would overcount the
                 // first bank into the common-RAM hole and miss the later
                 // banks entirely).
-                let e = physical_end(device, a, u16::from(g.size));
+                let e = physical_end(device, a, gsize(&mixed_spaces, g));
                 if a >= start && a <= end {
                     hi = Some(hi.map_or(e, |h| h.max(e)));
                 }
