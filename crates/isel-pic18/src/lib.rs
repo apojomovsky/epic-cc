@@ -7085,12 +7085,17 @@ impl<'m> Gen<'m> {
                 if self.flash_val(func, v) {
                     return TagSrc::Flash;
                 }
-                // A static chain over a mixed slot (a GEP with no dynamic
-                // terms) shares its space: the tag rides the base slot.
+                // A walk preserves its base's space, static or dynamic:
+                // the tag rides the base slot.
                 match self.resolved.get(&key) {
-                    Some((Base::Slot(sname, _), _, terms)) if terms.is_empty() => {
+                    Some((Base::Slot(sname, _), _, _)) => {
                         if self.slot_is_mixed(func, sname) {
-                            TagSrc::Slot(self.slot_addr(func, sname).direct() + 2)
+                            match self.addrs.get(&ssa_key(func, sname)).copied() {
+                                Some(sa) => TagSrc::Slot(sa + 2),
+                                None => panic!(
+                                    "isel-pic18: join of a walk over a slotless maybe-flash base %{sname} is not supported (epic-cc#1306)"
+                                ),
+                            }
                         } else {
                             TagSrc::Ram
                         }
@@ -8767,6 +8772,10 @@ impl<'m> Gen<'m> {
         k: u16,
         terms: &[(u16, String)],
     ) {
+        // The driver intercept bypasses `emit_memcpy_setups`, so run
+        // its destination check here: a copy into a maybe-flash slot
+        // has no tag source and stays refused (epic-cc#1306 defers it).
+        self.check_memcpy_flash_dst(&mc.dst);
         let l_ram = self.fresh_label();
         let l_end = self.fresh_label();
         let (ta, tf) = self.operand(tag);
