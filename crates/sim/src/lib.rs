@@ -247,10 +247,7 @@ fn cost14_masked(word: u16, pc: u16, next: u16, mask: u16, cls: u16) -> u64 {
 /// branch, return, computed jump): always 2, even when it lands on the
 /// next instruction, where the delta alone would read fall-through 1.
 /// Fixed classes first: `SLEEP`/`RESET` cost 1,
-/// `PUSH`/`POP` cost 2, `TBLRD*` costs 2, `GOTO`/`CALL`/`LFSR` cost 2
-/// over two words. Anything else follows the delta: fall-through 1, a
-/// one-word skip or any redirect 2, a skip over a two-word form 3.
-/// `MOVFF` needs no arm: two words advance `pc` by 4, which the delta
+/// `PUSH`/`POP` cost 2, `TBLRD*`/`TBLWT*` cost 2, `GOTO`/`CALL`/`LFSR` cost 2
 /// already charges 2.
 fn cost18(word: u16, pc: u32, next: u32, jumped: bool) -> u64 {
     if jumped {
@@ -259,7 +256,7 @@ fn cost18(word: u16, pc: u32, next: u32, jumped: bool) -> u64 {
     match word {
         0x0003 | 0x00FF => 1,
         0x0005 | 0x0006 => 2,
-        0x0008..=0x000B => 2,
+        0x0008..=0x000F => 2,
         0xEC00..=0xEFFF => 2,
         _ if next == pc + 2 => 1,
         _ if next == pc + 4 => 2,
@@ -2495,6 +2492,12 @@ impl Pic18 {
                 self.exec_tblrd(word);
                 pc + 2
             }
+            // TBLWT* / TBLWT*+ / TBLWT*- / TBLWT+*: the sim models no NVM
+            // write, only the TBLPTR side effect (see `exec_tblwt`).
+            0x000C | 0x000D | 0x000E | 0x000F => {
+                self.exec_tblwt(word);
+                pc + 2
+            }
             0x0100..=0x010F => {
                 self.ram[0xFE0] = (word & 0xF) as u8; // MOVLB: loads BSR
                 pc + 2
@@ -2935,6 +2938,20 @@ impl Pic18 {
         match opcode {
             0x0009 => self.set_tblptr(self.tblptr().wrapping_add(1) & 0x1F_FFFF), // TBLRD*+
             0x000A => self.set_tblptr(self.tblptr().wrapping_sub(1) & 0x1F_FFFF), // TBLRD*-
+            _ => {}
+        }
+    }
+    /// Apply one of the four `TBLWT*` forms to `TBLPTR` only: the sim
+    /// models no NVM unlock sequence and no holding-register write, so
+    /// flash and `TABLAT` stay unchanged. Pointer semantics mirror
+    /// `exec_tblrd` (`+*` pre-increments, the rest post-adjust).
+    fn exec_tblwt(&mut self, opcode: u16) {
+        if opcode == 0x000F {
+            self.set_tblptr(self.tblptr().wrapping_add(1) & 0x1F_FFFF); // TBLWT+*
+        }
+        match opcode {
+            0x000D => self.set_tblptr(self.tblptr().wrapping_add(1) & 0x1F_FFFF), // TBLWT*+
+            0x000E => self.set_tblptr(self.tblptr().wrapping_sub(1) & 0x1F_FFFF), // TBLWT*-
             _ => {}
         }
     }

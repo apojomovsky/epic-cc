@@ -743,3 +743,57 @@ fn daw_honors_digit_carry_without_tens_adjust() {
     assert_eq!(p.w(), 0x48);
     assert_eq!(p.ram()[0xFD8] & 0x01, 0x00, "C stays clear");
 }
+
+/// Run one `TBLWT*` form with `TBLPTR` preset to `tblptr` and return the
+/// simulator: flash starts as the single assembled word, `TABLAT` holds
+/// a sentinel proving the no-write model leaves it alone.
+fn run_tblwt(mnemonic: &str, tblptr: u32) -> Pic18 {
+    let words = asm::assemble_pic18(&format!("    {mnemonic}\n"));
+    let mut p = Pic18::new(words);
+    p.ram_mut()[0xFF6] = (tblptr & 0xFF) as u8;
+    p.ram_mut()[0xFF7] = ((tblptr >> 8) & 0xFF) as u8;
+    p.ram_mut()[0xFF8] = ((tblptr >> 16) & 0xFF) as u8;
+    p.ram_mut()[0xFF5] = 0xA5;
+    p.run(1);
+    p
+}
+
+fn tblptr_of(p: &Pic18) -> u32 {
+    ((p.ram()[0xFF8] as u32) << 16) | ((p.ram()[0xFF7] as u32) << 8) | p.ram()[0xFF6] as u32
+}
+
+#[test]
+fn tblwt_star_leaves_tblptr_and_flash_unchanged() {
+    let p = run_tblwt("TBLWT*", 0x04);
+    assert_eq!(tblptr_of(&p), 0x04, "TBLWT* leaves TBLPTR unchanged");
+    assert_eq!(p.read_prog_word(0), Some(0x000C), "flash image unchanged");
+    assert_eq!(p.ram()[0xFF5], 0xA5, "TABLAT unchanged: no write modelled");
+    assert_eq!(p.cycles(), 2, "TBLWT* costs 2");
+}
+
+#[test]
+fn tblwt_star_plus_post_increments_tblptr() {
+    let p = run_tblwt("TBLWT*+", 0x04);
+    assert_eq!(tblptr_of(&p), 0x05, "TBLWT*+ advances TBLPTR to 5");
+    assert_eq!(p.read_prog_word(0), Some(0x000D), "flash image unchanged");
+    assert_eq!(p.ram()[0xFF5], 0xA5, "TABLAT unchanged: no write modelled");
+    assert_eq!(p.cycles(), 2, "TBLWT*+ costs 2");
+}
+
+#[test]
+fn tblwt_star_minus_post_decrements_tblptr() {
+    let p = run_tblwt("TBLWT*-", 0x05);
+    assert_eq!(tblptr_of(&p), 0x04, "TBLWT*- backs TBLPTR to 4");
+    assert_eq!(p.read_prog_word(0), Some(0x000E), "flash image unchanged");
+    assert_eq!(p.ram()[0xFF5], 0xA5, "TABLAT unchanged: no write modelled");
+    assert_eq!(p.cycles(), 2, "TBLWT*- costs 2");
+}
+
+#[test]
+fn tblwt_plus_star_pre_increments_tblptr() {
+    let p = run_tblwt("TBLWT+*", 0x04);
+    assert_eq!(tblptr_of(&p), 0x05, "TBLWT+* leaves TBLPTR at 5");
+    assert_eq!(p.read_prog_word(0), Some(0x000F), "flash image unchanged");
+    assert_eq!(p.ram()[0xFF5], 0xA5, "TABLAT unchanged: no write modelled");
+    assert_eq!(p.cycles(), 2, "TBLWT+* costs 2");
+}
