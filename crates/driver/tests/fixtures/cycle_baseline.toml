@@ -13,6 +13,22 @@ ram_bytes = 11
 [[entry]]
 name = "speed-mul-u8-18f4550"
 device = "18F4550"
+profile = "O0"
+cycles = 6
+flash_words = 25
+ram_bytes = 11
+
+[[entry]]
+name = "speed-mul-u8-18f4550"
+device = "18F4550"
+profile = "O1"
+cycles = 6
+flash_words = 25
+ram_bytes = 11
+
+[[entry]]
+name = "speed-mul-u8-18f4550"
+device = "18F4550"
 profile = "O2"
 cycles = 6
 flash_words = 25
@@ -21,6 +37,22 @@ ram_bytes = 11
 [[entry]]
 name = "speed-mul-u8-16f877a"
 device = "16F877A"
+cycles = 85
+flash_words = 38
+ram_bytes = 11
+
+[[entry]]
+name = "speed-mul-u8-16f877a"
+device = "16F877A"
+profile = "O0"
+cycles = 85
+flash_words = 38
+ram_bytes = 11
+
+[[entry]]
+name = "speed-mul-u8-16f877a"
+device = "16F877A"
+profile = "O1"
 cycles = 85
 flash_words = 38
 ram_bytes = 11
@@ -43,6 +75,22 @@ ram_bytes = 21
 [[entry]]
 name = "speed-mul-u16-18f4550"
 device = "18F4550"
+profile = "O0"
+cycles = 36
+flash_words = 58
+ram_bytes = 21
+
+[[entry]]
+name = "speed-mul-u16-18f4550"
+device = "18F4550"
+profile = "O1"
+cycles = 36
+flash_words = 58
+ram_bytes = 21
+
+[[entry]]
+name = "speed-mul-u16-18f4550"
+device = "18F4550"
 profile = "O2"
 cycles = 22
 flash_words = 45
@@ -58,6 +106,22 @@ ram_bytes = 21
 [[entry]]
 name = "speed-mul-u16-16f877a"
 device = "16F877A"
+profile = "O0"
+cycles = 144
+flash_words = 78
+ram_bytes = 21
+
+[[entry]]
+name = "speed-mul-u16-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 144
+flash_words = 78
+ram_bytes = 21
+
+[[entry]]
+name = "speed-mul-u16-16f877a"
+device = "16F877A"
 profile = "O2"
 cycles = 144
 flash_words = 78
@@ -73,6 +137,22 @@ ram_bytes = 49
 [[entry]]
 name = "speed-mul-u32-18f4550"
 device = "18F4550"
+profile = "O0"
+cycles = 102
+flash_words = 132
+ram_bytes = 49
+
+[[entry]]
+name = "speed-mul-u32-18f4550"
+device = "18F4550"
+profile = "O1"
+cycles = 102
+flash_words = 132
+ram_bytes = 49
+
+[[entry]]
+name = "speed-mul-u32-18f4550"
+device = "18F4550"
 profile = "O2"
 cycles = 102
 flash_words = 132
@@ -81,6 +161,22 @@ ram_bytes = 49
 [[entry]]
 name = "speed-mul-u32-16f877a"
 device = "16F877A"
+cycles = 685
+flash_words = 144
+ram_bytes = 48
+
+[[entry]]
+name = "speed-mul-u32-16f877a"
+device = "16F877A"
+profile = "O0"
+cycles = 685
+flash_words = 144
+ram_bytes = 48
+
+[[entry]]
+name = "speed-mul-u32-16f877a"
+device = "16F877A"
+profile = "O1"
 cycles = 685
 flash_words = 144
 ram_bytes = 48
@@ -103,6 +199,22 @@ ram_bytes = 15
 [[entry]]
 name = "speed-divmod-u8-18f4550"
 device = "18F4550"
+profile = "O0"
+cycles = 288
+flash_words = 85
+ram_bytes = 15
+
+[[entry]]
+name = "speed-divmod-u8-18f4550"
+device = "18F4550"
+profile = "O1"
+cycles = 296
+flash_words = 84
+ram_bytes = 15
+
+[[entry]]
+name = "speed-divmod-u8-18f4550"
+device = "18F4550"
 profile = "O2"
 cycles = 276
 flash_words = 89
@@ -111,6 +223,22 @@ ram_bytes = 15
 [[entry]]
 name = "speed-divmod-u8-16f877a"
 device = "16F877A"
+cycles = 356
+flash_words = 90
+ram_bytes = 15
+
+[[entry]]
+name = "speed-divmod-u8-16f877a"
+device = "16F877A"
+profile = "O0"
+cycles = 356
+flash_words = 90
+ram_bytes = 15
+
+[[entry]]
+name = "speed-divmod-u8-16f877a"
+device = "16F877A"
+profile = "O1"
 cycles = 356
 flash_words = 90
 ram_bytes = 15
@@ -133,6 +261,22 @@ ram_bytes = 24
 [[entry]]
 name = "speed-divmod-i8-18f4550"
 device = "18F4550"
+profile = "O0"
+cycles = 668
+flash_words = 171
+ram_bytes = 24
+
+[[entry]]
+name = "speed-divmod-i8-18f4550"
+device = "18F4550"
+profile = "O1"
+cycles = 684
+flash_words = 166
+ram_bytes = 24
+
+[[entry]]
+name = "speed-divmod-i8-18f4550"
+device = "18F4550"
 profile = "O2"
 cycles = 492
 flash_words = 197
@@ -141,21 +285,53 @@ ram_bytes = 24
 [[entry]]
 name = "speed-divmod-i8-16f877a"
 device = "16F877A"
-cycles = 826
-flash_words = 184
+cycles = 822
+flash_words = 180
+ram_bytes = 24
+
+[[entry]]
+name = "speed-divmod-i8-16f877a"
+device = "16F877A"
+profile = "O0"
+cycles = 822
+flash_words = 180
+ram_bytes = 24
+
+[[entry]]
+name = "speed-divmod-i8-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 822
+flash_words = 180
 ram_bytes = 24
 
 [[entry]]
 name = "speed-divmod-i8-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 826
-flash_words = 184
+cycles = 822
+flash_words = 180
 ram_bytes = 24
 
 [[entry]]
 name = "speed-divmod-u16-18f4550"
 device = "18F4550"
+cycles = 612
+flash_words = 102
+ram_bytes = 29
+
+[[entry]]
+name = "speed-divmod-u16-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 604
+flash_words = 107
+ram_bytes = 29
+
+[[entry]]
+name = "speed-divmod-u16-18f4550"
+device = "18F4550"
+profile = "O1"
 cycles = 612
 flash_words = 102
 ram_bytes = 29
@@ -178,6 +354,22 @@ ram_bytes = 28
 [[entry]]
 name = "speed-divmod-u16-16f877a"
 device = "16F877A"
+profile = "O0"
+cycles = 752
+flash_words = 116
+ram_bytes = 28
+
+[[entry]]
+name = "speed-divmod-u16-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 752
+flash_words = 116
+ram_bytes = 28
+
+[[entry]]
+name = "speed-divmod-u16-16f877a"
+device = "16F877A"
 profile = "O2"
 cycles = 634
 flash_words = 360
@@ -186,6 +378,22 @@ ram_bytes = 28
 [[entry]]
 name = "speed-divmod-i16-18f4550"
 device = "18F4550"
+cycles = 652
+flash_words = 154
+ram_bytes = 29
+
+[[entry]]
+name = "speed-divmod-i16-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 644
+flash_words = 159
+ram_bytes = 29
+
+[[entry]]
+name = "speed-divmod-i16-18f4550"
+device = "18F4550"
+profile = "O1"
 cycles = 652
 flash_words = 154
 ram_bytes = 29
@@ -208,6 +416,22 @@ ram_bytes = 28
 [[entry]]
 name = "speed-divmod-i16-16f877a"
 device = "16F877A"
+profile = "O0"
+cycles = 792
+flash_words = 168
+ram_bytes = 28
+
+[[entry]]
+name = "speed-divmod-i16-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 792
+flash_words = 168
+ram_bytes = 28
+
+[[entry]]
+name = "speed-divmod-i16-16f877a"
+device = "16F877A"
 profile = "O2"
 cycles = 792
 flash_words = 168
@@ -216,6 +440,22 @@ ram_bytes = 28
 [[entry]]
 name = "speed-divmod-u32-18f4550"
 device = "18F4550"
+cycles = 1972
+flash_words = 159
+ram_bytes = 51
+
+[[entry]]
+name = "speed-divmod-u32-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 1964
+flash_words = 161
+ram_bytes = 51
+
+[[entry]]
+name = "speed-divmod-u32-18f4550"
+device = "18F4550"
+profile = "O1"
 cycles = 1972
 flash_words = 159
 ram_bytes = 51
@@ -238,6 +478,22 @@ ram_bytes = 51
 [[entry]]
 name = "speed-divmod-u32-16f877a"
 device = "16F877A"
+profile = "O0"
+cycles = 2676
+flash_words = 224
+ram_bytes = 51
+
+[[entry]]
+name = "speed-divmod-u32-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 2676
+flash_words = 224
+ram_bytes = 51
+
+[[entry]]
+name = "speed-divmod-u32-16f877a"
+device = "16F877A"
 profile = "O2"
 cycles = 1260
 flash_words = 576
@@ -246,6 +502,22 @@ ram_bytes = 51
 [[entry]]
 name = "speed-divmod-i32-18f4550"
 device = "18F4550"
+cycles = 1976
+flash_words = 247
+ram_bytes = 53
+
+[[entry]]
+name = "speed-divmod-i32-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 1968
+flash_words = 249
+ram_bytes = 53
+
+[[entry]]
+name = "speed-divmod-i32-18f4550"
+device = "18F4550"
+profile = "O1"
 cycles = 1976
 flash_words = 247
 ram_bytes = 53
@@ -268,6 +540,22 @@ ram_bytes = 53
 [[entry]]
 name = "speed-divmod-i32-16f877a"
 device = "16F877A"
+profile = "O0"
+cycles = 2620
+flash_words = 312
+ram_bytes = 53
+
+[[entry]]
+name = "speed-divmod-i32-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 2620
+flash_words = 312
+ram_bytes = 53
+
+[[entry]]
+name = "speed-divmod-i32-16f877a"
+device = "16F877A"
 profile = "O2"
 cycles = 2620
 flash_words = 312
@@ -276,6 +564,22 @@ ram_bytes = 53
 [[entry]]
 name = "speed-shift-18f4550"
 device = "18F4550"
+cycles = 498
+flash_words = 192
+ram_bytes = 43
+
+[[entry]]
+name = "speed-shift-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 490
+flash_words = 193
+ram_bytes = 43
+
+[[entry]]
+name = "speed-shift-18f4550"
+device = "18F4550"
+profile = "O1"
 cycles = 498
 flash_words = 192
 ram_bytes = 43
@@ -298,6 +602,22 @@ ram_bytes = 43
 [[entry]]
 name = "speed-shift-16f877a"
 device = "16F877A"
+profile = "O0"
+cycles = 536
+flash_words = 216
+ram_bytes = 43
+
+[[entry]]
+name = "speed-shift-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 536
+flash_words = 216
+ram_bytes = 43
+
+[[entry]]
+name = "speed-shift-16f877a"
+device = "16F877A"
 profile = "O2"
 cycles = 310
 flash_words = 266
@@ -313,6 +633,22 @@ ram_bytes = 77
 [[entry]]
 name = "speed-memcpy-32-18f4550"
 device = "18F4550"
+profile = "O0"
+cycles = 723
+flash_words = 103
+ram_bytes = 77
+
+[[entry]]
+name = "speed-memcpy-32-18f4550"
+device = "18F4550"
+profile = "O1"
+cycles = 723
+flash_words = 103
+ram_bytes = 77
+
+[[entry]]
+name = "speed-memcpy-32-18f4550"
+device = "18F4550"
 profile = "O2"
 cycles = 723
 flash_words = 103
@@ -328,6 +664,22 @@ ram_bytes = 84
 [[entry]]
 name = "speed-memcpy-32-16f877a"
 device = "16F877A"
+profile = "O0"
+cycles = 1295
+flash_words = 107
+ram_bytes = 84
+
+[[entry]]
+name = "speed-memcpy-32-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 1295
+flash_words = 107
+ram_bytes = 84
+
+[[entry]]
+name = "speed-memcpy-32-16f877a"
+device = "16F877A"
 profile = "O2"
 cycles = 1295
 flash_words = 107
@@ -337,75 +689,155 @@ ram_bytes = 84
 name = "speed-memset-32-18f4550"
 device = "18F4550"
 cycles = 493
-flash_words = 92
-ram_bytes = 47
+flash_words = 86
+ram_bytes = 45
+
+[[entry]]
+name = "speed-memset-32-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 493
+flash_words = 86
+ram_bytes = 45
+
+[[entry]]
+name = "speed-memset-32-18f4550"
+device = "18F4550"
+profile = "O1"
+cycles = 493
+flash_words = 86
+ram_bytes = 45
 
 [[entry]]
 name = "speed-memset-32-18f4550"
 device = "18F4550"
 profile = "O2"
 cycles = 493
-flash_words = 92
+flash_words = 86
+ram_bytes = 45
+
+[[entry]]
+name = "speed-memset-32-16f877a"
+device = "16F877A"
+cycles = 747
+flash_words = 84
 ram_bytes = 47
 
 [[entry]]
 name = "speed-memset-32-16f877a"
 device = "16F877A"
-cycles = 749
-flash_words = 86
+profile = "O0"
+cycles = 747
+flash_words = 84
+ram_bytes = 47
+
+[[entry]]
+name = "speed-memset-32-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 747
+flash_words = 84
 ram_bytes = 47
 
 [[entry]]
 name = "speed-memset-32-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 749
-flash_words = 86
+cycles = 747
+flash_words = 84
 ram_bytes = 47
 
 [[entry]]
 name = "speed-strlen-strcmp-18f4550"
 device = "18F4550"
-cycles = 962
-flash_words = 147
+cycles = 930
+flash_words = 143
+ram_bytes = 55
+
+[[entry]]
+name = "speed-strlen-strcmp-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 1236
+flash_words = 163
+ram_bytes = 53
+
+[[entry]]
+name = "speed-strlen-strcmp-18f4550"
+device = "18F4550"
+profile = "O1"
+cycles = 930
+flash_words = 143
 ram_bytes = 55
 
 [[entry]]
 name = "speed-strlen-strcmp-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 950
-flash_words = 149
+cycles = 918
+flash_words = 145
 ram_bytes = 55
 
 [[entry]]
 name = "speed-strlen-strcmp-16f877a"
 device = "16F877A"
-cycles = 1194
-flash_words = 201
-ram_bytes = 56
+cycles = 1192
+flash_words = 196
+ram_bytes = 52
+
+[[entry]]
+name = "speed-strlen-strcmp-16f877a"
+device = "16F877A"
+profile = "O0"
+cycles = 1494
+flash_words = 228
+ram_bytes = 54
+
+[[entry]]
+name = "speed-strlen-strcmp-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 1192
+flash_words = 196
+ram_bytes = 52
 
 [[entry]]
 name = "speed-strlen-strcmp-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 1194
-flash_words = 201
-ram_bytes = 56
+cycles = 1192
+flash_words = 196
+ram_bytes = 52
 
 [[entry]]
 name = "speed-crc16-18f4550"
 device = "18F4550"
-cycles = 9138
-flash_words = 131
+cycles = 8502
+flash_words = 116
+ram_bytes = 52
+
+[[entry]]
+name = "speed-crc16-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 8379
+flash_words = 109
+ram_bytes = 55
+
+[[entry]]
+name = "speed-crc16-18f4550"
+device = "18F4550"
+profile = "O1"
+cycles = 8502
+flash_words = 116
 ram_bytes = 52
 
 [[entry]]
 name = "speed-crc16-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 9138
-flash_words = 131
+cycles = 8502
+flash_words = 116
 ram_bytes = 52
 
 [[entry]]
@@ -413,7 +845,23 @@ name = "speed-crc16-16f877a"
 device = "16F877A"
 cycles = 9454
 flash_words = 132
+ram_bytes = 53
+
+[[entry]]
+name = "speed-crc16-16f877a"
+device = "16F877A"
+profile = "O0"
+cycles = 12253
+flash_words = 190
 ram_bytes = 55
+
+[[entry]]
+name = "speed-crc16-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 9454
+flash_words = 132
+ram_bytes = 53
 
 [[entry]]
 name = "speed-crc16-16f877a"
@@ -421,41 +869,89 @@ device = "16F877A"
 profile = "O2"
 cycles = 9454
 flash_words = 132
-ram_bytes = 55
+ram_bytes = 53
 
 [[entry]]
 name = "speed-switch16-18f4550"
 device = "18F4550"
-cycles = 53
+cycles = 50
+flash_words = 73
+ram_bytes = 10
+
+[[entry]]
+name = "speed-switch16-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 42
 flash_words = 75
 ram_bytes = 10
 
 [[entry]]
 name = "speed-switch16-18f4550"
 device = "18F4550"
+profile = "O1"
+cycles = 50
+flash_words = 73
+ram_bytes = 10
+
+[[entry]]
+name = "speed-switch16-18f4550"
+device = "18F4550"
 profile = "O2"
-cycles = 45
-flash_words = 78
+cycles = 42
+flash_words = 75
 ram_bytes = 10
 
 [[entry]]
 name = "speed-switch16-16f877a"
 device = "16F877A"
-cycles = 62
-flash_words = 95
+cycles = 50
+flash_words = 83
+ram_bytes = 11
+
+[[entry]]
+name = "speed-switch16-16f877a"
+device = "16F877A"
+profile = "O0"
+cycles = 50
+flash_words = 83
+ram_bytes = 11
+
+[[entry]]
+name = "speed-switch16-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 50
+flash_words = 83
 ram_bytes = 11
 
 [[entry]]
 name = "speed-switch16-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 62
-flash_words = 95
+cycles = 50
+flash_words = 83
 ram_bytes = 11
 
 [[entry]]
 name = "speed-struct-scan-18f4550"
 device = "18F4550"
+cycles = 241
+flash_words = 60
+ram_bytes = 46
+
+[[entry]]
+name = "speed-struct-scan-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 457
+flash_words = 85
+ram_bytes = 46
+
+[[entry]]
+name = "speed-struct-scan-18f4550"
+device = "18F4550"
+profile = "O1"
 cycles = 241
 flash_words = 60
 ram_bytes = 46
@@ -471,6 +967,22 @@ ram_bytes = 46
 [[entry]]
 name = "speed-struct-scan-16f877a"
 device = "16F877A"
+cycles = 518
+flash_words = 87
+ram_bytes = 47
+
+[[entry]]
+name = "speed-struct-scan-16f877a"
+device = "16F877A"
+profile = "O0"
+cycles = 590
+flash_words = 96
+ram_bytes = 47
+
+[[entry]]
+name = "speed-struct-scan-16f877a"
+device = "16F877A"
+profile = "O1"
 cycles = 518
 flash_words = 87
 ram_bytes = 47
@@ -486,6 +998,22 @@ ram_bytes = 47
 [[entry]]
 name = "speed-u16-dec-18f4550"
 device = "18F4550"
+cycles = 1488
+flash_words = 81
+ram_bytes = 23
+
+[[entry]]
+name = "speed-u16-dec-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 1488
+flash_words = 81
+ram_bytes = 23
+
+[[entry]]
+name = "speed-u16-dec-18f4550"
+device = "18F4550"
+profile = "O1"
 cycles = 1488
 flash_words = 81
 ram_bytes = 23
@@ -508,6 +1036,22 @@ ram_bytes = 29
 [[entry]]
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
+profile = "O0"
+cycles = 2623
+flash_words = 132
+ram_bytes = 29
+
+[[entry]]
+name = "speed-u16-dec-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 2623
+flash_words = 132
+ram_bytes = 29
+
+[[entry]]
+name = "speed-u16-dec-16f877a"
+device = "16F877A"
 profile = "O2"
 cycles = 1835
 flash_words = 281
@@ -523,6 +1067,22 @@ ram_bytes = 53
 [[entry]]
 name = "speed-pid-step-18f4550"
 device = "18F4550"
+profile = "O0"
+cycles = 281
+flash_words = 243
+ram_bytes = 53
+
+[[entry]]
+name = "speed-pid-step-18f4550"
+device = "18F4550"
+profile = "O1"
+cycles = 297
+flash_words = 236
+ram_bytes = 53
+
+[[entry]]
+name = "speed-pid-step-18f4550"
+device = "18F4550"
 profile = "O2"
 cycles = 281
 flash_words = 243
@@ -531,21 +1091,53 @@ ram_bytes = 53
 [[entry]]
 name = "speed-pid-step-16f877a"
 device = "16F877A"
-cycles = 1265
-flash_words = 362
-ram_bytes = 53
+cycles = 485
+flash_words = 284
+ram_bytes = 44
+
+[[entry]]
+name = "speed-pid-step-16f877a"
+device = "16F877A"
+profile = "O0"
+cycles = 485
+flash_words = 284
+ram_bytes = 44
+
+[[entry]]
+name = "speed-pid-step-16f877a"
+device = "16F877A"
+profile = "O1"
+cycles = 485
+flash_words = 284
+ram_bytes = 44
 
 [[entry]]
 name = "speed-pid-step-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 1265
-flash_words = 362
-ram_bytes = 53
+cycles = 485
+flash_words = 284
+ram_bytes = 44
 
 [[entry]]
 name = "speed-mul-u32-16f1937"
 device = "16F1937"
+cycles = 812
+flash_words = 144
+ram_bytes = 41
+
+[[entry]]
+name = "speed-mul-u32-16f1937"
+device = "16F1937"
+profile = "O0"
+cycles = 812
+flash_words = 144
+ram_bytes = 41
+
+[[entry]]
+name = "speed-mul-u32-16f1937"
+device = "16F1937"
+profile = "O1"
 cycles = 812
 flash_words = 144
 ram_bytes = 41
@@ -561,21 +1153,53 @@ ram_bytes = 41
 [[entry]]
 name = "speed-mul-u32-16f505"
 device = "16F505"
-cycles = 1824
-flash_words = 361
-ram_bytes = 48
+cycles = 1774
+flash_words = 335
+ram_bytes = 44
+
+[[entry]]
+name = "speed-mul-u32-16f505"
+device = "16F505"
+profile = "O0"
+cycles = 1774
+flash_words = 335
+ram_bytes = 44
+
+[[entry]]
+name = "speed-mul-u32-16f505"
+device = "16F505"
+profile = "O1"
+cycles = 1774
+flash_words = 335
+ram_bytes = 44
 
 [[entry]]
 name = "speed-mul-u32-16f505"
 device = "16F505"
 profile = "O2"
-cycles = 1824
-flash_words = 361
-ram_bytes = 48
+cycles = 1774
+flash_words = 335
+ram_bytes = 44
 
 [[entry]]
 name = "speed-mul-u32-12f509"
 device = "12F509"
+cycles = 1501
+flash_words = 218
+ram_bytes = 36
+
+[[entry]]
+name = "speed-mul-u32-12f509"
+device = "12F509"
+profile = "O0"
+cycles = 1501
+flash_words = 218
+ram_bytes = 36
+
+[[entry]]
+name = "speed-mul-u32-12f509"
+device = "12F509"
+profile = "O1"
 cycles = 1501
 flash_words = 218
 ram_bytes = 36
@@ -593,7 +1217,23 @@ name = "scen-pid-update-18f4550"
 device = "18F4550"
 cycles = 730
 flash_words = 794
-ram_bytes = 131
+ram_bytes = 109
+
+[[entry]]
+name = "scen-pid-update-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 690
+flash_words = 843
+ram_bytes = 111
+
+[[entry]]
+name = "scen-pid-update-18f4550"
+device = "18F4550"
+profile = "O1"
+cycles = 714
+flash_words = 819
+ram_bytes = 111
 
 [[entry]]
 name = "scen-pid-update-18f4550"
@@ -601,7 +1241,7 @@ device = "18F4550"
 profile = "O2"
 cycles = 690
 flash_words = 800
-ram_bytes = 131
+ram_bytes = 109
 
 [[entry]]
 name = "scen-control-pass-18f4550"
@@ -609,6 +1249,22 @@ device = "18F4550"
 cycles = 780
 flash_words = 3501
 ram_bytes = 442
+
+[[entry]]
+name = "scen-control-pass-18f4550"
+device = "18F4550"
+profile = "O0"
+cycles = 774
+flash_words = 4390
+ram_bytes = 460
+
+[[entry]]
+name = "scen-control-pass-18f4550"
+device = "18F4550"
+profile = "O1"
+cycles = 808
+flash_words = 3903
+ram_bytes = 460
 
 [[entry]]
 name = "scen-control-pass-18f4550"
@@ -623,14 +1279,46 @@ name = "speed-isr-18f4550-latency"
 device = "18F4550"
 cycles = 5
 flash_words = 40
-ram_bytes = 29
+ram_bytes = 28
 
 [[entry]]
 name = "speed-isr-18f4550-roundtrip"
 device = "18F4550"
 cycles = 11
 flash_words = 40
-ram_bytes = 29
+ram_bytes = 28
+
+[[entry]]
+name = "speed-isr-18f4550-latency"
+device = "18F4550"
+profile = "O0"
+cycles = 5
+flash_words = 40
+ram_bytes = 28
+
+[[entry]]
+name = "speed-isr-18f4550-roundtrip"
+device = "18F4550"
+profile = "O0"
+cycles = 11
+flash_words = 40
+ram_bytes = 28
+
+[[entry]]
+name = "speed-isr-18f4550-latency"
+device = "18F4550"
+profile = "O1"
+cycles = 5
+flash_words = 40
+ram_bytes = 28
+
+[[entry]]
+name = "speed-isr-18f4550-roundtrip"
+device = "18F4550"
+profile = "O1"
+cycles = 11
+flash_words = 40
+ram_bytes = 28
 
 [[entry]]
 name = "speed-isr-18f4550-latency"
@@ -638,7 +1326,7 @@ device = "18F4550"
 profile = "O2"
 cycles = 5
 flash_words = 40
-ram_bytes = 29
+ram_bytes = 28
 
 [[entry]]
 name = "speed-isr-18f4550-roundtrip"
@@ -646,34 +1334,66 @@ device = "18F4550"
 profile = "O2"
 cycles = 11
 flash_words = 40
-ram_bytes = 29
+ram_bytes = 28
 
 [[entry]]
 name = "speed-isr-16f877a-latency"
 device = "16F877A"
 cycles = 22
-flash_words = 78
-ram_bytes = 21
+flash_words = 76
+ram_bytes = 20
 
 [[entry]]
 name = "speed-isr-16f877a-roundtrip"
 device = "16F877A"
-cycles = 45
-flash_words = 78
-ram_bytes = 21
+cycles = 44
+flash_words = 76
+ram_bytes = 20
+
+[[entry]]
+name = "speed-isr-16f877a-latency"
+device = "16F877A"
+profile = "O0"
+cycles = 22
+flash_words = 76
+ram_bytes = 20
+
+[[entry]]
+name = "speed-isr-16f877a-roundtrip"
+device = "16F877A"
+profile = "O0"
+cycles = 44
+flash_words = 76
+ram_bytes = 20
+
+[[entry]]
+name = "speed-isr-16f877a-latency"
+device = "16F877A"
+profile = "O1"
+cycles = 22
+flash_words = 76
+ram_bytes = 20
+
+[[entry]]
+name = "speed-isr-16f877a-roundtrip"
+device = "16F877A"
+profile = "O1"
+cycles = 44
+flash_words = 76
+ram_bytes = 20
 
 [[entry]]
 name = "speed-isr-16f877a-latency"
 device = "16F877A"
 profile = "O2"
 cycles = 22
-flash_words = 78
-ram_bytes = 21
+flash_words = 76
+ram_bytes = 20
 
 [[entry]]
 name = "speed-isr-16f877a-roundtrip"
 device = "16F877A"
 profile = "O2"
-cycles = 45
-flash_words = 78
-ram_bytes = 21
+cycles = 44
+flash_words = 76
+ram_bytes = 20

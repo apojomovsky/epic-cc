@@ -40,21 +40,23 @@
 //! not have, and the vendored `hal-pic18-menu-demo` case (epic-cc#469)
 //! is the PIC18 counterpart, the largest whole-program PIC18 entry.
 //! See each fixture's `PROVENANCE.md` for where it comes from.
-//! Profiles (epic-cc#839): every case also compiles under `-O2`, which
-//! must succeed on all rows (the speed profile builds the whole ladder).
-//! Flash/RAM numbers are additionally recorded and gated for the
-//! `O2_BASELINED` subset: the smallest and largest row on each core plus
-//! the loop-shape bench that pins LSR under `-O2`. Gating `-O2` numbers
-//! on every row would double the strict number surface future speed work
-//! must re-baseline without adding signal, so the remaining rows get
-//! `-O2` build coverage only (success asserted, numbers shown in the
-//! step summary as build-only). Baseline entries carry `profile`; rows
-//! without one are `-Os`. `STRICT_SIZE_BASELINE` applies to each gated
-//! profile independently. `SIZE_BASELINE_ONLY` matches `name` for `-Os`
-//! rows and `name@O2` for `-O2` rows. `SIZE_LADDER_ARGS` forwards extra
-//! flags to every `epic-cc` invocation (e.g. `--no-outline` for the
-//! outline on/off split that prices a layout-churning lever's flash tax,
-//! epic-cc#1145); measure-only, never with the gate.
+//! Profiles (epic-cc#839, epic-cc#1343): every case also compiles under
+//! `-O2`, which must succeed on all rows (the speed profile builds the
+//! whole ladder). Flash/RAM numbers are additionally recorded and gated
+//! for the `OPT_BASELINED` subset under `-O0`, `-O1` and `-O2`: the
+//! smallest and largest row on each core plus the loop-shape bench that
+//! pins LSR under `-O2`. Gating optimized numbers on every row would
+//! multiply the strict number surface future speed work must re-baseline
+//! without adding signal, so the remaining rows get `-O2` build coverage
+//! only (success asserted, numbers shown in the step summary as
+//! build-only); `-O0`/`-O1` compile only gated rows. Baseline entries
+//! carry `profile`; rows without one are `-Os`. `STRICT_SIZE_BASELINE`
+//! applies to each gated profile independently. `SIZE_BASELINE_ONLY`
+//! matches `name` for `-Os` rows and `name@O0`, `name@O1`, `name@O2` for
+//! optimized rows. `SIZE_LADDER_ARGS` forwards extra flags to every
+//! `epic-cc` invocation (e.g. `--no-outline` for the outline on/off split
+//! that prices a layout-churning lever's flash tax, epic-cc#1145);
+//! measure-only, never with the gate.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -81,11 +83,11 @@ fn is_os_profile(s: &String) -> bool {
     s == "Os"
 }
 
-/// Rows whose `-O2` numbers are recorded and gated, not just built: the
-/// smallest and largest ladder row on each core, plus the loop-shape
+/// Rows whose optimized numbers are recorded and gated, not just built:
+/// the smallest and largest ladder row on each core, plus the loop-shape
 /// bench that pins LSR under `-O2`. Every other row still compiles
 /// under `-O2` (build coverage), without a gated number.
-const O2_BASELINED: &[&str] = &[
+const OPT_BASELINED: &[&str] = &[
     "add-16f877a",
     "add-18f4550",
     "bench-struct-scan-18f4550",
@@ -148,8 +150,9 @@ fn parse_only_filter(valid: &[String]) -> Option<std::collections::HashSet<Strin
 /// skipped report lines; updated lines carry old->new values for the PR body.
 ///
 /// Every row's baseline `name` is its key (`entry_key`): `-Os` rows keep the
-/// bare case name, `-O2` rows carry `name@O2`. Keys must be unique, since the
-/// overseer's baseline comparison keys rows by name.
+/// bare case name, optimized rows carry `name@O0`, `name@O1` or `name@O2`.
+/// Keys must be unique, since the overseer's baseline comparison keys rows
+/// by name.
 fn entry_key(name: &str, profile: &str) -> String {
     if profile == "Os" {
         name.to_string()
@@ -967,17 +970,19 @@ fn flash_and_ram_do_not_regress() {
     let strict = std::env::var("STRICT_SIZE_BASELINE").is_ok();
     let baseline = load_baseline();
     let mut measured_os = Vec::new();
-    let mut measured_o2 = Vec::new();
+    let mut measured_opt = Vec::new();
     let mut rows = Vec::new();
     let mut failures = Vec::new();
 
     let cases = cases();
     // Validate the filter before measuring: a typo must fail fast, not
-    // after minutes of compiling every case. `-O2` rows filter as
-    // `name@O2`, `-Os` rows as the bare name.
+    // after minutes of compiling every case. Optimized rows filter as
+    // `name@O0`, `name@O1` or `name@O2`, `-Os` rows as the bare name.
     let mut valid: Vec<String> = cases.iter().map(|c| c.name.to_string()).collect();
     for c in &cases {
-        valid.push(entry_key(c.name, "O2"));
+        for profile in ["O0", "O1", "O2"] {
+            valid.push(entry_key(c.name, profile));
+        }
     }
     let filter = update.then(|| parse_only_filter(&valid)).flatten();
     for c in &cases {
@@ -1016,46 +1021,54 @@ fn flash_and_ram_do_not_regress() {
             ram_bytes,
         });
 
-        // `-O2`: every row must build; numbers gate only the baselined
-        // subset (plus any row that already carries an `-O2` entry, so a
-        // recorded number is never silently ignored).
-        let report = measure(c, "O2");
-        let flash_words = parse_after(&report, "flash: ");
-        let ram_bytes = parse_after(&report, "RAM: ");
-        let base = baseline
-            .entry
-            .iter()
-            .find(|e| e.name == entry_key(c.name, "O2") && e.profile == "O2")
-            .cloned();
-        let key = entry_key(c.name, "O2");
-        let gated = O2_BASELINED.contains(&c.name) || base.is_some();
-        if gated {
-            check_gated(
-                &key,
+        // Optimized profiles: `-O2` builds every row (the speed profile
+        // must succeed on all rows); numbers gate only the baselined
+        // subset (plus any row that already carries an entry, so a
+        // recorded number is never silently ignored). `-O0`/`-O1`
+        // compile only gated rows: pinning every row would triple the
+        // ladder's compile cost without adding gate signal.
+        for profile in ["O0", "O1", "O2"] {
+            let key = entry_key(c.name, profile);
+            let base = baseline
+                .entry
+                .iter()
+                .find(|e| e.name == key && e.profile == profile)
+                .cloned();
+            let gated = OPT_BASELINED.contains(&c.name) || base.is_some();
+            if profile != "O2" && !gated {
+                continue;
+            }
+            let report = measure(c, profile);
+            let flash_words = parse_after(&report, "flash: ");
+            let ram_bytes = parse_after(&report, "RAM: ");
+            if gated {
+                check_gated(
+                    &key,
+                    flash_words,
+                    ram_bytes,
+                    base.as_ref(),
+                    update,
+                    strict,
+                    &mut failures,
+                );
+                measured_opt.push(BaselineEntry {
+                    name: key.clone(),
+                    device: c.device.to_string(),
+                    profile: profile.to_string(),
+                    flash_words,
+                    ram_bytes,
+                });
+            }
+            rows.push(Row {
+                name: key,
+                device: c.device,
                 flash_words,
+                flash_baseline: base.as_ref().map(|b| b.flash_words),
                 ram_bytes,
-                base.as_ref(),
-                update,
-                strict,
-                &mut failures,
-            );
-            measured_o2.push(BaselineEntry {
-                name: key.clone(),
-                device: c.device.to_string(),
-                profile: "O2".to_string(),
-                flash_words,
-                ram_bytes,
+                ram_baseline: base.as_ref().map(|b| b.ram_bytes),
+                gated,
             });
         }
-        rows.push(Row {
-            name: key,
-            device: c.device,
-            flash_words,
-            flash_baseline: base.as_ref().map(|b| b.flash_words),
-            ram_bytes,
-            ram_baseline: base.as_ref().map(|b| b.ram_bytes),
-            gated,
-        });
     }
     write_step_summary(&rows);
     if std::env::var("SIZE_REPORT_JSON").is_ok() {
@@ -1064,7 +1077,7 @@ fn flash_and_ram_do_not_regress() {
     }
 
     let mut measured = measured_os;
-    measured.extend(measured_o2);
+    measured.extend(measured_opt);
     if let Some(dir) = artifact_dir() {
         write_artifact(&dir, &measured);
         return;

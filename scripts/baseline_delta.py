@@ -44,7 +44,7 @@ FLASH_WORDS_LIMIT = 8
 CYCLE_PERCENT_LIMIT = 1
 # Above this an O2 lever is a design decision, not a tuning trade.
 O2_SPEED_FLASH_WORDS_LIMIT = 64
-ISR_ROW = re.compile(r"^(speed-isr-.+)-(latency|roundtrip)((?:@O2)?)$")
+ISR_ROW = re.compile(r"^(speed-isr-.+)-(latency|roundtrip)((?:@O0|@O1|@O2)?)$")
 
 
 def entry_key(name, profile):
