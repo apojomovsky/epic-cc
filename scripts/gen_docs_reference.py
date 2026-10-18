@@ -12,7 +12,9 @@ Outputs, all rewritten in place:
   cross-check: a shipped device missing there, or disagreeing on core or
   flash, fails the run instead of publishing a silent fork.
 - docs/reference/cli.md: the real `--help` output of the built binary
-  plus every subcommand's, captured by running it (pass --binary).
+  plus every subcommand's, and the gdbserver usage contract from the
+  sibling epic-cc-gdbserver binary, captured by running them
+  (pass --binary, optionally --gdbserver-binary).
 - docs/user/devices/index.md, docs/user/devices/families/<slug>.md and
   docs/user/compiler/cli-flags.md (epic-cc#1297): the pages the epic-docs
   hub serves, built from the same rows and help capture. One family page
@@ -297,6 +299,7 @@ def write_user_pages(rows, facts, sections) -> list:
     return list(pages)
 
 
+# capture_help stays strict: the compiler exits 0 with its help on stdout.
 def capture_help(binary: str, args: list) -> str:
     proc = subprocess.run([binary, *args], capture_output=True, text=True, check=False)
     if proc.returncode != 0:
@@ -304,6 +307,19 @@ def capture_help(binary: str, args: list) -> str:
             f"{binary} {' '.join(args)} exited {proc.returncode}: {proc.stderr.strip()}"
         )
     return proc.stdout
+
+
+def capture_gdbserver_help(binary: str) -> str:
+    # gdbserver has no --help flag: parse_args rejects it and main prints
+    # the usage contract on stderr with a nonzero exit, so stderr is the
+    # contract here and any exit code is fine while output is present.
+    proc = subprocess.run(
+        [binary, "--help"], capture_output=True, text=True, check=False
+    )
+    text = proc.stderr if proc.stderr.strip() else proc.stdout
+    if not text.strip():
+        raise RuntimeError(f"{binary} --help produced no output")
+    return text
 
 
 def discover_subcommands(top_help: str) -> list:
@@ -327,13 +343,17 @@ def discover_subcommands(top_help: str) -> list:
     return found
 
 
-def build_cli_sections(binary: str) -> list:
+def build_cli_sections(binary: str, gdbserver_binary: str | None = None) -> list:
     top = capture_help(binary, ["--help"])
     sections = [("epic-cc --help", top)]
     for sub in discover_subcommands(top):
         sub_help = capture_help(binary, [sub, "--help"])
         if sub_help and sub_help != top:
             sections.append((f"epic-cc {sub} --help", sub_help))
+    if gdbserver_binary:
+        gdb_help = capture_gdbserver_help(gdbserver_binary)
+        if gdb_help and all(gdb_help != text for _, text in sections):
+            sections.append(("epic-cc-gdbserver --help", gdb_help))
     return sections
 
 
@@ -407,6 +427,11 @@ def render_readme() -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, help="built epic-cc binary")
+    parser.add_argument(
+        "--gdbserver-binary",
+        default=None,
+        help="built epic-cc-gdbserver binary (defaults to epic-cc-gdbserver next to --binary)",
+    )
     args = parser.parse_args()
 
     problems = shared_includes.check(ROOT)
@@ -418,7 +443,10 @@ def main() -> int:
     catalog = load_catalog(CATALOG)
     status = load_status(STATUS_FILE)
     rows = build_device_rows(DEVICES_DIR, catalog, status)
-    sections = build_cli_sections(args.binary)
+    gdbserver_binary = args.gdbserver_binary or str(
+        pathlib.Path(args.binary).parent / "epic-cc-gdbserver"
+    )
+    sections = build_cli_sections(args.binary, gdbserver_binary)
     DEVICES_MD.write_text(render_devices(rows))
     CLI_MD.write_text(render_cli(sections))
     write_user_pages(rows, load_catalog_facts(CATALOG), sections)
