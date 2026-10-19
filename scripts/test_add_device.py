@@ -389,6 +389,16 @@ class FieldDiffTest(unittest.TestCase):
         self.assertIn("- icprt", text)
 
 
+class NamesSourceTest(unittest.TestCase):
+    def test_edc_pic_is_passed_through_any_case(self):
+        for path in ("/p/edc/PIC16F887.PIC", "x/pic16f887.pic"):
+            self.assertEqual(add_device.names_source(path), path)
+
+    def test_atdf_falls_back_to_pack_lookup(self):
+        # device_names.py reads EDC only; an ATDF would not parse.
+        self.assertEqual(add_device.names_source("/p/atdf/PIC16F887.atdf"), "")
+
+
 class SiblingTest(unittest.TestCase):
     def test_picks_closest_same_core(self):
         with tempfile.TemporaryDirectory() as d:
