@@ -1189,6 +1189,36 @@ fn runtime_u16_mul_uses_schoolbook_partials() {
         "schoolbook partials, P11 dropped:\n{asm}"
     );
 }
+/// Signed widening multiply (epic-cc#1344): four hardware partials feed a
+/// 32-bit column accumulation with explicit carry propagation, then each
+/// negative operand subtracts the other shifted left 16.
+#[test]
+fn runtime_s16_mul_uses_partials_with_correction() {
+    let m = parse(
+        "fn __mul_s16(i32) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 6\n    ret i32 0\n\
+         fn main(void) ()\n  block entry:\n    %1 = call i32 @__mul_s16(i16 3, i16 5)\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("__mul_s16::a", 0x20),
+        ("__mul_s16::b", 0x22),
+        ("__mul_s16::__scr", 0x30),
+        ("main::1", 0x40),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MULWF").count(),
+        4,
+        "four unsigned partials, P11 kept for the full 32 bits:\n{asm}"
+    );
+    assert!(
+        asm.contains("BTFSC 0xFD8,0,A"),
+        "each column add propagates its carry upstairs:\n{asm}"
+    );
+    assert!(
+        asm.contains("SUBWFB"),
+        "the sign correction borrows across bytes 2..3:\n{asm}"
+    );
+}
 
 /// Inline narrow multiply (epic-cc#892): a u8 call site lowers to one
 /// MULWF straight into the caller's dst. No `CALL` runs and the orphaned

@@ -13357,6 +13357,85 @@ impl<'m> Gen<'m> {
             _ => unreachable!("isel-pic18: hw mul width"),
         }
     }
+    /// One unsigned partial product: `W = [ai]`, `PRODH:PRODL = W * [bj]`.
+    /// Neither `MOVF` nor `MULWF` touches `C`, so a pending carry survives
+    /// across the call.
+    fn emit_mulwf(&mut self, ai: u16, bj: u16) {
+        self.emit_banked("MOVF", ai, ",W");
+        let (ba, bf) = self.operand(bj);
+        self.emit(format!(
+            "    MULWF 0x{bf:03X},{}",
+            if ba == 0 { "A" } else { "B" }
+        ));
+    }
+
+    /// One column add with explicit carry propagation: `W += [dst]`, and
+    /// the overflow lands in `hi` before the next add can clobber `C`.
+    /// `ADDWF` ignores carry-in, so chaining `ADDWFC` instead would reuse
+    /// a stale carry; the row-wise `__mul_u32` loop fails exactly there.
+    /// Costs two cycles either way (`BTFSC` skips the `INCF` when clear).
+    fn emit_col_add(&mut self, dst: u16, hi: u16) {
+        self.emit_banked("ADDWF", dst, ",F");
+        self.emit("    BTFSC 0xFD8,0,A".to_string()); // STATUS C
+        self.emit_banked("INCF", hi, ",F");
+    }
+
+    /// Sign correction for one operand: when `[sign_hi]` bit 7 is set,
+    /// subtract the other operand (`other_lo`, 2 bytes) from bytes 2..3.
+    /// `SUBWF` seeds the borrow in `C` for `SUBWFB`; the pair runs back
+    /// to back, so no `ADDWF` clobbers the borrow between them.
+    fn emit_mul_s16_corr(&mut self, sign_hi: u16, other_lo: u16, r2: u16, done: &str) {
+        self.emit_banked("BTFSS", sign_hi, ",7");
+        self.emit(format!("    BRA {done}"));
+        self.emit_banked("MOVF", other_lo, ",W");
+        self.emit_banked("SUBWF", r2, ",F");
+        self.emit_banked("MOVF", other_lo + 1, ",W");
+        self.emit_banked("SUBWFB", r2 + 1, ",F");
+    }
+
+    /// Signed 16x16 -> 32 multiply on the hardware `MULWF` (epic-cc#1344).
+    /// `P00` lands by move; every later partial byte joins its column
+    /// through `emit_col_add`, whose overflow propagates upstairs before
+    /// the next add runs. `P01`'s high byte parks in `scr[4]` because the
+    /// `P10` partials clobber `PRODH` before its column runs. The `P11`
+    /// high byte joins `r3` last, so its overflow past bit 32 drops, as
+    /// the 32-bit result requires. Each negative operand then subtracts
+    /// the other shifted left 16 over bytes 2..3.
+    fn emit_hw_mul_s16(&mut self, name: &str, scr: u16) {
+        let a = self.slot_addr(name, "a").direct();
+        let b = self.slot_addr(name, "b").direct();
+        let (r0, r1, r2, r3, park) = (scr, scr + 1, scr + 2, scr + 3, scr + 4);
+        for r in [r0, r1, r2, r3] {
+            self.emit_banked("CLRF", r, "");
+        }
+        self.emit_mulwf(a, b); // P00
+        self.emit(format!("    MOVFF 0xFF3, 0x{r0:03X}"));
+        self.emit(format!("    MOVFF 0xFF4, 0x{r1:03X}"));
+        self.emit_mulwf(a, b + 1); // P01
+        self.emit(format!("    MOVFF 0xFF4, 0x{park:03X}"));
+        self.emit("    MOVF 0xFF3,W,A".to_string()); // P01 low to column 1
+        self.emit_col_add(r1, r2);
+        self.emit_mulwf(a + 1, b); // P10
+        self.emit("    MOVF 0xFF3,W,A".to_string());
+        self.emit_col_add(r1, r2);
+        self.emit_banked("MOVF", park, ",W"); // P01 high to column 2
+        self.emit_col_add(r2, r3);
+        self.emit("    MOVF 0xFF4,W,A".to_string()); // P10 high
+        self.emit_col_add(r2, r3);
+        self.emit_mulwf(a + 1, b + 1); // P11
+        self.emit("    MOVF 0xFF3,W,A".to_string());
+        self.emit_col_add(r2, r3);
+        self.emit("    MOVF 0xFF4,W,A".to_string());
+        self.emit_banked("ADDWF", r3, ",F");
+        let l_a = self.fresh_label();
+        let l_b = self.fresh_label();
+        self.emit_mul_s16_corr(a + 1, b, r2, &l_a);
+        self.emit_label(&l_a);
+        self.emit_mul_s16_corr(b + 1, a, r2, &l_b);
+        self.emit_label(&l_b);
+        self.store_retval(scr, 4);
+        self.emit("    RETURN".to_string());
+    }
 
     /// Runs one restoring-division bit: shifts `num` left, accumulates the
     /// partial remainder, subtracts `den` with the borrow chain, and adds
@@ -15898,6 +15977,7 @@ impl<'m> Gen<'m> {
             "__mul_u8" => self.emit_hw_mul(name, 1, scr),
             "__mul_u16" => self.emit_hw_mul(name, 2, scr),
             "__mul_u32" => self.emit_hw_mul(name, 4, scr),
+            "__mul_s16" => self.emit_hw_mul_s16(name, scr),
             "__udiv_u8" => self.emit_divmod(name, 1, scr, true),
             "__urem_u8" => self.emit_divmod(name, 1, scr, false),
             "__udivmod_u8" => self.emit_udivmod(name, 1, scr),

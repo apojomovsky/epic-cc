@@ -610,6 +610,43 @@ fn muldiv_c_runs_correctly() {
 }
 
 #[test]
+fn smul16_c_runs_correctly() {
+    // epic-cc#1344: one pair per sign combination through the narrowed
+    // `__mul_s16` recipe, checked against the hand-computed bytes in the
+    // fixture (the `CALL` pin keeps the test on the narrowed path: the
+    // values alone would also pass through `__mul_u32`).
+    let (mut p, globals, asm) = compile_with_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/smul16.c"
+    ));
+    assert!(
+        asm.contains("CALL __mul_s16"),
+        "widening products must narrow:\n{asm}"
+    );
+    assert!(
+        !asm.contains("__mul_u32"),
+        "no 32-bit multiply may remain:\n{asm}"
+    );
+    p.run(500_000);
+    for (g, want) in [
+        ("r0", [0x00, 0x28, 0x00, 0x00]),
+        ("r1", [0x00, 0x0A, 0x00, 0x00]),
+        ("r2", [0x00, 0x80, 0x00, 0xC0]),
+        ("r3", [0x63, 0x28, 0x01, 0xFB]),
+    ] {
+        let base = globals[g] as usize;
+        let got = [
+            p.ram()[base],
+            p.ram()[base + 1],
+            p.ram()[base + 2],
+            p.ram()[base + 3],
+        ];
+        assert_eq!(got, want, "{g} must match the hand trace");
+    }
+    assert!(p.halted());
+}
+
+#[test]
 fn interrupt_mul_pic18_c_runs_correctly() {
     // Mirrors crates/driver/tests/interrupt_mul_e2e.rs: main and the ISR
     // both multiply/divide, so both contexts reach the injected __mul_u8
