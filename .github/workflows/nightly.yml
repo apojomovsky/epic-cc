@@ -209,7 +209,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/workspace" -w /workspace \
             -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
-            epic-cc-ci:latest bash -c 'cargo test -p fuzz --ignored --no-fail-fast'
+            epic-cc-ci:latest bash -c 'cargo test -p fuzz --no-fail-fast -- --ignored'
 
       # See devices-all's same-named step above.
       - name: Fix target dir ownership (container runs as root)
