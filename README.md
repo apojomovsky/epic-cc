@@ -14,9 +14,10 @@ same clear error messages you'd get from a desktop compiler. Everything
 after clang, down to the hex file, lives in this repository, where you can
 read it.
 
-It also ships a simulator with a gdb server. On mid-range (PIC14) parts you
-can set breakpoints on C lines, step through your code and print variables
-in gdb, with no programmer or chip attached.
+It also ships a simulator with a gdb server. On all supported cores
+(PIC14, PIC14E, PIC18, baseline PIC12) you can set breakpoints on C
+lines, step through your code and print variables in gdb, with no
+programmer or chip attached.
 
 [![CI](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml/badge.svg)](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/apojomovsky/epic-cc)](https://github.com/apojomovsky/epic-cc/releases)
 

@@ -69,6 +69,12 @@ now contains a complete compiler, not just documentation:
   mid-range, 193 PIC18, the brochure's count) were not independently refetched in this
   pass, and the PIC17 dismissal rests on PIC17's absence from the two cited sources, not
   on a direct Microchip statement.
+- **Source-level debugger:** `epic-cc-gdbserver` serves the simulator over
+  gdb RSP with an ELF+DWARF sidecar the driver emits via `--sidecar`:
+  line breakpoints, stepping, typed variable print and write watchpoints
+  (`#1358`, proven on every target in `#1375`), on all four cores (PIC14,
+  PIC14E, PIC18, baseline PIC12) with VS Code support. Designed in
+  [`34-debugger-design.md`](34-debugger-design.md).
 - **Multi-TU and distribution:** `llvm-link` merge and `epic-cc` binary naming per
   [ADR-011](../adr/ADR-011-multi-tu-front-end.md); silicon-real codegen (`EPIC_AT`,
   `EPIC_CONFIG`, `EPIC_FOSC_HZ`) per [ADR-012](../adr/ADR-012-cc3-silicon-real-codegen.md);
@@ -115,6 +121,7 @@ ADRs in [`03-decisions.md`](03-decisions.md) plus `docs/internals/adr/`.
 | PIC18 port: why it is smaller than a second compiler, and its phases | [`29-pic18-port-design.md`](29-pic18-port-design.md) |
 | Adding a device on a core this compiler already supports | [`32-adding-a-device.md`](32-adding-a-device.md) |
 | PIC14E port: Enhanced Mid-range backend plan and its phases | [`33-pic14e-port-design.md`](33-pic14e-port-design.md) |
+| Source-level debugging (gdb server, sidecar, watchpoints) | [`34-debugger-design.md`](34-debugger-design.md) |
 | Public binary distribution | [`30-distribution-design.md`](30-distribution-design.md) |
 | Ecosystem integration: epic-cc + epic-hal + PlatformIO | [`31-ecosystem-integration-design.md`](31-ecosystem-integration-design.md) |
 | Architecture decisions and rejected alternatives | [`03-decisions.md`](03-decisions.md) and `docs/internals/adr/` |

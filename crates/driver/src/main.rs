@@ -582,12 +582,18 @@ fn main() {
             } else {
                 isel::ConstPool::empty()
             };
-            // Speed-profile codegen: normalized divide loops (epic-cc#895),
+            // Speed-profile codegen: the divide core per tier (compact at
+            // -Os/-O0, coarse at -O1, exact at -O2; epic-cc#895, #1341),
             // the unrolled `__mul_u8` (epic-cc#974), and byte-granular
             // variable shifts (epic-cc#1171). All trade flash for cycles.
             let is_o2 = matches!(cli.opt_level, driver::cli::OptLevel::O2);
+            let divmod = match cli.opt_level {
+                driver::cli::OptLevel::O2 => isel::DivCore::Exact,
+                driver::cli::OptLevel::O1 => isel::DivCore::Coarse,
+                _ => isel::DivCore::Compact,
+            };
             let opts = isel::Options {
-                fast_divmod: is_o2,
+                divmod,
                 fast_mul_u8: is_o2,
                 fast_shift: is_o2,
             };

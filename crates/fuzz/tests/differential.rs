@@ -365,6 +365,19 @@ fn generator_corpus_differential_clean_under_o2() {
 }
 
 #[test]
+fn generator_corpus_differential_clean_under_o1() {
+    // The `-O1` slice of the differential gate: the same fast integer
+    // seeds through the coarse divide core (epic-cc#1341). Profiles change
+    // shaping, never semantics, so every seed stays clean.
+    for seed in 0..8 {
+        let prog = generate(seed);
+        run_differential_with_profile(&prog, &device::PIC16F877A, Some("O1")).unwrap_or_else(|e| {
+            panic!("generated seed {seed} not differential-clean under -O1: {e}")
+        });
+    }
+}
+
+#[test]
 #[ignore = "manual 20-seed smoke (slow)"]
 fn generator_20_seed_smoke() {
     for seed in 0..20 {
