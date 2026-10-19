@@ -115,9 +115,10 @@ fn run_case(words: &[u16], case: &Case) -> bool {
 }
 
 /// Every RAM byte that changed between `before` and `after` is either in
-/// `allowed` or is `STATUS_ADDR` (flag side effects from ALU/skip
-/// instructions are expected and never what a candidate is judged on).
-/// Anything else that moved is a clobber this candidate must not pass on.
+/// `allowed`, is `STATUS_ADDR` (flag side effects from ALU/skip
+/// instructions are expected and never what a candidate is judged on), or
+/// is the trailing `sleep`'s own RCON motion (TO set, PD cleared). Anything
+/// else that moved is a clobber this candidate must not pass on.
 ///
 /// Builds `expected` (a copy of `before` with only `STATUS_ADDR` and
 /// `allowed`'s addresses overwritten from `after`) and compares it to
@@ -128,6 +129,7 @@ fn run_case(words: &[u16], case: &Case) -> bool {
 fn no_unexpected_clobber(before: &[u8; 4096], after: &[u8; 4096], allowed: &[usize]) -> bool {
     let mut expected = *before;
     expected[STATUS_ADDR] = after[STATUS_ADDR];
+    expected[RCON_ADDR] = (before[RCON_ADDR] & !RCON_PD_BIT) | RCON_TO_BIT;
     for &addr in allowed {
         expected[addr] = after[addr];
     }
@@ -217,6 +219,12 @@ fn advance(idx: &mut [usize], base: usize) -> bool {
 pub const STATUS_ADDR: usize = 0xFD8;
 pub const STATUS_Z_BIT: u8 = 0x04;
 pub const STATUS_C_BIT: u8 = 0x01;
+/// PIC18 RCON's physical RAM address (`0xFD0`): the trailing `sleep` sets
+/// TO (bit 3) and clears PD (bit 2) there, so the clobber check expects
+/// exactly that motion and flags any other RCON change as a clobber.
+pub const RCON_ADDR: usize = 0xFD0;
+pub const RCON_TO_BIT: u8 = 0x08;
+pub const RCON_PD_BIT: u8 = 0x04;
 
 #[cfg(test)]
 mod tests {
