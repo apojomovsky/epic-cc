@@ -27,26 +27,28 @@ fn addwf_carries_and_zero() {
 
 #[test]
 fn decfsz_and_incfsz_leave_status_alone() {
-    // DECFSZ 0x20,F is 0x0BA0, INCFSZ 0x20,F is 0x0FA0, SLEEP is 0x0063.
+    // DECFSZ 0x20,F is 0x0BA0, INCFSZ 0x20,F is 0x0FA0, each trailed by
+    // a GOTO self-spin: SLEEP would set TO as its own architectural
+    // effect and pollute the STATUS assertion under test.
     // The no-flag sweep caught the sim setting Z here; silicon does not.
-    let mut p = Pic14::new(vec![0x0BA0, 0x0063]);
+    let mut p = Pic14::new(vec![0x0BA0, 0x2801]);
     p.ram_mut()[0x03] = 0x07;
     p.ram_mut()[0x20] = 0x02;
     p.run(10);
     assert_eq!(p.ram()[0x20], 0x01);
     assert_eq!(p.ram()[0x03], 0x07);
-    let mut p = Pic14::new(vec![0x0BA0, 0x0000, 0x0063]);
+    let mut p = Pic14::new(vec![0x0BA0, 0x0000, 0x2802]);
     p.ram_mut()[0x20] = 0x01;
     p.run(10);
     assert_eq!(p.ram()[0x20], 0x00);
     assert_eq!(p.ram()[0x03], 0x00);
-    let mut p = Pic14::new(vec![0x0FA0, 0x0063]);
+    let mut p = Pic14::new(vec![0x0FA0, 0x2801]);
     p.ram_mut()[0x03] = 0x07;
     p.ram_mut()[0x20] = 0x01;
     p.run(10);
     assert_eq!(p.ram()[0x20], 0x02);
     assert_eq!(p.ram()[0x03], 0x07);
-    let mut p = Pic14::new(vec![0x0FA0, 0x0000, 0x0063]);
+    let mut p = Pic14::new(vec![0x0FA0, 0x0000, 0x2802]);
     p.ram_mut()[0x20] = 0xFF;
     p.run(10);
     assert_eq!(p.ram()[0x20], 0x00);

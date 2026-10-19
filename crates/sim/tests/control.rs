@@ -4,7 +4,7 @@
 //! determinism guarantee (same state + same arguments -> byte-identical
 //! RAM and the same stop reason).
 
-use pic14_sim::{Pic14, StopReason};
+use pic14_sim::{Pic14, Pic14e, Pic18, PicBaseline, StopReason};
 
 //   0: MOVLW 0x11     0x3011   ; W = 0x11
 //   1: MOVWF 0x20     0x00A0   ; RAM[bank0 0x20] = W
@@ -123,4 +123,74 @@ fn run_until_is_deterministic() {
         (reason, p.w(), *p.ram(), p.pc())
     };
     assert_eq!(run(), run());
+}
+
+#[test]
+fn sleep_sets_to_pd() {
+    // SLEEP = 0x0063 halts with TO set, PD clear. The leading CLRWDT
+    // sets both first, so the PD 1->0 edge is exercised, not zero-fill.
+    let mut p = Pic14::new(vec![0x0064, 0x0063]);
+    p.run(2);
+    assert!(p.halted());
+    assert_eq!(p.status() & 0x18, 0x10, "SLEEP leaves TO set, PD clear");
+}
+
+#[test]
+fn clrwdt_sets_to_pd() {
+    let mut p = Pic14::new(vec![0x0064, 0x0000]); // CLRWDT; NOP
+    p.run(1);
+    assert_eq!(p.pc(), 1, "CLRWDT falls through");
+    assert_eq!(p.status() & 0x18, 0x18, "CLRWDT sets TO and PD");
+}
+
+#[test]
+fn sleep_sets_to_pd_pic14e() {
+    // Same opcodes as Pic14; STATUS TO is bit 4, PD is bit 3.
+    let mut p = Pic14e::with_device(&device::PIC16F1937, vec![0x0064, 0x0063]);
+    p.run(2);
+    assert!(p.halted());
+    assert_eq!(p.status() & 0x18, 0x10, "SLEEP leaves TO set, PD clear");
+}
+
+#[test]
+fn clrwdt_sets_to_pd_pic14e() {
+    let mut p = Pic14e::with_device(&device::PIC16F1937, vec![0x0064, 0x0000]);
+    p.run(1);
+    assert_eq!(p.pc(), 1, "CLRWDT falls through");
+    assert_eq!(p.status() & 0x18, 0x18, "CLRWDT sets TO and PD");
+}
+
+#[test]
+fn sleep_sets_to_pd_baseline() {
+    // 12-bit opcodes: SLEEP = 0x0003, CLRWDT = 0x0004.
+    let mut p = PicBaseline::with_device(&device::PIC12F509, vec![0x0004, 0x0003]);
+    p.run(2);
+    assert!(p.halted());
+    assert_eq!(p.status() & 0x18, 0x10, "SLEEP leaves TO set, PD clear");
+}
+
+#[test]
+fn clrwdt_sets_to_pd_baseline() {
+    let mut p = PicBaseline::with_device(&device::PIC12F509, vec![0x0004, 0x0000]);
+    p.run(1);
+    assert_eq!(p.pc(), 1, "CLRWDT falls through");
+    assert_eq!(p.status() & 0x18, 0x18, "CLRWDT sets TO and PD");
+}
+
+#[test]
+fn sleep_sets_to_pd_pic18() {
+    // PIC18 cause bits live in RCON (0xFD0): TO is bit 3, PD is bit 2.
+    let mut p = Pic18::new(vec![0x0004, 0x0003]); // CLRWDT; SLEEP
+    p.run(2);
+    assert!(p.halted());
+    assert_eq!(p.pc(), 2, "SLEEP does not advance pc past itself");
+    assert_eq!(p.ram()[0xFD0] & 0x0C, 0x08, "SLEEP leaves TO set, PD clear");
+}
+
+#[test]
+fn clrwdt_sets_to_pd_pic18() {
+    let mut p = Pic18::new(vec![0x0004]); // CLRWDT
+    p.run(1);
+    assert_eq!(p.pc(), 2, "CLRWDT falls through");
+    assert_eq!(p.ram()[0xFD0] & 0x0C, 0x0C, "CLRWDT sets TO and PD");
 }

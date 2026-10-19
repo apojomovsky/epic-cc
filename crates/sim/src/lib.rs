@@ -735,8 +735,14 @@ impl Pic14 {
                 self.ram[PIC14_OPTION_REG] = self.w;
                 return pc + 1;
             }
-            0x0064 => return pc + 1, // CLRWDT
+            0x0064 => {
+                // CLRWDT sets TO and PD.
+                self.ram[3] |= 0x18;
+                return pc + 1;
+            }
             0x0063 => {
+                // SLEEP sets TO and clears PD.
+                self.ram[3] = (self.ram[3] & !0x08) | 0x10;
                 self.halted = true; // SLEEP
                 return pc;
             }
@@ -1550,10 +1556,16 @@ impl Pic14e {
                 return pc + 1;
             }
             0x0063 => {
+                // SLEEP sets TO and clears PD.
+                self.ram[3] = (self.ram[3] & !0x08) | 0x10;
                 self.halted = true; // SLEEP
                 return pc;
             }
-            0x0064 => return pc + 1, // CLRWDT
+            0x0064 => {
+                // CLRWDT sets TO and PD.
+                self.ram[3] |= 0x18;
+                return pc + 1;
+            }
             _ if (0x0010..=0x001F).contains(&word) => {
                 // MOVIW/MOVWI with pre/post inc/dec: 00 0000 0001 dnmm.
                 let n = ((word >> 2) & 1) as usize;
@@ -2211,10 +2223,16 @@ impl<'a> PicBaseline<'a> {
                 return pc + 1;
             }
             0x0003 => {
+                // SLEEP sets TO and clears PD.
+                self.ram[0x03] = (self.ram[0x03] & !0x08) | 0x10;
                 self.halted = true; // SLEEP
                 return pc;
             }
-            0x0004 => return pc + 1, // CLRWDT
+            0x0004 => {
+                // CLRWDT sets TO and PD.
+                self.ram[0x03] |= 0x18;
+                return pc + 1;
+            }
             0x0040 => {
                 self.w = 0; // CLRW
                 self.set_z(0);
@@ -2740,16 +2758,21 @@ impl Pic18 {
         let next = match word {
             0x0000 => pc + 2,
             0x0003 => {
-                // SLEEP: matches Pic14's convention (see `Pic14::exec_byte`)
-                // of `halted = true` as the simulator's stop condition:
+                // SLEEP sets RCON TO and clears PD. `halted = true` stays
+                // the simulator's stop condition (see `Pic14::exec_byte`):
                 // real programs end on this, since `parse_hex_pic18`
                 // returns the full flash-sized buffer (zero-padded NOPs
                 // all the way out), so running off the end of `prog`
                 // stays out of reach for programs within a step budget.
+                self.ram[0xFD0] = (self.ram[0xFD0] & !0x04) | 0x08;
                 self.halted = true;
                 pc
             }
-            0x0004 => pc + 2, // CLRWDT: no observable effect in this simulator
+            0x0004 => {
+                // CLRWDT sets RCON TO and PD.
+                self.ram[0xFD0] |= 0x0C;
+                pc + 2
+            }
             0x0005 => {
                 // PUSH: pushes PC+2 (the address of the next instruction)
                 // without jumping: the same stack effect as CALL, minus the
