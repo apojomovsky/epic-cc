@@ -1035,7 +1035,6 @@ fn strip_dead_params(m: &mut Module, taken: &HashSet<String>) -> bool {
                 || f.isr
                 || f.naked
                 || f.blocks.is_empty()
-                || f.unreachable_body
                 || ir::is_runtime_routine(&f.name)
                 || taken.contains(&f.name)
             {
@@ -1424,6 +1423,24 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(terms, vec![zext_dst]);
+    }
+
+    /// An unreachable placeholder drops its unread params (epic-cc#1370):
+    /// no live call can pass args (isel rejects one), so the stub frame
+    /// shrinks to nothing and stops pinning the overlay high water.
+    #[test]
+    fn unreachable_body_strips_dead_params() {
+        let m = ir::parse(
+            "fn stub(i16) [unreachable] (0=ptr, 1=i16)\n\
+             block 3:\n\
+             br 3\n\
+             fn main(void) ()\n\
+             block 0:\n\
+             ret void\n",
+        );
+        let m = strip_dead(m);
+        let stub = m.funcs.iter().find(|f| f.name == "stub").unwrap();
+        assert!(stub.params.is_empty());
     }
 
     /// Unread params drop out of the signature and their args drop out

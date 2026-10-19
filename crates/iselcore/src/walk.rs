@@ -1269,6 +1269,59 @@ pub fn dead_call_results(f: &ir::Func) -> HashSet<String> {
     out
 }
 
+/// Whether any caller uses `func`'s return value (cut 4): a direct call
+/// with a live result, or an unknown caller (indirect targets,
+/// address-taken functions, entry points, module asm). With no user the
+/// callee skips its retval write and the report claims no retval bytes.
+pub fn ret_value_used(m: &Module, func: &str) -> bool {
+    let Some(f) = m.funcs.iter().find(|x| x.name == func) else {
+        return true;
+    };
+    if f.name == "main" || f.isr || f.naked {
+        return true;
+    }
+    // An unreachable body is a self-branch placeholder with no `Ret` and
+    // no live caller (isel rejects a live call): no write, no reader.
+    if f.unreachable_body {
+        return false;
+    }
+    if !m.module_asm.is_empty() {
+        return true;
+    }
+    let taken: HashSet<&str> = m
+        .funcs
+        .iter()
+        .flat_map(|g| g.blocks.iter())
+        .flat_map(|b| b.insts.iter())
+        .filter_map(|i| match i {
+            ir::Inst::Call(c) if !c.callees.is_empty() => {
+                Some(c.callees.iter().map(|s| s.as_str()))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    if taken.contains(func) {
+        return true;
+    }
+    for g in &m.funcs {
+        let dead = dead_call_results(g);
+        for b in &g.blocks {
+            for inst in &b.insts {
+                if let ir::Inst::Call(c) = inst {
+                    if c.func != func || !c.callees.is_empty() {
+                        continue;
+                    }
+                    match &c.dst {
+                        Some(d) if !dead.contains(d) => return true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    false
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1467,5 +1520,13 @@ mod tests {
         );
         let memcpy = m.funcs.iter().find(|x| x.name == "memcpy").unwrap();
         assert!(dead_call_results(memcpy).is_empty());
+    }
+
+    /// No caller uses memcpy's result, so its retval write goes away.
+    #[test]
+    fn unused_retval_skips_write() {
+        let m = ir::parse(COPY_IR);
+        assert!(!ret_value_used(&m, "memcpy"));
+        assert!(ret_value_used(&m, "main"));
     }
 }

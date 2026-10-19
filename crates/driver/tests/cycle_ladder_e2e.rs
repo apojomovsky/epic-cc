@@ -570,6 +570,12 @@ fn expected_results(name: &str) -> Vec<(&'static str, Vec<u8>)> {
         "speed-u16-dec" => vec![("digits", vec![3, 9, 2, 8, 4])],
         // CRC-16/CCITT (init FFFF, poly 1021) over seed+i*7 bytes = 0x4F3C.
         "speed-crc16" => vec![("crc", vec![60, 79])],
+        // 32-byte copy (epic-cc#1370): the checksum sinks the block, so
+        // the walk-home cuts stay value-pinned. memcpy sums seed+i over
+        // seed 0x5A (3376 mod 256 = 48); memset sums 32 fill bytes 0xA5
+        // (5280 mod 256 = 160).
+        "speed-memcpy-32" => vec![("checksum", vec![48])],
+        "speed-memset-32" => vec![("checksum", vec![160])],
         _ => vec![],
     }
 }
@@ -1093,10 +1099,21 @@ fn result_check_catches_a_truncated_divmod_quotient() {
         None,
         "full bytes match"
     );
+    // Copy kernels pin their checksums (epic-cc#1370), so the walk-home
+    // cuts stay value-checked: memcpy sums seed+i (48), memset sums fills.
+    let copy_map = "global checksum 0x30\n";
+    let copy_ok = |a: usize| if a == 0x30 { 48 } else { 0 };
     assert_eq!(
-        result_mismatch(map, "speed-memcpy-32-18f4550", truncated),
+        result_mismatch(copy_map, "speed-memcpy-32-18f4550", copy_ok),
         None,
-        "rows without checked-in values stay cycle-only"
+        "matching checksum passes"
+    );
+    let copy_bad = |a: usize| if a == 0x30 { 47 } else { 0 };
+    let msg = result_mismatch(copy_map, "speed-memcpy-32-18f4550", copy_bad)
+        .expect("wrong checksum must fail");
+    assert!(
+        msg.contains("checksum"),
+        "the message must name the wrong global: {msg}"
     );
 }
 
