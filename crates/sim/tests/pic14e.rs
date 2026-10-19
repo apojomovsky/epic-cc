@@ -609,7 +609,9 @@ fn parse_hex_pic14e_drops_the_ela_config_region() {
 #[test]
 fn decfsz_and_incfsz_leave_status_alone() {
     // Same silicon rule as the mid-range core: skip on the result,
-    // STATUS untouched.
+    // STATUS untouched. Each sequence ends in a GOTO self-spin: SLEEP
+    // would set TO as its own architectural effect and pollute the
+    // STATUS assertion under test.
     let p = run_asm(
         "    org 0x20\n\
              MOVLW 0x07\n\
@@ -617,7 +619,7 @@ fn decfsz_and_incfsz_leave_status_alone() {
              MOVLW 0x02\n\
              MOVWF 0x20\n\
              DECFSZ 0x20, F\n\
-             SLEEP\n",
+             GOTO 0x25\n",
     );
     assert_eq!(p.ram()[0x20], 0x01);
     // TO/PD are read-only and stay set from POR, so MOVWF STATUS with
@@ -630,7 +632,7 @@ fn decfsz_and_incfsz_leave_status_alone() {
              MOVLW 0x01\n\
              MOVWF 0x20\n\
              INCFSZ 0x20, F\n\
-             SLEEP\n",
+             GOTO 0x25\n",
     );
     assert_eq!(p.ram()[0x20], 0x02);
     assert_eq!(p.ram()[0x03], 0x1F);
