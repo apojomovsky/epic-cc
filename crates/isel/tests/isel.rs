@@ -9475,8 +9475,8 @@ fn isr_prologue_body_epilogue_simulates_with_retfie_return() {
     // 60-71 = __start (the "main" context).
     //
     // The interrupted context is built in __start: W = 0x41 (0x42 +
-    // 0xFF), STATUS = 0x03 (C+DC from the ADDLW), PCLATH = 0, FSR = 0x12
-    // (pre-seeded), an in-flight return value 0x11/0x22/0x33/0x44 in the
+    // 0xFF), STATUS = 0x1B (TO/PD from POR plus C+DC from the ADDLW),
+    // PCLATH = 0, FSR = 0x12, an in-flight return value 0x11/0x22/0x33/0x44 in the
     // retval region 0x71-0x74, and an in-flight scratch byte 0x5A in 0x70
     // (all pre-seeded — main was "inside" a call whose result it had not
     // yet consumed and mid-icmp with a value folded through the scratch).
@@ -9548,7 +9548,7 @@ fn isr_prologue_body_epilogue_simulates_with_retfie_return() {
         0x00F1, // 58: MOVWF 0x71        result through the retval region
         0x0008, // 59: RETURN
         0x3042, // 60: __start: MOVLW 0x42
-        0x3EFF, // 61: ADDLW 0xFF        W = 0x41, STATUS = 0x03 (interrupted ctx)
+        0x3EFF, // 61: ADDLW 0xFF        W = 0x41, STATUS = 0x1B (interrupted ctx)
         0x2004, // 62: CALL 4            "interrupt" — push 63, jump to vector
         0x00A3, // 63: MOVWF 0x23        out_w = restored W (0x41)
         0x080A, // 64: MOVF PCLATH, W
@@ -9556,7 +9556,7 @@ fn isr_prologue_body_epilogue_simulates_with_retfie_return() {
         0x0804, // 66: MOVF FSR, W
         0x00A5, // 67: MOVWF 0x25        out_fsr = restored FSR (0x12)
         0x0803, // 68: MOVF STATUS, W
-        0x00A6, // 69: MOVWF 0x26        out_status = restored STATUS (0x03)
+        0x00A6, // 69: MOVWF 0x26        out_status = restored STATUS (0x1B)
         0x2847, // 70: GOTO 71           needs the restored PCLATH = 0
         0x0063, // 71: SLEEP
     ];
@@ -9595,8 +9595,8 @@ fn isr_prologue_body_epilogue_simulates_with_retfie_return() {
     );
     assert_eq!(
         p.ram()[0x26],
-        0x03,
-        "out_status = restored STATUS (body left 0x00)"
+        0x1B,
+        "out_status = restored STATUS (body left 0x18)"
     );
     // The in-flight retval survives the ISR: the helper wrote 0x71 = 0x43
     // and the body wrote 0xFF into 0x72-0x74, but the epilogue restored
@@ -9632,8 +9632,8 @@ fn isr_prologue_body_epilogue_simulates_with_retfie_return() {
     assert_eq!(p.ram()[0x75], 0x14, "saved W nibble-swapped (0x41 -> 0x14)");
     assert_eq!(
         p.ram()[0x76],
-        0x30,
-        "saved STATUS nibble-swapped (0x03 -> 0x30)"
+        0xB1,
+        "saved STATUS nibble-swapped (0x1B -> 0xB1)"
     );
     assert_eq!(p.ram()[0x77], 0x00, "saved PCLATH");
     assert_eq!(p.ram()[0x78], 0x12, "saved FSR");
