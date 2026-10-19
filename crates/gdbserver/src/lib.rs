@@ -44,11 +44,48 @@ pub struct Args {
     pub device: Option<String>,
 }
 
+/// The usage contract `--help` prints and failures append. Public so the
+/// binary and the docs generator share one string instead of copying it.
+pub const USAGE: &str =
+    "usage: epic-cc-gdbserver <hex> <sidecar.elf> --port <port> [--device <name>]";
+
+/// Flags `parse_args` accepts, the suggestion pool for a misspelled option.
+const KNOWN_FLAGS: &[&str] = &["--port", "--device", "--help", "--version"];
+
+/// Farthest edit distance at which a candidate is still offered.
+const SUGGEST_MAX_DISTANCE: usize = 3;
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diag = row[0];
+        row[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let up = row[j + 1];
+            row[j + 1] = (diag + usize::from(ca != cb)).min(row[j] + 1).min(up + 1);
+            diag = up;
+        }
+    }
+    row[b.len()]
+}
+
+/// ` (did you mean X?)` for the nearest candidate within
+/// `SUGGEST_MAX_DISTANCE`, first listed wins a tie; empty when none is
+/// close. Same shape as the driver's `suggest`, so both CLIs hint alike.
+fn suggest(got: &str, candidates: &[&str]) -> String {
+    candidates
+        .iter()
+        .map(|c| (edit_distance(got, c), *c))
+        .filter(|(d, _)| *d <= SUGGEST_MAX_DISTANCE)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| format!(" (did you mean {c}?)"))
+        .unwrap_or_default()
+}
+
 /// Parse the server command line. Errors are plain strings: `main`
 /// prints the usage contract on failure.
 pub fn parse_args(argv: &[String]) -> Result<Args, String> {
-    const USAGE: &str =
-        "usage: epic-cc-gdbserver <hex> <sidecar.elf> --port <port> [--device <name>]";
     let mut args = argv.iter();
     let hex_path = args.next().cloned().ok_or_else(|| USAGE.to_string())?;
     let sidecar_path = args.next().cloned().ok_or_else(|| USAGE.to_string())?;
@@ -70,13 +107,20 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
                 .ok_or_else(|| "--device needs a value".to_string())?;
             device = Some(d.clone());
         } else {
-            return Err(format!("epic-cc-gdbserver: unknown option {a}\n\n{USAGE}"));
+            let hint = if a.starts_with("--") {
+                suggest(a, KNOWN_FLAGS)
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "epic-cc-gdbserver: unknown option {a}{hint}\n\n{USAGE}"
+            ));
         }
     }
     Ok(Args {
         hex_path,
         sidecar_path,
-        port: port.ok_or_else(|| "missing --port".to_string())?,
+        port: port.ok_or_else(|| format!("missing --port\n\n{USAGE}"))?,
         device,
     })
 }
@@ -88,8 +132,14 @@ pub fn core_of(device: Option<&str>) -> Result<Core, String> {
     let Some(name) = device else {
         return Ok(Core::Pic14);
     };
-    let dev =
-        device::resolve(name).ok_or_else(|| format!("epic-cc-gdbserver: unknown device {name}"))?;
+    let dev = device::resolve(name).ok_or_else(|| {
+        let available = device::ALL
+            .iter()
+            .map(|d| d.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("epic-cc-gdbserver: unknown device {name} (available: {available})")
+    })?;
     Ok(dev.core)
 }
 
@@ -110,12 +160,14 @@ pub fn load_program(hex_path: &str, sidecar_path: &str, core: Core) -> Result<Ve
 /// Serve one gdb session for `prog` over an already-accepted `stream`.
 /// `device` is the baseline part (its file map backs the sim); other
 /// cores ignore it. Absent means the P1 baseline part, p12f509.
+/// Returns the disconnect outcome so a serve loop can tell a clean
+/// detach (accept the next session) from a kill or a fatal error.
 pub fn serve_stream(
     stream: std::net::TcpStream,
     prog: Vec<u16>,
     core: Core,
     device: Option<&'static device::Device>,
-) {
+) -> Result<DisconnectReason, String> {
     let connection: Box<dyn ConnectionExt<Error = std::io::Error>> = Box::new(stream);
     // `GdbStub` is typed over its target, so each core builds its own.
     let outcome = match core {
@@ -160,11 +212,22 @@ pub fn serve_stream(
         }
     };
     match outcome {
-        Ok(DisconnectReason::Disconnect) | Ok(DisconnectReason::Kill) => {
-            eprintln!("epic-cc-gdbserver: session ended")
+        Ok(reason) => {
+            if matches!(
+                reason,
+                DisconnectReason::Disconnect | DisconnectReason::Kill
+            ) {
+                eprintln!("epic-cc-gdbserver: session ended")
+            } else {
+                eprintln!("epic-cc-gdbserver: disconnected: {reason:?}")
+            }
+            Ok(reason)
         }
-        Ok(other) => eprintln!("epic-cc-gdbserver: disconnected: {other:?}"),
-        Err(e) => eprintln!("epic-cc-gdbserver: fatal: {e}"),
+        Err(e) => {
+            let msg = format!("epic-cc-gdbserver: fatal: {e}");
+            eprintln!("{msg}");
+            Err(msg)
+        }
     }
 }
 
@@ -182,7 +245,7 @@ pub fn serve_once(
         let Ok((stream, _)) = listener.accept() else {
             return;
         };
-        serve_stream(stream, prog, core, device);
+        let _ = serve_stream(stream, prog, core, device);
     });
     Ok((addr, handle))
 }
@@ -1236,5 +1299,69 @@ mod tests {
         t.step_one();
         assert_eq!(t.poll_write_watch(), Some(0x20));
         assert_eq!(t.poll_write_watch(), None);
+    }
+
+    #[test]
+    fn reconnect_after_detach() {
+        // A detach ends only its own session: a second connect on the
+        // same listener gets a fresh target that answers `qSupported`.
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        fn packet(data: &str) -> Vec<u8> {
+            let sum = data.bytes().fold(0u8, |a, b| a.wrapping_add(b));
+            format!("${data}#{sum:02x}").into_bytes()
+        }
+        fn send(stream: &mut TcpStream, data: &str) {
+            stream.write_all(&packet(data)).unwrap();
+            let mut ack = [0u8; 1];
+            stream.read_exact(&mut ack).unwrap();
+            assert_eq!(ack, [b'+']);
+        }
+        fn recv(stream: &mut TcpStream) -> String {
+            let mut byte = [0u8; 1];
+            loop {
+                stream.read_exact(&mut byte).unwrap();
+                if byte[0] == b'$' {
+                    break;
+                }
+            }
+            let mut body = Vec::new();
+            loop {
+                stream.read_exact(&mut byte).unwrap();
+                if byte[0] == b'#' {
+                    break;
+                }
+                body.push(byte[0]);
+            }
+            let mut csum = [0u8; 2];
+            stream.read_exact(&mut csum).unwrap();
+            stream.write_all(b"+").unwrap();
+            String::from_utf8(body).unwrap()
+        }
+        fn session(addr: std::net::SocketAddr) {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            send(&mut stream, "qSupported:multiprocess+");
+            let reply = recv(&mut stream);
+            assert!(reply.contains("swbreak+"), "got {reply:?}");
+            send(&mut stream, "D");
+            assert_eq!(recv(&mut stream), "OK");
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let _ = serve_stream(stream, vec![0x302A, 0x00A0], Core::Pic14, None);
+            }
+        });
+        session(addr);
+        session(addr);
+        server.join().unwrap();
     }
 }

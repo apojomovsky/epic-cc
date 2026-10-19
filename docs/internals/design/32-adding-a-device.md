@@ -224,7 +224,9 @@ transcribed config and the pack's. `sfr_tables_match_gputils_headers`
 register gputils' `header/p<part>.inc` names, at the same address, and
 every single-bit position both name. `gen-device.py` rewrites the whole
 file and drops these names (its `--check` ignores them), so rerun
-`device_names.py` after any regeneration.
+`device_names.py` after any regeneration. `scripts/add-device.sh` runs
+it as step 3 (skipped, with a notice, when no EDC `.PIC` is found) ahead
+of the gputils crosscheck.
 
 ## §6. Sign-off
 

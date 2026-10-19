@@ -1,6 +1,6 @@
 use device::PIC16F877A;
 use ir::parse;
-use isel::{select, select_with_opts, verify_page_fit, ConstPool, Options};
+use isel::{select, select_with_opts, verify_page_fit, ConstPool, DivCore, Options};
 use iselcore::is_directive;
 use std::collections::{HashMap, HashSet};
 
@@ -3787,18 +3787,19 @@ fn sim_run_bytes(
     (0..n).map(|i| p.ram()[out as usize + i]).collect()
 }
 
-/// `sim_run_bytes` through the O2 normalized divide bodies.
-fn sim_run_bytes_o2(
+/// `sim_run_bytes` through a tiered divide body.
+fn sim_run_bytes_tier(
     ir_text: &str,
     map: &[(String, u16)],
     seed: &[(u16, u8)],
     out: u16,
     n: usize,
+    tier: DivCore,
 ) -> Vec<u8> {
     use pic14_sim::Pic14;
     let m = parse(ir_text);
     let opts = Options {
-        fast_divmod: true,
+        divmod: tier,
         fast_mul_u8: true,
         fast_shift: true,
     };
@@ -3915,7 +3916,7 @@ fn norm_u16_o2_simulates_quotient_and_remainder() {
         for (i, b) in y.iter().enumerate() {
             seed.push((0x22 + i as u16, *b));
         }
-        let got = sim_run_bytes_o2(&ir, &map, &seed, 0x24, want.len());
+        let got = sim_run_bytes_tier(&ir, &map, &seed, 0x24, want.len(), DivCore::Exact);
         assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) out");
         if !want_r.is_empty() {
             let slot = map
@@ -3923,7 +3924,7 @@ fn norm_u16_o2_simulates_quotient_and_remainder() {
                 .find(|(k, _)| k == slot_name(name))
                 .expect("spill slot in map")
                 .1;
-            let got_r = sim_run_bytes_o2(&ir, &map, &seed, slot, want_r.len());
+            let got_r = sim_run_bytes_tier(&ir, &map, &seed, slot, want_r.len(), DivCore::Exact);
             assert_eq!(&got_r[..], want_r, "{name}({x:?}, {y:?}) spill");
         }
     }
@@ -4016,7 +4017,7 @@ fn norm_u32_o2_simulates_quotient_and_remainder() {
         for (i, b) in y.iter().enumerate() {
             seed.push((0x24 + i as u16, *b));
         }
-        let got = sim_run_bytes_o2(&ir, &map, &seed, 0x28, want.len());
+        let got = sim_run_bytes_tier(&ir, &map, &seed, 0x28, want.len(), DivCore::Exact);
         assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) out");
         if !want_r.is_empty() {
             let slot = map
@@ -4024,7 +4025,223 @@ fn norm_u32_o2_simulates_quotient_and_remainder() {
                 .find(|(k, _)| k == slot_name(name))
                 .expect("spill slot in map")
                 .1;
-            let got_r = sim_run_bytes_o2(&ir, &map, &seed, slot, want_r.len());
+            let got_r = sim_run_bytes_tier(&ir, &map, &seed, slot, want_r.len(), DivCore::Exact);
+            assert_eq!(&got_r[..], want_r, "{name}({x:?}, {y:?}) spill");
+        }
+    }
+}
+
+/// O1 coarse-class u16 divides answer like the exact core on every class:
+/// the K12 and K13 bounds, their thresholds, the full-loop fallback, a
+/// zero numerator, and den-zero poison parity with the default body.
+#[test]
+fn coarse_u16_o1_simulates_quotient_and_remainder() {
+    // (routine, x bytes lo..hi, y bytes lo..hi, expected out bytes,
+    // expected spill bytes for the combined spelling, empty otherwise)
+    let cases: &[(&str, &[u8], &[u8], &[u8], &[u8])] = &[
+        (
+            "__udiv_u16",
+            &[0x50, 0xC3],
+            &[0x89, 0x00],
+            &[0x6C, 0x01],
+            &[],
+        ),
+        (
+            "__urem_u16",
+            &[0x50, 0xC3],
+            &[0x89, 0x00],
+            &[0x84, 0x00],
+            &[],
+        ),
+        (
+            "__udivmod_u16",
+            &[0x50, 0xC3],
+            &[0x89, 0x00],
+            &[0x6C, 0x01],
+            &[0x84, 0x00],
+        ),
+        (
+            "__udiv_u16",
+            &[0xA5, 0xBC],
+            &[0x0A, 0x00],
+            &[0xDD, 0x12],
+            &[],
+        ),
+        (
+            "__urem_u16",
+            &[0xA5, 0xBC],
+            &[0x0A, 0x00],
+            &[0x03, 0x00],
+            &[],
+        ),
+        (
+            "__udiv_u16",
+            &[0xFF, 0xFF],
+            &[0x40, 0x00],
+            &[0xFF, 0x03],
+            &[],
+        ),
+        (
+            "__urem_u16",
+            &[0xFF, 0xFF],
+            &[0x40, 0x00],
+            &[0x3F, 0x00],
+            &[],
+        ),
+        (
+            "__udiv_u16",
+            &[0xFF, 0xFF],
+            &[0x08, 0x00],
+            &[0xFF, 0x1F],
+            &[],
+        ),
+        (
+            "__udiv_u16",
+            &[0x50, 0xC3],
+            &[0x07, 0x00],
+            &[0xE6, 0x1B],
+            &[],
+        ),
+        (
+            "__udiv_u16",
+            &[0x05, 0x00],
+            &[0x00, 0x00],
+            &[0xFF, 0xFF],
+            &[],
+        ),
+        (
+            "__urem_u16",
+            &[0x05, 0x00],
+            &[0x00, 0x00],
+            &[0x05, 0x00],
+            &[],
+        ),
+        (
+            "__urem_u16",
+            &[0x00, 0x00],
+            &[0x89, 0x00],
+            &[0x00, 0x00],
+            &[],
+        ),
+    ];
+    for &(name, x, y, want, want_r) in cases {
+        let (ir, map) = routine_module(name);
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((0x20 + i as u16, *b));
+        }
+        for (i, b) in y.iter().enumerate() {
+            seed.push((0x22 + i as u16, *b));
+        }
+        let got = sim_run_bytes_tier(&ir, &map, &seed, 0x24, want.len(), DivCore::Coarse);
+        assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) out");
+        if !want_r.is_empty() {
+            let slot = map
+                .iter()
+                .find(|(k, _)| k == slot_name(name))
+                .expect("spill slot in map")
+                .1;
+            let got_r = sim_run_bytes_tier(&ir, &map, &seed, slot, want_r.len(), DivCore::Coarse);
+            assert_eq!(&got_r[..], want_r, "{name}({x:?}, {y:?}) spill");
+        }
+    }
+}
+
+/// O1 coarse-class u32 divides: the bench pair, both class thresholds,
+/// the full-loop fallback, a quotient-zero shape, and den-zero poison
+/// parity with the default body.
+#[test]
+fn coarse_u32_o1_simulates_quotient_and_remainder() {
+    let cases: &[(&str, &[u8], &[u8], &[u8], &[u8])] = &[
+        (
+            "__udiv_u32",
+            &[0x00, 0x5E, 0xD0, 0xB2],
+            &[0x87, 0xD6, 0x12, 0x00],
+            &[0x7E, 0x09, 0x00, 0x00],
+            &[],
+        ),
+        (
+            "__urem_u32",
+            &[0x00, 0x5E, 0xD0, 0xB2],
+            &[0x87, 0xD6, 0x12, 0x00],
+            &[0x8E, 0x08, 0x00, 0x00],
+            &[],
+        ),
+        (
+            "__udivmod_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[0x00, 0x10, 0x00, 0x00],
+            &[0x45, 0x23, 0x01, 0x00],
+            &[0x78, 0x06, 0x00, 0x00],
+        ),
+        (
+            "__udiv_u32",
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            &[0x00, 0x00, 0x01, 0x00],
+            &[0xFF, 0xFF, 0x00, 0x00],
+            &[],
+        ),
+        (
+            "__udiv_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[0x00, 0x01, 0x00, 0x00],
+            &[0x56, 0x34, 0x12, 0x00],
+            &[],
+        ),
+        (
+            "__urem_u32",
+            &[0x78, 0x56, 0x34, 0x12],
+            &[0x00, 0x01, 0x00, 0x00],
+            &[0x78, 0x00, 0x00, 0x00],
+            &[],
+        ),
+        (
+            "__udiv_u32",
+            &[0x05, 0x00, 0x00, 0x00],
+            &[0x01, 0x00, 0x00, 0x00],
+            &[0x05, 0x00, 0x00, 0x00],
+            &[],
+        ),
+        (
+            "__urem_u32",
+            &[0x07, 0x00, 0x00, 0x00],
+            &[0x78, 0x56, 0x34, 0x12],
+            &[0x07, 0x00, 0x00, 0x00],
+            &[],
+        ),
+        (
+            "__udiv_u32",
+            &[0x05, 0x00, 0x00, 0x00],
+            &[0x00, 0x00, 0x00, 0x00],
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            &[],
+        ),
+        (
+            "__urem_u32",
+            &[0x05, 0x00, 0x00, 0x00],
+            &[0x00, 0x00, 0x00, 0x00],
+            &[0x05, 0x00, 0x00, 0x00],
+            &[],
+        ),
+    ];
+    for &(name, x, y, want, want_r) in cases {
+        let (ir, map) = routine_module32(name);
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((0x20 + i as u16, *b));
+        }
+        for (i, b) in y.iter().enumerate() {
+            seed.push((0x24 + i as u16, *b));
+        }
+        let got = sim_run_bytes_tier(&ir, &map, &seed, 0x28, want.len(), DivCore::Coarse);
+        assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) out");
+        if !want_r.is_empty() {
+            let slot = map
+                .iter()
+                .find(|(k, _)| k == slot_name(name))
+                .expect("spill slot in map")
+                .1;
+            let got_r = sim_run_bytes_tier(&ir, &map, &seed, slot, want_r.len(), DivCore::Coarse);
             assert_eq!(&got_r[..], want_r, "{name}({x:?}, {y:?}) spill");
         }
     }
@@ -4260,7 +4477,7 @@ fn mul_u8_unrolled_body_matches_wrapping_mul() {
     let (ir, map) = routine_module("__mul_u8");
     let m = parse(&ir);
     let opts = Options {
-        fast_divmod: true,
+        divmod: DivCore::Exact,
         fast_mul_u8: true,
         fast_shift: true,
     };
@@ -4965,7 +5182,7 @@ fn sim_run_bytes_shift(
     use pic14_sim::Pic14;
     let m = parse(ir_text);
     let opts = Options {
-        fast_divmod: false,
+        divmod: DivCore::Compact,
         fast_mul_u8: false,
         fast_shift: true,
     };
@@ -4993,7 +5210,7 @@ fn sim_run_bytes_shift(
 #[test]
 fn fast_shift_prefix_emits_only_under_o2() {
     let fast = Options {
-        fast_divmod: false,
+        divmod: DivCore::Compact,
         fast_mul_u8: false,
         fast_shift: true,
     };

@@ -1,12 +1,23 @@
 //! `epic-cc-gdbserver`: the phase-4 debugger adapter binary.
 //!
 //! Thin entry over the library: parse the command line, load the HEX,
-//! serve one gdb session on the requested port.
+//! then accept gdb sessions in a loop so a second `target remote`,
+//! a gdb `run`, or a relaunch reconnects without restarting the binary.
+//! Each session reseeds a fresh simulator core; only a kill packet, a
+//! fatal session error, or an accept failure ends the loop.
 
-use epic_cc_gdbserver::{core_of, load_program, parse_args, serve_stream};
+use epic_cc_gdbserver::{core_of, load_program, parse_args, serve_stream, USAGE};
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return;
+    }
+    if argv.iter().any(|a| a == "--version" || a == "-V") {
+        println!("epic-cc-gdbserver {}", env!("EPIC_CC_STAMP"));
+        return;
+    }
     let args = match parse_args(&argv) {
         Ok(a) => a,
         Err(e) => {
@@ -36,15 +47,21 @@ fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("epic-cc-gdbserver: waiting for gdb on {sockaddr}");
-    let (stream, _) = match listener.accept() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("epic-cc-gdbserver: accept: {e}");
-            std::process::exit(1);
-        }
-    };
-    eprintln!("epic-cc-gdbserver: debugger connected");
     let device = args.device.as_deref().and_then(device::resolve);
-    serve_stream(stream, prog, core, device);
+    eprintln!("epic-cc-gdbserver: waiting for gdb on {sockaddr}");
+    loop {
+        let (stream, _) = match listener.accept() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("epic-cc-gdbserver: accept: {e}");
+                std::process::exit(1);
+            }
+        };
+        eprintln!("epic-cc-gdbserver: debugger connected");
+        match serve_stream(stream, prog.clone(), core, device) {
+            Ok(gdbstub::stub::DisconnectReason::Kill) => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
 }

@@ -189,10 +189,9 @@ struct Gen<'m> {
     walks: FlashProvenance,
     scratch: u16,
     retval_lo: u16,
-    /// Normalized divide loops (epic-cc#895): under the speed profile the
-    /// unsigned divmod routines run a bit-length-derived iteration count
-    /// instead of the full width, trading flash for cycles.
-    fast_divmod: bool,
+    /// Unsigned divide core (epic-cc#895, #1341): compact runs the full
+    /// width, coarse a class bound, exact a bit-length-derived count.
+    divmod: DivCore,
     /// Eight-pass straight-line `__mul_u8` body (epic-cc#974, #1095), speed profile only.
     fast_mul_u8: bool,
     /// Byte-granular variable shifts (epic-cc#1171): the u16/u32 shift
@@ -4797,6 +4796,74 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// O1 coarse-class u32 divide core: the shared 32-bit loop runs a
+    /// quotient-width bound from the denominator's top nonzero byte, not
+    /// all 32 iterations. Leading iterations provably fail, so a covering
+    /// bound answers identically. den above 16 bits runs 16, above 8 bits
+    /// runs 24, smaller (and den == 0) runs the full loop, matching the
+    /// default body. Ends at the loop; the caller emits `{l_tail}:`,
+    /// stores, RETURN, then the tails call, which takes the returned
+    /// labels.
+    fn emit_coarse_u32(&mut self, num: u16, den: u16, scr: u16) -> (String, String, String) {
+        let (rem0, cnt) = (scr, scr + 8);
+        let l16 = self.fresh_label();
+        let l24 = self.fresh_label();
+        let l_run = self.fresh_label();
+        for i in 0..4 {
+            self.emit(format!("    CLRF 0x{:02X}", rem0 + i));
+        }
+        // den above 16 bits tops out at 16 quotient bits.
+        self.emit(format!("    MOVF 0x{:02X}, W", den + 3));
+        self.emit(format!("    IORWF 0x{:02X}, W", den + 2));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l16}"));
+        // den above 8 bits tops out at 24 quotient bits.
+        self.emit(format!("    MOVF 0x{:02X}, F", den + 1));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l24}"));
+        // Smaller denominators (and den == 0) run the full loop.
+        self.emit("    MOVLW 0x20".to_string());
+        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        self.emit(format!("{l_run}:"));
+        self.emit_divmod32_loop(num, scr, den);
+        (l16, l24, l_run)
+    }
+
+    /// Class blocks for `emit_coarse_u32`, past the routine's RETURN: the
+    /// 16 path prescales two whole bytes, the 24 path one. Shifting the
+    /// `(rem:num)` pair reproduces the skipped leading iterations, so the
+    /// shared loop finishes identically.
+    fn emit_coarse_u32_tails(&mut self, num: u16, scr: u16, l16: &str, l24: &str, l_run: &str) {
+        let (rem0, cnt) = (scr, scr + 8);
+        self.emit(format!("{l16}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", num + 2));
+        self.emit(format!("    MOVWF 0x{:02X}", rem0));
+        self.emit(format!("    MOVF 0x{:02X}, W", num + 3));
+        self.emit(format!("    MOVWF 0x{:02X}", rem0 + 1));
+        self.emit(format!("    MOVF 0x{:02X}, W", num));
+        self.emit(format!("    MOVWF 0x{:02X}", num + 2));
+        self.emit(format!("    MOVF 0x{:02X}, W", num + 1));
+        self.emit(format!("    MOVWF 0x{:02X}", num + 3));
+        self.emit(format!("    CLRF 0x{num:02X}"));
+        self.emit(format!("    CLRF 0x{:02X}", num + 1));
+        self.emit("    MOVLW 0x10".to_string());
+        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        self.emit(format!("    GOTO {l_run}"));
+        self.emit(format!("{l24}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", num + 3));
+        self.emit(format!("    MOVWF 0x{:02X}", rem0));
+        self.emit(format!("    MOVF 0x{:02X}, W", num + 2));
+        self.emit(format!("    MOVWF 0x{:02X}", num + 3));
+        self.emit(format!("    MOVF 0x{:02X}, W", num + 1));
+        self.emit(format!("    MOVWF 0x{:02X}", num + 2));
+        self.emit(format!("    MOVF 0x{:02X}, W", num));
+        self.emit(format!("    MOVWF 0x{:02X}", num + 1));
+        self.emit(format!("    CLRF 0x{num:02X}"));
+        self.emit("    MOVLW 0x18".to_string());
+        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        self.emit(format!("    GOTO {l_run}"));
+    }
+
     /// Bit length of the byte at `addr` into W (0 for a zero byte): the
     /// normalization setup for the O2 divide loops. Straight-line BTFSS
     /// cascade, no tables or FSR, so no page or banking hazards. A set bit
@@ -4941,6 +5008,88 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVWF 0x{rem_hi:02X}"));
         self.emit(format!("    CLRF 0x{num:02X}"));
         self.emit(format!("    CLRF 0x{:02X}", num + 1));
+    }
+
+    /// O1 coarse-class u16 divide core: the loop below runs a
+    /// quotient-width bound from the denominator's low byte, not all 16
+    /// iterations. Leading iterations provably fail, so a covering bound
+    /// answers identically. den >= 64 runs 12, den >= 8 runs 13, smaller
+    /// (and den == 0) runs the full loop, matching the default body. A low
+    /// byte at or above a threshold implies it for the whole denominator.
+    /// Ends at the loop; the caller emits `{l_tail}:`, stores, RETURN,
+    /// then `emit_coarse_u16_tails`. Returns the labels for the tails call.
+    fn emit_coarse_u16(&mut self, num: u16, den: u16, scr: u16) -> (String, String, String) {
+        let (rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2);
+        let l12 = self.fresh_label();
+        let l13 = self.fresh_label();
+        let l_loop = self.fresh_label();
+        let l_body = self.fresh_label();
+        let l_restore = self.fresh_label();
+        let l_next = self.fresh_label();
+        self.emit(format!("    CLRF 0x{rem_lo:02X}"));
+        self.emit(format!("    CLRF 0x{rem_hi:02X}"));
+        self.emit("    MOVLW 0x40".to_string());
+        self.emit(format!("    SUBWF 0x{den:02X}, W"));
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l12}"));
+        self.emit("    MOVLW 0x08".to_string());
+        self.emit(format!("    SUBWF 0x{den:02X}, W"));
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l13}"));
+        self.emit("    MOVLW 0x10".to_string());
+        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        self.emit(format!("{l_loop}:"));
+        self.emit(format!("{l_body}:"));
+        self.emit("    BCF STATUS, 0".to_string());
+        self.emit(format!("    RLF 0x{num:02X}, F"));
+        self.emit(format!("    RLF 0x{:02X}, F", num + 1));
+        self.emit(format!("    RLF 0x{rem_lo:02X}, F"));
+        self.emit(format!("    RLF 0x{rem_hi:02X}, F"));
+        self.emit(format!("    MOVF 0x{den:02X}, W"));
+        self.emit(format!("    SUBWF 0x{rem_lo:02X}, F"));
+        self.emit(format!("    MOVF 0x{:02X}, W", den + 1));
+        self.emit("    BTFSS STATUS, 0".to_string());
+        self.emit(format!("    INCFSZ 0x{:02X}, W", den + 1));
+        self.emit(format!("    SUBWF 0x{rem_hi:02X}, F"));
+        self.emit("    BTFSS STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l_restore}"));
+        self.emit(format!("    BSF 0x{num:02X}, 0"));
+        self.emit(format!("    GOTO {l_next}"));
+        self.emit(format!("{l_restore}:"));
+        self.emit(format!("    MOVF 0x{den:02X}, W"));
+        self.emit(format!("    ADDWF 0x{rem_lo:02X}, F"));
+        self.emit(format!("    MOVF 0x{:02X}, W", den + 1));
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit(format!("    INCFSZ 0x{:02X}, W", den + 1));
+        self.emit(format!("    ADDWF 0x{rem_hi:02X}, F"));
+        self.emit(format!("{l_next}:"));
+        self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
+        self.emit(format!("    GOTO {l_body}"));
+        (l12, l13, l_loop)
+    }
+
+    /// Class blocks for `emit_norm_u16`, past the routine's RETURN: each
+    /// prescales `(rem:num)` by its skipped leading shifts, then runs its
+    /// bound through the shared loop.
+    fn emit_coarse_u16_tails(&mut self, num: u16, scr: u16, l12: &str, l13: &str, l_loop: &str) {
+        let (rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2);
+        for (lab, t, k) in [(l12, 4, 12), (l13, 3, 13)] {
+            let l_pre = self.fresh_label();
+            self.emit(format!("{lab}:"));
+            self.emit(format!("    MOVLW 0x{t:02X}"));
+            self.emit(format!("    MOVWF 0x{cnt:02X}"));
+            self.emit(format!("{l_pre}:"));
+            self.emit("    BCF STATUS, 0".to_string());
+            self.emit(format!("    RLF 0x{num:02X}, F"));
+            self.emit(format!("    RLF 0x{:02X}, F", num + 1));
+            self.emit(format!("    RLF 0x{rem_lo:02X}, F"));
+            self.emit(format!("    RLF 0x{rem_hi:02X}, F"));
+            self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
+            self.emit(format!("    GOTO {l_pre}"));
+            self.emit(format!("    MOVLW 0x{k:02X}"));
+            self.emit(format!("    MOVWF 0x{cnt:02X}"));
+            self.emit(format!("    GOTO {l_loop}"));
+        }
     }
 
     /// The recipe body for one of the fifteen mul/div/rem runtime routines
@@ -5233,45 +5382,56 @@ impl<'m> Gen<'m> {
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 1, den, den + 1, scr, scr + 6], name);
                 let (rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2);
-                if self.fast_divmod {
-                    let l_tail = self.fresh_label();
-                    self.emit_norm_u16(num, den, scr, &l_tail);
-                    self.emit(format!("{l_tail}:"));
-                } else {
-                    let l_loop = self.fresh_label();
-                    let l_restore = self.fresh_label();
-                    let l_next = self.fresh_label();
-                    self.emit(format!("    CLRF 0x{rem_lo:02X}"));
-                    self.emit(format!("    CLRF 0x{rem_hi:02X}"));
-                    self.emit("    MOVLW 0x10".to_string());
-                    self.emit(format!("    MOVWF 0x{cnt:02X}"));
-                    self.emit(format!("{l_loop}:"));
-                    self.emit("    BCF STATUS, 0".to_string());
-                    self.emit(format!("    RLF 0x{num:02X}, F"));
-                    self.emit(format!("    RLF 0x{:02X}, F", num + 1));
-                    self.emit(format!("    RLF 0x{rem_lo:02X}, F"));
-                    self.emit(format!("    RLF 0x{rem_hi:02X}, F"));
-                    self.emit(format!("    MOVF 0x{den:02X}, W"));
-                    self.emit(format!("    SUBWF 0x{rem_lo:02X}, F"));
-                    self.emit(format!("    MOVF 0x{:02X}, W", den + 1));
-                    self.emit("    BTFSS STATUS, 0".to_string());
-                    self.emit(format!("    INCFSZ 0x{:02X}, W", den + 1)); // den_hi + borrow
-                    self.emit(format!("    SUBWF 0x{rem_hi:02X}, F")); // C = (rem >= den)
-                    self.emit("    BTFSS STATUS, 0".to_string());
-                    self.emit(format!("    GOTO {l_restore}"));
-                    self.emit(format!("    BSF 0x{num:02X}, 0"));
-                    self.emit(format!("    GOTO {l_next}"));
-                    self.emit(format!("{l_restore}:"));
-                    self.emit(format!("    MOVF 0x{den:02X}, W"));
-                    self.emit(format!("    ADDWF 0x{rem_lo:02X}, F"));
-                    self.emit(format!("    MOVF 0x{:02X}, W", den + 1));
-                    self.emit("    BTFSC STATUS, 0".to_string());
-                    self.emit(format!("    INCFSZ 0x{:02X}, W", den + 1)); // den_hi + carry
-                    self.emit(format!("    ADDWF 0x{rem_hi:02X}, F"));
-                    self.emit(format!("{l_next}:"));
-                    self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
-                    self.emit(format!("    GOTO {l_loop}"));
-                }
+                let coarse_tails = match self.divmod {
+                    DivCore::Coarse => {
+                        let l_tail = self.fresh_label();
+                        let tails = self.emit_coarse_u16(num, den, scr);
+                        self.emit(format!("{l_tail}:"));
+                        Some(tails)
+                    }
+                    DivCore::Exact => {
+                        let l_tail = self.fresh_label();
+                        self.emit_norm_u16(num, den, scr, &l_tail);
+                        self.emit(format!("{l_tail}:"));
+                        None
+                    }
+                    DivCore::Compact => {
+                        let l_loop = self.fresh_label();
+                        let l_restore = self.fresh_label();
+                        let l_next = self.fresh_label();
+                        self.emit(format!("    CLRF 0x{rem_lo:02X}"));
+                        self.emit(format!("    CLRF 0x{rem_hi:02X}"));
+                        self.emit("    MOVLW 0x10".to_string());
+                        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+                        self.emit(format!("{l_loop}:"));
+                        self.emit("    BCF STATUS, 0".to_string());
+                        self.emit(format!("    RLF 0x{num:02X}, F"));
+                        self.emit(format!("    RLF 0x{:02X}, F", num + 1));
+                        self.emit(format!("    RLF 0x{rem_lo:02X}, F"));
+                        self.emit(format!("    RLF 0x{rem_hi:02X}, F"));
+                        self.emit(format!("    MOVF 0x{den:02X}, W"));
+                        self.emit(format!("    SUBWF 0x{rem_lo:02X}, F"));
+                        self.emit(format!("    MOVF 0x{:02X}, W", den + 1));
+                        self.emit("    BTFSS STATUS, 0".to_string());
+                        self.emit(format!("    INCFSZ 0x{:02X}, W", den + 1)); // den_hi + borrow
+                        self.emit(format!("    SUBWF 0x{rem_hi:02X}, F")); // C = (rem >= den)
+                        self.emit("    BTFSS STATUS, 0".to_string());
+                        self.emit(format!("    GOTO {l_restore}"));
+                        self.emit(format!("    BSF 0x{num:02X}, 0"));
+                        self.emit(format!("    GOTO {l_next}"));
+                        self.emit(format!("{l_restore}:"));
+                        self.emit(format!("    MOVF 0x{den:02X}, W"));
+                        self.emit(format!("    ADDWF 0x{rem_lo:02X}, F"));
+                        self.emit(format!("    MOVF 0x{:02X}, W", den + 1));
+                        self.emit("    BTFSC STATUS, 0".to_string());
+                        self.emit(format!("    INCFSZ 0x{:02X}, W", den + 1)); // den_hi + carry
+                        self.emit(format!("    ADDWF 0x{rem_hi:02X}, F"));
+                        self.emit(format!("{l_next}:"));
+                        self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
+                        self.emit(format!("    GOTO {l_loop}"));
+                        None
+                    }
+                };
                 match recipe {
                     "__urem_u16" => self.store_retval(rem_lo, 2),
                     "__udivmod_u16" => {
@@ -5281,6 +5441,9 @@ impl<'m> Gen<'m> {
                     _ => self.store_retval(num, 2),
                 }
                 self.emit("    RETURN".to_string());
+                if let Some((l12, l13, l_loop)) = coarse_tails {
+                    self.emit_coarse_u16_tails(num, scr, &l12, &l13, &l_loop);
+                }
             }
             // Signed 8-bit wrappers: abs both operands in place in the param
             // slots (unsigned abs, INT_MIN safe), run the unsigned divmod,
@@ -5518,17 +5681,29 @@ impl<'m> Gen<'m> {
                 let num = self.slot_addr(name, "num").direct();
                 let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 3, den, den + 3, scr, scr + 9], name);
-                if self.fast_divmod {
-                    let l_tail = self.fresh_label();
-                    self.emit_norm_u32(num, den, scr, &l_tail);
-                    self.emit(format!("{l_tail}:"));
-                } else {
-                    for i in 0..4 {
-                        self.emit(format!("    MOVF 0x{:02X}, W", den + i));
-                        self.emit(format!("    MOVWF 0x{:02X}", scr + 4 + i)); // den copy
+                let coarse_tails = match self.divmod {
+                    DivCore::Coarse => {
+                        let l_tail = self.fresh_label();
+                        let tails = self.emit_coarse_u32(num, den, scr);
+                        self.emit(format!("{l_tail}:"));
+                        Some(tails)
                     }
-                    self.emit_divmod32(num, scr);
-                }
+                    DivCore::Exact => {
+                        let l_tail = self.fresh_label();
+                        self.emit_norm_u32(num, den, scr, &l_tail);
+                        self.emit(format!("{l_tail}:"));
+                        None
+                    }
+                    DivCore::Compact => {
+                        for i in 0..4 {
+                            self.emit(format!("    MOVF 0x{:02X}, W", den + i));
+                            self.emit(format!("    MOVWF 0x{:02X}", scr + 4 + i));
+                            // den copy
+                        }
+                        self.emit_divmod32(num, scr);
+                        None
+                    }
+                };
                 match recipe {
                     "__urem_u32" => self.store_retval(scr, 4),
                     "__udivmod_u32" => {
@@ -5538,6 +5713,9 @@ impl<'m> Gen<'m> {
                     _ => self.store_retval(num, 4),
                 }
                 self.emit("    RETURN".to_string());
+                if let Some((l16, l24, l_run)) = coarse_tails {
+                    self.emit_coarse_u32_tails(num, scr, &l16, &l24, &l_run);
+                }
             }
             // Signed 32-bit wrappers: abs both operands in place in the
             // param slots (unsigned abs, INT_MIN safe: |INT_MIN| wraps to
@@ -8415,7 +8593,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         walks: g.walks.clone(),
         scratch: g.scratch,
         retval_lo: g.retval_lo,
-        fast_divmod: g.fast_divmod,
+        divmod: g.divmod,
         fast_mul_u8: g.fast_mul_u8,
         fast_shift: g.fast_shift,
         cur_func: g.cur_func,
@@ -13576,14 +13754,27 @@ fn ref_byte_operand(addrs: &HashMap<String, u16>, offset: usize, target: &str, a
     }
 }
 
+/// Unsigned divide core. Compact runs the full-width restoring loop;
+/// coarse runs a denominator-class bound with a matching prescale;
+/// exact derives the bit-length count. Each step up trades flash for
+/// cycles; every tier answers identically, including den == 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DivCore {
+    /// Full-width loop: `-Os`/`-O0` output, the flash floor.
+    Compact,
+    /// Class bound: the `-O1` middle rung.
+    Coarse,
+    /// Bit-length count: the `-O2` speed core.
+    Exact,
+}
+
 /// Codegen options. Every field defaults to today's output, so unflagged
 /// callers keep byte-identical asm.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
-    /// Normalized divide loops (epic-cc#895): the unsigned divmod routines
-    /// run a bit-length-derived iteration count instead of the full width.
-    /// The speed profile turns it on, trading flash for cycles.
-    pub fast_divmod: bool,
+    /// Unsigned divide core: the driver picks compact under `-Os`/`-O0`,
+    /// coarse under `-O1`, exact under `-O2`.
+    pub divmod: DivCore,
     /// Unrolled `__mul_u8` (epic-cc#974, #1095): eight straight-line passes,
     /// no loop and no per-bit branch. The speed profile turns it on.
     pub fast_mul_u8: bool,
@@ -13596,7 +13787,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            fast_divmod: false,
+            divmod: DivCore::Compact,
             fast_mul_u8: false,
             fast_shift: false,
         }
@@ -13678,11 +13869,10 @@ fn place_unit(
     (pi, start)
 }
 
-/// `select_with_locs` with codegen options. The driver sets `fast_divmod`,
-/// `fast_mul_u8`, and `fast_shift` under O2, so the unsigned divide and
-/// multiply routines run their normalized loops and the u16/u32 shift
-/// routines move whole bytes first, instead of trading cycles for flash
-/// (epic-cc#895, epic-cc#974, epic-cc#1171).
+/// `select_with_locs` with codegen options. The driver sets the divide core
+/// by profile (coarse at O1, exact at O2) and `fast_mul_u8`/`fast_shift`
+/// under O2, so the unsigned divide and multiply routines trade flash for
+/// cycles instead of the reverse (epic-cc#895, epic-cc#974, epic-cc#1171).
 pub fn select_with_opts(
     device: &Device,
     m: &Module,
@@ -13891,7 +14081,7 @@ pub fn select_with_opts(
                 walks: walks.clone(),
                 scratch,
                 retval_lo,
-                fast_divmod: opts.fast_divmod,
+                divmod: opts.divmod,
                 fast_mul_u8: opts.fast_mul_u8,
                 fast_shift: opts.fast_shift,
                 cur_func: &f.name,
@@ -14129,7 +14319,7 @@ pub fn select_with_opts(
                     walks: walks.clone(),
                     scratch,
                     retval_lo,
-                    fast_divmod: opts.fast_divmod,
+                    divmod: opts.divmod,
                     fast_mul_u8: opts.fast_mul_u8,
                     fast_shift: opts.fast_shift,
                     cur_func: &f.name,
@@ -14450,7 +14640,7 @@ pub fn select_with_opts(
                                 walks: walks.clone(),
                                 scratch,
                                 retval_lo,
-                                fast_divmod: opts.fast_divmod,
+                                divmod: opts.divmod,
                                 fast_mul_u8: opts.fast_mul_u8,
                                 fast_shift: opts.fast_shift,
                                 cur_func: &f.name,
