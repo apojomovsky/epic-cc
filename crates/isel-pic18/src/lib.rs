@@ -13349,6 +13349,20 @@ impl<'m> Gen<'m> {
                             "    ADDWFC 0x{o1f:03X},F,{}",
                             if o1a == 0 { "A" } else { "B" }
                         ));
+                        // The next group's ADDWF sets C without reading it,
+                        // so ripple this group's overflow upstairs now.
+                        // W is dead here, so W = 0 folds each higher byte's
+                        // carry in and passes its own up. off >= 2 needs no
+                        // ripple: byte 3 is the top of the u32 result, and
+                        // byte 4 (off = 3) drops out of the result.
+                        for k in off + 2..4 {
+                            self.emit("    MOVLW 0x00".to_string());
+                            let (ka, kf) = self.operand(scr + k);
+                            self.emit(format!(
+                                "    ADDWFC 0x{kf:03X},F,{}",
+                                if ka == 0 { "A" } else { "B" }
+                            ));
+                        }
                     }
                 }
                 self.store_retval(scr, 4);
@@ -13372,7 +13386,8 @@ impl<'m> Gen<'m> {
     /// One column add with explicit carry propagation: `W += [dst]`, and
     /// the overflow lands in `hi` before the next add can clobber `C`.
     /// `ADDWF` ignores carry-in, so chaining `ADDWFC` instead would reuse
-    /// a stale carry; the row-wise `__mul_u32` loop fails exactly there.
+    /// a stale carry; the row-wise `__mul_u32` loop instead ripples with
+    /// `MOVLW 0` / `ADDWFC` upstairs (epic-cc#1407).
     /// Costs two cycles either way (`BTFSC` skips the `INCF` when clear).
     fn emit_col_add(&mut self, dst: u16, hi: u16) {
         self.emit_banked("ADDWF", dst, ",F");

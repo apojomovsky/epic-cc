@@ -130,32 +130,32 @@ ram_bytes = 21
 [[entry]]
 name = "speed-mul-u32-18f4550"
 device = "18F4550"
-cycles = 102
-flash_words = 132
+cycles = 110
+flash_words = 140
 ram_bytes = 49
 
 [[entry]]
 name = "speed-mul-u32-18f4550"
 device = "18F4550"
 profile = "O0"
-cycles = 102
-flash_words = 132
+cycles = 110
+flash_words = 140
 ram_bytes = 49
 
 [[entry]]
 name = "speed-mul-u32-18f4550"
 device = "18F4550"
 profile = "O1"
-cycles = 102
-flash_words = 132
+cycles = 110
+flash_words = 140
 ram_bytes = 49
 
 [[entry]]
 name = "speed-mul-u32-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 102
-flash_words = 132
+cycles = 110
+flash_words = 140
 ram_bytes = 49
 
 [[entry]]

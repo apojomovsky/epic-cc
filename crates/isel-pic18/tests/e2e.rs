@@ -647,6 +647,41 @@ fn smul16_c_runs_correctly() {
 }
 
 #[test]
+fn mul_u32_carry_c_runs_correctly() {
+    // epic-cc#1407: the row-wise `__mul_u32` recipe dropped an
+    // inter-group carry (`0xFFFFFFFF * 0xFFFFFFFF` gave `0xFF000001`),
+    // so carry-heavy pairs pin the ripple against hand-computed bytes.
+    let (mut p, globals, asm) = compile_with_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mul_u32_carry.c"
+    ));
+    assert!(
+        asm.contains("CALL __mul_u32"),
+        "genuine u32 products must call the routine:\n{asm}"
+    );
+    p.run(2_000_000);
+    for (g, want) in [
+        ("r0", [0x01, 0x00, 0x00, 0x00]),
+        ("r1", [0xF8, 0x76, 0x61, 0x36]),
+        ("r2", [0x00, 0x00, 0x01, 0x00]),
+        ("r3", [0x01, 0x00, 0x00, 0x00]),
+        ("r4", [0xFE, 0xFF, 0xFF, 0xFF]),
+        ("r5", [0x01, 0xFE, 0x02, 0xFC]),
+        ("r6", [0x32, 0x93, 0xF7, 0x49]),
+    ] {
+        let base = globals[g] as usize;
+        let got = [
+            p.ram()[base],
+            p.ram()[base + 1],
+            p.ram()[base + 2],
+            p.ram()[base + 3],
+        ];
+        assert_eq!(got, want, "{g} must match the hand trace");
+    }
+    assert!(p.halted());
+}
+
+#[test]
 fn interrupt_mul_pic18_c_runs_correctly() {
     // Mirrors crates/driver/tests/interrupt_mul_e2e.rs: main and the ISR
     // both multiply/divide, so both contexts reach the injected __mul_u8
