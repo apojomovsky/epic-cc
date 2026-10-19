@@ -194,7 +194,7 @@ struct Gen<'m> {
     divmod: DivCore,
     /// Eight-pass straight-line `__mul_u8` body (epic-cc#974, #1095), speed profile only.
     fast_mul_u8: bool,
-    /// Eight-pass unrolled `__mul_u16` body (epic-cc#1342), speed profile only.
+    /// Seven-pass unrolled `__mul_u16` body (epic-cc#1342), speed profile only.
     fast_mul_u16: bool,
     /// Byte-granular variable shifts (epic-cc#1171): the u16/u32 shift
     /// routines move whole bytes first when the masked count is >= 8,
@@ -13833,9 +13833,9 @@ pub struct Options {
     /// Unrolled `__mul_u8` (epic-cc#974, #1095): eight straight-line passes,
     /// no loop and no per-bit branch. The speed profile turns it on.
     pub fast_mul_u8: bool,
-    /// Unrolled `__mul_u16` (epic-cc#1342): eight straight-line passes over
-    /// the low multiplier byte, rerun once for a nonzero high byte. The
-    /// speed profile turns it on.
+    /// Unrolled `__mul_u16` (epic-cc#1342): seven straight-line passes over
+    /// the multiplier's low byte, rerun while the multiplier shifted right
+    /// by seven is nonzero. The speed profile turns it on.
     pub fast_mul_u16: bool,
     /// Byte-granular variable shifts (epic-cc#1171): the u16/u32 shift
     /// routines move whole bytes first when the masked count is >= 8,
@@ -13930,9 +13930,10 @@ fn place_unit(
 }
 
 /// `select_with_locs` with codegen options. The driver sets the divide core
-/// by profile (coarse at O1, exact at O2) and `fast_mul_u8`/`fast_shift`
-/// under O2, so the unsigned divide and multiply routines trade flash for
-/// cycles instead of the reverse (epic-cc#895, epic-cc#974, epic-cc#1171).
+/// by profile (coarse at O1, exact at O2) and `fast_mul_u8`/`fast_mul_u16`/
+/// `fast_shift` under O2, so the unsigned divide and multiply routines trade
+/// flash for cycles instead of the reverse (epic-cc#895, epic-cc#974,
+/// epic-cc#1342, epic-cc#1171).
 pub fn select_with_opts(
     device: &Device,
     m: &Module,

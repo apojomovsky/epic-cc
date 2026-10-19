@@ -4507,7 +4507,7 @@ fn mul_u8_unrolled_body_matches_wrapping_mul() {
 /// The unrolled `__mul_u16` body (O2) against `wrapping_mul`: every pair
 /// from a boundary-heavy operand set (each high/low byte zero and nonzero,
 /// top bits, carry-ripple values) plus a fixed pseudo-random stream, so the
-/// swap, the single run and the b_hi rerun are all exercised.
+/// swap path and the one-, two- and three-run multipliers are all exercised.
 #[test]
 fn mul_u16_unrolled_body_matches_wrapping_mul() {
     use pic14_sim::Pic14;
