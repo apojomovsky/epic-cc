@@ -155,9 +155,22 @@ const PIC14_ADCON1: usize = 0x9F;
 /// CMCON 0x9C latches comparators off (0x07) at POR, as PIC18 does.
 const PIC14_CMCON: usize = 0x9C;
 const PIC14_CMCON_OFF: u8 = 0x07;
-/// PIC14 POR latches over the zero-filled RAM. The ADC registers reset to
-/// zero (ADC off, GO clear); only the comparator needs a nonzero latch.
+/// PIC14 POR latches over the zero-filled RAM (DS39582B Table 4-2, as
+/// observed on gpsim 0.31.0): STATUS TO/PD set, OPTION all ones, TRIS
+/// all inputs, TXSTA TRMT set with TSR empty, PR2 period reset. The ADC
+/// registers reset to zero (ADC off, GO clear); only the comparator
+/// needs a nonzero latch. Zero-POR registers are omitted: the fill
+/// already matches them.
 const PIC14_POR: &[(usize, u8)] = &[
+    (0x03, 0x18),             // STATUS: TO/PD set
+    (PIC14_OPTION_REG, 0xFF), // OPTION_REG: prescaler max, external clock
+    (0x85, 0x3F),             // TRISA: RA5:RA0 inputs, bits 7:6 unimplemented
+    (0x86, 0xFF),             // TRISB: pins are inputs
+    (0x87, 0xFF),             // TRISC: pins are inputs
+    (0x88, 0xFF),             // TRISD: pins are inputs
+    (0x89, 0x07),             // TRISE: RE2:RE0 inputs, PSP bits reset clear
+    (0x92, 0xFF),             // PR2: Timer2 period reset
+    (0x98, 0x02),             // TXSTA: TRMT set, TSR empty
     (PIC14_ADCON0, 0x00),
     (PIC14_ADCON1, 0x00),
     (PIC14_CMCON, PIC14_CMCON_OFF),
@@ -172,10 +185,22 @@ const PIC14E_ADRESH: usize = 0x9C;
 const PIC14E_ADCON1: usize = 0x9E;
 const PIC14E_CM1CON0: usize = 0x111;
 const PIC14E_CM2CON0: usize = 0x113;
-/// PIC14E POR latches: every entry is zero (ADC off, GO clear, CxON
-/// clear), stated explicitly so the off-by-default contract has an
-/// address to test against rather than relying on the fill.
+/// PIC14E POR latches over the zero-filled RAM (DS41364E section 3.5;
+/// the shared enhanced-core resets match gpsim 0.31.0 on the 16F1825,
+/// and the 28-pin part stops at TRISC: TRISD/E are unimplemented and
+/// read 0, so the fill already matches them): STATUS TO/PD set,
+/// OPTION all ones, TRIS inputs, TXSTA TRMT set, PR2 period reset.
+/// Zero entries (ADC off, GO clear, CxON clear) stay explicit so the
+/// off-by-default contract has an address to test against rather
+/// than relying on the fill.
 const PIC14E_POR: &[(usize, u8)] = &[
+    (0x03, 0x18),              // STATUS: TO/PD set
+    (PIC14E_OPTION_REG, 0xFF), // OPTION_REG: prescaler max, external clock
+    (0x8C, 0xFF),              // TRISA: pins are inputs
+    (0x8D, 0xFF),              // TRISB: pins are inputs
+    (0x8E, 0xFF),              // TRISC: pins are inputs
+    (0x1B, 0xFF),              // PR2: Timer2 period reset
+    (0x19E, 0x02),             // TXSTA: TRMT set, TSR empty
     (PIC14E_ADCON0, 0x00),
     (PIC14E_ADCON1, 0x00),
     (PIC14E_CM1CON0, 0x00),
@@ -674,6 +699,11 @@ impl Pic14 {
                 }
                 self.adc_store(addr, v);
             }
+            0x03 => {
+                // STATUS TO/PD are read-only latches (DS39582B Register
+                // 4-2): a write reaches IRP/RP/Z/DC/C only.
+                self.ram[3] = (self.ram[3] & 0x18) | (v & 0xE7);
+            }
             _ => match self.banked_addr(f) {
                 Some(phys) => {
                     let v = self.ee_store(phys, v).unwrap_or(v);
@@ -735,8 +765,14 @@ impl Pic14 {
                 self.ram[PIC14_OPTION_REG] = self.w;
                 return pc + 1;
             }
-            0x0064 => return pc + 1, // CLRWDT
+            0x0064 => {
+                // CLRWDT sets TO and PD.
+                self.ram[3] |= 0x18;
+                return pc + 1;
+            }
             0x0063 => {
+                // SLEEP sets TO and clears PD.
+                self.ram[3] = (self.ram[3] & !0x08) | 0x10;
                 self.halted = true; // SLEEP
                 return pc;
             }
@@ -1515,9 +1551,16 @@ impl Pic14e {
             0x0000 => return pc + 1, // NOP
             0x0001 => {
                 // RESET: reinitialize the core (PC 0, W 0, stack emptied),
-                // matching `Pic18`'s RESET model.
+                // matching `Pic18`'s RESET model. The POR image re-applies:
+                // MCLR restores SFR resets while GPRs keep their contents.
+                // Z/DC/C survive: only TO/PD are reset-affected.
+                let flags = self.ram[3] & 0x07;
                 self.w = 0;
                 self.stack.clear();
+                for &(addr, v) in PIC14E_POR {
+                    self.ram[addr] = v;
+                }
+                self.ram[3] |= flags;
                 return 0;
             }
             0x0008 => return self.pop_return(), // RETURN
@@ -1550,10 +1593,16 @@ impl Pic14e {
                 return pc + 1;
             }
             0x0063 => {
+                // SLEEP sets TO and clears PD.
+                self.ram[3] = (self.ram[3] & !0x08) | 0x10;
                 self.halted = true; // SLEEP
                 return pc;
             }
-            0x0064 => return pc + 1, // CLRWDT
+            0x0064 => {
+                // CLRWDT sets TO and PD.
+                self.ram[3] |= 0x18;
+                return pc + 1;
+            }
             _ if (0x0010..=0x001F).contains(&word) => {
                 // MOVIW/MOVWI with pre/post inc/dec: 00 0000 0001 dnmm.
                 let n = ((word >> 2) & 1) as usize;
@@ -2211,10 +2260,16 @@ impl<'a> PicBaseline<'a> {
                 return pc + 1;
             }
             0x0003 => {
+                // SLEEP sets TO and clears PD.
+                self.ram[0x03] = (self.ram[0x03] & !0x08) | 0x10;
                 self.halted = true; // SLEEP
                 return pc;
             }
-            0x0004 => return pc + 1, // CLRWDT
+            0x0004 => {
+                // CLRWDT sets TO and PD.
+                self.ram[0x03] |= 0x18;
+                return pc + 1;
+            }
             0x0040 => {
                 self.w = 0; // CLRW
                 self.set_z(0);
@@ -2740,16 +2795,21 @@ impl Pic18 {
         let next = match word {
             0x0000 => pc + 2,
             0x0003 => {
-                // SLEEP: matches Pic14's convention (see `Pic14::exec_byte`)
-                // of `halted = true` as the simulator's stop condition:
+                // SLEEP sets RCON TO and clears PD. `halted = true` stays
+                // the simulator's stop condition (see `Pic14::exec_byte`):
                 // real programs end on this, since `parse_hex_pic18`
                 // returns the full flash-sized buffer (zero-padded NOPs
                 // all the way out), so running off the end of `prog`
                 // stays out of reach for programs within a step budget.
+                self.ram[0xFD0] = (self.ram[0xFD0] & !0x04) | 0x08;
                 self.halted = true;
                 pc
             }
-            0x0004 => pc + 2, // CLRWDT: no observable effect in this simulator
+            0x0004 => {
+                // CLRWDT sets RCON TO and PD.
+                self.ram[0xFD0] |= 0x0C;
+                pc + 2
+            }
             0x0005 => {
                 // PUSH: pushes PC+2 (the address of the next instruction)
                 // without jumping: the same stack effect as CALL, minus the
@@ -4180,6 +4240,66 @@ mod pic18_reset {
             assert_eq!(pic.ram()[addr], want, "POR latch at {addr:#06X}");
         }
         assert_eq!(pic.ram()[0x20], 0x00, "GPR still zero-filled");
+    }
+}
+
+#[cfg(test)]
+mod pic14_reset {
+    use super::Pic14;
+
+    /// Power-on latches over zero-filled RAM: STATUS TO/PD set, OPTION
+    /// all ones, TRIS inputs (DS39582B Table 4-2, gpsim 0.31.0). GPR
+    /// stays zero-filled around them.
+    #[test]
+    fn por_applies_latches_and_keeps_gpr_zero() {
+        let pic = Pic14::new(vec![0x0000; 4]);
+        // Every PIC14_POR entry, so a typo in any latch fails the suite.
+        for &(addr, want) in super::PIC14_POR {
+            assert_eq!(pic.ram()[addr], want, "POR latch at {addr:#05X}");
+        }
+        assert_eq!(pic.ram()[0x20], 0x00, "GPR still zero-filled");
+    }
+
+    /// STATUS writes cannot clear the POR cause bits: TO/PD are
+    /// read-only, so MOVWF STATUS with 0x07 lands as 0x1F. Ends on a
+    /// GOTO spin: SLEEP would clear PD as its own architectural effect.
+    #[test]
+    fn status_write_keeps_to_pd() {
+        let mut pic = Pic14::new(vec![0x3007, 0x0083, 0x2802]);
+        pic.run(10);
+        assert_eq!(pic.ram()[0x03], 0x1F);
+    }
+}
+
+#[cfg(test)]
+mod pic14e_reset {
+    use super::Pic14e;
+
+    /// Power-on latches over zero-filled RAM: STATUS TO/PD set, OPTION
+    /// all ones, TRIS inputs (DS41364E section 3.5). GPR stays
+    /// zero-filled around them.
+    #[test]
+    fn por_applies_latches_and_keeps_gpr_zero() {
+        let pic = Pic14e::new(vec![0x0000; 4]);
+        // Every PIC14E_POR entry, so a typo in any latch fails the suite.
+        for &(addr, want) in super::PIC14E_POR {
+            assert_eq!(pic.ram()[addr], want, "POR latch at {addr:#06X}");
+        }
+        assert_eq!(pic.ram()[0x20], 0x00, "GPR still zero-filled");
+    }
+
+    /// RESET re-applies the POR image to the SFRs while GPRs keep
+    /// their contents: MCLR restores SFR resets, not RAM.
+    #[test]
+    fn reset_reapplies_por_but_keeps_gpr() {
+        let mut pic = Pic14e::new(vec![0x0001]);
+        pic.ram_mut()[super::PIC14E_OPTION_REG] = 0x00;
+        pic.ram_mut()[0x03] |= 0x07; // ALU flags set before RESET
+        pic.ram_mut()[0x20] = 0x5A;
+        pic.run(1);
+        assert_eq!(pic.ram()[super::PIC14E_OPTION_REG], 0xFF);
+        assert_eq!(pic.ram()[0x03], 0x1F, "TO/PD restored, Z/DC/C survive");
+        assert_eq!(pic.ram()[0x20], 0x5A, "GPR survives RESET");
     }
 }
 

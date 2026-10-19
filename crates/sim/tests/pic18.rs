@@ -615,10 +615,11 @@ fn sleep_halts_the_simulator() {
 }
 
 #[test]
-fn clrwdt_advances_pc_with_no_other_effect() {
+fn clrwdt_advances_pc_and_sets_rcon_cause_bits() {
     let mut p = Pic18::new(vec![0x0004]); // CLRWDT
     p.run(1);
     assert_eq!(p.pc(), 2);
+    assert_eq!(p.ram()[0xFD0] & 0x0C, 0x0C, "CLRWDT sets RCON TO and PD");
 }
 
 #[test]

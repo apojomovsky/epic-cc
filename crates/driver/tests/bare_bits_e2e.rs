@@ -67,7 +67,8 @@ fn bare_bits_drive_sfr_bits_on_pic14() {
         !map.lines().any(|l| l.contains("GIE")),
         "GIE must not appear in the map:\n{map}"
     );
-    assert_eq!(p.ram()[0x86], 0x02, "bank-1 TRISB1 entity sets TRISB");
+    // TRISB POR is all-inputs, so setting the already-set TRISB1 keeps 0xFF.
+    assert_eq!(p.ram()[0x86], 0xFF, "bank-1 TRISB1 entity sets TRISB");
     // out = 0 (branch on the cleared RB0) plus PORTB (0x02).
     assert_eq!(p.ram()[map_addr(&map, "out")], 0x02, "out pins the read");
 }
@@ -222,7 +223,8 @@ fn struct_bit_rmw_matches_the_byte_semantics_in_the_simulator() {
     p.run(200_000);
     assert!(p.halted(), "program must halt");
     assert_eq!(p.ram()[0x06], 0x1A, "PORTB after the struct writes");
-    assert_eq!(p.ram()[0x86], 0x04, "TRISB2 via the bank-1 struct write");
+    // TRISB POR is all-inputs, so setting the already-set TRISB2 keeps 0xFF.
+    assert_eq!(p.ram()[0x86], 0xFF, "TRISB2 via the bank-1 struct write");
     assert_eq!(p.ram()[0x0B], 0x80, "GIE via the INTCON struct write");
     assert_eq!(p.ram()[map_addr(&map, "out")], 0x1A, "out reads PORTB back");
 }
