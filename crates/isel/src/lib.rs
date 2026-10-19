@@ -194,6 +194,8 @@ struct Gen<'m> {
     divmod: DivCore,
     /// Eight-pass straight-line `__mul_u8` body (epic-cc#974, #1095), speed profile only.
     fast_mul_u8: bool,
+    /// Seven-pass unrolled `__mul_u16` body (epic-cc#1342), speed profile only.
+    fast_mul_u16: bool,
     /// Byte-granular variable shifts (epic-cc#1171): the u16/u32 shift
     /// routines move whole bytes first when the masked count is >= 8,
     /// then bit-loop the remainder. Speed profile only.
@@ -5198,52 +5200,104 @@ impl<'m> Gen<'m> {
                 let (r0, r1) = (scr, scr + 1);
                 let (a_lo, a_hi) = (a, a + 1);
                 let (bk_lo, bk_hi) = (b, b + 1);
-                let l_loop = self.fresh_label();
-                let l_skip = self.fresh_label();
-                let l_noswap = self.fresh_label();
-                // Multiply commutes, but the loop runs bitlen(multiplier)
-                // passes: when the short operand arrived in `a`, exchange
-                // the slots (XOR swap, no temp needed) so the long one is
-                // shifted as the multiplicand instead of iterated over.
-                self.emit(format!("    MOVF 0x{a_hi:02X}, W"));
-                self.emit("    BTFSS STATUS, 2".to_string());
-                self.emit(format!("    GOTO {l_noswap}"));
-                self.emit(format!("    MOVF 0x{bk_hi:02X}, W"));
-                self.emit("    BTFSC STATUS, 2".to_string());
-                self.emit(format!("    GOTO {l_noswap}"));
-                for (x, y) in [(a_lo, bk_lo), (a_hi, bk_hi)] {
-                    self.emit(format!("    MOVF 0x{y:02X}, W"));
-                    self.emit(format!("    XORWF 0x{x:02X}, F"));
-                    self.emit(format!("    MOVF 0x{x:02X}, W"));
-                    self.emit(format!("    XORWF 0x{y:02X}, F"));
-                    self.emit(format!("    MOVF 0x{y:02X}, W"));
-                    self.emit(format!("    XORWF 0x{x:02X}, F"));
+                if self.fast_mul_u16 {
+                    // Pass k of the chain adds t = a << k to r when bit k of
+                    // the multiplier byte is set, testing the bit in place (no
+                    // multiplier shifts per pass, no exit test). Seven passes
+                    // shift t by 7, so the tail advances the 16-bit multiplier
+                    // by 7 bits and reruns the chain until it is zero (three
+                    // runs at most). A short `a` is swapped into the
+                    // multiplier slot first: its hi byte is zero, so the
+                    // multiplier then needs one or two runs.
+                    let l_start = self.fresh_label();
+                    let l_chain = self.fresh_label();
+                    self.emit(format!("    MOVF 0x{a_hi:02X}, W"));
+                    self.emit("    BTFSS STATUS, 2".to_string());
+                    self.emit(format!("    GOTO {l_start}"));
+                    self.emit(format!("    MOVF 0x{a_lo:02X}, W"));
+                    self.emit(format!("    XORWF 0x{bk_lo:02X}, W"));
+                    self.emit(format!("    XORWF 0x{a_lo:02X}, F"));
+                    self.emit(format!("    XORWF 0x{bk_lo:02X}, F")); // a_lo <-> b_lo
+                    self.emit(format!("    MOVF 0x{bk_hi:02X}, W"));
+                    self.emit(format!("    MOVWF 0x{a_hi:02X}"));
+                    self.emit(format!("    CLRF 0x{bk_hi:02X}"));
+                    self.emit(format!("{l_start}:"));
+                    self.emit(format!("    CLRF 0x{r0:02X}"));
+                    self.emit(format!("    CLRF 0x{r1:02X}")); // r = 0
+                    self.emit(format!("{l_chain}:"));
+                    for pass in 0..7 {
+                        let l_skip = self.fresh_label();
+                        self.emit(format!("    BTFSS 0x{bk_lo:02X}, {pass}"));
+                        self.emit(format!("    GOTO {l_skip}"));
+                        self.emit(format!("    MOVF 0x{a_lo:02X}, W"));
+                        self.emit(format!("    ADDWF 0x{r0:02X}, F"));
+                        self.emit(format!("    MOVF 0x{a_hi:02X}, W"));
+                        self.emit("    BTFSC STATUS, 0".to_string());
+                        self.emit(format!("    INCF 0x{a_hi:02X}, W")); // a_hi + carry; W target, slot kept
+                        self.emit(format!("    ADDWF 0x{r1:02X}, F"));
+                        self.emit(format!("{l_skip}:"));
+                        self.emit("    BCF STATUS, 0".to_string());
+                        self.emit(format!("    RLF 0x{a_lo:02X}, F"));
+                        self.emit(format!("    RLF 0x{a_hi:02X}, F")); // t <<= 1, mod 65536
+                    }
+                    self.emit(format!("    RLF 0x{bk_lo:02X}, W")); // C = bit 7 of b_lo
+                    self.emit(format!("    RLF 0x{bk_hi:02X}, W")); // W = (b >> 7) lo, C = b_hi bit 7
+                    self.emit(format!("    MOVWF 0x{bk_lo:02X}"));
+                    self.emit(format!("    CLRF 0x{bk_hi:02X}"));
+                    self.emit(format!("    RLF 0x{bk_hi:02X}, F")); // b_hi = (b >> 7) hi
+                    self.emit(format!("    IORWF 0x{bk_hi:02X}, W")); // Z = (b >> 7 == 0)
+                    self.emit("    BTFSS STATUS, 2".to_string());
+                    self.emit(format!("    GOTO {l_chain}"));
+                    self.store_retval(r0, 2);
+                    self.emit("    RETURN".to_string());
+                } else {
+                    let l_loop = self.fresh_label();
+                    let l_skip = self.fresh_label();
+                    let l_noswap = self.fresh_label();
+                    // Multiply commutes, but the loop runs bitlen(multiplier)
+                    // passes: when the short operand arrived in `a`, exchange
+                    // the slots (XOR swap, no temp needed) so the long one is
+                    // shifted as the multiplicand instead of iterated over.
+                    self.emit(format!("    MOVF 0x{a_hi:02X}, W"));
+                    self.emit("    BTFSS STATUS, 2".to_string());
+                    self.emit(format!("    GOTO {l_noswap}"));
+                    self.emit(format!("    MOVF 0x{bk_hi:02X}, W"));
+                    self.emit("    BTFSC STATUS, 2".to_string());
+                    self.emit(format!("    GOTO {l_noswap}"));
+                    for (x, y) in [(a_lo, bk_lo), (a_hi, bk_hi)] {
+                        self.emit(format!("    MOVF 0x{y:02X}, W"));
+                        self.emit(format!("    XORWF 0x{x:02X}, F"));
+                        self.emit(format!("    MOVF 0x{x:02X}, W"));
+                        self.emit(format!("    XORWF 0x{y:02X}, F"));
+                        self.emit(format!("    MOVF 0x{y:02X}, W"));
+                        self.emit(format!("    XORWF 0x{x:02X}, F"));
+                    }
+                    self.emit(format!("{l_noswap}:"));
+                    self.emit(format!("    CLRF 0x{r0:02X}"));
+                    self.emit(format!("    CLRF 0x{r1:02X}")); // r = 0
+                    self.emit(format!("{l_loop}:"));
+                    self.emit(format!("    BTFSS 0x{bk_lo:02X}, 0")); // test multiplier LSB
+                    self.emit(format!("    GOTO {l_skip}"));
+                    self.emit(format!("    MOVF 0x{a_lo:02X}, W"));
+                    self.emit(format!("    ADDWF 0x{r0:02X}, F"));
+                    self.emit(format!("    MOVF 0x{a_hi:02X}, W"));
+                    self.emit("    BTFSC STATUS, 0".to_string());
+                    self.emit(format!("    INCFSZ 0x{a_hi:02X}, W")); // a_hi + carry; W target, slot kept
+                    self.emit(format!("    ADDWF 0x{r1:02X}, F"));
+                    self.emit(format!("{l_skip}:"));
+                    self.emit("    BCF STATUS, 0".to_string());
+                    self.emit(format!("    RLF 0x{a_lo:02X}, F"));
+                    self.emit(format!("    RLF 0x{a_hi:02X}, F")); // t <<= 1, mod 65536
+                    self.emit("    BCF STATUS, 0".to_string());
+                    self.emit(format!("    RRF 0x{bk_hi:02X}, F"));
+                    self.emit(format!("    RRF 0x{bk_lo:02X}, F")); // bk >>= 1
+                    self.emit(format!("    MOVF 0x{bk_lo:02X}, W"));
+                    self.emit(format!("    IORWF 0x{bk_hi:02X}, W")); // Z = (bk == 0)
+                    self.emit("    BTFSS STATUS, 2".to_string());
+                    self.emit(format!("    GOTO {l_loop}"));
+                    self.store_retval(r0, 2);
+                    self.emit("    RETURN".to_string());
                 }
-                self.emit(format!("{l_noswap}:"));
-                self.emit(format!("    CLRF 0x{r0:02X}"));
-                self.emit(format!("    CLRF 0x{r1:02X}")); // r = 0
-                self.emit(format!("{l_loop}:"));
-                self.emit(format!("    BTFSS 0x{bk_lo:02X}, 0")); // test multiplier LSB
-                self.emit(format!("    GOTO {l_skip}"));
-                self.emit(format!("    MOVF 0x{a_lo:02X}, W"));
-                self.emit(format!("    ADDWF 0x{r0:02X}, F"));
-                self.emit(format!("    MOVF 0x{a_hi:02X}, W"));
-                self.emit("    BTFSC STATUS, 0".to_string());
-                self.emit(format!("    INCFSZ 0x{a_hi:02X}, W")); // a_hi + carry; W target, slot kept
-                self.emit(format!("    ADDWF 0x{r1:02X}, F"));
-                self.emit(format!("{l_skip}:"));
-                self.emit("    BCF STATUS, 0".to_string());
-                self.emit(format!("    RLF 0x{a_lo:02X}, F"));
-                self.emit(format!("    RLF 0x{a_hi:02X}, F")); // t <<= 1, mod 65536
-                self.emit("    BCF STATUS, 0".to_string());
-                self.emit(format!("    RRF 0x{bk_hi:02X}, F"));
-                self.emit(format!("    RRF 0x{bk_lo:02X}, F")); // bk >>= 1
-                self.emit(format!("    MOVF 0x{bk_lo:02X}, W"));
-                self.emit(format!("    IORWF 0x{bk_hi:02X}, W")); // Z = (bk == 0)
-                self.emit("    BTFSS STATUS, 2".to_string());
-                self.emit(format!("    GOTO {l_loop}"));
-                self.store_retval(r0, 2);
-                self.emit("    RETURN".to_string());
             }
             // Signed 16x16 -> 32 shift-add (epic-cc#1174): the loop
             // multiplies the two's-complement patterns as unsigned into
@@ -8595,6 +8649,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         retval_lo: g.retval_lo,
         divmod: g.divmod,
         fast_mul_u8: g.fast_mul_u8,
+        fast_mul_u16: g.fast_mul_u16,
         fast_shift: g.fast_shift,
         cur_func: g.cur_func,
         bool_temps: HashSet::new(),
@@ -13778,6 +13833,10 @@ pub struct Options {
     /// Unrolled `__mul_u8` (epic-cc#974, #1095): eight straight-line passes,
     /// no loop and no per-bit branch. The speed profile turns it on.
     pub fast_mul_u8: bool,
+    /// Unrolled `__mul_u16` (epic-cc#1342): seven straight-line passes over
+    /// the multiplier's low byte, rerun while the multiplier shifted right
+    /// by seven is nonzero. The speed profile turns it on.
+    pub fast_mul_u16: bool,
     /// Byte-granular variable shifts (epic-cc#1171): the u16/u32 shift
     /// routines move whole bytes first when the masked count is >= 8,
     /// then bit-loop the remainder. The speed profile turns it on.
@@ -13789,6 +13848,7 @@ impl Default for Options {
         Self {
             divmod: DivCore::Compact,
             fast_mul_u8: false,
+            fast_mul_u16: false,
             fast_shift: false,
         }
     }
@@ -13870,9 +13930,10 @@ fn place_unit(
 }
 
 /// `select_with_locs` with codegen options. The driver sets the divide core
-/// by profile (coarse at O1, exact at O2) and `fast_mul_u8`/`fast_shift`
-/// under O2, so the unsigned divide and multiply routines trade flash for
-/// cycles instead of the reverse (epic-cc#895, epic-cc#974, epic-cc#1171).
+/// by profile (coarse at O1, exact at O2) and `fast_mul_u8`/`fast_mul_u16`/
+/// `fast_shift` under O2, so the unsigned divide and multiply routines trade
+/// flash for cycles instead of the reverse (epic-cc#895, epic-cc#974,
+/// epic-cc#1342, epic-cc#1171).
 pub fn select_with_opts(
     device: &Device,
     m: &Module,
@@ -14083,6 +14144,7 @@ pub fn select_with_opts(
                 retval_lo,
                 divmod: opts.divmod,
                 fast_mul_u8: opts.fast_mul_u8,
+                fast_mul_u16: opts.fast_mul_u16,
                 fast_shift: opts.fast_shift,
                 cur_func: &f.name,
                 bool_temps: HashSet::new(),
@@ -14321,6 +14383,7 @@ pub fn select_with_opts(
                     retval_lo,
                     divmod: opts.divmod,
                     fast_mul_u8: opts.fast_mul_u8,
+                    fast_mul_u16: opts.fast_mul_u16,
                     fast_shift: opts.fast_shift,
                     cur_func: &f.name,
                     bool_temps: HashSet::new(),
@@ -14642,6 +14705,7 @@ pub fn select_with_opts(
                                 retval_lo,
                                 divmod: opts.divmod,
                                 fast_mul_u8: opts.fast_mul_u8,
+                                fast_mul_u16: opts.fast_mul_u16,
                                 fast_shift: opts.fast_shift,
                                 cur_func: &f.name,
                                 bool_temps: HashSet::new(),

@@ -3801,6 +3801,7 @@ fn sim_run_bytes_tier(
     let opts = Options {
         divmod: tier,
         fast_mul_u8: true,
+        fast_mul_u16: false,
         fast_shift: true,
     };
     let (asm, _, _, _) = select_with_opts(
@@ -4479,6 +4480,7 @@ fn mul_u8_unrolled_body_matches_wrapping_mul() {
     let opts = Options {
         divmod: DivCore::Exact,
         fast_mul_u8: true,
+        fast_mul_u16: false,
         fast_shift: true,
     };
     let (asm, _, _, _) = select_with_opts(
@@ -4499,6 +4501,65 @@ fn mul_u8_unrolled_body_matches_wrapping_mul() {
             assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
             assert_eq!(p.ram()[0x22], a.wrapping_mul(b), "__mul_u8({a}, {b})");
         }
+    }
+}
+
+/// The unrolled `__mul_u16` body (O2) against `wrapping_mul`: every pair
+/// from a boundary-heavy operand set (each high/low byte zero and nonzero,
+/// top bits, carry-ripple values) plus a fixed pseudo-random stream, so the
+/// swap path and the one-, two- and three-run multipliers are all exercised.
+#[test]
+fn mul_u16_unrolled_body_matches_wrapping_mul() {
+    use pic14_sim::Pic14;
+    let (ir, map) = routine_module("__mul_u16");
+    let m = parse(&ir);
+    let opts = Options {
+        divmod: DivCore::Exact,
+        fast_mul_u8: true,
+        fast_mul_u16: true,
+        fast_shift: true,
+    };
+    let (asm, _, _, _) = select_with_opts(
+        &PIC16F877A,
+        &m,
+        &addrs(&map_refs(&map)),
+        &HashSet::new(),
+        &ConstPool::empty(),
+        opts,
+    );
+    let words = asm::assemble(&asm);
+    let mut vals: Vec<u16> = vec![
+        0, 1, 2, 3, 5, 0x25, 0x7F, 0x80, 0x81, 0xFE, 0xFF, 0x100, 0x101, 0x1FF, 0x200, 0x1234,
+        0x7FFF, 0x8000, 0x8001, 0xFF00, 0xFF01, 0xFFFE, 0xFFFF, 0x0105, 0x2C01, 0xAAAA, 0x5555,
+        0x3FFF, 0x4000, 0x4001, 0xC000, 0x00C0, 0x0040,
+    ];
+    let edge = vals.len();
+    let mut x: u32 = 0x1234_5678;
+    for _ in 0..64 {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        vals.push((x >> 8) as u16);
+    }
+    let mut pairs: Vec<(u16, u16)> = Vec::new();
+    for &a in &vals[..edge] {
+        for &b in &vals[..edge] {
+            pairs.push((a, b));
+        }
+    }
+    for w in vals[edge..].windows(2) {
+        pairs.push((w[0], w[1]));
+        pairs.push((w[1] & 0xFF, w[0]));
+        pairs.push((w[1], w[0] & 0xFF));
+    }
+    for (a, b) in pairs {
+        let mut p = Pic14::new(words.clone());
+        p.ram_mut()[0x20] = a as u8;
+        p.ram_mut()[0x21] = (a >> 8) as u8;
+        p.ram_mut()[0x22] = b as u8;
+        p.ram_mut()[0x23] = (b >> 8) as u8;
+        p.run(200_000);
+        assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+        let got = u16::from(p.ram()[0x24]) | u16::from(p.ram()[0x25]) << 8;
+        assert_eq!(got, a.wrapping_mul(b), "__mul_u16({a:#06x}, {b:#06x})");
     }
 }
 
@@ -5184,6 +5245,7 @@ fn sim_run_bytes_shift(
     let opts = Options {
         divmod: DivCore::Compact,
         fast_mul_u8: false,
+        fast_mul_u16: false,
         fast_shift: true,
     };
     let (asm, _, _, _) = select_with_opts(
@@ -5212,6 +5274,7 @@ fn fast_shift_prefix_emits_only_under_o2() {
     let fast = Options {
         divmod: DivCore::Compact,
         fast_mul_u8: false,
+        fast_mul_u16: false,
         fast_shift: true,
     };
     let emit = |ir: &str, map: &[(String, u16)], opts: Options| {

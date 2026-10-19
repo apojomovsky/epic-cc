@@ -595,6 +595,7 @@ fn main() {
             let opts = isel::Options {
                 divmod,
                 fast_mul_u8: is_o2,
+                fast_mul_u16: is_o2,
                 fast_shift: is_o2,
             };
             let (asm, locs, c, b) =
