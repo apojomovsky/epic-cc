@@ -1,7 +1,7 @@
 # Nightly (and manual) lightweight for every device in crates/device/devices/*.toml,
 # plus the slow ignored fuzz corpus as an informational lane (doc 36, section 6:
 # slow lanes must not become gates, so fuzz-long is continue-on-error).
-# PR CI runs devices-all only for TOMLs touched in the diff; nightly proves no TOML
+# PR CI runs devices-changed only for TOMLs touched in the diff; nightly proves no TOML
 # drifted while no PR touched it. Per-device full fixtures stay out: a fuzz bug
 # is core-wide and the canonical already covers it (see ADR-019 and
 # docs/internals/specs/2026-08-22-pic-variants-design.md §8).
@@ -211,6 +211,9 @@ jobs:
             -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
             epic-cc-ci:latest bash -c 'cargo test -p fuzz --no-fail-fast -- --ignored'
 
-      # See devices-all's same-named step above.
+      # See devices-all's same-named step above. Always runs: this lane is
+      # expected to go red, and a failed test step must not leave target/
+      # root-owned (cache save would fail silently).
       - name: Fix target dir ownership (container runs as root)
+        if: always()
         run: sudo chown -R "$(id -u):$(id -g)" target
