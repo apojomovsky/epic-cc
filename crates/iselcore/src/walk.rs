@@ -2,9 +2,9 @@
 //! the driver size report. A counted single-block loop the walk lowering
 //! fuses (counter to `DECFSZ`, latch compare dropped, index chains rebuilt
 //! from the down-counter) leaves temps no emission reads: the increment,
-//! the latch compare, dead chain/trunc/link regs, and dead `@`-global
-//! loads take no home, single-use loads feeding an accumulate add stay in
-//! W, and the add shares its carried phi's home.
+//! the latch compare, and dead chain/trunc/link regs take no home,
+//! single-use loads feeding an accumulate add stay in W, and the add
+//! shares its carried phi's home.
 //!
 //! One analysis serves all three so a dropped slot is never read: the
 //! match below replicates `isel`'s single-block acceptance exactly, minus
@@ -186,7 +186,6 @@ fn match_one(
     dead.extend(body.vadds.iter().cloned());
     dead.extend(body.anddefs.iter().cloned());
     dead.extend(body.truncs.iter().cloned());
-    dead.extend(body.dead_loads.keys().cloned());
     let (wloads, acc) = accumulate_roles(b, uses, ctx, &body);
     Some(WalkMatch {
         header: b.label.clone(),
@@ -356,7 +355,6 @@ struct BodyRoles {
     anddefs: HashSet<String>,
     truncs: HashSet<String>,
     loads: Vec<(String, (String, usize))>,
-    dead_loads: HashMap<String, (String, usize)>,
 }
 
 struct AndDef {
@@ -613,52 +611,13 @@ fn walk_store_src_ok(ctx: &WalkCtx, f: &ir::Func, v: &Val) -> bool {
     }
 }
 
-/// A region `@`-global load feeding only the value chain at `aii`: its
-/// site goes dead and the chain re-reads the global. Anything else
-/// (shared, non-global) keeps the load emitted.
-fn walk_dead_load(
-    f: &ir::Func,
-    uses: &HashMap<String, Vec<(String, usize)>>,
-    r: &str,
-    aii: &(String, usize),
-) -> Option<((String, usize), String)> {
-    let mut found: Option<((String, usize), String)> = None;
-    for b in &f.blocks {
-        for (ii, i) in b.insts.iter().enumerate() {
-            if let Inst::Load(l) = i {
-                if l.dst == r {
-                    if found.is_some() {
-                        return None;
-                    }
-                    let glob = l.ptr.strip_prefix('@')?.to_string();
-                    found = Some(((b.label.clone(), ii), glob));
-                }
-            }
-        }
-    }
-    let (lii, glob) = found?;
-    if uses.get(r) == Some(&vec![aii.clone()]) {
-        Some((lii, glob))
-    } else {
-        None
-    }
-}
-
 /// Classify an index-as-value store's base: a literal folds into the
 /// rebuild, a data global re-reads per iteration, and a register reads
-/// its slot. A dead `@`-global load feeding only the chain re-reads its
-/// global instead. Records the dead load site, if any.
-#[allow(clippy::too_many_arguments)]
-fn walk_value_base_ok(
-    ctx: &WalkCtx,
-    f: &ir::Func,
-    uses: &HashMap<String, Vec<(String, usize)>>,
-    cntreg: &str,
-    increg: &str,
-    aii: (String, usize),
-    base: Val,
-    dead_loads: &mut HashMap<String, (String, usize)>,
-) -> bool {
+/// its slot. The backend's own dead-load skip (a single-use `@`-global
+/// load feeding only the chain, re-read from its global) stays on the
+/// emission side: those loads keep their homes here, so the drop set
+/// never names a value the planner's twin might still stage.
+fn walk_value_base_ok(ctx: &WalkCtx, f: &ir::Func, cntreg: &str, increg: &str, base: Val) -> bool {
     match base {
         Val::Const(_) => true,
         Val::Global(gg) => !global_is_const(ctx.module, &gg),
@@ -674,13 +633,6 @@ fn walk_value_base_ok(
             }
             if pool_risk(ctx, &f.name, &Val::Reg(r.clone())) {
                 return false;
-            }
-            if let Some((lii, glob)) = walk_dead_load(f, uses, &r, &aii) {
-                if glob.is_empty() || global_is_const(ctx.module, &glob) {
-                    return false;
-                }
-                dead_loads.insert(r.clone(), lii);
-                return true;
             }
             true
         }
@@ -767,7 +719,6 @@ fn match_body(
     // Masked-link dst to the chain dsts reading it, filled as masked adds
     // classify.
     let mut andmap: HashMap<String, Vec<String>> = HashMap::new();
-    let mut dead_loads: HashMap<String, (String, usize)> = HashMap::new();
     let mut loads: Vec<(String, (String, usize))> = Vec::new();
     let last = b.insts.len().checked_sub(1)?;
     for (ii, inst) in b.insts.iter().enumerate() {
@@ -944,16 +895,7 @@ fn match_body(
                     if vadds.contains(v) {
                         // Shared chains stay walkable while every use
                         // consumes them; the finish proof refuses the rest.
-                        if !walk_value_base_ok(
-                            ctx,
-                            f,
-                            uses,
-                            cntreg,
-                            increg,
-                            site(ii),
-                            vadd_bases[v].clone(),
-                            &mut dead_loads,
-                        ) {
+                        if !walk_value_base_ok(ctx, f, cntreg, increg, vadd_bases[v].clone()) {
                             return None;
                         }
                         walk_memop_ok(
@@ -1020,13 +962,12 @@ fn match_body(
         anddefs: anddefs.keys().cloned().collect(),
         truncs: ctr_truncs.keys().cloned().collect(),
         loads,
-        dead_loads,
     })
 }
 
 /// Walk-loop finish: consumption proofs. Everything the walk drops
-/// (value chain, dead loads, masked links) must read nowhere else; every
-/// counter read must sit on the pattern; every GEP must feed only the
+/// (value chain, masked links, counter truncs) must read nowhere else;
+/// every counter read must sit on the pattern; every GEP must feed only the
 /// walk memops that name it. Carried phis may read anywhere in the
 /// region; outside it they would see the exiting iteration's backedge
 /// copy, one update too many. A value chain may feed several walk
