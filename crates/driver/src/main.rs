@@ -778,7 +778,10 @@ fn main() {
     // Reserves the PIC14E hold byte only when isel parks a byte in it.
     let const_memcpy_hold = device.core == device::Core::Pic14e
         && isel_pic14e::const_memcpy_parks_hold(device, &m, &addrs);
-    let fixed_uses = driver::report::fixed_uses(&m, device.core, const_memcpy_hold);
+    // Fused walk latches never touch scratch (epic-cc#1370): same shared
+    // match, over the final map alloc and isel agreed on.
+    let latch_fused = driver::report::walk_latch_regs(&m, &layout.globals, device);
+    let fixed_uses = driver::report::fixed_uses(&m, device.core, const_memcpy_hold, &latch_fused);
     eprint!(
         "{}",
         driver::report::render_size(&device, &layout, &fixed_uses, program_words.len())

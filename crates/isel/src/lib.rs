@@ -246,6 +246,11 @@ struct Gen<'m> {
     /// loads whose byte never stages to a slot. `alloc` drops those
     /// slots; the load arm skips them and consumers read the source.
     w_folds: iselcore::ValueFolds,
+    /// Call-result regs no use reads (epic-cc#1370, PIC14 only): filled
+    /// per function in `emit_func_body` from the shared analysis `alloc`
+    /// drops homes by, so the caller copy and the callee retval write
+    /// skip them. Other cores leave it empty and emit as before.
+    dead_results: HashSet<String>,
     /// The slot address whose value `emit_w_store`/`emit_w_load` last left
     /// in W, or `None` when unknown. The cache skips a reload when the value
     /// never left W, and every cached slot is the SSA value's own private
@@ -3751,29 +3756,34 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVLW PAGE({target})"));
         self.emit("    MOVWF PCLATH".to_string());
         self.emit(format!("    CALL {target}"));
+        // A result no use reads takes no caller copy (epic-cc#1370):
+        // `alloc` gave it no home, so there is nothing to copy into.
+        // The restore below still runs; only the copy is dead.
         if let Some(d) = dst {
-            let t = ty.expect("isel: valued call must carry a type");
-            // A valued callee leaves its last retval byte in W: valued
-            // `Ret` stores low to high through W-preserving MOVWF, and
-            // the integer recipes end on `store_retval` the same way.
-            // Seed before the restore (no deferred store straddles the
-            // call, `emit` flushes it): a cross-page restore's MOVLW
-            // clears the seed, a same-page skip keeps it for the copy.
-            // Float callees keep the reload (see `call_returns_in_w`).
-            if Self::call_returns_in_w(func) {
-                self.w_holds = Some(self.retval_lo + u16::from(t.bytes()) - 1);
-                self.w_committed = true;
-            }
-            // Copy the retval region (0x71..0x71+bytes-1, up to 0x74 for
-            // i32) into dst ahead of the restore: the copy is MOVF/MOVWF
-            // only, it reads neither PCLATH nor a flag relation, so it
-            // runs identically on either page while W is still live.
-            // High byte first: W holds the last retval byte, so the
-            // first load elides for every width, not just single-byte.
-            let da = self.slot_addr(self.cur_func, d).direct();
-            for i in (0..t.bytes()).rev() {
-                self.emit_w_load(self.retval_lo + u16::from(i));
-                self.emit_w_store(da + u16::from(i));
+            if !self.dead_results.contains(d) {
+                let t = ty.expect("isel: valued call must carry a type");
+                // A valued callee leaves its last retval byte in W: valued
+                // `Ret` stores low to high through W-preserving MOVWF, and
+                // the integer recipes end on `store_retval` the same way.
+                // Seed before the restore (no deferred store straddles the
+                // call, `emit` flushes it): a cross-page restore's MOVLW
+                // clears the seed, a same-page skip keeps it for the copy.
+                // Float callees keep the reload (see `call_returns_in_w`).
+                if Self::call_returns_in_w(func) {
+                    self.w_holds = Some(self.retval_lo + u16::from(t.bytes()) - 1);
+                    self.w_committed = true;
+                }
+                // Copy the retval region (0x71..0x71+bytes-1, up to 0x74 for
+                // i32) into dst ahead of the restore: the copy is MOVF/MOVWF
+                // only, it reads neither PCLATH nor a flag relation, so it
+                // runs identically on either page while W is still live.
+                // High byte first: W holds the last retval byte, so the
+                // first load elides for every width, not just single-byte.
+                let da = self.slot_addr(self.cur_func, d).direct();
+                for i in (0..t.bytes()).rev() {
+                    self.emit_w_load(self.retval_lo + u16::from(i));
+                    self.emit_w_store(da + u16::from(i));
+                }
             }
         }
         // The next direct call sets PCLATH before any PCLATH read, so this restore is dead.
@@ -3830,7 +3840,11 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_trap}:"));
         self.emit(format!("    GOTO {l_trap}"));
         self.emit(format!("{l_done}:"));
+        // A result no use reads takes no copy either (epic-cc#1370).
         if let Some(d) = dst {
+            if self.dead_results.contains(d) {
+                return;
+            }
             let t = ty.expect("isel: valued call must carry a type");
             let da = self.slot_addr(self.cur_func, d).direct();
             for i in 0..t.bytes() {
@@ -4465,6 +4479,15 @@ impl<'m> Gen<'m> {
             }
             Inst::Ret(None, _) => self.emit("    RETURN".to_string()),
             Inst::Ret(Some((ty, v)), _) => {
+                // No caller uses the value (epic-cc#1370, PIC14 only):
+                // skip the fixed retval write, nobody reads it. The
+                // report claims no retval bytes on the same predicate.
+                if matches!(self.device.core, device::Core::Pic14)
+                    && !iselcore::walk::ret_value_used(self.m, self.cur_func)
+                {
+                    self.emit("    RETURN".to_string());
+                    return;
+                }
                 // Copy the value into the fixed retval slots (0x71..0x74 for
                 // i32), then RETURN.
                 for i in 0..ty.bytes() {
@@ -8662,6 +8685,7 @@ fn emit_log_pool_variant<'m>(g: &mut Gen<'m>, f: &ir::Func) {
         split: g.split,
         global_addrs: g.global_addrs,
         w_folds: g.w_folds.clone(),
+        dead_results: HashSet::new(),
         w_holds: None,
         w_committed: false,
         use_count: HashMap::new(),
@@ -8707,13 +8731,21 @@ struct WalkLoop {
 enum WalkOp {
     /// Normal arm, region-block inst index.
     Emit(usize),
-    /// `FSR = base + (K - count)`, byte to its slot.
+    /// `FSR = base + (K - count)`, byte to its slot, or left in W when
+    /// the shared walk match proves the single consumer reads it there
+    /// (epic-cc#1370: `slot` is `None` and the value takes no home).
     Load {
-        slot: u16,
+        slot: Option<u16>,
         irp: bool,
         lit: u8,
         loc: Option<SrcLoc>,
     },
+    /// A single-use walk load accumulated straight into its carried phi's
+    /// home (epic-cc#1370): W holds the load, `slot` the phi, and one
+    /// `ADDWF`/`MOVWF` pair replaces the parked load plus the add plus
+    /// the backedge copy. Runs immediately after its load op, so nothing
+    /// clobbers W between them.
+    Accumulate { slot: u16, loc: Option<SrcLoc> },
     /// `FSR = base + (K - count)`, slot or literal into INDF.
     Store {
         src: WalkBase,
@@ -9287,6 +9319,47 @@ impl<'m> Gen<'m> {
         let header = by_label.get(region.first()?.as_str())?;
         let latch = by_label.get(region.last()?.as_str())?;
         let site = |bl: &str, ii: usize| (bl.to_string(), ii);
+        // Shared walk roles (epic-cc#1370): the one analysis `alloc`
+        // drops homes by. A header the match declines plans exactly as
+        // before; adhoc divergence panics on the missing slot, never a
+        // wrong address. Multi-shape headers never match (the match is
+        // single-block), so their regions keep every home.
+        let roles = if matches!(g.device.core, device::Core::Pic14) {
+            let globals: HashMap<String, u16> =
+                g.m.globals
+                    .iter()
+                    .filter_map(|gg| g.addrs.get(&gg.name).map(|a| (gg.name.clone(), *a)))
+                    .collect();
+            let ctx = iselcore::walk::WalkCtx {
+                resolved: g.resolved,
+                folds: &g.w_folds,
+                unplaced,
+                prov: &g.prov,
+                globals: &globals,
+                ram_banks: g.device.ram_banks,
+                common_ram: g.device.common_ram,
+                module: g.m,
+                pic14: true,
+            };
+            iselcore::walk::match_walks(g.m, f, &ctx)
+                .into_iter()
+                .find(|w| w.header == region[0])
+        } else {
+            None
+        };
+        let acc: HashMap<&str, &str> = roles
+            .as_ref()
+            .map(|r| {
+                r.acc
+                    .iter()
+                    .map(|(a, p)| (a.as_str(), p.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let wloads: HashSet<&str> = roles
+            .as_ref()
+            .map(|r| r.wloads.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
         let phi_ii = header
             .insts
             .iter()
@@ -9476,7 +9549,21 @@ impl<'m> Gen<'m> {
                                     if !Self::walk_plain_bin(q) {
                                         return None;
                                     }
-                                    body.push(WalkOp::Emit(ii));
+                                    // An accumulate add shares its carried
+                                    // phi's home and reads its load from W:
+                                    // one fused arm instead of the parked
+                                    // load plus the add. The match proves
+                                    // the shape; a missing phi home panics
+                                    // loud here, never a wrong address.
+                                    if let Some(phi) = acc.get(q.dst.as_str()) {
+                                        let slot = g.slot_addr(&f.name, phi).direct();
+                                        body.push(WalkOp::Accumulate {
+                                            slot,
+                                            loc: q.loc.clone(),
+                                        });
+                                    } else {
+                                        body.push(WalkOp::Emit(ii));
+                                    }
                                 }
                             }
                             WalkAdd::PostInc => return None,
@@ -9562,7 +9649,14 @@ impl<'m> Gen<'m> {
                             &mut gep_users,
                             &mut term_sites,
                         )?;
-                        let slot = g.slot_addr(&f.name, &l.dst).direct();
+                        // A W-held load takes no home: the byte stays in W
+                        // for its accumulate consumer, which the match
+                        // proves adjacent with no clobber between them.
+                        let slot = if wloads.contains(l.dst.as_str()) {
+                            None
+                        } else {
+                            Some(g.slot_addr(&f.name, &l.dst).direct())
+                        };
                         body.push(WalkOp::Load {
                             slot,
                             irp,
@@ -10277,7 +10371,20 @@ impl<'m> Gen<'m> {
                     self.cur_loc = loc.clone();
                     self.emit_walk_fsr(plan, *irp, *lit);
                     self.emit("    MOVF INDF, W".to_string());
-                    self.emit(format!("    MOVWF 0x{slot:02X}"));
+                    // A `None` slot leaves the byte in W for the
+                    // immediately following accumulate arm: the match
+                    // proves no other reader and no clobber between them.
+                    if let Some(s) = slot {
+                        self.emit(format!("    MOVWF 0x{s:02X}"));
+                    }
+                }
+                WalkOp::Accumulate { slot, loc } => {
+                    self.cur_loc = loc.clone();
+                    // W holds the load; the phi home takes the sum. The
+                    // store marks W with the result, so the latch's
+                    // backedge self-copy elides entirely.
+                    self.emit(format!("    ADDWF 0x{slot:02X}, W"));
+                    self.emit_w_store(*slot);
                 }
                 WalkOp::Store { src, irp, lit, loc } => {
                     self.cur_loc = loc.clone();
@@ -11378,6 +11485,14 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
     g.use_count = use_count;
     g.deferred_store = None;
     g.deferred_uses = 0;
+    // Call results no use reads (epic-cc#1370): the caller copy and the
+    // callee retval write skip them. Other cores leave the set empty and
+    // emit as before, so only PIC14 programs change shape.
+    g.dead_results = if matches!(g.device.core, device::Core::Pic14) {
+        iselcore::walk::dead_call_results(f)
+    } else {
+        HashSet::new()
+    };
     // Runtime routines (legalize-injected): the entry block holds only the
     // scratch alloca, so instead of the (empty) block emission the recipe
     // body goes here: the label, the adapted epicurus asm, and the RETURN
@@ -14157,6 +14272,7 @@ pub fn select_with_opts(
                 split: &no_split,
                 global_addrs: &global_addrs,
                 w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
+                dead_results: HashSet::new(),
                 w_holds: None,
                 w_committed: false,
                 use_count: HashMap::new(),
@@ -14396,6 +14512,7 @@ pub fn select_with_opts(
                     split: &split_set,
                     global_addrs: &global_addrs,
                     w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
+                    dead_results: HashSet::new(),
                     w_holds: None,
                     w_committed: false,
                     use_count: HashMap::new(),
@@ -14718,6 +14835,7 @@ pub fn select_with_opts(
                                 split: &split_set,
                                 global_addrs: &global_addrs,
                                 w_folds: folds.get(&f.name).cloned().unwrap_or_default(),
+                                dead_results: HashSet::new(),
                                 w_holds: None,
                                 w_committed: false,
                                 use_count: HashMap::new(),

@@ -3,6 +3,7 @@
 
 pub mod chunk;
 pub mod delay;
+pub mod walk;
 
 use ir::{GepBase, Inst, Module};
 use std::collections::{HashMap, HashSet};

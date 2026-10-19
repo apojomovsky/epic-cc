@@ -654,6 +654,7 @@ fn frame_layout(
     va_size: u16,
     unplaced: &HashSet<String>,
     retval_homed: &HashSet<String>,
+    walk_acc: &HashMap<String, String>,
 ) -> FrameLayout {
     let order = block_order(f);
     let idx: HashMap<&str, usize> = order
@@ -1205,6 +1206,28 @@ fn frame_layout(
                 }
             }
         }
+    }
+    // Walk accumulate edge (epic-cc#1370): a one-byte add feeding a carried
+    // walk phi shares the phi's home. The match proves the add reads the
+    // phi before writing (the other operand rides W) and every use is the
+    // phi edge or a post-loop read served by the exit copy, so the shared
+    // slot carries the same bytes the two homes would. The pin machinery
+    // below applies the edge with its usual clash guard; a missed pin
+    // keeps two homes, never a wrong one. Fixed-region values stay out
+    // like above: liveness cannot see their clobbers.
+    for (add, phi) in walk_acc {
+        let (Some(&(_, _, w_a, _, mem_a)), Some(&(_, _, w_d, _, mem_d))) =
+            (defs.get(add), defs.get(phi))
+        else {
+            continue;
+        };
+        if mem_a || mem_d || w_a != w_d {
+            continue;
+        }
+        if retval_homed.contains(add) || retval_homed.contains(phi) {
+            continue;
+        }
+        coalesce.insert(add.clone(), phi.clone());
     }
 
     // Diamond-touch phi pin (epic-cc#1160): a phi joining two distinct live
@@ -2855,7 +2878,7 @@ pub fn allocate_with_pool(
     };
     let select_impl = |dip: Dip, precise: bool| -> (AllocLayout, HashMap<String, u16>) {
         let (nofold, fit, nofold_base) =
-            allocate_inner(device, m, edges_text, None, pool, dip, precise);
+            allocate_inner(device, m, edges_text, None, pool, dip, precise, None);
         if matches!(device.core, Core::Pic14 | Core::Pic14e) {
             // Globals-first is exact, not monotone: global placement reads
             // only the module's globals, never the frame widths the gated
@@ -2867,8 +2890,16 @@ pub fn allocate_with_pool(
                 .filter(|g| !g.is_const && nofold.globals.contains_key(&g.name))
                 .map(|g| g.name.clone())
                 .collect();
-            let (layout, _, base) =
-                allocate_inner(device, m, edges_text, Some(&safe), pool, dip, precise);
+            let (layout, _, base) = allocate_inner(
+                device,
+                m,
+                edges_text,
+                Some(&safe),
+                pool,
+                dip,
+                precise,
+                Some(&nofold.globals),
+            );
             return (layout, base);
         }
         if device.core != Core::Pic18 || !fit {
@@ -2886,7 +2917,7 @@ pub fn allocate_with_pool(
             .map(|g| g.name.clone())
             .collect();
         let (layout, _, base) =
-            allocate_inner(device, m, edges_text, Some(&safe), pool, dip, precise);
+            allocate_inner(device, m, edges_text, Some(&safe), pool, dip, precise, None);
         (layout, base)
     };
     // Precise intervals shrink frames, and every shrink re-tiles the
@@ -3119,8 +3150,12 @@ fn flash_resident_consts(
 /// the per-site live-high dip; `Dip::Off` follows the caller-end rule
 /// everywhere, the pre-dip layout bit for bit. `precise` bounds memory
 /// objects by their use ranges (epic-cc#853); off keeps the pre-lever
-/// layout bit for bit. Returns the layout, the fit flag, and the frame
-/// bases (the tie-break in `allocate_with_pool` compares them).
+/// layout bit for bit. `walk_globals` is the bounding pass's globals map
+/// (epic-cc#1370): the gated pass reads global addresses off it for the
+/// walk window proof, which is exact because global placement never reads
+/// frame widths. `None` (the bounding pass) drops no walk temps. Returns
+/// the layout, the fit flag, and the frame bases (the tie-break in
+/// `allocate_with_pool` compares them).
 fn allocate_inner(
     device: &Device,
     m: &Module,
@@ -3129,6 +3164,7 @@ fn allocate_inner(
     pool: bool,
     dip: Dip,
     precise: bool,
+    walk_globals: Option<&HashMap<String, u16>>,
 ) -> (AllocLayout, bool, HashMap<String, u16>) {
     // The va region size frame_layout reserves: the widest call site, with
     // a one-byte floor so a variadic function whose call sites pass no
@@ -3200,31 +3236,60 @@ fn allocate_inner(
     // load-forwarded stores, and single-byte `Bin`-into-store results,
     // which both backends compute straight into the destination
     // (epic-cc#862). Wider forwarded bins keep their slot.
-    let unplaced: HashMap<String, HashSet<String>> = m
-        .funcs
-        .iter()
-        .map(|f| {
-            let empty = ValueFolds::default();
-            let folds = folds.get(&f.name).unwrap_or(&empty);
-            let dropped = if matches!(device.core, Core::Pic14 | Core::Pic14e) {
-                folds.unplaced_pic14(f)
-            } else {
-                folds.unplaced()
-            };
-            let mut dropped = dropped;
-            // isel-pic18's fused compares write no 0/1 byte and read their
-            // operand loads in place, and its W-threaded const producers
-            // leave the byte in W for the store (epic-cc#862). Both are
-            // gate-independent, so the bounding pass drops the same regs
-            // and the gated pass still only shrinks the overlay.
-            if device.core == Core::Pic18 {
-                dropped.extend(iselcore::fused_compare_regs(f, m, &resolved, &packed_bits));
-                dropped.extend(iselcore::const_w_phi_regs(f, m, &resolved, &packed_bits));
+    //
+    // PIC14 also drops walk temps (epic-cc#1370): the latch increments and
+    // compares, dead index chains, and W-held loads take no home, from the
+    // one analysis `isel` fuses by, over the bounding pass's globals (the
+    // window proof's addresses, exact per the two-pass rule above). Unused
+    // call results take no home either: no use ever reads them.
+    let prov = iselcore::flash_provenance(m);
+    let mut walk_acc: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut unplaced: HashMap<String, HashSet<String>> = HashMap::new();
+    for f in &m.funcs {
+        let empty = ValueFolds::default();
+        let folds = folds.get(&f.name).unwrap_or(&empty);
+        let fold_dropped = if matches!(device.core, Core::Pic14 | Core::Pic14e) {
+            folds.unplaced_pic14(f)
+        } else {
+            folds.unplaced()
+        };
+        let mut dropped = fold_dropped.clone();
+        // isel-pic18's fused compares write no 0/1 byte and read their
+        // operand loads in place, and its W-threaded const producers
+        // leave the byte in W for the store (epic-cc#862). Both are
+        // gate-independent, so the bounding pass drops the same regs
+        // and the gated pass still only shrinks the overlay.
+        if device.core == Core::Pic18 {
+            dropped.extend(iselcore::fused_compare_regs(f, m, &resolved, &packed_bits));
+            dropped.extend(iselcore::const_w_phi_regs(f, m, &resolved, &packed_bits));
+        }
+        if device.core == Core::Pic14 {
+            if let Some(globals) = walk_globals {
+                let ctx = iselcore::walk::WalkCtx {
+                    resolved: &resolved,
+                    folds,
+                    unplaced: &fold_dropped,
+                    prov: &prov,
+                    globals,
+                    ram_banks: &device.ram_banks,
+                    common_ram: device.common_ram,
+                    module: m,
+                    pic14: true,
+                };
+                for wm in iselcore::walk::match_walks(m, f, &ctx) {
+                    dropped.extend(wm.dead.iter().cloned());
+                    dropped.extend(wm.wloads.iter().cloned());
+                    for (add, phi) in wm.acc {
+                        walk_acc.entry(f.name.clone()).or_default().insert(add, phi);
+                    }
+                }
             }
-            (f.name.clone(), dropped)
-        })
-        .collect();
+            dropped.extend(iselcore::walk::dead_call_results(f));
+        }
+        unplaced.insert(f.name.clone(), dropped);
+    }
     let no_fold: HashSet<String> = HashSet::new();
+    let no_acc: HashMap<String, String> = HashMap::new();
     let unplaced_in = |name: &str| unplaced.get(name).unwrap_or(&no_fold);
 
     // Steps 1-5 shape the frame overlay over a region whose start is still
@@ -3345,6 +3410,7 @@ fn allocate_inner(
             floored_va_size(f, &va_sizes),
             unplaced_in(&f.name),
             &retval_in(&f.name),
+            walk_acc.get(&f.name).unwrap_or(&no_acc),
         );
         live_map.insert(f.name.clone(), fl.live);
         locals_widths.insert(f.name.clone(), fl.widths);
@@ -4985,6 +5051,7 @@ fn allocate_inner(
             floored_va_size(f, &va_sizes),
             unplaced_in(&f.name),
             &retval_in(&f.name),
+            walk_acc.get(&f.name).unwrap_or(&no_acc),
         );
         // The frame end the coloring's own slot order produces; every callee
         // base is derived from it (`frame_end` over `locals_widths`), so a

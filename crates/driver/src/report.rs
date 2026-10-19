@@ -14,6 +14,7 @@ use alloc::AllocLayout;
 use device::Device;
 use ir::{Bin, BinOp, Icmp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use irparse::DebugVars;
+use std::collections::{HashMap, HashSet};
 
 /// The address-to-source-line table: one `file:line:col <addr>` record per
 /// word of the final program, sorted by address. Compiler-generated words
@@ -357,7 +358,12 @@ fn bin_scratch(bin: &Bin) -> bool {
 /// memcpy parks the byte in the hold byte across an indirect
 /// destination setup. `const_memcpy_hold` reports whether any constant
 /// memcpy has one; only alloc addresses decide that, so the caller asks isel.
-pub fn fixed_uses(module: &Module, core: device::Core, const_memcpy_hold: bool) -> FixedUses {
+pub fn fixed_uses(
+    module: &Module,
+    core: device::Core,
+    const_memcpy_hold: bool,
+    latch_fused: &HashSet<String>,
+) -> FixedUses {
     let mut retval: u8 = 0;
     let mut flag = false;
     let mut delay: u8 = 0;
@@ -374,18 +380,35 @@ pub fn fixed_uses(module: &Module, core: device::Core, const_memcpy_hold: bool) 
         _ => None,
     };
     for f in &module.funcs {
+        // Unused call results claim no retval bytes on PIC14 (epic-cc#1370):
+        // the caller copy and the callee write are both gone. Other cores
+        // keep the type-based claim and stay byte-identical.
+        let dead = if core == device::Core::Pic14 {
+            iselcore::walk::dead_call_results(f)
+        } else {
+            HashSet::new()
+        };
+        let ret_used =
+            core != device::Core::Pic14 || iselcore::walk::ret_value_used(module, &f.name);
         if let Some(t) = f.ret {
-            retval = retval.max(t.bytes());
+            if ret_used {
+                retval = retval.max(t.bytes());
+            }
         }
         for b in &f.blocks {
             for inst in &b.insts {
                 match inst {
                     Inst::Ret(Some((t, _)), _) => {
-                        retval = retval.max(t.bytes());
+                        if ret_used {
+                            retval = retval.max(t.bytes());
+                        }
                     }
                     Inst::Call(c) => {
                         if let Some(t) = c.ty {
-                            retval = retval.max(t.bytes());
+                            let used = c.dst.as_ref().is_some_and(|d| !dead.contains(d));
+                            if core != device::Core::Pic14 || used {
+                                retval = retval.max(t.bytes());
+                            }
                         }
                         if c.func == "_delay" && c.callees.is_empty() {
                             match c.args.as_slice() {
@@ -467,7 +490,12 @@ pub fn fixed_uses(module: &Module, core: device::Core, const_memcpy_hold: bool) 
                         {
                             wide_icmp = true;
                         }
-                        if resolved.is_some() && icmp_scratch(core, ic) {
+                        // A fused walk latch compare never materializes, so
+                        // it never touches scratch (epic-cc#1370). The set
+                        // comes from the same match the backends fuse by.
+                        let fused = core == device::Core::Pic14
+                            && latch_fused.contains(&iselcore::ssa_key(&f.name, &ic.dst));
+                        if resolved.is_some() && !fused && icmp_scratch(core, ic) {
                             scratch = true;
                         }
                     }
@@ -538,6 +566,48 @@ pub fn fixed_uses(module: &Module, core: device::Core, const_memcpy_hold: bool) 
             memcpy_hold: false,
         },
     }
+}
+
+/// Walk latch compares the backend fuses (epic-cc#1370), as
+/// `{func}::{reg}` keys for `fixed_uses`' scratch model. Runs the same
+/// shared match `alloc` drops homes by, over the final globals, so the
+/// verdicts agree on every loop. Empty off PIC14.
+pub fn walk_latch_regs(
+    module: &Module,
+    globals: &HashMap<String, u16>,
+    device: &Device,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    if device.core != device::Core::Pic14 {
+        return out;
+    }
+    let resolved = iselcore::resolve_pointers(module);
+    let safe: HashSet<String> = module
+        .globals
+        .iter()
+        .filter(|g| !g.is_const && globals.contains_key(&g.name))
+        .map(|g| g.name.clone())
+        .collect();
+    let prov = iselcore::flash_provenance(module);
+    for f in &module.funcs {
+        let folds = iselcore::find_value_folds(f, module, &resolved, Some(&safe));
+        let unplaced = folds.unplaced_pic14(f);
+        let ctx = iselcore::walk::WalkCtx {
+            resolved: &resolved,
+            folds: &folds,
+            unplaced: &unplaced,
+            prov: &prov,
+            globals,
+            ram_banks: device.ram_banks,
+            common_ram: device.common_ram,
+            module,
+            pic14: true,
+        };
+        for wm in iselcore::walk::match_walks(module, f, &ctx) {
+            out.insert(iselcore::ssa_key(&f.name, &wm.latch));
+        }
+    }
+    out
 }
 
 /// The fixed bytes the program occupies outside the overlay: PIC14's
@@ -828,9 +898,9 @@ mod tests {
     #[test]
     fn empty_program_touches_no_fixed_bytes() {
         let m = void_main(vec![]);
-        let u18 = fixed_uses(&m, pic18(), false);
+        let u18 = fixed_uses(&m, pic18(), false, &HashSet::new());
         assert_eq!((u18.retval_bytes, u18.flag), (0, false));
-        let u14 = fixed_uses(&m, pic14(), false);
+        let u14 = fixed_uses(&m, pic14(), false, &HashSet::new());
         assert_eq!((u14.retval_bytes, u14.flag), (0, false));
         assert!(!u14.scratch);
         assert!(!u14.memcpy_park);
@@ -849,8 +919,14 @@ mod tests {
         });
         let ret = Inst::Ret(Some((Ty::I16, Val::Reg("r".to_string()))), None);
         let m = void_main(vec![call, ret]);
-        assert_eq!(fixed_uses(&m, pic18(), false).retval_bytes, 2);
-        assert_eq!(fixed_uses(&m, pic14(), false).retval_bytes, 2);
+        assert_eq!(
+            fixed_uses(&m, pic18(), false, &HashSet::new()).retval_bytes,
+            2
+        );
+        assert_eq!(
+            fixed_uses(&m, pic14(), false, &HashSet::new()).retval_bytes,
+            2
+        );
     }
 
     #[test]
@@ -864,9 +940,12 @@ mod tests {
             loc: None,
         });
         let m = void_main(vec![sub]);
-        assert!(fixed_uses(&m, pic18(), false).flag);
-        assert_eq!(fixed_uses(&m, pic18(), false).retval_bytes, 0);
-        assert!(!fixed_uses(&m, pic14(), false).flag);
+        assert!(fixed_uses(&m, pic18(), false, &HashSet::new()).flag);
+        assert_eq!(
+            fixed_uses(&m, pic18(), false, &HashSet::new()).retval_bytes,
+            0
+        );
+        assert!(!fixed_uses(&m, pic14(), false, &HashSet::new()).flag);
     }
 
     #[test]
@@ -879,7 +958,7 @@ mod tests {
             b: Val::Reg("x".to_string()),
             loc: None,
         });
-        assert!(!fixed_uses(&void_main(vec![sub]), pic18(), false).flag);
+        assert!(!fixed_uses(&void_main(vec![sub]), pic18(), false, &HashSet::new()).flag);
     }
 
     #[test]
@@ -891,7 +970,7 @@ mod tests {
             loc: None,
         });
         assert_eq!(
-            fixed_uses(&void_main(vec![reg]), pic14(), false).retval_bytes,
+            fixed_uses(&void_main(vec![reg]), pic14(), false, &HashSet::new()).retval_bytes,
             2
         );
         let fixed = Inst::Memcpy(Memcpy {
@@ -901,7 +980,7 @@ mod tests {
             loc: None,
         });
         assert_eq!(
-            fixed_uses(&void_main(vec![fixed]), pic14(), false).retval_bytes,
+            fixed_uses(&void_main(vec![fixed]), pic14(), false, &HashSet::new()).retval_bytes,
             0
         );
     }
@@ -917,11 +996,17 @@ mod tests {
             loc: None,
         });
         assert_eq!(
-            fixed_uses(&void_main(vec![cmp.clone()]), pic14(), false).retval_bytes,
+            fixed_uses(
+                &void_main(vec![cmp.clone()]),
+                pic14(),
+                false,
+                &HashSet::new()
+            )
+            .retval_bytes,
             1
         );
         assert_eq!(
-            fixed_uses(&void_main(vec![cmp]), pic18(), false).retval_bytes,
+            fixed_uses(&void_main(vec![cmp]), pic18(), false, &HashSet::new()).retval_bytes,
             0
         );
         let unsigned = Inst::Icmp(Icmp {
@@ -933,7 +1018,7 @@ mod tests {
             loc: None,
         });
         assert_eq!(
-            fixed_uses(&void_main(vec![unsigned]), pic14(), false).retval_bytes,
+            fixed_uses(&void_main(vec![unsigned]), pic14(), false, &HashSet::new()).retval_bytes,
             0
         );
     }
@@ -954,8 +1039,14 @@ mod tests {
             funcs: vec![],
             module_asm: vec![],
         };
-        assert_eq!(fixed_uses(&m, pic14(), false).retval_bytes, 1);
-        assert_eq!(fixed_uses(&m, pic18(), false).retval_bytes, 0);
+        assert_eq!(
+            fixed_uses(&m, pic14(), false, &HashSet::new()).retval_bytes,
+            1
+        );
+        assert_eq!(
+            fixed_uses(&m, pic18(), false, &HashSet::new()).retval_bytes,
+            0
+        );
     }
 
     #[test]
@@ -976,8 +1067,14 @@ mod tests {
         let m = void_main(vec![delay]);
         let plan = iselcore::delay::plan_delay(1000);
         let depth = plan.nests.iter().map(Vec::len).max().unwrap_or(0) as u8;
-        assert_eq!(fixed_uses(&m, pic18(), false).retval_bytes, depth);
-        assert_eq!(fixed_uses(&m, pic14(), false).retval_bytes, depth);
+        assert_eq!(
+            fixed_uses(&m, pic18(), false, &HashSet::new()).retval_bytes,
+            depth
+        );
+        assert_eq!(
+            fixed_uses(&m, pic14(), false, &HashSet::new()).retval_bytes,
+            depth
+        );
     }
 
     fn bin_op(op: BinOp, ty: Ty, a: Val, b: Val) -> Inst {
@@ -1005,17 +1102,17 @@ mod tests {
     #[test]
     fn narrow_alu_skips_pic14_scratch() {
         let add = bin_op(BinOp::Add, Ty::I8, Val::Reg("x".to_string()), Val::Const(1));
-        let u = fixed_uses(&void_main(vec![add]), pic14(), false);
+        let u = fixed_uses(&void_main(vec![add]), pic14(), false, &HashSet::new());
         assert!(!u.scratch);
         let sub8 = bin_op(BinOp::Sub, Ty::I8, Val::Const(7), Val::Reg("x".to_string()));
-        assert!(!fixed_uses(&void_main(vec![sub8]), pic14(), false).scratch);
+        assert!(!fixed_uses(&void_main(vec![sub8]), pic14(), false, &HashSet::new()).scratch);
         let sub16 = bin_op(
             BinOp::Sub,
             Ty::I16,
             Val::Reg("x".to_string()),
             Val::Reg("y".to_string()),
         );
-        assert!(!fixed_uses(&void_main(vec![sub16]), pic14(), false).scratch);
+        assert!(!fixed_uses(&void_main(vec![sub16]), pic14(), false, &HashSet::new()).scratch);
     }
 
     #[test]
@@ -1026,15 +1123,23 @@ mod tests {
             Val::Reg("x".to_string()),
             Val::Reg("y".to_string()),
         );
-        assert!(fixed_uses(&void_main(vec![add32.clone()]), pic14(), false).scratch);
-        assert!(fixed_uses(&void_main(vec![add32]), pic14e(), false).scratch);
+        assert!(
+            fixed_uses(
+                &void_main(vec![add32.clone()]),
+                pic14(),
+                false,
+                &HashSet::new()
+            )
+            .scratch
+        );
+        assert!(fixed_uses(&void_main(vec![add32]), pic14e(), false, &HashSet::new()).scratch);
         let sub16 = bin_op(
             BinOp::Sub,
             Ty::I16,
             Val::Const(7),
             Val::Reg("x".to_string()),
         );
-        assert!(fixed_uses(&void_main(vec![sub16]), pic14(), false).scratch);
+        assert!(fixed_uses(&void_main(vec![sub16]), pic14(), false, &HashSet::new()).scratch);
     }
 
     #[test]
@@ -1045,15 +1150,23 @@ mod tests {
             Val::Reg("x".to_string()),
             Val::Reg("y".to_string()),
         );
-        assert!(fixed_uses(&void_main(vec![wide]), pic14(), false).scratch);
+        assert!(fixed_uses(&void_main(vec![wide]), pic14(), false, &HashSet::new()).scratch);
         let narrow = icmp_op(
             "eq",
             Ty::I8,
             Val::Reg("x".to_string()),
             Val::Reg("y".to_string()),
         );
-        assert!(!fixed_uses(&void_main(vec![narrow.clone()]), pic14(), false).scratch);
-        assert!(fixed_uses(&void_main(vec![narrow]), pic14e(), false).scratch);
+        assert!(
+            !fixed_uses(
+                &void_main(vec![narrow.clone()]),
+                pic14(),
+                false,
+                &HashSet::new()
+            )
+            .scratch
+        );
+        assert!(fixed_uses(&void_main(vec![narrow]), pic14e(), false, &HashSet::new()).scratch);
     }
 
     #[test]
@@ -1061,18 +1174,18 @@ mod tests {
         let reg = || Val::Reg("x".to_string());
         // Unsigned reg-reg chain without equality folds in place.
         let ult = icmp_op("ult", Ty::I16, reg(), Val::Reg("y".to_string()));
-        assert!(!fixed_uses(&void_main(vec![ult]), pic14(), false).scratch);
+        assert!(!fixed_uses(&void_main(vec![ult]), pic14(), false, &HashSet::new()).scratch);
         // Equality-needing, signed, and const-byte chains spill.
         let ugt = icmp_op("ugt", Ty::I16, reg(), Val::Reg("y".to_string()));
-        assert!(fixed_uses(&void_main(vec![ugt]), pic14(), false).scratch);
+        assert!(fixed_uses(&void_main(vec![ugt]), pic14(), false, &HashSet::new()).scratch);
         let slt = icmp_op("slt", Ty::I16, reg(), Val::Reg("y".to_string()));
-        assert!(fixed_uses(&void_main(vec![slt]), pic14(), false).scratch);
+        assert!(fixed_uses(&void_main(vec![slt]), pic14(), false, &HashSet::new()).scratch);
         let const_rhs = icmp_op("ult", Ty::I16, reg(), Val::Const(9));
-        assert!(fixed_uses(&void_main(vec![const_rhs]), pic14(), false).scratch);
+        assert!(fixed_uses(&void_main(vec![const_rhs]), pic14(), false, &HashSet::new()).scratch);
         let signed8 = icmp_op("slt", Ty::I8, reg(), Val::Reg("y".to_string()));
-        assert!(fixed_uses(&void_main(vec![signed8]), pic14(), false).scratch);
+        assert!(fixed_uses(&void_main(vec![signed8]), pic14(), false, &HashSet::new()).scratch);
         let unsigned8 = icmp_op("ult", Ty::I8, reg(), Val::Reg("y".to_string()));
-        assert!(!fixed_uses(&void_main(vec![unsigned8]), pic14(), false).scratch);
+        assert!(!fixed_uses(&void_main(vec![unsigned8]), pic14(), false, &HashSet::new()).scratch);
     }
 
     fn table_module(is_const: bool, terms: Vec<(u16, String)>) -> Module {
@@ -1108,21 +1221,37 @@ mod tests {
 
     #[test]
     fn const_table_load_touches_scratch() {
-        assert!(fixed_uses(&table_module(true, vec![]), pic14(), false).scratch);
-        assert!(fixed_uses(&table_module(true, vec![]), pic14e(), false).scratch);
-        assert!(!fixed_uses(&table_module(false, vec![]), pic14(), false).scratch);
+        assert!(fixed_uses(&table_module(true, vec![]), pic14(), false, &HashSet::new()).scratch);
+        assert!(
+            fixed_uses(
+                &table_module(true, vec![]),
+                pic14e(),
+                false,
+                &HashSet::new()
+            )
+            .scratch
+        );
+        assert!(
+            !fixed_uses(
+                &table_module(false, vec![]),
+                pic14(),
+                false,
+                &HashSet::new()
+            )
+            .scratch
+        );
     }
 
     #[test]
     fn general_index_sum_touches_scratch() {
         // One scale-1 term keeps the fast FSR shape on both cores.
         let fast = table_module(false, vec![(1, "i".to_string())]);
-        assert!(!fixed_uses(&fast, pic14(), false).scratch);
-        assert!(!fixed_uses(&fast, pic14e(), false).scratch);
+        assert!(!fixed_uses(&fast, pic14(), false, &HashSet::new()).scratch);
+        assert!(!fixed_uses(&fast, pic14e(), false, &HashSet::new()).scratch);
         // Two terms accumulate through scratch.
         let slow = table_module(false, vec![(1, "i".to_string()), (1, "j".to_string())]);
-        assert!(fixed_uses(&slow, pic14(), false).scratch);
-        assert!(fixed_uses(&slow, pic14e(), false).scratch);
+        assert!(fixed_uses(&slow, pic14(), false, &HashSet::new()).scratch);
+        assert!(fixed_uses(&slow, pic14e(), false, &HashSet::new()).scratch);
     }
 
     #[test]
@@ -1133,7 +1262,7 @@ mod tests {
             len: MemLen::Reg(Val::Reg("n".to_string())),
             loc: None,
         });
-        let u = fixed_uses(&void_main(vec![reg]), pic14(), false);
+        let u = fixed_uses(&void_main(vec![reg]), pic14(), false, &HashSet::new());
         assert!(u.memcpy_park);
         assert!(u.scratch);
         // Plain globals take the empty term list: PIC14 still
@@ -1144,10 +1273,15 @@ mod tests {
             len: MemLen::Reg(Val::Reg("n".to_string())),
             loc: None,
         });
-        let u14 = fixed_uses(&void_main(vec![global.clone()]), pic14(), false);
+        let u14 = fixed_uses(
+            &void_main(vec![global.clone()]),
+            pic14(),
+            false,
+            &HashSet::new(),
+        );
         assert!(u14.memcpy_park);
         assert!(u14.scratch);
-        let u14e = fixed_uses(&void_main(vec![global]), pic14e(), false);
+        let u14e = fixed_uses(&void_main(vec![global]), pic14e(), false, &HashSet::new());
         assert!(u14e.memcpy_park);
         assert!(!u14e.scratch);
     }
@@ -1160,11 +1294,21 @@ mod tests {
             len: MemLen::Const(4),
             loc: None,
         });
-        let u14 = fixed_uses(&void_main(vec![copy.clone()]), pic14(), true);
+        let u14 = fixed_uses(
+            &void_main(vec![copy.clone()]),
+            pic14(),
+            true,
+            &HashSet::new(),
+        );
         assert!(!u14.memcpy_hold);
-        let direct = fixed_uses(&void_main(vec![copy.clone()]), pic14e(), false);
+        let direct = fixed_uses(
+            &void_main(vec![copy.clone()]),
+            pic14e(),
+            false,
+            &HashSet::new(),
+        );
         assert!(!direct.memcpy_hold);
-        let indirect = fixed_uses(&void_main(vec![copy]), pic14e(), true);
+        let indirect = fixed_uses(&void_main(vec![copy]), pic14e(), true, &HashSet::new());
         assert!(indirect.memcpy_hold);
         assert!(!indirect.memcpy_park);
     }
@@ -1202,11 +1346,11 @@ mod tests {
     fn store_term_shapes_match_load_shapes() {
         let mut fast = slot_chain_terms(vec![(1, "i".to_string())]);
         with_store(&mut fast);
-        assert!(!fixed_uses(&fast, pic14(), false).scratch);
+        assert!(!fixed_uses(&fast, pic14(), false, &HashSet::new()).scratch);
         let mut slow = slot_chain_terms(vec![(1, "i".to_string()), (1, "j".to_string())]);
         with_store(&mut slow);
-        assert!(fixed_uses(&slow, pic14(), false).scratch);
-        assert!(fixed_uses(&slow, pic14e(), false).scratch);
+        assert!(fixed_uses(&slow, pic14(), false, &HashSet::new()).scratch);
+        assert!(fixed_uses(&slow, pic14e(), false, &HashSet::new()).scratch);
     }
 
     #[test]
@@ -1238,8 +1382,8 @@ mod tests {
                 loc: None,
             }),
         ]);
-        assert!(fixed_uses(&m, pic14(), false).scratch);
-        assert!(!fixed_uses(&m, pic14e(), false).scratch);
+        assert!(fixed_uses(&m, pic14(), false, &HashSet::new()).scratch);
+        assert!(!fixed_uses(&m, pic14e(), false, &HashSet::new()).scratch);
     }
 
     #[test]
@@ -1268,7 +1412,7 @@ mod tests {
             addr: None,
             internal: false,
         });
-        assert!(fixed_uses(&m, pic14(), false).scratch);
+        assert!(fixed_uses(&m, pic14(), false, &HashSet::new()).scratch);
         m.funcs.push(Func {
             name: iselcore::LOG_POOL_CALLEE.to_string(),
             ret: None,
@@ -1280,6 +1424,6 @@ mod tests {
             unreachable_body: false,
             variadic: false,
         });
-        assert!(fixed_uses(&m, pic14(), false).scratch);
+        assert!(fixed_uses(&m, pic14(), false, &HashSet::new()).scratch);
     }
 }
