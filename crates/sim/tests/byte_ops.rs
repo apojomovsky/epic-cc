@@ -36,6 +36,7 @@ fn decfsz_and_incfsz_leave_status_alone() {
     assert_eq!(p.ram()[0x20], 0x01);
     assert_eq!(p.ram()[0x03], 0x07);
     let mut p = Pic14::new(vec![0x0BA0, 0x0000, 0x0063]);
+    p.ram_mut()[0x03] = 0x00;
     p.ram_mut()[0x20] = 0x01;
     p.run(10);
     assert_eq!(p.ram()[0x20], 0x00);
@@ -47,6 +48,7 @@ fn decfsz_and_incfsz_leave_status_alone() {
     assert_eq!(p.ram()[0x20], 0x02);
     assert_eq!(p.ram()[0x03], 0x07);
     let mut p = Pic14::new(vec![0x0FA0, 0x0000, 0x0063]);
+    p.ram_mut()[0x03] = 0x00;
     p.ram_mut()[0x20] = 0xFF;
     p.run(10);
     assert_eq!(p.ram()[0x20], 0x00);

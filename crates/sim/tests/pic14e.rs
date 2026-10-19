@@ -620,7 +620,9 @@ fn decfsz_and_incfsz_leave_status_alone() {
              SLEEP\n",
     );
     assert_eq!(p.ram()[0x20], 0x01);
-    assert_eq!(p.ram()[0x03], 0x07);
+    // TO/PD are read-only and stay set from POR, so MOVWF STATUS with
+    // 0x07 lands as 0x1F.
+    assert_eq!(p.ram()[0x03], 0x1F);
     let p = run_asm(
         "    org 0x20\n\
              MOVLW 0x07\n\
@@ -631,5 +633,5 @@ fn decfsz_and_incfsz_leave_status_alone() {
              SLEEP\n",
     );
     assert_eq!(p.ram()[0x20], 0x02);
-    assert_eq!(p.ram()[0x03], 0x07);
+    assert_eq!(p.ram()[0x03], 0x1F);
 }

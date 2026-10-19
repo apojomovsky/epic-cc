@@ -155,9 +155,22 @@ const PIC14_ADCON1: usize = 0x9F;
 /// CMCON 0x9C latches comparators off (0x07) at POR, as PIC18 does.
 const PIC14_CMCON: usize = 0x9C;
 const PIC14_CMCON_OFF: u8 = 0x07;
-/// PIC14 POR latches over the zero-filled RAM. The ADC registers reset to
-/// zero (ADC off, GO clear); only the comparator needs a nonzero latch.
+/// PIC14 POR latches over the zero-filled RAM (DS39582B Table 4-2, as
+/// observed on gpsim 0.31.0): STATUS TO/PD set, OPTION all ones, TRIS
+/// all inputs, TXSTA TRMT set with TSR empty, PR2 period reset. The ADC
+/// registers reset to zero (ADC off, GO clear); only the comparator
+/// needs a nonzero latch. Zero-POR registers are omitted: the fill
+/// already matches them.
 const PIC14_POR: &[(usize, u8)] = &[
+    (0x03, 0x18),             // STATUS: TO/PD set
+    (PIC14_OPTION_REG, 0xFF), // OPTION_REG: prescaler max, external clock
+    (0x85, 0x3F),             // TRISA: RA5:RA0 inputs, bits 7:6 unimplemented
+    (0x86, 0xFF),             // TRISB: pins are inputs
+    (0x87, 0xFF),             // TRISC: pins are inputs
+    (0x88, 0xFF),             // TRISD: pins are inputs
+    (0x89, 0x07),             // TRISE: RE2:RE0 inputs, bits 7:3 unimplemented
+    (0x92, 0xFF),             // PR2: Timer2 period reset
+    (0x98, 0x02),             // TXSTA: TRMT set, TSR empty
     (PIC14_ADCON0, 0x00),
     (PIC14_ADCON1, 0x00),
     (PIC14_CMCON, PIC14_CMCON_OFF),
@@ -172,10 +185,20 @@ const PIC14E_ADRESH: usize = 0x9C;
 const PIC14E_ADCON1: usize = 0x9E;
 const PIC14E_CM1CON0: usize = 0x111;
 const PIC14E_CM2CON0: usize = 0x113;
-/// PIC14E POR latches: every entry is zero (ADC off, GO clear, CxON
-/// clear), stated explicitly so the off-by-default contract has an
-/// address to test against rather than relying on the fill.
+/// PIC14E POR latches over the zero-filled RAM (DS41364E section 3.5;
+/// the shared enhanced-core resets match gpsim 0.31.0 on the 16F1825):
+/// STATUS TO/PD set, OPTION all ones, TRIS all inputs, TXSTA TRMT set,
+/// PR2 period reset. Zero entries (ADC off, GO clear, CxON clear) stay
+/// explicit so the off-by-default contract has an address to test
+/// against rather than relying on the fill.
 const PIC14E_POR: &[(usize, u8)] = &[
+    (0x03, 0x18),              // STATUS: TO/PD set
+    (PIC14E_OPTION_REG, 0xFF), // OPTION_REG: prescaler max, external clock
+    (0x8C, 0xFF),              // TRISA: pins are inputs
+    (0x8D, 0xFF),              // TRISB: pins are inputs
+    (0x8E, 0xFF),              // TRISC: pins are inputs
+    (0x1B, 0xFF),              // PR2: Timer2 period reset
+    (0x19E, 0x02),             // TXSTA: TRMT set, TSR empty
     (PIC14E_ADCON0, 0x00),
     (PIC14E_ADCON1, 0x00),
     (PIC14E_CM1CON0, 0x00),
@@ -1515,9 +1538,13 @@ impl Pic14e {
             0x0000 => return pc + 1, // NOP
             0x0001 => {
                 // RESET: reinitialize the core (PC 0, W 0, stack emptied),
-                // matching `Pic18`'s RESET model.
+                // matching `Pic18`'s RESET model. The POR image re-applies:
+                // MCLR restores SFR resets while GPRs keep their contents.
                 self.w = 0;
                 self.stack.clear();
+                for &(addr, v) in PIC14E_POR {
+                    self.ram[addr] = v;
+                }
                 return 0;
             }
             0x0008 => return self.pop_return(), // RETURN
@@ -4180,6 +4207,55 @@ mod pic18_reset {
             assert_eq!(pic.ram()[addr], want, "POR latch at {addr:#06X}");
         }
         assert_eq!(pic.ram()[0x20], 0x00, "GPR still zero-filled");
+    }
+}
+
+#[cfg(test)]
+mod pic14_reset {
+    use super::Pic14;
+
+    /// Power-on latches over zero-filled RAM: STATUS TO/PD set, OPTION
+    /// all ones, TRIS inputs (DS39582B Table 4-2, gpsim 0.31.0). GPR
+    /// stays zero-filled around them.
+    #[test]
+    fn por_applies_latches_and_keeps_gpr_zero() {
+        let pic = Pic14::new(vec![0x0000; 4]);
+        // Every PIC14_POR entry, so a typo in any latch fails the suite.
+        for &(addr, want) in super::PIC14_POR {
+            assert_eq!(pic.ram()[addr], want, "POR latch at {addr:#05X}");
+        }
+        assert_eq!(pic.ram()[0x20], 0x00, "GPR still zero-filled");
+    }
+}
+
+#[cfg(test)]
+mod pic14e_reset {
+    use super::Pic14e;
+
+    /// Power-on latches over zero-filled RAM: STATUS TO/PD set, OPTION
+    /// all ones, TRIS inputs (DS41364E section 3.5). GPR stays
+    /// zero-filled around them.
+    #[test]
+    fn por_applies_latches_and_keeps_gpr_zero() {
+        let pic = Pic14e::new(vec![0x0000; 4]);
+        // Every PIC14E_POR entry, so a typo in any latch fails the suite.
+        for &(addr, want) in super::PIC14E_POR {
+            assert_eq!(pic.ram()[addr], want, "POR latch at {addr:#06X}");
+        }
+        assert_eq!(pic.ram()[0x20], 0x00, "GPR still zero-filled");
+    }
+
+    /// RESET re-applies the POR image to the SFRs while GPRs keep
+    /// their contents: MCLR restores SFR resets, not RAM.
+    #[test]
+    fn reset_reapplies_por_but_keeps_gpr() {
+        let mut pic = Pic14e::new(vec![0x0001]);
+        pic.ram_mut()[super::PIC14E_OPTION_REG] = 0x00;
+        pic.ram_mut()[0x20] = 0x5A;
+        pic.run(1);
+        assert_eq!(pic.ram()[super::PIC14E_OPTION_REG], 0xFF);
+        assert_eq!(pic.ram()[0x03], 0x18);
+        assert_eq!(pic.ram()[0x20], 0x5A, "GPR survives RESET");
     }
 }
 
