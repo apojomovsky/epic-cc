@@ -111,10 +111,11 @@ fn legalize_inner(m: Module, pic18: bool, core: device::Core) -> Module {
     // carried form for its own walk.
     let m = if pic18 { m } else { rotate_strcmp_loops(m) };
     let m = narrow_div_rem_tails(m);
-    // Widening products narrow on classic PIC14 only: the other cores keep
-    // `__mul_u32` and have no `__mul_s16` recipe. Runs before the lowering
-    // loop so the loop never sees the wide multiply it would route to u32.
-    let (m, wide_mul) = if core == device::Core::Pic14 {
+    // Widening products narrow on classic PIC14 and PIC18: pic14e and
+    // baseline keep `__mul_u32` and have no `__mul_s16` recipe. Runs
+    // before the lowering loop so the loop never sees the wide multiply
+    // it would route to u32.
+    let (m, wide_mul) = if matches!(core, device::Core::Pic14 | device::Core::Pic18) {
         narrow_widening_mul(m)
     } else {
         (m, false)
@@ -2818,13 +2819,14 @@ fn narrow_div_rem_tails(m: Module) -> Module {
     }
 }
 
-/// Narrow a widening product to a signed 16x16 -> 32 call (epic-cc#1174).
-/// clang widens both Q8.8 factors (`sext i16 -> i32`) before `mul i32`,
-/// which pays two sign-extension diamonds plus a 32-iteration `__mul_u32`.
-/// The product of two i16 values always fits i32, so `__mul_s16` (two i16
-/// params, i32 result) computes it with a 16-iteration loop and a sign
-/// correction. Sexts with surviving uses stay; the sweep drops only defs
-/// the rewrite orphaned.
+/// Narrow a widening product to a signed 16x16 -> 32 call (epic-cc#1174,
+/// epic-cc#1344). clang widens both Q8.8 factors (`sext i16 -> i32`)
+/// before `mul i32`, which pays two sign-extension diamonds plus a wide
+/// `__mul_u32`. The product of two i16 values always fits i32, so
+/// `__mul_s16` (two i16 params, i32 result) computes it instead: a
+/// 16-iteration loop with sign correction on PIC14, four hardware
+/// partials with correction on PIC18. Sexts with surviving uses stay;
+/// the sweep drops only defs the rewrite orphaned.
 fn narrow_widening_mul(m: Module) -> (Module, bool) {
     let mut funcs = Vec::with_capacity(m.funcs.len());
     let mut fired = false;

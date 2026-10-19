@@ -4174,11 +4174,11 @@ fn narrowing_keeps_shared_sexts_and_plain_wide_muls() {
     );
 }
 
-/// Other cores keep the wide form: only classic PIC14 has a `__mul_s16`
-/// recipe, so PIC18 (and pic14e/baseline through the same gate) still
-/// lower to `__mul_u32` with the sexts intact.
+/// PIC18 narrows widening products too (epic-cc#1344): same shape as the
+/// classic rewrite, through the core-sized entry, into the MULWF recipe's
+/// 6-byte frame.
 #[test]
-fn widening_mul_stays_wide_off_pic14() {
+fn narrows_sext_mul_on_pic18() {
     let src = "global in i16\n\
          global out i32\n\
          fn main(void) ()\n\
@@ -4190,11 +4190,44 @@ fn widening_mul_stays_wide_off_pic14() {
              %m = mul i32 %x, %y\n\
              store i32 %m @out\n\
              ret void\n";
-    for core in [
+    let text = ir::serialize(&legalize::legalize_for_core(
+        parse(src),
         device::Core::Pic18,
-        device::Core::Pic14e,
-        device::Core::PicBaseline,
-    ] {
+    ));
+    assert!(
+        text.contains("%m = call i32 @__mul_s16(i16 %a, i16 %b)"),
+        "PIC18 must narrow to the i16 sources:\n{text}"
+    );
+    assert!(
+        !text.contains("sext i16"),
+        "orphaned sexts must drop:\n{text}"
+    );
+    assert!(
+        text.contains("fn __mul_s16(i32) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 6"),
+        "the widening routine must inject with its 6-byte frame:\n{text}"
+    );
+    assert!(
+        !text.contains("__mul_u32"),
+        "no 32-bit multiply may remain:\n{text}"
+    );
+}
+
+/// pic14e and baseline keep the wide form: without a `__mul_s16` recipe
+/// they still lower to `__mul_u32` with the sexts intact.
+#[test]
+fn widening_mul_stays_wide_off_pic14_and_pic18() {
+    let src = "global in i16\n\
+         global out i32\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load i16 @in\n\
+             %b = load i16 @in\n\
+             %x = sext i16 %a to i32\n\
+             %y = sext i16 %b to i32\n\
+             %m = mul i32 %x, %y\n\
+             store i32 %m @out\n\
+             ret void\n";
+    for core in [device::Core::Pic14e, device::Core::PicBaseline] {
         let text = ir::serialize(&legalize::legalize_for_core(parse(src), core));
         assert!(
             text.contains("%m = call i32 @__mul_u32(i32 %x, i32 %y)"),
@@ -4202,7 +4235,7 @@ fn widening_mul_stays_wide_off_pic14() {
         );
         assert!(
             !text.contains("__mul_s16"),
-            "core {core:?} must not reference the classic-only routine:\n{text}"
+            "core {core:?} must not reference the narrowing routine:\n{text}"
         );
     }
 }
