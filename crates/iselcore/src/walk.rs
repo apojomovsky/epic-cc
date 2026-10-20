@@ -23,7 +23,10 @@ use std::collections::{HashMap, HashSet};
 
 use ir::{BinOp, Inst, Module, Val};
 
-use crate::{const_fan_in, ssa_key, Base, FlashProvenance, LoadFold, PtrResolution, ValueFolds};
+use crate::{
+    const_fan_in, ssa_key, Base, FlashProvenance, LoadFold, PtrResolution, ValueFolds,
+    LOG_POOL_CALLEE,
+};
 
 /// Inputs to the walk match. `unplaced` is the caller's own folds drop
 /// set (`alloc` passes its gated folds, `isel` its `w_folds` set); on
@@ -104,7 +107,80 @@ pub fn match_walks(m: &Module, f: &ir::Func, ctx: &WalkCtx) -> Vec<WalkMatch> {
     out
 }
 
-#[allow(clippy::too_many_arguments)]
+/// `{func}::{reg}` slots the pool-log variant rewrites to pool indices
+/// (epic-cc#817): the fmt param, closed over phi/gep/select derivations.
+/// Mirrors `isel`'s closure so the match declines what the variant must.
+fn pool_slot_closure(f: &ir::Func) -> HashSet<String> {
+    let key = |n: &str| ssa_key(&f.name, n);
+    let mut set = HashSet::new();
+    if let Some(p) = f.params.iter().find(|p| p.ptr) {
+        set.insert(key(&p.name));
+    }
+    let mut progressed = true;
+    while progressed {
+        progressed = false;
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let dst = match inst {
+                    Inst::Phi(p) if p.ptr => {
+                        let any = p
+                            .incoming
+                            .iter()
+                            .any(|(v, _)| matches!(v, Val::Reg(r) if set.contains(&key(r))));
+                        any.then(|| p.dst.clone())
+                    }
+                    Inst::Gep(g) => match &g.base {
+                        ir::GepBase::Reg(b) if set.contains(&key(b)) => Some(g.dst.clone()),
+                        _ => None,
+                    },
+                    Inst::Select(s) if s.ptr => {
+                        let arm = |v: &Val| matches!(v, Val::Reg(r) if set.contains(&key(r)));
+                        (arm(&s.a) || arm(&s.b)).then(|| s.dst.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(d) = dst {
+                    if set.insert(key(&d)) {
+                        progressed = true;
+                    }
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Whether a walk header block names any pool-index slot, as a use or a
+/// def. Either way the variant's divergence owns the loop, so the match
+/// stays out and every home survives for the variant's normal emission.
+fn block_touches_pool_slots(func: &str, b: &ir::Block, slots: &HashSet<String>) -> bool {
+    let key = |n: &str| ssa_key(func, n);
+    for inst in &b.insts {
+        for r in ir::read_vals(inst) {
+            if !r.is_empty() && !r.starts_with('@') && slots.contains(&key(&r)) {
+                return true;
+            }
+        }
+        let dst: Option<&String> = match inst {
+            Inst::Phi(p) => Some(&p.dst),
+            Inst::Bin(q) => Some(&q.dst),
+            Inst::Gep(g) => Some(&g.dst),
+            Inst::Load(l) => Some(&l.dst),
+            Inst::Trunc(t) => Some(&t.dst),
+            Inst::Zext(z) => Some(&z.dst),
+            Inst::Sext(s) => Some(&s.dst),
+            Inst::Icmp(c) => Some(&c.dst),
+            Inst::Select(s) => Some(&s.dst),
+            Inst::Call(c) => c.dst.as_ref(),
+            _ => None,
+        };
+        if dst.is_some_and(|d| slots.contains(&key(d))) {
+            return true;
+        }
+    }
+    false
+}
+
 fn match_one(
     f: &ir::Func,
     b: &ir::Block,
@@ -173,6 +249,17 @@ fn match_one(
     let pre_block = f.blocks.iter().find(|x| x.label == pre)?;
     if !matches!(&pre_block.insts.last(), Some(Inst::Br(br)) if br.target == b.label) {
         return None;
+    }
+    // Pool-log variant guard (epic-cc#1409): the variant rewrites the fmt
+    // param's phi/gep/select derivations to pool indices and declines any
+    // walk touching them, while this match only declines const-derived
+    // pool risk. A loop the variant must decline keeps every home here,
+    // so the variant's normal emission never names a dropped slot.
+    if f.name == LOG_POOL_CALLEE {
+        let slots = pool_slot_closure(f);
+        if block_touches_pool_slots(&f.name, b, &slots) {
+            return None;
+        }
     }
     match preds.get(b.label.as_str()) {
         Some(ps)
@@ -1411,6 +1498,56 @@ mod tests {
         assert!(!w.dead.contains("8"), "held byte keeps its home");
         assert!(w.wloads.is_empty());
         assert!(w.acc.is_empty());
+    }
+
+    /// Pool-log variant guard (epic-cc#1409): a loop the variant must
+    /// decline keeps every home. The same shape in a plain function
+    /// still matches.
+    #[test]
+    fn log_callee_loop_touching_fmt_derivation_declines() {
+        const IR: &str = "global src i8\n\
+            global dst i8\n\
+            fn epic_harness_log(void) (0=ptr)\n\
+            block 3:\n\
+            br 5\n\
+            block 4:\n\
+            ret void\n\
+            block 5:\n\
+            %6 = phi i16 %10 5 0 3\n\
+            %d = gep %0 +0\n\
+            %7 = gep @src +0 +1*%6\n\
+            %8 = load i8 %7\n\
+            %9 = gep @dst +0 +1*%6\n\
+            store i8 %8 %9\n\
+            %10 = add i16 %6 1\n\
+            %11 = icmp eq i16 %10 32\n\
+            br i1 %11 4 5\n\
+            fn log_plain(void) (0=ptr)\n\
+            block 3:\n\
+            br 5\n\
+            block 4:\n\
+            ret void\n\
+            block 5:\n\
+            %6 = phi i16 %10 5 0 3\n\
+            %d = gep %0 +0\n\
+            %7 = gep @src +0 +1*%6\n\
+            %8 = load i8 %7\n\
+            %9 = gep @dst +0 +1*%6\n\
+            store i8 %8 %9\n\
+            %10 = add i16 %6 1\n\
+            %11 = icmp eq i16 %10 32\n\
+            br i1 %11 4 5\n";
+        let m = ir::parse(IR);
+        let globals = HashMap::from([("src".to_string(), 0x22), ("dst".to_string(), 0x42)]);
+        assert!(
+            matches_for(&m, "epic_harness_log", &globals).is_empty(),
+            "fmt-derived loop keeps its homes for the variant"
+        );
+        assert_eq!(
+            matches_for(&m, "log_plain", &globals).len(),
+            1,
+            "same shape still walks outside the log callee"
+        );
     }
 
     /// A span crossing the FSR window keeps every home.
