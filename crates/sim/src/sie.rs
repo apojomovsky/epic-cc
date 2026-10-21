@@ -362,7 +362,13 @@ mod tests {
     }
 
     fn arm_in(ram: &mut [u8; 4096], len: u8, data1: bool) {
+        arm_in_at(ram, len, data1, 0x508);
+    }
+
+    fn arm_in_at(ram: &mut [u8; 4096], len: u8, data1: bool, addr: usize) {
         ram[0x404 + 1] = len;
+        ram[0x404 + 2] = addr as u8;
+        ram[0x404 + 3] = (addr >> 8) as u8;
         ram[0x404] = BD_UOWN | BD_DTSEN | if data1 { BD_DTS } else { 0 };
     }
 
@@ -493,6 +499,22 @@ mod tests {
         assert_eq!(ram[BDT + 1], 8, "count untouched");
         assert_eq!(ram[BDT] & BD_UOWN, BD_UOWN, "still armed");
         assert_eq!(ram[UIR] & UIR_TRNIF, 0, "no transaction completed");
+    }
+
+    #[test]
+    fn a_descriptor_pointing_outside_usb_ram_is_refused() {
+        // A buffer descriptor address outside USB RAM loses the data on
+        // real silicon (DS39632E 17.4.3), and a linker that scatters the
+        // endpoint buffers into the ordinary GPR banks produces exactly
+        // that. The SIE cannot move a packet to or from such a buffer.
+        let mut ram = endpoint0();
+        arm_in_at(&mut ram, 8, false, 0x0200);
+        assert_eq!(in_token(&mut ram), UsbToken::Nak, "no buffer in USB RAM");
+
+        let mut ram = endpoint0();
+        arm_out(&mut ram, 8, 0x0200);
+        let pkt = [0x00u8; 8];
+        assert_eq!(setup(&mut ram, &pkt), UsbToken::Nak, "no buffer in USB RAM");
     }
 
     #[test]
