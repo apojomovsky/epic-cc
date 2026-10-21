@@ -1048,7 +1048,7 @@ fn dynamic_walk_over_mixed_base_keeps_base_tag() {
 }
 
 #[test]
-#[should_panic(expected = "flash address that passed through integers")]
+#[should_panic(expected = "load through maybe-flash address")]
 fn int_laundered_flash_joined_with_ram_arm_is_refused() {
     // epic-cc#1346: a select joining a laundered flash address with a
     // RAM address is maybe-flash, so no tag survives and the refusal
@@ -1056,6 +1056,57 @@ fn int_laundered_flash_joined_with_ram_arm_is_refused() {
     let _ = laundering_asm(
         "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal out i8\n\
          fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %f = load i8 @flag\n    %m = select i1 %f, ptr @buf, ptr %p\n    %v = load i8 %m\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "load through maybe-flash address")]
+fn int_laundered_flash_gep_joined_with_ram_arm_is_refused() {
+    // The same join, with a GEP between the laundered address and the
+    // join. The GEP derives from the flash pointer, so the join is
+    // maybe-flash through the derivation too.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %q = gep %p +0\n    %f = load i8 @flag\n    %m = select i1 %f, ptr @buf, ptr %q\n    %v = load i8 %m\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn memcpy_of_dynamic_term_source_is_refused() {
+    // epic-cc#1346 review: a memcpy source with a runtime term names no
+    // fixed bytes, so the copy's destination is not proven to hold the
+    // table address, and the laundered value is not a flash address.
+    let _ = laundering_asm(
+        "const c i8\nglobal tab i8\nglobal idx i8\nglobal h i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %i = load i8 @idx\n    %s = gep @tab +2 +4*%i\n    memcpy @h %s 2\n    %y = load i16 @h\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |m| tab_mut(m, false),
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn memcpy_of_dynamic_term_destination_is_refused() {
+    // The same, with the runtime term on the destination side: the copy
+    // lands in bytes the proof does not name.
+    let _ = laundering_asm(
+        "const c i8\nglobal tab i8\nglobal idx i8\nglobal h i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %i = load i8 @idx\n    %d = gep @h +0 +4*%i\n    memcpy %d @tab 2\n    %y = load i16 @h\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |m| tab_mut(m, false),
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn call_result_over_a_clobbered_param_is_refused() {
+    // epic-cc#1346 review: the callee overwrites its parameter's name,
+    // so the returned value is not the incoming address.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal ram i16\nglobal out i8\n\
+         fn clobber(i16) (x=i16)\n  block entry:\n    %x = load i16 @ram\n    ret i16 %x\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %t = load i16 @g\n    %r = call i16 @clobber(i16 %t)\n    %p = inttoptr i16 %r to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
         |_| {},
     );
 }

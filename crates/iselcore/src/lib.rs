@@ -3507,14 +3507,20 @@ pub fn add_int_flash_definite(
     // memory may hold it, so no byte is definite.
     let mut void_all = false;
 
-    // The slot a value names, for a memcpy side.
+    // The slot a value names, for a memcpy side. A dynamic term makes
+    // the location runtime-dependent, so the copy names no known bytes
+    // and the caller voids the whole memory proof.
     let val_slot = |func: &str, v: &ir::Val| -> Option<(String, u32)> {
         match v {
             ir::Val::Global(g) => Some((format!("@{g}"), 0)),
             ir::Val::Reg(r) => match resolved.get(&ssa_key(func, r)) {
-                Some((Base::Global(g), k, _)) => Some((format!("@{g}"), u32::from(*k))),
-                Some((Base::Slot(sname, _), k, _)) => Some((ssa_key(func, sname), u32::from(*k))),
-                None => None,
+                Some((Base::Global(g), k, terms)) if terms.is_empty() => {
+                    Some((format!("@{g}"), u32::from(*k)))
+                }
+                Some((Base::Slot(sname, _), k, terms)) if terms.is_empty() => {
+                    Some((ssa_key(func, sname), u32::from(*k)))
+                }
+                _ => None,
             },
             ir::Val::Const(_) => None,
         }
@@ -3768,6 +3774,33 @@ pub fn add_int_flash_definite(
                 }
             }
         }
+        // The names the callee defines, so a returned register that the
+        // body overwrites is not the parameter's incoming value. The IR
+        // is a slot IR, so a name may be reused.
+        let mut defined: HashSet<String> = HashSet::new();
+        for bb in &callee.blocks {
+            for ri in &bb.insts {
+                let dst: Option<&String> = match ri {
+                    Inst::Load(l) => Some(&l.dst),
+                    Inst::Bin(x) => Some(&x.dst),
+                    Inst::Zext(z) => Some(&z.dst),
+                    Inst::Sext(s) => Some(&s.dst),
+                    Inst::Trunc(t) => Some(&t.dst),
+                    Inst::Freeze(z) => Some(&z.dst),
+                    Inst::IntToPtr(p) => Some(&p.dst),
+                    Inst::Icmp(i) => Some(&i.dst),
+                    Inst::Select(s) => Some(&s.dst),
+                    Inst::Phi(p) => Some(&p.dst),
+                    Inst::Call(cc) => cc.dst.as_ref(),
+                    Inst::Gep(g) => Some(&g.dst),
+                    Inst::Alloca(a) => Some(&a.dst),
+                    _ => None,
+                };
+                if let Some(d) = dst {
+                    defined.insert(d.clone());
+                }
+            }
+        }
         !returns.is_empty()
             && returns.iter().all(|v| match v {
                 ir::Val::Global(n) => is_flash_const(n),
@@ -3778,6 +3811,12 @@ pub fn add_int_flash_definite(
                     // Only an integer param carries an address through
                     // the call: a pointer param has its own slot rules.
                     if callee.params[idx].ptr {
+                        return false;
+                    }
+                    // The body must not have overwritten the name: the
+                    // returned value is the parameter's incoming value
+                    // only when nothing else wrote it.
+                    if defined.contains(r) {
                         return false;
                     }
                     let Some(arg) = c.args.get(idx) else {
@@ -3931,7 +3970,17 @@ pub fn add_int_flash_definite(
     // them (a GEP over one, a select or a phi arm). The derivation
     // walk starts at the `inttoptr` dsts alone: a slot that merely
     // holds a definite integer (an alloca, a plain global) is data,
-    // not an address, so it never enters the set.
+    // not an address, so it never enters the set. A pointer that never
+    // derives from an `inttoptr` dst is not a candidate at all, so a
+    // RAM-only pointer phi never reaches the removal fixpoint.
+    //
+    // Within the candidates, the set is a fixpoint by removal, like the
+    // value proof: one that does not derive from a flash pointer is
+    // dropped. Removal keeps the derivations consistent, so a pointer
+    // derived from a dropped one is dropped too, and a join that mixes
+    // a flash pointer with a non-flash value drops the join's result
+    // and the flash arm it joined. The maybe-flash shape then keeps the
+    // int_flash refusal.
     let mut ptr: HashSet<String> = HashSet::new();
     for f in &m.funcs {
         for b in &f.blocks {
@@ -3945,179 +3994,160 @@ pub fn add_int_flash_definite(
             }
         }
     }
-    // The pointer derivations over a flash pointer: a GEP base, a
-    // select arm, a phi arm, a freeze operand. A derivation of a
-    // flash pointer is a flash pointer.
+    // The candidates: the pointers derived from an `inttoptr` dst (a
+    // GEP base, a select arm, a phi arm, a freeze operand).
+    let mut cands: HashSet<String> = ptr.clone();
     let mut grew = true;
     while grew {
         grew = false;
         for f in &m.funcs {
             for b in &f.blocks {
                 for i in &b.insts {
-                    let dst: &String = match i {
-                        Inst::Gep(g) => &g.dst,
-                        Inst::Select(s) if s.ptr => &s.dst,
-                        Inst::Phi(p) if p.ptr => &p.dst,
-                        Inst::Freeze(fr) => &fr.dst,
-                        _ => continue,
-                    };
-                    // The arms the derivation reads. A join is a flash
-                    // pointer only when every arm is, so an arm that is
-                    // not a reg counts as flash only when it names a
-                    // flash const (a RAM global arm makes the join
-                    // maybe-flash, which stays refused).
-                    let arms: Vec<&ir::Val> = match i {
-                        Inst::Select(s) if s.ptr => vec![&s.a, &s.b],
-                        Inst::Phi(p) if p.ptr => p.incoming.iter().map(|(v, _)| v).collect(),
-                        Inst::Freeze(fr) => vec![&fr.val],
-                        _ => Vec::new(),
-                    };
-                    // A GEP's base is a single reg, handled apart from
-                    // the joins because its arm is not an `ir::Val` in
-                    // the instruction.
-                    let gep_base: Option<String> = match i {
-                        Inst::Gep(g) => match &g.base {
-                            GepBase::Reg(r) => Some(r.clone()),
-                            GepBase::Global(_) => None,
-                        },
+                    let dst: Option<&String> = match i {
+                        Inst::Gep(g) => Some(&g.dst),
+                        Inst::Select(s) if s.ptr => Some(&s.dst),
+                        Inst::Phi(p) if p.ptr => Some(&p.dst),
+                        Inst::Freeze(fr) => Some(&fr.dst),
                         _ => None,
                     };
-                    if arms.is_empty() && gep_base.is_none() {
+                    let Some(dst) = dst else { continue };
+                    let srcs: Vec<String> = match i {
+                        Inst::Gep(g) => match &g.base {
+                            GepBase::Reg(r) => vec![r.clone()],
+                            GepBase::Global(_) => continue,
+                        },
+                        Inst::Select(s) if s.ptr => [&s.a, &s.b]
+                            .iter()
+                            .filter_map(|v| match v {
+                                ir::Val::Reg(r) => Some(r.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        Inst::Phi(p) if p.ptr => p
+                            .incoming
+                            .iter()
+                            .filter_map(|(v, _)| match v {
+                                ir::Val::Reg(r) => Some(r.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        Inst::Freeze(fr) => match &fr.val {
+                            ir::Val::Reg(r) => vec![r.clone()],
+                            _ => continue,
+                        },
+                        _ => continue,
+                    };
+                    if srcs.is_empty() {
                         continue;
                     }
-                    let hit = arms.iter().all(|v| match v {
-                        ir::Val::Reg(r) => ptr.contains(&ssa_key(&f.name, r)),
-                        ir::Val::Global(n) => is_flash_const(n),
-                        ir::Val::Const(_) => false,
-                    }) && gep_base
-                        .as_ref()
-                        .is_none_or(|r| ptr.contains(&ssa_key(&f.name, r)));
-                    if hit && ptr.insert(ssa_key(&f.name, dst)) {
+                    let key = ssa_key(&f.name, dst);
+                    if srcs.iter().any(|r| cands.contains(&ssa_key(&f.name, r)))
+                        && cands.insert(key)
+                    {
                         grew = true;
                     }
                 }
             }
         }
     }
-    // The withdrawal: a pointer joined with a value that is not a flash
-    // address is maybe-flash, and no tag survives the join, so the
-    // pointer loses its flash claim and the int_flash refusal stands.
-    // The withdrawal is a fixpoint by removal: a join over a pointer
-    // that has itself been withdrawn drops the join's result too.
-    let mut withdrew = true;
-    while withdrew {
-        withdrew = false;
+    ptr = cands;
+    // The derivation of one pointer, under the current state: a GEP
+    // over a flash pointer, a join whose every arm is a flash pointer
+    // (a flash const global arm counts), and a freeze of one.
+    let derives = |ptr: &HashSet<String>, func: &str, inst: &Inst| -> bool {
+        match inst {
+            Inst::IntToPtr(p) => flash_val.contains(&ssa_key(func, &p.dst)),
+            Inst::Gep(g) => match &g.base {
+                GepBase::Reg(r) => ptr.contains(&ssa_key(func, r)),
+                GepBase::Global(n) => is_flash_const(n),
+            },
+            Inst::Select(s) if s.ptr => [&s.a, &s.b].iter().all(|v| match v {
+                ir::Val::Reg(r) => ptr.contains(&ssa_key(func, r)),
+                ir::Val::Global(n) => is_flash_const(n),
+                ir::Val::Const(_) => false,
+            }),
+            Inst::Phi(p) if p.ptr => {
+                !p.incoming.is_empty()
+                    && p.incoming.iter().all(|(v, _)| match v {
+                        ir::Val::Reg(r) => ptr.contains(&ssa_key(func, r)),
+                        ir::Val::Global(n) => is_flash_const(n),
+                        ir::Val::Const(_) => false,
+                    })
+            }
+            Inst::Freeze(fr) => match &fr.val {
+                ir::Val::Reg(r) => ptr.contains(&ssa_key(func, r)),
+                ir::Val::Global(n) => is_flash_const(n),
+                ir::Val::Const(_) => false,
+            },
+            _ => false,
+        }
+    };
+    // The greatest fixpoint by removal: a pointer that no longer
+    // derives is dropped, and the state only shrinks.
+    //
+    // A join that mixes a flash pointer with a non-flash value is
+    // maybe-flash: its result is marked mixed, so the backend's
+    // maybe-flash refusal fires on a dereference through it. The join's
+    // flash arm is dropped from the set for the same reason: the value
+    // reaches the join, so a dereference through the join cannot be
+    // settled statically.
+    let mut mixed_joins: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
         for f in &m.funcs {
             for b in &f.blocks {
                 for i in &b.insts {
+                    let dst: Option<&String> = match i {
+                        Inst::IntToPtr(p) => Some(&p.dst),
+                        Inst::Gep(g) => Some(&g.dst),
+                        Inst::Select(s) if s.ptr => Some(&s.dst),
+                        Inst::Phi(p) if p.ptr => Some(&p.dst),
+                        Inst::Freeze(fr) => Some(&fr.dst),
+                        _ => None,
+                    };
+                    let Some(dst) = dst else { continue };
+                    let key = ssa_key(&f.name, dst);
+                    if !ptr.contains(&key) {
+                        continue;
+                    }
+                    if derives(&ptr, &f.name, i) {
+                        continue;
+                    }
+                    // A join that dropped because one of its arms is
+                    // not a flash pointer is a maybe-flash join.
                     let arms: Vec<&ir::Val> = match i {
                         Inst::Select(s) if s.ptr => vec![&s.a, &s.b],
                         Inst::Phi(p) if p.ptr => p.incoming.iter().map(|(v, _)| v).collect(),
-                        _ => continue,
+                        _ => Vec::new(),
                     };
-                    // A join is maybe-flash when one arm is a flash
-                    // pointer and another is not.
-                    let flash_arm = arms.iter().any(|v| match v {
-                        ir::Val::Reg(r) => ptr.contains(&ssa_key(&f.name, r)),
-                        ir::Val::Global(n) => is_flash_const(n),
-                        ir::Val::Const(_) => false,
-                    });
-                    if !flash_arm {
-                        continue;
-                    }
-                    let other_arm = arms.iter().any(|v| match v {
-                        ir::Val::Reg(r) => !ptr.contains(&ssa_key(&f.name, r)),
-                        ir::Val::Global(n) => !is_flash_const(n),
-                        ir::Val::Const(_) => true,
-                    });
-                    if !other_arm {
-                        continue;
-                    }
-                    // The join's result is not a flash pointer, and
-                    // neither is the flash arm it joined: the arm's
-                    // value reaches the join, so a dereference through
-                    // the join cannot be settled statically. Both the
-                    // join's dst and the flash arms leave the set, and
-                    // so does every pointer derived from them.
-                    let mut drop: HashSet<String> = HashSet::new();
-                    if let Inst::Select(s) = i {
-                        drop.insert(ssa_key(&f.name, &s.dst));
-                    }
-                    if let Inst::Phi(p) = i {
-                        drop.insert(ssa_key(&f.name, &p.dst));
-                    }
-                    for v in &arms {
-                        if let ir::Val::Reg(r) = v {
-                            let key = ssa_key(&f.name, r);
-                            if ptr.contains(&key) {
-                                drop.insert(key);
-                            }
+                    if !arms.is_empty() {
+                        let flash_arm = arms.iter().any(|v| match v {
+                            ir::Val::Reg(r) => ptr.contains(&ssa_key(&f.name, r)),
+                            ir::Val::Global(n) => is_flash_const(n),
+                            ir::Val::Const(_) => false,
+                        });
+                        let other_arm = arms.iter().any(|v| match v {
+                            ir::Val::Reg(r) => !ptr.contains(&ssa_key(&f.name, r)),
+                            ir::Val::Global(n) => !is_flash_const(n),
+                            ir::Val::Const(_) => true,
+                        });
+                        if flash_arm && other_arm {
+                            mixed_joins.insert(key.clone());
                         }
                     }
-                    let mut grew = true;
-                    while grew {
-                        grew = false;
-                        for f in &m.funcs {
-                            for b in &f.blocks {
-                                for i in &b.insts {
-                                    let dst: &String = match i {
-                                        Inst::Gep(g) => &g.dst,
-                                        Inst::Select(s) if s.ptr => &s.dst,
-                                        Inst::Phi(p) if p.ptr => &p.dst,
-                                        Inst::Freeze(fr) => &fr.dst,
-                                        _ => continue,
-                                    };
-                                    let base: Option<String> = match i {
-                                        Inst::Gep(g) => match &g.base {
-                                            GepBase::Reg(r) => Some(r.clone()),
-                                            GepBase::Global(_) => None,
-                                        },
-                                        _ => None,
-                                    };
-                                    let srcs: Vec<String> = match i {
-                                        Inst::Gep(_) => base.into_iter().collect(),
-                                        Inst::Select(s) if s.ptr => [&s.a, &s.b]
-                                            .iter()
-                                            .filter_map(|v| match v {
-                                                ir::Val::Reg(r) => Some(r.clone()),
-                                                _ => None,
-                                            })
-                                            .collect(),
-                                        Inst::Phi(p) if p.ptr => p
-                                            .incoming
-                                            .iter()
-                                            .filter_map(|(v, _)| match v {
-                                                ir::Val::Reg(r) => Some(r.clone()),
-                                                _ => None,
-                                            })
-                                            .collect(),
-                                        Inst::Freeze(fr) => match &fr.val {
-                                            ir::Val::Reg(r) => vec![r.clone()],
-                                            _ => continue,
-                                        },
-                                        _ => continue,
-                                    };
-                                    if srcs.is_empty() {
-                                        continue;
-                                    }
-                                    let key = ssa_key(&f.name, dst);
-                                    if srcs.iter().any(|r| drop.contains(&ssa_key(&f.name, r)))
-                                        && drop.insert(key)
-                                    {
-                                        grew = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    for k in drop {
-                        if ptr.remove(&k) {
-                            withdrew = true;
-                        }
-                    }
+                    ptr.remove(&key);
+                    changed = true;
                 }
             }
         }
+        if !changed {
+            break;
+        }
+    }
+    // The maybe-flash joins are mixed pointers: the backend refuses a
+    // dereference through one, because no tag survives the join.
+    for key in &mixed_joins {
+        prov.mixed.insert(key.clone());
     }
     prov.int_flash_ptr = ptr;
     prov.int_flash_definite = flash_val;
