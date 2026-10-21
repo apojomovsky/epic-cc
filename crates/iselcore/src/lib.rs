@@ -3794,6 +3794,7 @@ pub fn add_int_flash_definite(
                     Inst::Call(cc) => cc.dst.as_ref(),
                     Inst::Gep(g) => Some(&g.dst),
                     Inst::Alloca(a) => Some(&a.dst),
+                    Inst::VaArg(v) => Some(&v.dst),
                     _ => None,
                 };
                 if let Some(d) = dst {

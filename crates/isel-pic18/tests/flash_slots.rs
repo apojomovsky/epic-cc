@@ -1171,3 +1171,17 @@ fn int_laundered_flash_joined_with_a_ram_reg_arm_keeps_ram_read() {
     assert!(p.halted(), "program must halt");
     assert_eq!(p.ram()[0x18], b'R', "the RAM arm must read RAM");
 }
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn call_result_over_a_va_arg_clobbered_param_is_refused() {
+    // epic-cc#1346 review: the callee overwrites its parameter's name
+    // with a `va_arg` result, so the returned value is not the incoming
+    // address.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn clobber(i16) (x=i16)\n  block entry:\n    %ap = alloca 4\n    %x = va_arg ptr %ap i16\n    ret i16 %x\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %t = load i16 @g\n    %r = call i16 @clobber(i16 %t)\n    %p = inttoptr i16 %r to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
