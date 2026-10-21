@@ -3654,7 +3654,7 @@ pub fn add_int_flash_definite(
                         let idx = writes.len();
                         writes.push(Write::Copy {
                             func: func.clone(),
-                            sslot: ss,
+                            sslot: ss.clone(),
                             soff: so,
                             doff,
                             block: b.label.clone(),
@@ -3665,6 +3665,13 @@ pub fn add_int_flash_definite(
                                 .entry((ds.clone(), doff + k))
                                 .or_default()
                                 .push(idx);
+                            // The copy reads the source bytes, so a
+                            // write to them must have happened by it.
+                            reads_by.entry((ss.clone(), so + k)).or_default().push((
+                                func.clone(),
+                                b.label.clone(),
+                                inst_index,
+                            ));
                         }
                     }
                     Inst::Asm(a) => {

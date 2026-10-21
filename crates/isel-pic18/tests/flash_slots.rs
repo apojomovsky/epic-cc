@@ -1359,3 +1359,33 @@ fn int_laundered_call_result_looks_up_its_actual_in_the_caller_reads_ram() {
         "the caller's RAM address must not read flash:\n{asm}"
     );
 }
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_memcpy_before_its_source_store_is_refused() {
+    // epic-cc#1346 review: the copy reads the source before the only
+    // write into it, so the copy holds the source's reset value, not
+    // the flash address. A copy reads the source's bytes, so the
+    // source's write must have happened by it.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    memcpy @h @g 2\n    store ptr @c @g\n    %y = load i16 @h\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x12),
+            ("out", 0x14),
+            ("main::y", 0x15),
+            ("main::p", 0x17),
+            ("main::v", 0x19),
+        ]),
+        None,
+    );
+}
