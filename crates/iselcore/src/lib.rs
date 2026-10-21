@@ -4115,9 +4115,7 @@ pub fn add_int_flash_definite(
     // marked mixed and the backend's maybe-flash refusal fires on a
     // dereference through it. The classification runs after the
     // removal fixpoint, so it does not depend on the order the joins
-    // were examined in. Only the joins over a candidate are classified:
-    // the other pointer joins are the pre-existing walk shapes, which
-    // the slot proof already serves.
+    // were examined in. Only the joins over a candidate are classified.
     let mut mixed_joins: HashSet<String> = HashSet::new();
     for f in &m.funcs {
         for b in &f.blocks {
