@@ -1287,3 +1287,34 @@ fn int_laundered_global_read_on_another_switch_arm_is_refused() {
         None,
     );
 }
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_pointer_load_before_its_store_is_refused() {
+    // epic-cc#1346 review: the pointer load reads the global's bytes
+    // before the only store into it, so it observes the global's reset
+    // value, not the store. A pointer load counts as a read of the same
+    // bytes a value load does.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %p = load ptr @g\n    store ptr @c @g\n    store ptr %p @h\n    %y = load i16 @h\n    %q = inttoptr i16 %y to ptr\n    %v = load i8 %q\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x12),
+            ("out", 0x14),
+            ("main::p", 0x15),
+            ("main::y", 0x17),
+            ("main::q", 0x19),
+            ("main::v", 0x1b),
+        ]),
+        None,
+    );
+}

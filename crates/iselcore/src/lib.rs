@@ -3690,9 +3690,11 @@ pub fn add_int_flash_definite(
                             }
                         }
                     }
-                    Inst::Load(l) if !l.ptr_ty => {
+                    Inst::Load(l) => {
                         // A read observes the slot's bytes at this
                         // place, so a write must have happened by it.
+                        // A pointer load reads the same two bytes a
+                        // value load does, so it counts too.
                         if let Loc::Fixed(slot, off) = loc(&func, &l.ptr) {
                             for k in 0..u32::from(l.ty.bytes()) {
                                 reads_by.entry((slot.clone(), off + k)).or_default().push((
@@ -3701,6 +3703,15 @@ pub fn add_int_flash_definite(
                                     inst_index,
                                 ));
                             }
+                        }
+                        if l.ptr_ty {
+                            slot_rule.insert(
+                                ssa_key(&func, &l.dst),
+                                SlotRule::LoadPtr {
+                                    func: func.clone(),
+                                    ptr: l.ptr.clone(),
+                                },
+                            );
                         }
                     }
                     Inst::IntToPtr(p) => {
@@ -3727,15 +3738,6 @@ pub fn add_int_flash_definite(
                             SlotRule::Join {
                                 func: func.clone(),
                                 arms: p.incoming.iter().map(|(v, _)| v.clone()).collect(),
-                            },
-                        );
-                    }
-                    Inst::Load(l) if l.ptr_ty => {
-                        slot_rule.insert(
-                            ssa_key(&func, &l.dst),
-                            SlotRule::LoadPtr {
-                                func: func.clone(),
-                                ptr: l.ptr.clone(),
                             },
                         );
                     }
