@@ -148,8 +148,10 @@ marking the `inttoptr` dst a flash writer there would widen the slot
 on the backend side only.
 
 The proof leaves the `inttoptr` dsts out of the slot proof's writer
-set, so the set is extended in the backend alone, for the deref path
-only.
+set, so the set is extended in the backend alone. The extension
+reaches the deref path, and the store path with it: a store through
+a definite flash address is a ROM write, which the backend refuses,
+as it does for any other flash pointer.
 
 Six shapes stay refused. A `ptrtoint` of a GEP reads the GEP's own
 slot, which `resolve_pointers` folds away and never writes, so the
