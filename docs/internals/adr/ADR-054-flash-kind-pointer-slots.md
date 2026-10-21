@@ -136,6 +136,13 @@ write in another block counts only when that block dominates the
 read's. Without that order, a global read before its only store would
 observe the store's value.
 
+A value is definite the same way: its definition must have happened
+by every use of it, and a name the function defines more than once is
+never definite, because the IR is a slot IR and a use cannot be
+attributed to one definition. A parameter's name the body writes is
+such a redefinition, so a use before that write keeps the incoming
+value.
+
 A pointer that joins a definite flash pointer with a value that is
 not a flash address is maybe-flash, and no tag survives the join, so
 the proof withdraws the flash claim from the join's result and marks

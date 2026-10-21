@@ -3614,8 +3614,15 @@ pub fn add_int_flash_definite(
         CallPtr { callee: String },
     }
     let mut slot_rule: HashMap<String, SlotRule> = HashMap::new();
-    // The instruction defining each value, keyed `{func}::{name}`.
-    let mut defs: HashMap<String, (String, &Inst)> = HashMap::new();
+    // The instruction defining each value, keyed `{func}::{name}`, with
+    // the place of the definition. A param has no instruction: its
+    // definition is the call site's actual.
+    let mut defs: HashMap<String, (String, Option<&Inst>, String, usize)> = HashMap::new();
+    // The names a function defines more than once.
+    let mut redefined: HashSet<String> = HashSet::new();
+    // The uses of every name, with the place of the use, so a def
+    // can be checked against them.
+    let mut uses: HashMap<String, Vec<(String, String, usize)>> = HashMap::new();
 
     for f in &m.funcs {
         for b in &f.blocks {
@@ -3766,6 +3773,18 @@ pub fn add_int_flash_definite(
                     }
                     _ => {}
                 }
+                // Record the uses of every value this instruction
+                // reads.
+                for r in ir::read_vals(i) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    uses.entry(ssa_key(&func, &r)).or_default().push((
+                        func.clone(),
+                        b.label.clone(),
+                        inst_index,
+                    ));
+                }
                 // Record the defining instruction of every value.
                 let dst: Option<&String> = match i {
                     Inst::Zext(z) => Some(&z.dst),
@@ -3782,7 +3801,14 @@ pub fn add_int_flash_definite(
                     _ => None,
                 };
                 if let Some(d) = dst {
-                    defs.insert(ssa_key(&func, d), (func.clone(), i));
+                    let key = ssa_key(&func, d);
+                    // A name defined more than once in a function is
+                    // not definite: the IR is a slot IR, so a use
+                    // cannot be attributed to one definition.
+                    if defs.contains_key(&key) {
+                        redefined.insert(key.clone());
+                    }
+                    defs.insert(key, (func.clone(), Some(i), b.label.clone(), inst_index));
                 }
             }
         }
@@ -3801,6 +3827,21 @@ pub fn add_int_flash_definite(
                     .entry((key.clone(), *pos as u32 + k))
                     .or_default()
                     .push(idx);
+            }
+        }
+    }
+    // A param's def is the entry block, before every instruction: the
+    // body's own write of the name is a redefinition.
+    for f in &m.funcs {
+        let Some(entry) = f.blocks.first().map(|b| b.label.clone()) else {
+            continue;
+        };
+        for p in &f.params {
+            let key = ssa_key(&f.name, &p.name);
+            if defs.contains_key(&key) {
+                redefined.insert(key.clone());
+            } else {
+                defs.insert(key, (f.name.clone(), None, entry.clone(), 0));
             }
         }
     }
@@ -3932,12 +3973,70 @@ pub fn add_int_flash_definite(
             })
     };
 
+    // The blocks each block dominates, so a write in one block is known
+    // to have happened when a later block reads.
+    let dominators: HashMap<String, HashMap<String, HashSet<String>>> = m
+        .funcs
+        .iter()
+        .map(|f| (f.name.clone(), func_dominators(f)))
+        .collect();
+    // Whether a write has happened by a read: the same block counts
+    // when the write comes first, and another block counts when it
+    // dominates the read's block.
+    let write_precedes = |write_func: &str,
+                          write_block: &str,
+                          write_index: usize,
+                          read_func: &str,
+                          read_block: &str,
+                          read_index: usize|
+     -> bool {
+        if write_func != read_func {
+            // A write in another function happens at a call site the
+            // proof does not track, so it never precedes a read here.
+            return false;
+        }
+        if write_block == read_block {
+            write_index < read_index
+        } else {
+            dominators
+                .get(read_func)
+                .and_then(|d| d.get(read_block))
+                .is_some_and(|set| set.contains(write_block))
+        }
+    };
+
     // The derivation of one value, under the current state.
     let derive =
         |flash_val: &HashSet<String>, flash_bytes: &HashSet<(String, u32)>, key: &str| -> bool {
-            let Some((func, inst)) = defs.get(key) else {
+            let Some((func, inst, def_block, def_index)) = defs.get(key) else {
                 return false;
             };
+            let Some(inst) = inst else {
+                // A param's value is the call site's actual, which the
+                // slot rules settle.
+                return false;
+            };
+            // The def must have happened by every use: the same block
+            // counts when the def comes first, and another block counts
+            // when it dominates the use's.
+            if let Some(us) = uses.get(key) {
+                if !us
+                    .iter()
+                    .all(|(uf, ub, ui)| write_precedes(func, def_block, *def_index, uf, ub, *ui))
+                {
+                    return false;
+                }
+            }
+            // A name the function defines more than once is not
+            // definite: the IR is a slot IR, so a use cannot be
+            // attributed to one definition.
+            if redefined.contains(key) {
+                return false;
+            }
+            // The def must have happened by every use: the same block
+            // counts when the def comes first, and another block counts
+            // when it dominates the use's.
+
             match inst {
                 // A load reads the bytes the location holds: the value is a
                 // flash address when both address bytes are definite. A
@@ -3988,38 +4087,6 @@ pub fn add_int_flash_definite(
                 _ => false,
             }
         };
-
-    // The blocks each block dominates, so a write in one block is known
-    // to have happened when a later block reads.
-    let dominators: HashMap<String, HashMap<String, HashSet<String>>> = m
-        .funcs
-        .iter()
-        .map(|f| (f.name.clone(), func_dominators(f)))
-        .collect();
-    // Whether a write has happened by a read: the same block counts
-    // when the write comes first, and another block counts when it
-    // dominates the read's block.
-    let write_precedes = |write_func: &str,
-                          write_block: &str,
-                          write_index: usize,
-                          read_func: &str,
-                          read_block: &str,
-                          read_index: usize|
-     -> bool {
-        if write_func != read_func {
-            // A write in another function happens at a call site the
-            // proof does not track, so it never precedes a read here.
-            return false;
-        }
-        if write_block == read_block {
-            write_index < read_index
-        } else {
-            dominators
-                .get(read_func)
-                .and_then(|d| d.get(read_block))
-                .is_some_and(|set| set.contains(write_block))
-        }
-    };
 
     // The derivation of one memory byte, under the current state.
     let derive_byte = |flash_val: &HashSet<String>,

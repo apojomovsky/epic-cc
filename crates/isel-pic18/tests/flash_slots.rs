@@ -1389,3 +1389,113 @@ fn int_laundered_memcpy_before_its_source_store_is_refused() {
         None,
     );
 }
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_value_of_a_redefined_name_is_refused() {
+    // epic-cc#1346 review: the function defines the name twice, so a
+    // use cannot be attributed to one definition. The first load holds
+    // the RAM value the program means; the later one reads a const
+    // table's address, which would be the flash value.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nconst tab i8\nglobal ram i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %x = load i16 @ram\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    br next\n\
+             block next:\n    %x = load i16 @tab\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    for g in &mut m.globals {
+        if g.name == "tab" {
+            g.bytes = vec![1, 0, 0x81, 0x0F];
+            g.size = 4;
+            g.refs = vec![(0, "c".to_string(), 0)];
+            g.is_const = true;
+        }
+    }
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("ram", 0x10),
+            ("out", 0x13),
+            ("main::x", 0x14),
+            ("main::p", 0x16),
+            ("main::v", 0x18),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_param_overwritten_later_in_the_body_is_refused() {
+    // epic-cc#1346 review: the body overwrites the parameter's name
+    // after the use, so the use observes the incoming value, not the
+    // overwrite. A param's name the body writes is a redefinition.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nconst tab i8\nglobal out i8\n\
+             fn f(i16) (x=i16)\n  block entry:\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    %x = load i16 @tab\n    ret void\n\
+             fn main(void) ()\n  block entry:\n    call void @f(i16 16)\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    for g in &mut m.globals {
+        if g.name == "tab" {
+            g.bytes = vec![1, 0, 0x81, 0x0F];
+            g.size = 4;
+            g.refs = vec![(0, "c".to_string(), 0)];
+            g.is_const = true;
+        }
+    }
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("out", 0x10),
+            ("f::x", 0x11),
+            ("f::p", 0x13),
+            ("f::v", 0x15),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_value_used_before_its_def_is_refused() {
+    // epic-cc#1346 review: the use precedes the definition, so the
+    // value the use observes is the slot's, not the definition's.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nconst tab i8\nglobal ram i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    br next\n\
+             block next:\n    %y = load i16 @tab\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    for g in &mut m.globals {
+        if g.name == "tab" {
+            g.bytes = vec![1, 0, 0x81, 0x0F];
+            g.size = 4;
+            g.refs = vec![(0, "c".to_string(), 0)];
+            g.is_const = true;
+        }
+    }
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("ram", 0x10),
+            ("out", 0x13),
+            ("main::y", 0x14),
+            ("main::p", 0x16),
+            ("main::v", 0x18),
+        ]),
+        None,
+    );
+}
