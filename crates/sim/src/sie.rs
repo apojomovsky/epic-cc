@@ -515,6 +515,58 @@ mod tests {
         arm_out(&mut ram, 8, 0x0200);
         let pkt = [0x00u8; 8];
         assert_eq!(setup(&mut ram, &pkt), UsbToken::Nak, "no buffer in USB RAM");
+
+        let mut ram = endpoint0();
+        arm_out(&mut ram, 8, 0x0200);
+        assert_eq!(
+            out_token(&mut ram, &[0x00; 4], true),
+            UsbToken::Nak,
+            "no buffer in USB RAM"
+        );
+    }
+
+    #[test]
+    fn the_usb_ram_window_is_exactly_400h_to_7ffh() {
+        // USB RAM is banks 4 to 7 (DS39632E 17.3), so a buffer may start at
+        // 0x400 and may end at 0x7FF, but neither a start at 0x3FF nor an
+        // end at 0x800 is inside it.
+        let mut ram = endpoint0();
+        arm_in_at(&mut ram, 8, false, 0x400);
+        assert!(
+            matches!(in_token(&mut ram), UsbToken::Ack { .. }),
+            "0x400 is inside"
+        );
+
+        let mut ram = endpoint0();
+        arm_in_at(&mut ram, 8, false, 0x7F8);
+        assert!(
+            matches!(in_token(&mut ram), UsbToken::Ack { .. }),
+            "a buffer ending at 0x7FF is inside"
+        );
+
+        let mut ram = endpoint0();
+        arm_in_at(&mut ram, 8, false, 0x3F8);
+        assert_eq!(
+            in_token(&mut ram),
+            UsbToken::Nak,
+            "a buffer ending at 0x3FF is outside"
+        );
+
+        let mut ram = endpoint0();
+        arm_in_at(&mut ram, 8, false, 0x3FF);
+        assert_eq!(
+            in_token(&mut ram),
+            UsbToken::Nak,
+            "a buffer starting at 0x3FF is outside"
+        );
+
+        let mut ram = endpoint0();
+        arm_in_at(&mut ram, 8, false, 0x7F9);
+        assert_eq!(
+            in_token(&mut ram),
+            UsbToken::Nak,
+            "a buffer ending at 0x800 is outside"
+        );
     }
 
     #[test]
