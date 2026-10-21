@@ -3,6 +3,10 @@
 
 use device::Device;
 
+/// The PIC18Fxx5x USB Serial Interface Engine, driven token by token from a
+/// host. See the module docs for what the model does and does not cover.
+pub mod sie;
+
 /// Decode Intel HEX (gpasm output) into 14-bit words, indexed by word address.
 pub fn parse_hex(data: &str) -> Vec<u16> {
     let mut max_word = 8191usize; // Keeps the minimum program size for small images.
@@ -2752,6 +2756,28 @@ impl Pic18 {
     }
     pub fn cycles(&self) -> u64 {
         self.cycles
+    }
+    /// Drive a USB bus reset into the SIE: `UADDR` clears, the endpoint
+    /// stall latches clear, and `UIR.URSTIF` tells firmware to re-initialise.
+    /// The host side of the model is the test or gate that calls this and the
+    /// three token methods below.
+    pub fn usb_reset(&mut self) {
+        sie::reset(&mut self.ram);
+    }
+    /// Issue a SETUP token to endpoint 0. `Ack` means the packet reached the
+    /// armed OUT buffer; `Nak` means the endpoint was not ready.
+    pub fn usb_setup(&mut self, packet: &[u8; 8]) -> sie::UsbToken {
+        sie::setup(&mut self.ram, packet)
+    }
+    /// Issue an IN token to endpoint 0: `Ack` carries the packet firmware
+    /// armed, `Stall` the handshake a `BSTALL` descriptor asked for.
+    pub fn usb_in(&mut self) -> sie::UsbToken {
+        sie::in_token(&mut self.ram)
+    }
+    /// Issue an OUT token to endpoint 0 with `data` and its DATA0/DATA1
+    /// toggle. A packet larger than the armed buffer is NAKed.
+    pub fn usb_out(&mut self, data: &[u8], data1: bool) -> sie::UsbToken {
+        sie::out_token(&mut self.ram, data, data1)
     }
     pub fn run(&mut self, max_steps: usize) -> usize {
         let mut steps = 0;

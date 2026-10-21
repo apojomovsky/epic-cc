@@ -169,6 +169,14 @@ magic addresses. A USB stack is out of scope.
 obligation is correct code generation and honest register names. A stack belongs in a
 library above the compiler, in `epic-hal` if anywhere.
 
+**Amendment (2026-10-21, epic-cc#1416).** The simulator now models the SIE's endpoint 0
+(`crates/sim/src/sie.rs`): the buffer descriptor table, the `USTAT`/`UIR` transaction
+report, and the SETUP, IN and OUT tokens a host drives against endpoint 0. The stack stays
+out of scope: the model serves whatever device code the caller links, and the enumeration
+walk in `crates/driver/tests/usb_ep0_e2e.rs` drives a CDC-ACM device program written
+against M-Stack's endpoint 0 protocol, the one epic-hal's `lib/usb` wraps. Endpoints 1
+and above are not modelled, so the model proves enumeration, not data traffic.
+
 ---
 
 ## 3. Architecture
