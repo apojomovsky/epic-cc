@@ -1123,3 +1123,51 @@ fn int_laundered_flash_deref_beside_a_ram_join_reads_flash() {
     );
     assert!(asm.contains("TBLRD*"), "must read flash:\n{asm}");
 }
+
+#[test]
+fn int_laundered_flash_joined_with_a_ram_reg_arm_keeps_ram_read() {
+    // epic-cc#1346 review: the RAM arm of the join is a register, not
+    // a global. The join is maybe-flash, so the arm keeps its own
+    // space: a load through it reads RAM, never program memory.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal ram i16\nglobal data i8\nglobal flag i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %r = load ptr @ram\n    %f = load i8 @flag\n    %m = select i1 %f, ptr %r, ptr %p\n    %v = load i8 %r\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("ram", 0x13),
+            ("data", 0x16),
+            ("flag", 0x17),
+            ("out", 0x18),
+            ("main::x", 0x19),
+            ("main::p", 0x1B),
+            ("main::r", 0x1D),
+            ("main::f", 0x1F),
+            ("main::m", 0x20),
+            ("main::v", 0x22),
+        ]),
+        None,
+    );
+    // The RAM arm is read through FSR, never through TBLRD.
+    assert!(
+        !asm.contains("TBLRD*"),
+        "a RAM arm must not read flash:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    // The RAM pointer holds the address of the data byte.
+    p.ram_mut()[0x13] = 0x16;
+    p.ram_mut()[0x14] = 0x00;
+    p.ram_mut()[0x16] = b'R';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x18], b'R', "the RAM arm must read RAM");
+}

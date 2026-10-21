@@ -4042,7 +4042,7 @@ pub fn add_int_flash_definite(
             }
         }
     }
-    ptr = cands;
+    ptr = cands.clone();
     // The derivation of one pointer, under the current state: a GEP
     // over a flash pointer, a join whose every arm is a flash pointer
     // (a flash const global arm counts), and a freeze of one.
@@ -4079,11 +4079,6 @@ pub fn add_int_flash_definite(
     };
     // The greatest fixpoint by removal: a pointer that no longer
     // derives is dropped, and the state only shrinks.
-    //
-    // A join that mixes a flash pointer with a non-flash value is
-    // maybe-flash: its result is marked mixed, so the backend's
-    // maybe-flash refusal fires on a dereference through it.
-    let mut mixed_joins: HashSet<String> = HashSet::new();
     loop {
         let mut changed = false;
         for f in &m.funcs {
@@ -4105,28 +4100,6 @@ pub fn add_int_flash_definite(
                     if derives(&ptr, &f.name, i) {
                         continue;
                     }
-                    // A join that dropped because one of its arms is
-                    // not a flash pointer is a maybe-flash join.
-                    let arms: Vec<&ir::Val> = match i {
-                        Inst::Select(s) if s.ptr => vec![&s.a, &s.b],
-                        Inst::Phi(p) if p.ptr => p.incoming.iter().map(|(v, _)| v).collect(),
-                        _ => Vec::new(),
-                    };
-                    if !arms.is_empty() {
-                        let flash_arm = arms.iter().any(|v| match v {
-                            ir::Val::Reg(r) => ptr.contains(&ssa_key(&f.name, r)),
-                            ir::Val::Global(n) => is_flash_const(n),
-                            ir::Val::Const(_) => false,
-                        });
-                        let other_arm = arms.iter().any(|v| match v {
-                            ir::Val::Reg(r) => !ptr.contains(&ssa_key(&f.name, r)),
-                            ir::Val::Global(n) => !is_flash_const(n),
-                            ir::Val::Const(_) => true,
-                        });
-                        if flash_arm && other_arm {
-                            mixed_joins.insert(key.clone());
-                        }
-                    }
                     ptr.remove(&key);
                     changed = true;
                 }
@@ -4136,37 +4109,49 @@ pub fn add_int_flash_definite(
             break;
         }
     }
-    // A flash arm of a maybe-flash join keeps its claim: the arm still
-    // holds a flash address, so a direct dereference through it reads
-    // flash. The join's own result is the maybe-flash one.
+    // The maybe-flash joins, classified over the final set: a join
+    // whose arms mix a flash pointer with a value that is not one
+    // carries flash on one path and RAM on another, so its result is
+    // marked mixed and the backend's maybe-flash refusal fires on a
+    // dereference through it. The classification runs after the
+    // removal fixpoint, so it does not depend on the order the joins
+    // were examined in. Only the joins over a candidate are classified:
+    // the other pointer joins are the pre-existing walk shapes, which
+    // the slot proof already serves.
+    let mut mixed_joins: HashSet<String> = HashSet::new();
     for f in &m.funcs {
         for b in &f.blocks {
             for i in &b.insts {
-                let arms: Vec<&ir::Val> = match i {
-                    Inst::Select(s) if s.ptr => vec![&s.a, &s.b],
-                    Inst::Phi(p) if p.ptr => p.incoming.iter().map(|(v, _)| v).collect(),
-                    _ => Vec::new(),
+                let (dst, arms): (&String, Vec<&ir::Val>) = match i {
+                    Inst::Select(s) if s.ptr => (&s.dst, vec![&s.a, &s.b]),
+                    Inst::Phi(p) if p.ptr => (&p.dst, p.incoming.iter().map(|(v, _)| v).collect()),
+                    _ => continue,
                 };
                 if arms.is_empty() {
                     continue;
                 }
-                let dst = match i {
-                    Inst::Select(s) if s.ptr => &s.dst,
-                    Inst::Phi(p) if p.ptr => &p.dst,
-                    _ => continue,
-                };
-                if !mixed_joins.contains(&ssa_key(&f.name, dst)) {
+                let key = ssa_key(&f.name, dst);
+                if !cands.contains(&key) {
                     continue;
                 }
-                for v in &arms {
-                    if let ir::Val::Reg(r) = v {
-                        let key = ssa_key(&f.name, r);
-                        // The arm is a flash pointer again, unless it
-                        // is itself the result of a maybe-flash join.
-                        if !mixed_joins.contains(&key) {
-                            ptr.insert(key);
-                        }
-                    }
+                // The flash arms of the join, read off the final set.
+                let flash_arms = arms.iter().any(|v| match v {
+                    ir::Val::Reg(r) => ptr.contains(&ssa_key(&f.name, r)),
+                    ir::Val::Global(n) => is_flash_const(n),
+                    ir::Val::Const(_) => false,
+                });
+                if !flash_arms {
+                    continue;
+                }
+                // Every arm must be a flash arm for the join to be
+                // flash; one that is not makes it maybe-flash.
+                let all_flash = arms.iter().all(|v| match v {
+                    ir::Val::Reg(r) => ptr.contains(&ssa_key(&f.name, r)),
+                    ir::Val::Global(n) => is_flash_const(n),
+                    ir::Val::Const(_) => false,
+                });
+                if !all_flash {
+                    mixed_joins.insert(key);
                 }
             }
         }
