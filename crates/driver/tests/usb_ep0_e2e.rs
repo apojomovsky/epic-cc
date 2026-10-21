@@ -274,7 +274,7 @@ impl Device {
                 Some(StageResult::Stalled) => {
                     panic!("{stage}: EP0 stalled in the data stage")
                 }
-                None => break,
+                None => panic!("{stage}: the device stopped answering mid-transfer"),
             }
         }
         // The status stage of a control read is a zero-length OUT packet.

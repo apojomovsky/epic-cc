@@ -101,7 +101,9 @@ pub const PID_SETUP: u8 = 0x0D;
 pub enum UsbToken {
     /// The SIE accepted the token and moved `data`: device to host for an
     /// IN token, host to device for an OUT or SETUP token. `data1` is the
-    /// packet's DATA1 toggle (`false` for DATA0).
+    /// packet's DATA1 toggle (`false` for DATA0). An OUT token the SIE
+    /// acknowledged without storing (a data-toggle mismatch) carries no
+    /// data, because none reached the buffer.
     Ack { data: Vec<u8>, data1: bool },
     /// The endpoint is not ready: no buffer armed, packet processing
     /// disabled, or the packet does not fit the armed buffer.
@@ -119,7 +121,7 @@ pub fn reset(ram: &mut [u8; 4096]) {
     // reset that leaves `PKTDIS` set would leave the device deaf until
     // firmware rewrote `UCON`. A bus reset re-arms the module.
     ram[UCON] &= !UCON_PKTDIS;
-    raise_usbif(ram, UIR_URSTIF, UIE_URSTIE);
+    raise_usbif(ram, UIE_URSTIE);
     for ep in 0..16 {
         ram[UEP0 + ep] &= !UEP_EPSTALL;
     }
@@ -313,17 +315,16 @@ fn in_usb_ram(addr: usize, len: usize) -> bool {
 fn complete(ram: &mut [u8; 4096], ep: u8, dir_in: bool) {
     ram[USTAT] = ((ep & 0x0F) << 3) | if dir_in { 0x04 } else { 0 };
     ram[UIR] |= UIR_TRNIF;
-    raise_usbif(ram, UIR_TRNIF, UIE_TRNIE);
+    raise_usbif(ram, UIE_TRNIE);
 }
 
 /// Raise the top-level USB interrupt flag when an enabled source fired
 /// (DS39632E figure 17-8: every `UIR` flag is ANDed with its `UIE` enable
 /// before the OR into `PIR2.USBIF`).
-fn raise_usbif(ram: &mut [u8; 4096], flag: u8, enable: u8) {
+fn raise_usbif(ram: &mut [u8; 4096], enable: u8) {
     if ram[UIE] & enable != 0 {
         ram[PIR2] |= PIR2_USBIF;
     }
-    let _ = flag;
 }
 
 /// Answer STALL: the endpoint latch and flag rise, and the armed descriptor
@@ -333,7 +334,7 @@ fn raise_usbif(ram: &mut [u8; 4096], flag: u8, enable: u8) {
 fn stall(ram: &mut [u8; 4096]) -> UsbToken {
     ram[UEP0] |= UEP_EPSTALL;
     ram[UIR] |= UIR_STALLIF;
-    raise_usbif(ram, UIR_STALLIF, UIE_STALLIE);
+    raise_usbif(ram, UIE_STALLIE);
     UsbToken::Stall
 }
 

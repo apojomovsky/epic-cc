@@ -208,6 +208,9 @@ static void answer_short(uint8_t lo, uint8_t hi, uint8_t len)
     arm_in(0, len, 1);
 }
 
+static void handle_standard_in(uint16_t value, uint16_t length);
+static void handle_standard_out(uint16_t value);
+
 static void handle_setup(void)
 {
     /* PIC18 silicon leaves BSTALL and UOWN set across a new SETUP, so the
@@ -244,15 +247,22 @@ static void handle_setup(void)
         return;
     }
 
+    /* The device-to-host form of a standard request has the direction bit
+     * set, the host-to-device form clear; a request with the wrong
+     * direction is one no device can answer, so each direction gets its
+     * own handler. */
+    if (ep0_out[0] == 0x80U) {
+        handle_standard_in(value, length);
+    } else {
+        handle_standard_out(value);
+    }
+}
+
+/* A standard request the host reads from the device. */
+static void handle_standard_in(uint16_t value, uint16_t length)
+{
     switch (ep0_out[1]) {
     case GET_DESCRIPTOR: {
-        /* The device-to-host form only: a host-to-device GET_DESCRIPTOR is
-         * not a request a device can answer (M-Stack matches the whole
-         * bmRequestType). */
-        if (ep0_out[0] != 0x80U) {
-            stall_ep0();
-            break;
-        }
         uint8_t type = (uint8_t)(value >> 8);
         uint8_t idx = (uint8_t)value;
         if (type == DESC_DEVICE) {
@@ -279,6 +289,25 @@ static void handle_setup(void)
         }
         break;
     }
+    case GET_CONFIGURATION:
+        answer_short(g_configured, 0, 1);
+        break;
+    case GET_STATUS:
+        answer_short(0, 0, 2);
+        break;
+    case GET_INTERFACE:
+        answer_short(0, 0, 1);
+        break;
+    default:
+        stall_ep0();
+        break;
+    }
+}
+
+/* A standard request the host writes to the device. */
+static void handle_standard_out(uint16_t value)
+{
+    switch (ep0_out[1]) {
     case SET_ADDRESS:
         /* The address takes effect after the status stage, DS39632E 17.2.5. */
         pending_addr = (uint8_t)value;
@@ -289,17 +318,8 @@ static void handle_setup(void)
         g_configured = (uint8_t)value;
         send_zlp_status();
         break;
-    case GET_CONFIGURATION:
-        answer_short(g_configured, 0, 1);
-        break;
-    case GET_STATUS:
-        answer_short(0, 0, 2);
-        break;
     case SET_INTERFACE:
         send_zlp_status();
-        break;
-    case GET_INTERFACE:
-        answer_short(0, 0, 1);
         break;
     default:
         stall_ep0();
