@@ -1251,3 +1251,39 @@ fn int_laundered_global_read_before_its_store_is_refused() {
         |_| {},
     );
 }
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_global_read_on_another_switch_arm_is_refused() {
+    // epic-cc#1346 review: the flash write is on one switch arm and
+    // the read on another, so the read observes the global's reset
+    // value, not the write. The switch's edges are part of the block
+    // graph the order check reads.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal v i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %v = load i16 @v\n    \
+             switch i16 %v, default %def, cases 0 %c0, 1 %c1\n\
+             block c0:\n    store ptr @c @g\n    br join\n\
+             block c1:\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %c = load i8 %p\n    store i8 %c @out\n    br join\n\
+             block def:\n    store ptr @c @g\n    br join\n\
+             block join:\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("v", 0x12),
+            ("out", 0x14),
+            ("main::v", 0x15),
+            ("main::x", 0x17),
+            ("main::p", 0x19),
+            ("main::c", 0x1B),
+        ]),
+        None,
+    );
+}

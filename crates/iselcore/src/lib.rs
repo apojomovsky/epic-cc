@@ -20,11 +20,22 @@ pub fn func_dominators(f: &Func) -> HashMap<String, HashSet<String>> {
     // the last inst of every block).
     let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
     for b in &f.blocks {
-        let targets: Vec<&str> = match b.insts.last() {
-            Some(Inst::Br(br)) => vec![br.target.as_str()],
-            Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
-            _ => vec![],
-        };
+        let mut targets: Vec<&str> = Vec::new();
+        match b.insts.last() {
+            Some(Inst::Br(br)) => targets.push(br.target.as_str()),
+            Some(Inst::BrCond(bc)) => {
+                targets.push(bc.t.as_str());
+                targets.push(bc.f.as_str());
+            }
+            // A switch dispatches to every case and to the default.
+            Some(Inst::Switch(sw)) => {
+                for (_, l) in &sw.cases {
+                    targets.push(l);
+                }
+                targets.push(&sw.default);
+            }
+            _ => {}
+        }
         for t in targets {
             preds.entry(t).or_default().push(b.label.as_str());
         }
