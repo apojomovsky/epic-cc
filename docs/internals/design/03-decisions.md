@@ -51,7 +51,7 @@ one-line index entry here, e.g.:
 - ADR-051: Short const-table readers share their base's page (caller sets full HIGH(base), 2-word entries; pic14e port in #1188), 2026-10-12
 - ADR-052: All-constant search loops fold by guarded unrolling (unroll-disable scoped off constant-divide functions, fold kept only when IR shrinks; encoder-sim 6495 to 5215 words), 2026-10-12
 - ADR-053: Bare bit names as section-placed `_Bool` entities (PIC14 headers emit `.epic.bit` declarations, backend lowers to BSF/BCF/BTFSC; PIC18 needs a binding rule first), 2026-10-14
-- ADR-054: PIC18 pointer slots carry a static flash or RAM address space (whole-program slot proof, TBLPTR slot-seed loads, RAM copies for mixed; decides #1119 and #1092), 2026-10-14
+- ADR-054: PIC18 pointer slots carry a static flash or RAM address space (whole-program slot proof, TBLPTR slot-seed loads, RAM copies for mixed; runtime-tagged fallback for maybe-flash slots; integer-domain space proof for laundered addresses; decides #1119, #1092, #1306 and #1346), 2026-10-14
 - ADR-055: PIC18 debugger rows come from the assembler's final layout (opaque loc ids through far-branch splices and PCL pads; `--device` selects `Pic18Target`; step-over-call limit filed as follow-up), 2026-10-17
 - ADR-056: PIC12 baseline debugger reuses the PIC14 raw-text row walk (flat physical memory surface, `ebx` reads PCL with machine-semantics writes, volatile fixture keeps homes fresh; decides #1313), 2026-10-17
 

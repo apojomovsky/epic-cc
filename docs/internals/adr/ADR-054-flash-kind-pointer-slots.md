@@ -1,8 +1,10 @@
 # ADR-054 -- PIC18 pointer slots carry a static flash or RAM address space
 
 **Status:** Accepted 2026-10-14 (oracle decision on `epic-cc#1119`;
-amended 2026-10-17 by `epic-cc#1306`)<br>
-**Decides:** `epic-cc#1119`, `epic-cc#1092`, `epic-cc#1306`<br>
+amended 2026-10-17 by `epic-cc#1306`; amended 2026-10-21 by
+`epic-cc#1346`)<br>
+**Decides:** `epic-cc#1119`, `epic-cc#1092`, `epic-cc#1306`,
+`epic-cc#1346`<br>
 **Evidence:** `crates/isel-pic18/tests/flash_slots.rs`,
 `crates/iselcore/tests/slot_spaces.rs`,
 `crates/driver/tests/flash_walk_e2e.rs`
@@ -101,3 +103,45 @@ and benches carry no mixed pointer to widen. Deferred, each filed as
 an issue under epic-cc#1306: int-laundered addresses (no tag survives
 `ptrtoint`), PIC14 (no `TBLRD` path there), and memcpy into a
 maybe-flash destination (a raw byte copy has no tag source).
+
+## Integer-domain space proof (epic-cc#1346)
+
+An address that passes through the integer domain keeps its space when
+the space is settled statically, so no runtime tag is needed.
+
+The key fact is what an integer read of a pointer slot holds: the
+slot's own bytes, which are the address, not the table content. A
+flash-kind slot read as `i16` yields the table's byte address, and
+the `inttoptr` of that integer is the same address a direct pointer
+would carry. The read of a *const table* yields the table's content,
+whose first two bytes are the address of the const it names.
+
+`iselcore::add_int_flash_definite` proves the space with a greatest
+fixpoint by removal, the mirror image of the maybe-taint: a value is
+definite only when every path that produces it yields a flash address,
+and the state only shrinks, so the iteration terminates. A value is
+definite when it is a flash const global, a two-byte load from a
+location whose two bytes are definite, a copy of a definite value, an
+add or subtract of a definite value and a constant (a difference of
+two addresses is a length, a mask or a shift leaves a fragment), or a
+select, phi, or call result whose every arm is definite. Memory bytes
+are definite when every write to them writes a definite value, so a
+slot that also takes RAM loses the proof for exactly those bytes.
+
+A pointer that joins a definite flash pointer with a value that is
+not a flash address is maybe-flash, and no tag survives the join, so
+the proof withdraws the flash claim from the join's result and from
+the flash arm it joined. The shape then keeps the `int_flash`
+refusal. The withdrawal is what keeps the maybe case safe without the
+3-byte tagged form: a maybe-flash slot is sized by `alloc` from its
+own slot proof, so marking the `inttoptr` dst a flash writer there
+would widen the slot on the backend side only.
+
+The proof leaves the `inttoptr` dsts out of the slot proof's writer
+set, so the set is extended in the backend alone, for the deref path
+only.
+
+Two shapes stay refused. A `ptrtoint` of a GEP reads the GEP's own
+slot, which `resolve_pointers` folds away and never writes, so the
+value is not an address. A store of a flash address through a pointer
+the proof cannot resolve names no location, so no byte is definite.

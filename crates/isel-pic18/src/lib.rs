@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use device::Device;
 use ir::{Block, Func, Icmp, Inst, Module, SrcLoc, Ty, Val};
 use iselcore::{
-    add_flash_laundering, add_flash_walks, flash_provenance, flash_slot_spaces_ex,
-    resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot,
+    add_flash_laundering, add_flash_walks, add_int_flash_definite, flash_provenance,
+    flash_slot_spaces_ex, resolve_pointers, ssa_key, Base, FlashProvenance, PtrResolution, Slot,
 };
 
 /// The high Access Bank segment's start: every classic-mode PIC18's SFRs
@@ -11516,11 +11516,20 @@ impl<'m> Gen<'m> {
                     "isel-pic18: const source IntToPtr not yet supported"
                 );
                 // A flash table address copied through integers would be
-                // dereferenced as RAM: refuse (epic-cc#1284).
-                let launders = match &p.val {
-                    Val::Reg(r) => self.prov.int_flash.contains(&ssa_key(self.cur_func, r)),
-                    Val::Global(_) | Val::Const(_) => false,
-                };
+                // dereferenced as RAM: refuse (epic-cc#1284). The
+                // exception is a value the space proof settles (epic-cc#1346):
+                // the integer certainly carries a flash address, so the
+                // dst slot is flash-kind and a dereference through it
+                // seeds `TBLPTR` from the slot bytes.
+                let definite = self
+                    .prov
+                    .int_flash_ptr
+                    .contains(&ssa_key(self.cur_func, &p.dst));
+                let launders = !definite
+                    && match &p.val {
+                        Val::Reg(r) => self.prov.int_flash.contains(&ssa_key(self.cur_func, r)),
+                        Val::Global(_) | Val::Const(_) => false,
+                    };
                 assert!(
                     !launders,
                     "isel-pic18: inttoptr of %{} is derived from a flash address that passed through integers (ptrtoint or an integer copy of a pointer); a dereference would read RAM, not program memory (epic-cc#1284, epic-cc#1119)",
@@ -17585,6 +17594,17 @@ pub fn select_with_opts(
     add_flash_walks(&mut prov, m, |n| {
         !n.starts_with("_ZTV") && is_flash_const_global(m, addrs, n)
     });
+    // The integer-domain space proof (epic-cc#1346): an integer that
+    // certainly carries a flash address keeps its space through the
+    // int domain. The `inttoptr` dsts it proves stay out of the slot
+    // proof's writer set: a slot joining one of them with a RAM value
+    // is maybe-flash, and a maybe-flash slot needs the 3-byte tagged
+    // form, which `alloc` sizes from its own slot proof. Keeping the
+    // dsts here leaves that slot RAM-only, so the maybe case keeps the
+    // int_flash refusal instead of widening.
+    add_int_flash_definite(&mut prov, m, &resolved, |n| {
+        !n.starts_with("_ZTV") && is_flash_const_global(m, addrs, n)
+    });
     // Static address space of every pointer slot (epic-cc#1119): a slot
     // whose writers are all flash addresses or null lowers its loads
     // through `TBLPTR` seeded from the slot bytes. Same flash predicate
@@ -17598,6 +17618,13 @@ pub fn select_with_opts(
     add_flash_laundering(&mut prov, m, &resolved, &slot_flash, &slot_mixed, |n| {
         !n.starts_with("_ZTV") && is_flash_const_global(m, addrs, n)
     });
+    // An `inttoptr` of a definitely-flash integer keeps the space
+    // (epic-cc#1346): the slot holds a flash address, so a dereference
+    // through it seeds `TBLPTR` from the slot bytes, like any other
+    // flash-kind pointer slot. The set is the pointer's own slots, so
+    // the join that made it maybe-flash is already withdrawn from it.
+    let mut slot_flash = slot_flash;
+    slot_flash.extend(prov.int_flash_ptr.iter().cloned());
     // Priority ISRs (epic-cc#346): at most one handler per vector. A lone
     // handler of any priority keeps the P5 compatibility wiring (body at
     // the 0x0008 vector, fixed save block); a high/low pair uses priority
