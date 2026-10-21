@@ -86,7 +86,11 @@ const SERVICE_STEPS: usize = 20_000;
 /// The host's view of a control transfer's data stage.
 #[derive(Debug, PartialEq, Eq)]
 enum StageResult {
-    Data(Vec<u8>),
+    /// The device's packet, and the DATA1 toggle it sent it with.
+    Data {
+        data: Vec<u8>,
+        data1: bool,
+    },
     Stalled,
 }
 
@@ -157,9 +161,9 @@ impl Device {
     fn in_token(&mut self, stage: &str) -> StageResult {
         for _ in 0..64 {
             match self.sim.usb_in() {
-                UsbToken::Ack { data, .. } => {
+                UsbToken::Ack { data, data1 } => {
                     self.service(stage);
-                    return StageResult::Data(data);
+                    return StageResult::Data { data, data1 };
                 }
                 UsbToken::Stall => {
                     self.service(stage);
@@ -215,13 +219,25 @@ impl Device {
         self.setup(stage, request);
         let mut got = Vec::new();
         let max = u16::from_le_bytes([request[6], request[7]]) as usize;
+        // A control transfer's data stage starts with DATA1 and then
+        // alternates (USB 2.0 section 8.5.3); the host tracks the toggle,
+        // so a device that sends the wrong one is a protocol error rather
+        // than a host detail.
+        let mut expect_data1 = true;
         while got.len() < max && got.len() < want.len() {
             match self.in_token(stage) {
-                StageResult::Data(packet) => {
-                    if packet.is_empty() {
+                StageResult::Data { data, data1 } => {
+                    if data1 != expect_data1 {
+                        panic!(
+                            "{stage}: the device sent DATA{} where DATA{} was due",
+                            data1 as u8, expect_data1 as u8
+                        );
+                    }
+                    expect_data1 = !expect_data1;
+                    if data.is_empty() {
                         break;
                     }
-                    got.extend_from_slice(&packet);
+                    got.extend_from_slice(&data);
                 }
                 StageResult::Stalled => panic!("{stage}: EP0 stalled in the data stage"),
             }
@@ -273,7 +289,10 @@ fn cdc_acm_enumeration_walks_every_endpoint_zero_stage() {
     dev.setup("SET_ADDRESS", setup_packet(0x00, 0x05, 5, 0, 0));
     assert_eq!(
         dev.in_token("SET_ADDRESS status"),
-        StageResult::Data(vec![])
+        StageResult::Data {
+            data: vec![],
+            data1: true
+        }
     );
     assert_eq!(dev.sim.ram()[UADDR], 5, "UADDR takes the new address");
 
@@ -321,7 +340,10 @@ fn cdc_acm_enumeration_walks_every_endpoint_zero_stage() {
     dev.setup("SET_CONFIGURATION", setup_packet(0x00, 0x09, 1, 0, 0));
     assert_eq!(
         dev.in_token("SET_CONFIGURATION status"),
-        StageResult::Data(vec![])
+        StageResult::Data {
+            data: vec![],
+            data1: true
+        }
     );
     assert_eq!(
         dev.ram("g_configured"),
@@ -352,7 +374,10 @@ fn cdc_acm_enumeration_walks_every_endpoint_zero_stage() {
     );
     assert_eq!(
         dev.in_token("SET_LINE_CODING status"),
-        StageResult::Data(vec![]),
+        StageResult::Data {
+            data: vec![],
+            data1: true
+        },
         "the status stage is a zero-length IN"
     );
 
@@ -371,7 +396,10 @@ fn cdc_acm_enumeration_walks_every_endpoint_zero_stage() {
     );
     assert_eq!(
         dev.in_token("SET_CONTROL_LINE_STATE status"),
-        StageResult::Data(vec![])
+        StageResult::Data {
+            data: vec![],
+            data1: true
+        }
     );
     assert_eq!(dev.ram("g_dtr"), 1, "DTR latched");
 
@@ -412,7 +440,7 @@ fn an_unsupported_request_stalls_at_the_data_stage_and_the_walk_sees_it() {
         setup_packet(IN_STD, 0x06, 0x0100, 0, 18),
     );
     match dev.in_token("device descriptor after a stall") {
-        StageResult::Data(packet) => assert_eq!(packet, &DEVICE_DESC[..8]),
+        StageResult::Data { data, .. } => assert_eq!(data, &DEVICE_DESC[..8]),
         StageResult::Stalled => panic!("EP0 stayed stalled after a fresh SETUP"),
     }
 }

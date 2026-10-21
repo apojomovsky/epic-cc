@@ -111,6 +111,7 @@ volatile uint8_t g_ep0_stalls;
 static uint8_t stage;
 static const uint8_t *in_src; /* next descriptor byte to send */
 static uint8_t in_left;       /* descriptor bytes still unsent */
+static uint8_t in_data1;      /* toggle of the next IN data packet */
 static uint8_t returning_short;
 static uint8_t need_zlp;
 static uint8_t out_len;
@@ -173,7 +174,10 @@ static void start_in(const uint8_t *src, uint8_t len, uint8_t asked)
     in_left = (uint8_t)(((asked < len) ? asked : len) - n);
     need_zlp = (uint8_t)(in_left == 0 && returning_short);
     stage = STAGE_IN_DATA;
-    arm_in(src, n, 1);
+    /* A control transfer's data stage starts with DATA1 and alternates. */
+    in_data1 = 1;
+    arm_in(src, n, in_data1);
+    in_data1 = (uint8_t)!in_data1;
 }
 
 static void next_in_packet(void)
@@ -186,13 +190,15 @@ static void next_in_packet(void)
         if (in_left == 0 && n == EP0_LEN && returning_short) {
             need_zlp = 1;
         }
-        arm_in(in_src, n, 0);
+        arm_in(in_src, n, in_data1);
+        in_data1 = (uint8_t)!in_data1;
         in_src += n;
         return;
     }
     if (need_zlp) {
         need_zlp = 0;
-        arm_in(0, 0, 0);
+        arm_in(0, 0, in_data1);
+        in_data1 = (uint8_t)!in_data1;
         return;
     }
     stage = STAGE_IDLE;
