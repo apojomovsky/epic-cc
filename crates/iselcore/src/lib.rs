@@ -5,8 +5,61 @@ pub mod chunk;
 pub mod delay;
 pub mod walk;
 
-use ir::{GepBase, Inst, Module};
+use ir::{Func, GepBase, Inst, Module};
 use std::collections::{HashMap, HashSet};
+
+/// The blocks each block of `f` dominates, keyed by the block's label.
+/// The entry block dominates itself; every other block dominates the
+/// blocks every predecessor path reaches.
+pub fn func_dominators(f: &Func) -> HashMap<String, HashSet<String>> {
+    let Some(entry) = f.blocks.first().map(|b| b.label.clone()) else {
+        return HashMap::new();
+    };
+    let all: HashSet<String> = f.blocks.iter().map(|b| b.label.clone()).collect();
+    // Predecessor lists from the terminators' targets (the terminator is
+    // the last inst of every block).
+    let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+    for b in &f.blocks {
+        let targets: Vec<&str> = match b.insts.last() {
+            Some(Inst::Br(br)) => vec![br.target.as_str()],
+            Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+            _ => vec![],
+        };
+        for t in targets {
+            preds.entry(t).or_default().push(b.label.as_str());
+        }
+    }
+    let mut dom: HashMap<String, HashSet<String>> = HashMap::new();
+    dom.insert(entry.clone(), HashSet::from([entry.clone()]));
+    for b in &f.blocks {
+        if b.label != entry {
+            dom.insert(b.label.clone(), all.clone());
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in &f.blocks {
+            if b.label == entry {
+                continue;
+            }
+            let mut new: HashSet<String> = match preds.get(b.label.as_str()) {
+                Some(ps) => ps
+                    .iter()
+                    .map(|p| dom[*p].clone())
+                    .reduce(|a, c| a.intersection(&c).cloned().collect())
+                    .unwrap_or_else(|| all.clone()),
+                None => all.clone(),
+            };
+            new.insert(b.label.clone());
+            if new != dom[&b.label] {
+                dom.insert(b.label.clone(), new);
+                changed = true;
+            }
+        }
+    }
+    dom
+}
 
 /// Map key for a local value: `{func}::{name}` (IR value names without `%`).
 /// Matches the keys `alloc` emits in its overlay layout, so a callee's param
@@ -1620,12 +1673,6 @@ pub struct FlashProvenance {
     /// domain (epic-cc#1284). An `inttoptr` of one would dereference the
     /// table address as RAM, so the backend refuses it.
     pub int_flash: HashSet<String>,
-    /// Integer regs (`{func}::{reg}`) and integer globals (`@{name}`) that
-    /// certainly carry a flash table address laundered through the integer
-    /// domain (epic-cc#1346). A subset of `int_flash`: the definite proof
-    /// keeps the space, so the backend lowers the `inttoptr` through
-    /// `TBLPTR` instead of refusing it.
-    pub int_flash_definite: HashSet<String>,
     /// Pointer slots (`{func}::{slot}`) an `inttoptr` produced from a
     /// definitely-flash integer (epic-cc#1346). Each holds a flash
     /// address, so a dereference through it seeds `TBLPTR` from the slot
@@ -3417,11 +3464,10 @@ pub fn add_flash_laundering(
 /// other pointer names an unknown location, whose load is never
 /// definite and whose store voids the whole memory proof.
 ///
-/// `prov.int_flash_definite` holds the definite values, and
-/// `prov.int_flash_ptr` the pointer regs that hold a flash address: an
-/// `inttoptr` of a definite value, and every pointer derived from it
-/// (a GEP over it, a select or a phi arm). A dereference through one
-/// seeds `TBLPTR` from the slot bytes.
+/// `prov.int_flash_ptr` holds the pointer regs that hold a flash
+/// address: an `inttoptr` of a definite value, and every pointer
+/// derived from it (a GEP over it, a select or a phi arm). A
+/// dereference through one seeds `TBLPTR` from the slot bytes.
 pub fn add_int_flash_definite(
     prov: &mut FlashProvenance,
     m: &Module,
@@ -3496,13 +3542,30 @@ pub fn add_int_flash_definite(
     // from one location to another, and `Init` names the const a
     // global's initializer holds.
     enum Write {
-        Val { func: String, val: ir::Val },
-        Copy { sslot: String, soff: u32, doff: u32 },
-        Init { target: String },
+        Val {
+            func: String,
+            val: ir::Val,
+            block: String,
+            index: usize,
+        },
+        Copy {
+            func: String,
+            sslot: String,
+            soff: u32,
+            doff: u32,
+            block: String,
+            index: usize,
+        },
+        Init {
+            target: String,
+        },
     }
     let mut writes: Vec<Write> = Vec::new();
     // The writes covering each byte, as indices into `writes`.
     let mut writes_by: HashMap<(String, u32), Vec<usize>> = HashMap::new();
+    // The reads of each byte, with the place of the read, so a write is
+    // known to have happened by every read of the byte.
+    let mut reads_by: HashMap<(String, u32), Vec<(String, String, usize)>> = HashMap::new();
     // A write through a pointer no proof can resolve: every byte of
     // memory may hold it, so no byte is definite.
     let mut void_all = false;
@@ -3545,7 +3608,7 @@ pub fn add_int_flash_definite(
 
     for f in &m.funcs {
         for b in &f.blocks {
-            for i in &b.insts {
+            for (inst_index, i) in b.insts.iter().enumerate() {
                 let func = f.name.clone();
                 match i {
                     Inst::Store(s) => match loc(&func, &s.ptr) {
@@ -3554,6 +3617,8 @@ pub fn add_int_flash_definite(
                             writes.push(Write::Val {
                                 func: func.clone(),
                                 val: s.val.clone(),
+                                block: b.label.clone(),
+                                index: inst_index,
                             });
                             for k in 0..u32::from(s.ty.bytes()) {
                                 writes_by
@@ -3577,9 +3642,12 @@ pub fn add_int_flash_definite(
                         };
                         let idx = writes.len();
                         writes.push(Write::Copy {
+                            func: func.clone(),
                             sslot: ss,
                             soff: so,
                             doff,
+                            block: b.label.clone(),
+                            index: inst_index,
                         });
                         for k in 0..u32::from(n) {
                             writes_by
@@ -3601,11 +3669,26 @@ pub fn add_int_flash_definite(
                                         writes.push(Write::Val {
                                             func: func.clone(),
                                             val: ir::Val::Const(-1),
+                                            block: b.label.clone(),
+                                            index: inst_index,
                                         });
                                         writes_by.entry((slot, off)).or_default().push(idx);
                                     }
                                     Loc::Unknown => void_all = true,
                                 }
+                            }
+                        }
+                    }
+                    Inst::Load(l) if !l.ptr_ty => {
+                        // A read observes the slot's bytes at this
+                        // place, so a write must have happened by it.
+                        if let Loc::Fixed(slot, off) = loc(&func, &l.ptr) {
+                            for k in 0..u32::from(l.ty.bytes()) {
+                                reads_by.entry((slot.clone(), off + k)).or_default().push((
+                                    func.clone(),
+                                    b.label.clone(),
+                                    inst_index,
+                                ));
                             }
                         }
                     }
@@ -3862,7 +3945,8 @@ pub fn add_int_flash_definite(
                     let a_const = matches!(x.a, ir::Val::Const(_));
                     let b_const = matches!(x.b, ir::Val::Const(_));
                     match x.op {
-                        ir::BinOp::Add | ir::BinOp::Sub => (a_def && b_const) || (b_def && a_const),
+                        ir::BinOp::Add => (a_def && b_const) || (b_def && a_const),
+                        ir::BinOp::Sub => a_def && b_const,
                         _ => false,
                     }
                 }
@@ -3884,6 +3968,38 @@ pub fn add_int_flash_definite(
                 _ => false,
             }
         };
+
+    // The blocks each block dominates, so a write in one block is known
+    // to have happened when a later block reads.
+    let dominators: HashMap<String, HashMap<String, HashSet<String>>> = m
+        .funcs
+        .iter()
+        .map(|f| (f.name.clone(), func_dominators(f)))
+        .collect();
+    // Whether a write has happened by a read: the same block counts
+    // when the write comes first, and another block counts when it
+    // dominates the read's block.
+    let write_precedes = |write_func: &str,
+                          write_block: &str,
+                          write_index: usize,
+                          read_func: &str,
+                          read_block: &str,
+                          read_index: usize|
+     -> bool {
+        if write_func != read_func {
+            // A write in another function happens at a call site the
+            // proof does not track, so it never precedes a read here.
+            return false;
+        }
+        if write_block == read_block {
+            write_index < read_index
+        } else {
+            dominators
+                .get(read_func)
+                .and_then(|d| d.get(read_block))
+                .is_some_and(|set| set.contains(write_block))
+        }
+    };
 
     // The derivation of one memory byte, under the current state.
     let derive_byte = |flash_val: &HashSet<String>,
@@ -3931,18 +4047,56 @@ pub fn add_int_flash_definite(
                 }
             };
         }
-        // Every write to the byte must write a definite value.
+        // Every write to the byte must write a definite value, and
+        // every read of the byte must observe one of those writes: a
+        // read before a later write sees the earlier value, so the
+        // byte is not definite.
         let Some(list) = writes_by.get(&(slot.to_string(), off)) else {
             return false;
         };
-        !list.is_empty()
-            && list.iter().all(|idx| match &writes[*idx] {
-                Write::Val { func, val } => is_def(flash_val, func, val),
-                Write::Copy { sslot, soff, doff } => {
-                    flash_bytes.contains(&(sslot.clone(), soff + (off - doff)))
+        if list.is_empty() {
+            return false;
+        }
+        let reads = reads_by.get(&(slot.to_string(), off));
+        list.iter().all(|idx| match &writes[*idx] {
+            Write::Val {
+                func,
+                val,
+                block,
+                index,
+            } => {
+                if !is_def(flash_val, func, val) {
+                    return false;
                 }
-                Write::Init { target } => is_flash_const(target),
-            })
+                // The write must have happened by every read of the
+                // byte.
+                match reads {
+                    Some(rs) => rs
+                        .iter()
+                        .all(|(rf, rb, ri)| write_precedes(func, block, *index, rf, rb, *ri)),
+                    None => true,
+                }
+            }
+            Write::Copy {
+                func,
+                sslot,
+                soff,
+                doff,
+                block,
+                index,
+            } => {
+                if !flash_bytes.contains(&(sslot.clone(), soff + (off - doff))) {
+                    return false;
+                }
+                match reads {
+                    Some(rs) => rs
+                        .iter()
+                        .all(|(rf, rb, ri)| write_precedes(func, block, *index, rf, rb, *ri)),
+                    None => true,
+                }
+            }
+            Write::Init { target } => is_flash_const(target),
+        })
     };
 
     // The greatest fixpoint by removal: a value or byte that no longer
@@ -4161,7 +4315,6 @@ pub fn add_int_flash_definite(
         prov.mixed.insert(key.clone());
     }
     prov.int_flash_ptr = ptr;
-    prov.int_flash_definite = flash_val;
 }
 
 /// Global names an address value may carry, following pointer

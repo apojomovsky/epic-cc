@@ -1185,3 +1185,69 @@ fn call_result_over_a_va_arg_clobbered_param_is_refused() {
         |_| {},
     );
 }
+
+#[test]
+fn int_laundered_global_with_a_plain_initializer_reads_ram() {
+    // epic-cc#1346 review: the global's own initializer holds a plain
+    // value, so its bytes are not an address. The laundered value is
+    // the initialized one, and the dereference reads RAM, not flash.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" {
+            g.bytes = vec![0x40, 0x00];
+        }
+    }
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("main::x", 0x13),
+            ("main::p", 0x15),
+            ("main::v", 0x17),
+        ]),
+        None,
+    );
+    assert!(!asm.contains("TBLRD*"), "must not read flash:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x40] = b'R';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x12], b'R', "the laundered value must read RAM");
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_address_minus_from_a_constant_is_refused() {
+    // epic-cc#1346 review: `n - address` is not an address, so the
+    // subtraction does not keep the space.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %y = sub i16 4, %x\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_global_read_before_its_store_is_refused() {
+    // epic-cc#1346 review: the global is read before the only store
+    // into it, so the read sees the initializer, not the store. The
+    // proof cannot say which write a read observes, so the slot is not
+    // definite.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal h i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %t = load i16 @g\n    %y = load i16 @h\n    store i16 %t @h\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}

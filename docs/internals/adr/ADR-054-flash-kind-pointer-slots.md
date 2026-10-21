@@ -122,11 +122,19 @@ definite only when every path that produces it yields a flash address,
 and the state only shrinks, so the iteration terminates. A value is
 definite when it is a flash const global, a two-byte load from a
 location whose two bytes are definite, a copy of a definite value, an
-add or subtract of a definite value and a constant (a difference of
-two addresses is a length, a mask or a shift leaves a fragment), or a
-select, phi, or call result whose every arm is definite. Memory bytes
-are definite when every write to them writes a definite value, so a
-slot that also takes RAM loses the proof for exactly those bytes.
+add of a definite value and a constant (a subtraction keeps the space
+only when the address is the minuend, and a difference of two
+addresses is a length, a mask or a shift leaves a fragment), or a
+select, phi, or call result whose every arm is definite.
+
+Memory bytes are definite when every write to them writes a definite
+value, so a slot that also takes RAM loses the proof for exactly those
+bytes. A write must also have happened by every read of the byte: a
+read before a later write observes the earlier value, so the proof
+tracks the block and the position of each write and each read, and a
+write in another block counts only when that block dominates the
+read's. Without that order, a global read before its only store would
+observe the store's value.
 
 A pointer that joins a definite flash pointer with a value that is
 not a flash address is maybe-flash, and no tag survives the join, so
@@ -143,11 +151,14 @@ The proof leaves the `inttoptr` dsts out of the slot proof's writer
 set, so the set is extended in the backend alone, for the deref path
 only.
 
-Four shapes stay refused. A `ptrtoint` of a GEP reads the GEP's own
+Six shapes stay refused. A `ptrtoint` of a GEP reads the GEP's own
 slot, which `resolve_pointers` folds away and never writes, so the
 value is not an address. A store of a flash address through a pointer
 the proof cannot resolve names no location, so no byte is definite. A
 `memcpy` side with a runtime term names no fixed bytes, so the copy's
 other side is not proven to hold the address. A call result is
 definite only when the callee returned a parameter it never
-overwrote, since the IR is a slot IR and a name may be reused.
+overwrote, since the IR is a slot IR and a name may be reused. A
+global whose initializer holds a plain value holds no address, so its
+bytes are not definite. A subtraction with a constant minuend is not
+an address, so it does not keep the space.
