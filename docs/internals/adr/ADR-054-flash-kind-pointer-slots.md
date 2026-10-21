@@ -130,18 +130,24 @@ slot that also takes RAM loses the proof for exactly those bytes.
 
 A pointer that joins a definite flash pointer with a value that is
 not a flash address is maybe-flash, and no tag survives the join, so
-the proof withdraws the flash claim from the join's result and from
-the flash arm it joined. The shape then keeps the `int_flash`
-refusal. The withdrawal is what keeps the maybe case safe without the
-3-byte tagged form: a maybe-flash slot is sized by `alloc` from its
-own slot proof, so marking the `inttoptr` dst a flash writer there
-would widen the slot on the backend side only.
+the proof withdraws the flash claim from the join's result and marks
+it mixed. The join's own dereference then keeps the maybe-flash
+refusal; the flash arm it joined keeps its claim, so a direct
+dereference through the arm still reads flash. The withdrawal is what
+keeps the maybe case safe without the 3-byte tagged form: a
+maybe-flash slot is sized by `alloc` from its own slot proof, so
+marking the `inttoptr` dst a flash writer there would widen the slot
+on the backend side only.
 
 The proof leaves the `inttoptr` dsts out of the slot proof's writer
 set, so the set is extended in the backend alone, for the deref path
 only.
 
-Two shapes stay refused. A `ptrtoint` of a GEP reads the GEP's own
+Four shapes stay refused. A `ptrtoint` of a GEP reads the GEP's own
 slot, which `resolve_pointers` folds away and never writes, so the
 value is not an address. A store of a flash address through a pointer
-the proof cannot resolve names no location, so no byte is definite.
+the proof cannot resolve names no location, so no byte is definite. A
+`memcpy` side with a runtime term names no fixed bytes, so the copy's
+other side is not proven to hold the address. A call result is
+definite only when the callee returned a parameter it never
+overwrote, since the IR is a slot IR and a name may be reused.

@@ -4054,6 +4054,11 @@ pub fn add_int_flash_definite(
     // The derivation of one pointer, under the current state: a GEP
     // over a flash pointer, a join whose every arm is a flash pointer
     // (a flash const global arm counts), and a freeze of one.
+    //
+    // A join that mixes a flash pointer with a non-flash value does not
+    // derive, so its result is withdrawn. The flash arm keeps its
+    // claim: the arm still holds a flash address, and a direct
+    // dereference through it is sound.
     let derives = |ptr: &HashSet<String>, func: &str, inst: &Inst| -> bool {
         match inst {
             Inst::IntToPtr(p) => flash_val.contains(&ssa_key(func, &p.dst)),
@@ -4088,9 +4093,8 @@ pub fn add_int_flash_definite(
     // A join that mixes a flash pointer with a non-flash value is
     // maybe-flash: its result is marked mixed, so the backend's
     // maybe-flash refusal fires on a dereference through it. The join's
-    // flash arm is dropped from the set for the same reason: the value
-    // reaches the join, so a dereference through the join cannot be
-    // settled statically.
+    // flash arm keeps its claim, so a direct dereference through the
+    // arm is still served.
     let mut mixed_joins: HashSet<String> = HashSet::new();
     loop {
         let mut changed = false;
@@ -4142,6 +4146,41 @@ pub fn add_int_flash_definite(
         }
         if !changed {
             break;
+        }
+    }
+    // A flash arm of a maybe-flash join keeps its claim: the arm still
+    // holds a flash address, so a direct dereference through it reads
+    // flash. The join's own result is the maybe-flash one.
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                let arms: Vec<&ir::Val> = match i {
+                    Inst::Select(s) if s.ptr => vec![&s.a, &s.b],
+                    Inst::Phi(p) if p.ptr => p.incoming.iter().map(|(v, _)| v).collect(),
+                    _ => Vec::new(),
+                };
+                if arms.is_empty() {
+                    continue;
+                }
+                let dst = match i {
+                    Inst::Select(s) if s.ptr => &s.dst,
+                    Inst::Phi(p) if p.ptr => &p.dst,
+                    _ => continue,
+                };
+                if !mixed_joins.contains(&ssa_key(&f.name, dst)) {
+                    continue;
+                }
+                for v in &arms {
+                    if let ir::Val::Reg(r) = v {
+                        let key = ssa_key(&f.name, r);
+                        // The arm is a flash pointer again, unless it
+                        // is itself the result of a maybe-flash join.
+                        if !mixed_joins.contains(&key) {
+                            ptr.insert(key);
+                        }
+                    }
+                }
+            }
         }
     }
     // The maybe-flash joins are mixed pointers: the backend refuses a

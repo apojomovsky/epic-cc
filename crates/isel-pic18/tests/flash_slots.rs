@@ -1110,3 +1110,16 @@ fn call_result_over_a_clobbered_param_is_refused() {
         |_| {},
     );
 }
+
+#[test]
+fn int_laundered_flash_deref_beside_a_ram_join_reads_flash() {
+    // epic-cc#1346 review: a maybe-flash join withdraws the join's
+    // result, not the flash arm it joined. A direct dereference
+    // through the arm still reads flash.
+    let asm = laundering_asm(
+        "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    %f = load i8 @flag\n    %m = select i1 %f, ptr @buf, ptr %p\n    ret void\n",
+        |_| {},
+    );
+    assert!(asm.contains("TBLRD*"), "must read flash:\n{asm}");
+}
