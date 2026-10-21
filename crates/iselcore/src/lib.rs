@@ -3967,20 +3967,12 @@ pub fn add_int_flash_definite(
 
     // The pointer regs that hold a flash address: the `inttoptr` dsts
     // whose source integer is definite, and the pointers derived from
-    // them (a GEP over one, a select or a phi arm). The derivation
-    // walk starts at the `inttoptr` dsts alone: a slot that merely
-    // holds a definite integer (an alloca, a plain global) is data,
-    // not an address, so it never enters the set. A pointer that never
-    // derives from an `inttoptr` dst is not a candidate at all, so a
-    // RAM-only pointer phi never reaches the removal fixpoint.
+    // them. The walk starts at the `inttoptr` dsts alone: a slot that
+    // merely holds a definite integer is data, not an address.
     //
     // Within the candidates, the set is a fixpoint by removal, like the
-    // value proof: one that does not derive from a flash pointer is
-    // dropped. Removal keeps the derivations consistent, so a pointer
-    // derived from a dropped one is dropped too, and a join that mixes
-    // a flash pointer with a non-flash value drops the join's result
-    // and the flash arm it joined. The maybe-flash shape then keeps the
-    // int_flash refusal.
+    // value proof. Removal keeps the derivations consistent, so a
+    // pointer derived from a dropped one is dropped too.
     let mut ptr: HashSet<String> = HashSet::new();
     for f in &m.funcs {
         for b in &f.blocks {
@@ -4056,9 +4048,7 @@ pub fn add_int_flash_definite(
     // (a flash const global arm counts), and a freeze of one.
     //
     // A join that mixes a flash pointer with a non-flash value does not
-    // derive, so its result is withdrawn. The flash arm keeps its
-    // claim: the arm still holds a flash address, and a direct
-    // dereference through it is sound.
+    // derive, so its result is withdrawn.
     let derives = |ptr: &HashSet<String>, func: &str, inst: &Inst| -> bool {
         match inst {
             Inst::IntToPtr(p) => flash_val.contains(&ssa_key(func, &p.dst)),
@@ -4092,9 +4082,7 @@ pub fn add_int_flash_definite(
     //
     // A join that mixes a flash pointer with a non-flash value is
     // maybe-flash: its result is marked mixed, so the backend's
-    // maybe-flash refusal fires on a dereference through it. The join's
-    // flash arm keeps its claim, so a direct dereference through the
-    // arm is still served.
+    // maybe-flash refusal fires on a dereference through it.
     let mut mixed_joins: HashSet<String> = HashSet::new();
     loop {
         let mut changed = false;
