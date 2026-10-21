@@ -1318,3 +1318,44 @@ fn int_laundered_pointer_load_before_its_store_is_refused() {
         None,
     );
 }
+
+#[test]
+fn int_laundered_call_result_looks_up_its_actual_in_the_caller_reads_ram() {
+    // epic-cc#1346 review: the callee's own register holds a flash
+    // address while the caller's register of the same name holds a RAM
+    // address. The actual lives in the caller's scope, so the result
+    // is the caller's value, and the dereference reads RAM.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i16\nglobal h i16\nglobal h2 i16\nglobal out i8\n\
+             fn f(i16) (x=i16)\n  block entry:\n    store ptr @c @g\n    %1 = load i16 @g\n    ret i16 %x\n\
+             fn main(void) ()\n  block entry:\n    store ptr @buf @h\n    %1 = load i16 @h\n    %r = call i16 @f(i16 %1)\n    %q = gep %r +0\n    memcpy @h2 %q 2\n    %y = load i16 @h2\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("buf", 0x13),
+            ("h", 0x16),
+            ("h2", 0x19),
+            ("out", 0x1C),
+            ("f::1", 0x1D),
+            ("f::x", 0x1F),
+            ("main::1", 0x21),
+            ("main::r", 0x23),
+            ("main::q", 0x25),
+            ("main::y", 0x27),
+            ("main::p", 0x29),
+            ("main::v", 0x2B),
+        ]),
+        None,
+    );
+    assert!(
+        !asm.contains("TBLRD*"),
+        "the caller's RAM address must not read flash:\n{asm}"
+    );
+}

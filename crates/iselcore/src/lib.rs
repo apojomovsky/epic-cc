@@ -4040,14 +4040,16 @@ pub fn add_int_flash_definite(
                     // The slot holds what the callee returns. Every
                     // call site of that callee must agree, and each
                     // site's own arguments decide the callee's
-                    // integer params.
-                    let mut sites: Vec<&ir::Call> = Vec::new();
+                    // integer params. The actual lives in the caller's
+                    // scope, so the caller's name is the one to look it
+                    // up in.
+                    let mut sites: Vec<(&String, &ir::Call)> = Vec::new();
                     for g in &m.funcs {
                         for b in &g.blocks {
                             for i in &b.insts {
                                 if let Inst::Call(cc) = i {
                                     if cc.func == *callee {
-                                        sites.push(cc);
+                                        sites.push((&g.name, cc));
                                     }
                                 }
                             }
@@ -4056,7 +4058,7 @@ pub fn add_int_flash_definite(
                     !sites.is_empty()
                         && sites
                             .iter()
-                            .all(|cc| call_returns_def(flash_val, &cc.func, cc))
+                            .all(|(caller, cc)| call_returns_def(flash_val, caller, cc))
                 }
             };
         }
