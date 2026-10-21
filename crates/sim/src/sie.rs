@@ -56,6 +56,12 @@ pub const UCON_USBEN: u8 = 0x08;
 pub const UCON_PKTDIS: u8 = 0x10;
 /// `UIR<0>`: a valid USB reset was seen and `UADDR` was cleared.
 pub const UIR_URSTIF: u8 = 0x01;
+/// `UIE<0>`: the USB reset interrupt is enabled.
+pub const UIE_URSTIE: u8 = 0x01;
+/// `UIE<3>`: the transaction complete interrupt is enabled.
+pub const UIE_TRNIE: u8 = 0x08;
+/// `UIE<5>`: the stall interrupt is enabled.
+pub const UIE_STALLIE: u8 = 0x20;
 /// `UIR<3>`: a transaction completed; clearing it advances the USTAT FIFO.
 pub const UIR_TRNIF: u8 = 0x08;
 /// `UIR<5>`: the SIE answered a STALL handshake.
@@ -109,7 +115,11 @@ pub enum UsbToken {
 pub fn reset(ram: &mut [u8; 4096]) {
     ram[UADDR] = 0;
     ram[UIR] = (ram[UIR] & !(UIR_TRNIF | UIR_STALLIF)) | UIR_URSTIF;
-    ram[PIR2] |= PIR2_USBIF;
+    // The SIE stops processing packets for the rest of the setup, so a
+    // reset that leaves `PKTDIS` set would leave the device deaf until
+    // firmware rewrote `UCON`. A bus reset re-arms the module.
+    ram[UCON] &= !UCON_PKTDIS;
+    raise_usbif(ram, UIR_URSTIF, UIE_URSTIE);
     for ep in 0..16 {
         ram[UEP0 + ep] &= !UEP_EPSTALL;
     }
@@ -189,8 +199,10 @@ pub fn out_token(ram: &mut [u8; 4096], data: &[u8], data1: bool) -> UsbToken {
         return UsbToken::Nak;
     }
     if out.stat & BD_DTSEN != 0 && data1 != (out.stat & BD_DTS != 0) {
+        // Acknowledged but not stored: the payload never reached the
+        // buffer, so there is none to hand back.
         return UsbToken::Ack {
-            data: data.to_vec(),
+            data: Vec::new(),
             data1,
         };
     }
@@ -301,7 +313,17 @@ fn in_usb_ram(addr: usize, len: usize) -> bool {
 fn complete(ram: &mut [u8; 4096], ep: u8, dir_in: bool) {
     ram[USTAT] = ((ep & 0x0F) << 3) | if dir_in { 0x04 } else { 0 };
     ram[UIR] |= UIR_TRNIF;
-    ram[PIR2] |= PIR2_USBIF;
+    raise_usbif(ram, UIR_TRNIF, UIE_TRNIE);
+}
+
+/// Raise the top-level USB interrupt flag when an enabled source fired
+/// (DS39632E figure 17-8: every `UIR` flag is ANDed with its `UIE` enable
+/// before the OR into `PIR2.USBIF`).
+fn raise_usbif(ram: &mut [u8; 4096], flag: u8, enable: u8) {
+    if ram[UIE] & enable != 0 {
+        ram[PIR2] |= PIR2_USBIF;
+    }
+    let _ = flag;
 }
 
 /// Answer STALL: the endpoint latch and flag rise, and the armed descriptor
@@ -311,7 +333,7 @@ fn complete(ram: &mut [u8; 4096], ep: u8, dir_in: bool) {
 fn stall(ram: &mut [u8; 4096]) -> UsbToken {
     ram[UEP0] |= UEP_EPSTALL;
     ram[UIR] |= UIR_STALLIF;
-    ram[PIR2] |= PIR2_USBIF;
+    raise_usbif(ram, UIR_STALLIF, UIE_STALLIE);
     UsbToken::Stall
 }
 
@@ -367,7 +389,11 @@ mod tests {
             UCON_PKTDIS,
             "SETUP disables tokens"
         );
-        assert_eq!(ram[PIR2] & PIR2_USBIF, PIR2_USBIF);
+        assert_eq!(
+            ram[PIR2] & PIR2_USBIF,
+            0,
+            "an unmasked source raises no flag"
+        );
     }
 
     #[test]
@@ -425,6 +451,11 @@ mod tests {
         assert_eq!(ram[UEP0] & UEP_EPSTALL, UEP_EPSTALL);
         assert_eq!(ram[UIR] & UIR_STALLIF, UIR_STALLIF);
         assert_eq!(ram[UIR] & UIR_TRNIF, 0, "a stalled token is no completion");
+        assert_eq!(
+            ram[PIR2] & PIR2_USBIF,
+            0,
+            "an unmasked source raises no flag"
+        );
     }
 
     #[test]
@@ -477,6 +508,53 @@ mod tests {
         assert_eq!(ram[UIR] & UIR_TRNIF, 0);
         assert_eq!(ram[UEP0] & UEP_EPSTALL, 0);
         assert_eq!(ram[UEP0 + 3] & UEP_EPSTALL, 0);
+    }
+
+    #[test]
+    fn a_bus_reset_leaves_the_module_able_to_answer_again() {
+        let mut ram = endpoint0();
+        let pkt = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x40, 0x00];
+        assert!(matches!(setup(&mut ram, &pkt), UsbToken::Ack { .. }));
+        assert_eq!(ram[UCON] & UCON_PKTDIS, UCON_PKTDIS);
+        reset(&mut ram);
+        assert_eq!(ram[UCON] & UCON_PKTDIS, 0, "the reset re-arms the module");
+        arm_out(&mut ram, 8, 0x500);
+        assert!(
+            matches!(setup(&mut ram, &pkt), UsbToken::Ack { .. }),
+            "the device is enumerable again after a bus reset"
+        );
+    }
+
+    #[test]
+    fn the_top_level_flag_follows_the_enable_bits() {
+        let mut ram = endpoint0();
+        // No enable: the flag in UIR rises, the top-level flag does not.
+        arm_in(&mut ram, 1, false);
+        assert!(matches!(in_token(&mut ram), UsbToken::Ack { .. }));
+        assert_eq!(ram[UIR] & UIR_TRNIF, UIR_TRNIF);
+        assert_eq!(
+            ram[PIR2] & PIR2_USBIF,
+            0,
+            "an unmasked source raises no flag"
+        );
+
+        // With the enable set, the top-level flag follows.
+        ram[UIE] = UIE_TRNIE;
+        arm_in(&mut ram, 1, false);
+        assert!(matches!(in_token(&mut ram), UsbToken::Ack { .. }));
+        assert_eq!(ram[PIR2] & PIR2_USBIF, PIR2_USBIF);
+    }
+
+    #[test]
+    fn an_ignored_but_acknowledged_packet_hands_back_no_data() {
+        let mut ram = endpoint0();
+        ram[BDT] = BD_UOWN | BD_DTSEN; /* expect DATA0 */
+        ram[BDT + 1] = 8;
+        match out_token(&mut ram, &[0xAA, 0xBB], true) {
+            UsbToken::Ack { data, .. } => assert!(data.is_empty(), "nothing was stored"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(&ram[0x500..0x502], &[0x00, 0x00], "the buffer is untouched");
     }
 
     #[test]

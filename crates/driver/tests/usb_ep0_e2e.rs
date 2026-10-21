@@ -4,20 +4,20 @@
 //! endpoint 0 protocol (crates/driver/tests/fixtures/usb-ep0/usb_ep0_cdc.c),
 //! compiled by the real `epic-cc` binary and run on the `Pic18` simulator.
 //! The host half below issues SETUP, IN and OUT tokens against
-//! `crates/sim`'s SIE model and walks the enumeration a CDC host performs:
-//! device descriptor, SET_ADDRESS, configuration descriptor, string
-//! descriptors, SET_CONFIGURATION, then the CDC class requests that open the
-//! port. Every stage names itself in a failure, so a stall at the wrong
-//! stage reads as such instead of as a generic timeout.
-//!
-//! The descriptor bytes the walk asserts are the set epic-hal's lib/usb
-//! ships (lib/usb/src/usb_descriptors.c), which is what makes this the
-//! example's enumeration path rather than a generic USB exercise.
+//! `crates/sim`'s SIE model and walks the enumeration a CDC host performs.
+//! Every stage names itself in a failure, so a stall at the wrong stage
+//! reads as such instead of as a generic timeout.
 
 use pic14_sim::sie::{
-    UsbToken, UADDR, UCON, UCON_PKTDIS, UCON_USBEN, UEP0, UIR, UIR_STALLIF, UIR_TRNIF,
+    UsbToken, UADDR, UCON, UCON_PKTDIS, UCON_USBEN, UEP0, UIR, UIR_STALLIF, UIR_TRNIF, UIR_URSTIF,
 };
 
+/// The descriptor bytes below are a hand-synced copy of the ones epic-hal's
+/// `lib/usb` ships (`lib/usb/src/usb_descriptors.c`): the device descriptor
+/// here, the configuration descriptor, and the four string descriptors. A
+/// change to epic-hal's copies does not reach this file, so the two drift
+/// apart unless someone syncs them.
+///
 /// The device descriptor `lib/usb` ships: USB 2.0, CDC-ACM, EP0 packet size
 /// 8, VID 0xA0A0 / PID 0x0004, one configuration.
 const DEVICE_DESC: [u8; 18] = [
@@ -142,39 +142,67 @@ impl Device {
         panic!("{stage}: the device did not service the token within {SERVICE_STEPS} steps");
     }
 
-    /// A bus reset, then the device re-initialises itself from `URSTIF`.
-    fn bus_reset(&mut self) {
-        self.sim.usb_reset();
+    /// Let the device program reach a running state: the module enabled and
+    /// its buffers armed.
+    fn warm_up(&mut self) {
         for _ in 0..SERVICE_STEPS {
-            if self.sim.ram()[UIR] & UIR_TRNIF == 0 && self.sim.ram()[UCON] & UCON_USBEN != 0 {
+            if self.sim.ram()[UCON] & UCON_USBEN != 0 {
                 self.sim.run(256);
                 return;
             }
             self.sim.step();
         }
-        panic!("bus reset: the device did not re-initialise within {SERVICE_STEPS} steps");
+        panic!("the device did not enable the USB module within {SERVICE_STEPS} steps");
+    }
+
+    /// A bus reset, then the device re-initialises itself from `URSTIF`.
+    /// The wait is for the reset to be consumed, not for the device to be up:
+    /// the device was already up before the reset.
+    fn bus_reset(&mut self) {
+        self.sim.usb_reset();
+        assert_eq!(
+            self.sim.ram()[UIR] & UIR_URSTIF,
+            UIR_URSTIF,
+            "the reset raises URSTIF"
+        );
+        for _ in 0..SERVICE_STEPS {
+            if self.sim.ram()[UIR] & UIR_URSTIF == 0 {
+                self.sim.run(256);
+                return;
+            }
+            self.sim.step();
+        }
+        panic!("the device did not consume the bus reset within {SERVICE_STEPS} steps");
     }
 
     /// Issue one IN token, letting the device arm its descriptor first. A
     /// stalled endpoint is reported to the caller, a token the device never
     /// arms is a named failure.
     fn in_token(&mut self, stage: &str) -> StageResult {
+        self.try_in_token(stage)
+            .unwrap_or_else(|| panic!("{stage}: the device never armed an IN packet"))
+    }
+
+    /// Issue one IN token, or report that the device has nothing armed.
+    /// The end of a data stage looks like this: the device answered the
+    /// last packet with a short one and queued nothing after it.
+    fn try_in_token(&mut self, stage: &str) -> Option<StageResult> {
         for _ in 0..64 {
             match self.sim.usb_in() {
                 UsbToken::Ack { data, data1 } => {
                     self.service(stage);
-                    return StageResult::Data { data, data1 };
+                    return Some(StageResult::Data { data, data1 });
                 }
                 UsbToken::Stall => {
                     self.service(stage);
-                    return StageResult::Stalled;
+                    return Some(StageResult::Stalled);
                 }
                 UsbToken::Nak => {
                     self.sim.run(64);
                 }
             }
         }
-        panic!("{stage}: the device never armed an IN packet");
+        None
     }
 
     /// Issue one OUT token, retrying while the device has not armed the
@@ -224,9 +252,9 @@ impl Device {
         // so a device that sends the wrong one is a protocol error rather
         // than a host detail.
         let mut expect_data1 = true;
-        while got.len() < max && got.len() < want.len() {
-            match self.in_token(stage) {
-                StageResult::Data { data, data1 } => {
+        loop {
+            match self.try_in_token(stage) {
+                Some(StageResult::Data { data, data1 }) => {
                     if data1 != expect_data1 {
                         panic!(
                             "{stage}: the device sent DATA{} where DATA{} was due",
@@ -235,20 +263,23 @@ impl Device {
                     }
                     expect_data1 = !expect_data1;
                     if data.is_empty() {
+                        // The zero-length packet ends the data stage.
                         break;
                     }
                     got.extend_from_slice(&data);
+                    if got.len() >= max || got.len() >= want.len() {
+                        break;
+                    }
                 }
-                StageResult::Stalled => panic!("{stage}: EP0 stalled in the data stage"),
+                Some(StageResult::Stalled) => {
+                    panic!("{stage}: EP0 stalled in the data stage")
+                }
+                None => break,
             }
         }
         // The status stage of a control read is a zero-length OUT packet.
         self.out_token(stage, &[], true);
-        assert_eq!(
-            &got[..],
-            &want[..got.len().min(want.len())],
-            "{stage}: descriptor bytes"
-        );
+        assert_eq!(got, want, "{stage}: the device's answer");
         got
     }
 }
@@ -270,7 +301,7 @@ fn setup_packet(bm: u8, request: u8, value: u16, index: u16, length: u16) -> [u8
 #[test]
 fn cdc_acm_enumeration_walks_every_endpoint_zero_stage() {
     let mut dev = Device::build("enumerate");
-    dev.sim.run(4096); // `load_descriptors`, then `usb_init`
+    dev.warm_up();
     dev.bus_reset();
 
     // The device descriptor: the host learns EP0's packet size from it, so
@@ -414,7 +445,7 @@ fn cdc_acm_enumeration_walks_every_endpoint_zero_stage() {
 #[test]
 fn an_unsupported_request_stalls_at_the_data_stage_and_the_walk_sees_it() {
     let mut dev = Device::build("stall");
-    dev.sim.run(4096);
+    dev.warm_up();
     dev.bus_reset();
 
     // A GET_DESCRIPTOR for a descriptor type the device does not have: the

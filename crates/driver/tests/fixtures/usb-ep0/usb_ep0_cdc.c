@@ -1,18 +1,7 @@
-/* A minimal USB CDC-ACM device stack for endpoint 0: the device half of the
- * enumeration walk in crates/driver/tests/usb_ep0_e2e.rs.
- *
- * It speaks the same register and buffer-descriptor protocol as M-Stack's
- * usb.c, which is what epic-hal's lib/usb wraps: the firmware owns the BDT
- * (DS39632E 17.4), hands a descriptor to the SIE by setting UOWN, and reads
- * the completed token back from USTAT and BDnSTAT. Only the request subset
- * enumeration needs is here: GET_DESCRIPTOR, SET_ADDRESS,
- * SET_CONFIGURATION, GET_CONFIGURATION, GET_STATUS, and the CDC class
- * requests SET_LINE_CODING, GET_LINE_CODING and SET_CONTROL_LINE_STATE.
- *
- * The descriptor bytes are the set epic-hal's lib/usb ships
- * (lib/usb/src/usb_descriptors.c): a CDC-ACM device with an IAD, the
- * communications interface's functional descriptors and notification
- * endpoint, and the data interface's bulk pair.
+/* A minimal USB CDC-ACM device stack for endpoint 0, the device half of the
+ * enumeration walk in crates/driver/tests/usb_ep0_e2e.rs. It speaks
+ * M-Stack's endpoint 0 protocol, the one epic-hal's lib/usb wraps, and
+ * serves the descriptor bytes that example ships.
  */
 
 #include <stdint.h>
@@ -94,9 +83,6 @@ static uint8_t string2[18] EPIC_AT(0x5C0);
 static uint8_t string3[60] EPIC_AT(0x5D8);
 
 /* Observable state, read off the compiler's --map by the test. */
-volatile uint8_t g_request;  /* bRequest of the last SETUP handled */
-volatile uint16_t g_value;   /* its wValue */
-volatile uint16_t g_length;  /* its wLength */
 volatile uint8_t g_configured;
 volatile uint8_t g_dtr;
 volatile uint8_t g_line_coding[7];
@@ -210,23 +196,6 @@ static void send_zlp_status(void)
     arm_in(0, 0, 1);
 }
 
-static uint8_t string_len(uint8_t index)
-{
-    if (index == 0) {
-        return sizeof(string0);
-    }
-    if (index == 1) {
-        return sizeof(string1);
-    }
-    if (index == 2) {
-        return sizeof(string2);
-    }
-    if (index == 3) {
-        return sizeof(string3);
-    }
-    return 0;
-}
-
 /* A one- or two-byte answer staged through ep0_in. */
 static void answer_short(uint8_t lo, uint8_t hi, uint8_t len)
 {
@@ -255,10 +224,6 @@ static void handle_setup(void)
     uint16_t value = (uint16_t)ep0_out[2] | ((uint16_t)ep0_out[3] << 8);
     uint16_t length = (uint16_t)ep0_out[6] | ((uint16_t)ep0_out[7] << 8);
 
-    g_request = ep0_out[1];
-    g_value = value;
-    g_length = length;
-
     if ((ep0_out[0] & 0x60U) == REQ_TYPE_CLASS) {
         if (ep0_out[1] == CDC_SET_LINE_CODING) {
             stage = STAGE_OUT_DATA;
@@ -281,6 +246,13 @@ static void handle_setup(void)
 
     switch (ep0_out[1]) {
     case GET_DESCRIPTOR: {
+        /* The device-to-host form only: a host-to-device GET_DESCRIPTOR is
+         * not a request a device can answer (M-Stack matches the whole
+         * bmRequestType). */
+        if (ep0_out[0] != 0x80U) {
+            stall_ep0();
+            break;
+        }
         uint8_t type = (uint8_t)(value >> 8);
         uint8_t idx = (uint8_t)value;
         if (type == DESC_DEVICE) {
