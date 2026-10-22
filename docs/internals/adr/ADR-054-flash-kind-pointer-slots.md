@@ -119,12 +119,31 @@ whose first two bytes are the address of the const it names.
 `iselcore::add_int_flash_definite` proves the space with a greatest
 fixpoint by removal, the mirror image of the maybe-taint: a value is
 definite only when every path that produces it yields a flash address,
-and the state only shrinks, so the iteration terminates. A value is
-definite when it is a flash const global, a two-byte load from a
-location whose two bytes are definite, a copy of a definite value, an
-add of a definite value and a constant (a subtraction keeps the space
-only when the address is the minuend, and a difference of two
-addresses is a length, a mask or a shift leaves a fragment), or a
+and the state only shrinks, so the iteration terminates.
+
+The two integer-domain passes answer different questions, and where
+they overlap the definite one is authoritative: a value the definite
+proof settles is served, and a value it does not falls back to the
+maybe-taint's refusal. The definite pass is the stricter of the two
+on the shapes they share, because it requires every path to agree
+while the taint requires only one. A shape the taint refuses and the
+definite pass serves is a shape the definite pass has proved: the
+`inttoptr` of a value whose space is settled statically. A shape the
+definite pass refuses and the taint serves is refused, never served
+as flash.
+
+The two passes do not share their substrate: each has its own object
+set, location resolver, memory-byte model, and binop algebra. The
+algebras differ in one place: the taint treats a subtraction
+symmetrically, while the definite pass requires the address to be
+the minuend, because `n - address` is not an address. The definite
+pass's rule is the one the backend applies.
+
+A value is definite when it is a flash const global, a two-byte load
+from a location whose two bytes are definite, a copy of a definite
+value, an add of a definite value and a constant (a subtraction keeps
+the space only when the address is the minuend, and a difference of
+two addresses is a length, a mask or a shift leaves a fragment), or a
 select, phi, or call result whose every arm is definite.
 
 Memory bytes are definite when every write to them writes a definite
