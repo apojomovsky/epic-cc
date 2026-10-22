@@ -12980,3 +12980,91 @@ fn post_loop_load_through_scaled_index_reads_the_last_element() {
     );
     assert_eq!(p.ram()[0x129], 0xC3, "in-loop reads stay live");
 }
+
+/// The RAM address an asm line writes, for the two PIC18 write forms:
+/// `MOVWF <addr>,<bank>` and `MOVFF <src>,<dst>`. Returns `None` for
+/// every other line.
+fn write_target(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if let Some(rest) = line.strip_prefix("MOVWF ") {
+        return Some(rest.split(',').next()?.trim());
+    }
+    if let Some(rest) = line.strip_prefix("MOVFF ") {
+        return Some(rest.split(',').nth(1)?.trim());
+    }
+    None
+}
+
+/// epic-cc#1424: a switch case block is a CFG edge like any other, so the
+/// dominator pass must see it. The case block c0 branches to a merge
+/// holding a phi chain: `%acc = phi [%v, c0]` and `%acc2 = phi [%acc,
+/// c0]`. The two copies on the c0 -> merge edge alias (the second reads
+/// the first's destination), so their order is load-bearing: the edge is
+/// a forward edge, so the copies must run writer-first, and %acc2 must
+/// see the value %acc just wrote.
+///
+/// With the switch's edges invisible to the dominator pass, c0 claimed to
+/// dominate the merge, the edge was classified as a back edge, the copies
+/// ran reader-first, and %acc2 read %acc's slot before %acc wrote it: the
+/// program returned 0 for every input.
+#[test]
+fn switch_case_phi_copies_run_writer_first() {
+    let ir = "\
+global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @x\n    \
+br dispatch\n  block dispatch:\n    \
+switch i8 %1, default %def, cases 0 %c0, 1 %c1, 2 %c2\n  \
+block c0:\n    %v = add i8 %1, 1\n    br merge\n  \
+block c1:\n    %v1 = add i8 %1, 2\n    br merge\n  \
+block c2:\n    %v2 = add i8 %1, 3\n    br merge\n  \
+block def:\n    %vd = add i8 %1, 4\n    br merge\n  \
+block merge:\n    %acc = phi i8 %v c0 %v1 c1 %v2 c2 %vd def\n    \
+%acc2 = phi i8 %acc c0 %acc c1 %acc c2 %acc def\n    \
+store i8 %acc2 @out\n    ret void\n";
+    let m = parse(ir);
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("x", 0x20),
+            ("out", 0x28),
+            ("main::1", 0x30),
+            ("main::v", 0x31),
+            ("main::v1", 0x32),
+            ("main::v2", 0x33),
+            ("main::vd", 0x34),
+            ("main::acc", 0x35),
+            ("main::acc2", 0x36),
+        ]),
+        None,
+    );
+    // The c0 edge's copies: %acc's write to 0x035 must come before %acc2's
+    // write to 0x036 (which takes %acc's value). With the bug the second
+    // copy read 0x035 before the first wrote it, so the reader-first order
+    // showed up as a write to 0x036 ahead of the write to 0x035.
+    let c0 = block_section(&asm, "main_Lc0");
+    let write_of = |dst: &str| -> usize {
+        c0.lines()
+            .position(|l| write_target(l) == Some(dst))
+            .unwrap_or_else(|| panic!("no write to {dst} in the c0 block:\n{asm}"))
+    };
+    assert!(
+        write_of("0x035") < write_of("0x036"),
+        "the forward edge's copies run writer-first:\n{asm}"
+    );
+    // And the program must compute the right value: each arm adds its own
+    // constant to the selector (the case index plus one), so the expected
+    // result walks 1, 3, 5, 7 across the four selectors.
+    let words = asm::assemble_pic18(&asm);
+    for (sel, want) in [(0u8, 1u8), (1, 3), (2, 5), (3, 7)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20] = sel;
+        p.run(2000);
+        assert!(p.halted(), "program must halt for sel={sel}:\n{asm}");
+        assert_eq!(
+            p.ram()[0x28],
+            want,
+            "the switch case's value must reach the merge:\n{asm}"
+        );
+    }
+}
