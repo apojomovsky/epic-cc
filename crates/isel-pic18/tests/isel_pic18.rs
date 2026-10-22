@@ -12995,18 +12995,12 @@ fn write_target(line: &str) -> Option<&str> {
     None
 }
 
-/// epic-cc#1424: a switch case block is a CFG edge like any other, so the
-/// dominator pass must see it. The case block c0 branches to a merge
-/// holding a phi chain: `%acc = phi [%v, c0]` and `%acc2 = phi [%acc,
-/// c0]`. The two copies on the c0 -> merge edge alias (the second reads
-/// the first's destination), so their order is load-bearing: the edge is
-/// a forward edge, so the copies must run writer-first, and %acc2 must
-/// see the value %acc just wrote.
-///
-/// With the switch's edges invisible to the dominator pass, c0 claimed to
-/// dominate the merge, the edge was classified as a back edge, the copies
-/// ran reader-first, and %acc2 read %acc's slot before %acc wrote it: the
-/// program returned 0 for every input.
+/// epic-cc#1424: the case block c0 branches to a merge holding a phi
+/// chain: `%acc = phi [%v, c0]` and `%acc2 = phi [%acc, c0]`. The two
+/// copies on the c0 -> merge edge alias (the second reads the first's
+/// destination), so their order is load-bearing: the edge is a forward
+/// edge, so the copies must run writer-first, and %acc2 must see the
+/// value %acc just wrote.
 #[test]
 fn switch_case_phi_copies_run_writer_first() {
     let ir = "\
@@ -13038,9 +13032,8 @@ store i8 %acc2 @out\n    ret void\n";
         None,
     );
     // The c0 edge's copies: %acc's write to 0x035 must come before %acc2's
-    // write to 0x036 (which takes %acc's value). With the bug the second
-    // copy read 0x035 before the first wrote it, so the reader-first order
-    // showed up as a write to 0x036 ahead of the write to 0x035.
+    // write to 0x036 (which takes %acc's value), so %acc2 reads a slot
+    // this edge has just defined.
     let c0 = block_section(&asm, "main_Lc0");
     let write_of = |dst: &str| -> usize {
         c0.lines()

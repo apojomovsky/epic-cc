@@ -8776,13 +8776,12 @@ mod fit_repair_tests {
     }
 }
 
-/// epic-cc#1424: a `Switch` terminator's edges are CFG edges like any
-/// other. The dominator pass read only `Br` and `BrCond`, so a block
-/// reached only by a switch dispatch had no recorded predecessor: its
-/// dominator set stayed at the initial "every block", and it claimed to
-/// dominate blocks it cannot reach. The phi-copy ordering reads that set
-/// to tell a back edge from a forward one, so the wrong claim flips the
-/// copy order on a switch edge.
+/// epic-cc#1424: a switch dispatches to every case and to the default, so
+/// those targets are CFG edges like any other. The dominator set of a
+/// block tells the phi-copy ordering whether an edge is a back edge
+/// (`merge` dominates `pred`), so an edge the pass cannot see is an edge
+/// it cannot classify: the target claims to dominate every block, and the
+/// copy order on it flips.
 #[cfg(test)]
 mod switch_dominator_tests {
     use super::block_dominators;
