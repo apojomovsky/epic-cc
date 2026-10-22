@@ -1920,20 +1920,23 @@ fn longest_dense_run(cases: &[(Ty, Val, String)], switch_text: &str) -> Option<(
 /// incoming count does not line up with the re-pointed edges is
 /// malformed IR, and the rename panics rather than guess.
 fn rename_switch_phi_incomings(blocks: &mut [Block], repoints: &[(String, String, String)]) {
-    // Group the re-pointed edges by target: one entry per (target, old
-    // predecessor) holds the chain blocks that now branch to it.
-    let mut by_target: HashMap<String, (String, Vec<String>)> = HashMap::new();
+    // Group the re-pointed edges by (target, old predecessor): a
+    // target reached by two cases of one switch names that switch block
+    // once in its phi, and the two chain blocks both replace it. A
+    // target reached by two different switches names two different
+    // blocks, and each is replaced by its own chain block.
+    let mut by_edge: HashMap<(String, String), Vec<String>> = HashMap::new();
     for (target, new_pred, old_pred) in repoints {
-        let e = by_target
-            .entry(target.clone())
-            .or_insert_with(|| (old_pred.clone(), Vec::new()));
-        e.1.push(new_pred.clone());
+        by_edge
+            .entry((target.clone(), old_pred.clone()))
+            .or_default()
+            .push(new_pred.clone());
     }
-    for (target, (old_pred, new_preds)) in by_target {
+    let mut renamed_targets: Vec<String> = Vec::new();
+    for ((target, old_pred), new_preds) in by_edge {
         let Some(idx) = blocks.iter().position(|b| b.label == target) else {
             continue;
         };
-        let label = blocks[idx].label.clone();
         let mut renamed = false;
         for inst in &mut blocks[idx].insts {
             let Inst::Phi(p) = inst else { continue };
@@ -1948,13 +1951,19 @@ fn rename_switch_phi_incomings(blocks: &mut [Block], repoints: &[(String, String
             }
             renamed = true;
         }
-        if !renamed {
-            // No phi names the old predecessor, so nothing to rename.
-            continue;
+        if renamed && !renamed_targets.contains(&target) {
+            renamed_targets.push(target);
         }
-        // Every real predecessor of the target must now have an
-        // incoming on every phi, or the edge's copy would go missing
-        // again.
+    }
+    // Every real predecessor of a re-pointed target must now have an
+    // incoming on every one of its phis, or the edge's copy would go
+    // missing again. The check runs after every rename, since one
+    // target can be re-pointed by more than one switch.
+    for target in renamed_targets {
+        let Some(idx) = blocks.iter().position(|b| b.label == target) else {
+            continue;
+        };
+        let label = blocks[idx].label.clone();
         let real_preds = block_predecessors(blocks, &label);
         for inst in &blocks[idx].insts {
             let Inst::Phi(p) = inst else { continue };
