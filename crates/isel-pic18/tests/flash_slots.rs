@@ -699,7 +699,11 @@ fn ptrtoint_of_flash_gep_is_refused() {
 /// declarations and params get a slot, and so does every `%reg =` def
 /// except a `Gep` dst, which defines no value needing one. Handing a
 /// GEP dst a slot here would hide the defect this covers.
-fn laundry_sim(ir: &str, consts: &[(&str, &[u8])]) -> (String, HashMap<String, u16>) {
+fn laundry_sim(
+    ir: &str,
+    consts: &[(&str, &[u8])],
+    overrides: &[(&str, u16)],
+) -> (String, HashMap<String, u16>) {
     let mut m = parse(ir);
     for (name, bytes) in consts {
         m = with_bytes(m, name, bytes);
@@ -736,7 +740,30 @@ fn laundry_sim(ir: &str, consts: &[(&str, &[u8])]) -> (String, HashMap<String, u
             }
         }
     }
+    for (name, addr) in overrides {
+        map.insert((*name).to_string(), *addr);
+    }
     (select(&PIC18F4550, &m, &map, None), map)
+}
+
+/// The byte address of a const table's bytes in the program image: the
+/// label sits right before its `db` line, so the bytes' position is
+/// the label's address.
+fn table_addr(words: &[u16], bytes: &[u8]) -> u16 {
+    let image: Vec<u8> = words
+        .iter()
+        .flat_map(|w| [*w as u8, (*w >> 8) as u8])
+        .collect();
+    let at = image
+        .windows(bytes.len())
+        .position(|w| w == bytes)
+        .expect("the table must sit in the program image");
+    assert_eq!(
+        image.windows(bytes.len()).filter(|w| *w == bytes).count(),
+        1,
+        "the table bytes must be unique in the image"
+    );
+    at as u16
 }
 
 #[test]
@@ -747,7 +774,7 @@ fn zext_of_a_gep_reads_the_ram_table() {
     // a dereference through the laundered integer reads the table.
     let ir = "global tab i8\nglobal out i8\n\
               fn main(void) ()\n  block entry:\n    %q = gep @tab +1\n    %x = zext i16 %q to i16\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
-    let (asm, map) = laundry_sim(ir, &[]);
+    let (asm, map) = laundry_sim(ir, &[], &[]);
     let tab = map["tab"];
     let out = map["out"];
     assert!(
@@ -772,13 +799,32 @@ fn zext_of_a_gep_reads_the_ram_table() {
 fn zext_of_a_flash_gep_materializes_the_label() {
     // Same shape over a flash const: LOW/HIGH of the table label, the
     // form every other use of the GEP takes (#193, #645), never a copy
-    // of the GEP's nonexistent slot.
-    let ir = "const c i8\nglobal out i8\n\
+    // of the GEP's nonexistent slot. The GEP's `+1` must ride along: the
+    // address of `c[1]`, not of `c`.
+    let ir = "const c i8\nglobal out i16\n\
               fn main(void) ()\n  block entry:\n    %q = gep @c +1\n    %x = zext i16 %q to i16\n    store i16 %x @out\n    ret void\n";
-    let (asm, _) = laundry_sim(ir, &[("c", b"PQ")]);
+    let (asm, _) = laundry_sim(ir, &[("c", b"PQ")], &[]);
     assert!(
         asm.contains("MOVLW LOW(c)") && asm.contains("MOVLW HIGH(c)"),
         "a flash const GEP must materialize its label:\n{asm}"
+    );
+    // The offset rides on the low byte, and its carry into the high
+    // byte, so `ADDLW 0x01` must be there.
+    assert!(
+        asm.contains("ADDLW 0x01"),
+        "the GEP's constant offset must be added:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let base = table_addr(&words, b"PQ") as u32;
+    let want = base + 1;
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        [p.ram()[0x20], p.ram()[0x21]],
+        [(want & 0xFF) as u8, ((want >> 8) & 0xFF) as u8],
+        "the laundered integer must be the address of c[1]:\n{asm}"
     );
 }
 
@@ -789,7 +835,7 @@ fn sext_of_a_gep_materializes_the_address() {
     // the materialization wrote (epic-cc#1418).
     let ir = "global tab i8\nglobal out i32\n\
               fn main(void) ()\n  block entry:\n    %q = gep @tab +1\n    %x = sext i16 %q to i32\n    store i32 %x @out\n    ret void\n";
-    let (asm, map) = laundry_sim(ir, &[]);
+    let (asm, map) = laundry_sim(ir, &[], &[]);
     let tab = map["tab"];
     let out = map["out"];
     assert!(
@@ -806,6 +852,30 @@ fn sext_of_a_gep_materializes_the_address() {
         [p.ram()[out as usize], p.ram()[out as usize + 1]],
         [base as u8, (base >> 8) as u8],
         "the low address bytes must land in the sext dst:\n{asm}"
+    );
+    assert_eq!(
+        [p.ram()[out as usize + 2], p.ram()[out as usize + 3]],
+        [0, 0],
+        "a low address sign-fills with zeros:\n{asm}"
+    );
+    // The sign fill comes from bit 7 of the materialized high byte, so
+    // an address with that bit set fills the upper bytes with 0xFF.
+    let (asm, map) = laundry_sim(ir, &[], &[("tab", 0x807F)]);
+    let out = map["out"];
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        [
+            p.ram()[out as usize],
+            p.ram()[out as usize + 1],
+            p.ram()[out as usize + 2],
+            p.ram()[out as usize + 3],
+        ],
+        [0x80, 0x80, 0xFF, 0xFF],
+        "a high address must sign-fill the upper bytes:\n{asm}"
     );
 }
 

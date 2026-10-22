@@ -7863,6 +7863,12 @@ impl<'m> Gen<'m> {
     /// address instead, and must not ask for that slot (epic-cc#1418).
     fn folded_gep_src(&self, v: &Val) -> bool {
         let Val::Reg(r) = v else { return false };
+        let key = ssa_key(self.cur_func, r);
+        // Every `Gep` dst resolves, so the map answers the common case
+        // (a cast of an ordinary value) without the scan below.
+        if !self.resolved.contains_key(&key) {
+            return false;
+        }
         self.m
             .funcs
             .iter()
@@ -11508,7 +11514,7 @@ impl<'m> Gen<'m> {
                     assert_eq!(
                         z.from.bytes(),
                         2,
-                        "isel-pic18: a folded GEP source is a 16-bit address (zext from {:?})",
+                        "isel-pic18: a cast of a folded GEP must take the whole 16-bit address (the IR's source width is {:?}); a narrower source is a truncation, which the Trunc arm refuses (epic-cc#1418)",
                         z.from
                     );
                     self.emit_move_val_to_slot(&z.val, Ty::I16, dst);
@@ -11665,7 +11671,7 @@ impl<'m> Gen<'m> {
                     assert_eq!(
                         s.from.bytes(),
                         2,
-                        "isel-pic18: a folded GEP source is a 16-bit address (sext from {:?})",
+                        "isel-pic18: a cast of a folded GEP must take the whole 16-bit address (the IR's source width is {:?}); a narrower source is a truncation, which the Trunc arm refuses (epic-cc#1418)",
                         s.from
                     );
                     self.emit_move_val_to_slot(&s.val, Ty::I16, dst);
