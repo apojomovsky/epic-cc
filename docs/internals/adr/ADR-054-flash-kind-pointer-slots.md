@@ -179,7 +179,7 @@ reaches the deref path, and the store path with it: a store through
 a definite flash address is a ROM write, which the backend refuses,
 as it does for any other flash pointer.
 
-Six shapes stay refused. A `ptrtoint` of a GEP reads the GEP's own
+Eight shapes stay refused. A `ptrtoint` of a GEP reads the GEP's own
 slot, which `resolve_pointers` folds away and never writes, so the
 value is not an address. A store of a flash address through a pointer
 the proof cannot resolve names no location, so no byte is definite. A
@@ -189,4 +189,12 @@ definite only when the callee returned a parameter it never
 overwrote, since the IR is a slot IR and a name may be reused. A
 global whose initializer holds a plain value holds no address, so its
 bytes are not definite. A subtraction with a constant minuend is not
-an address, so it does not keep the space.
+an address, so it does not keep the space. A pair of bytes counts as
+an address only when one write produced both of them, so a wide store
+and two byte stores that overlap do not make one. A `memcpy` whose
+side names a pointer value copies the pointee's content, which the
+proof cannot bound, so it names no bytes.
+
+The proof cannot see an `asm` that writes a hardcoded address, since
+the proof only knows the slots an `asm` names as operands. The
+pre-existing slot proof has the same blind spot.

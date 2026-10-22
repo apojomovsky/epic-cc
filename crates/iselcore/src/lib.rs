@@ -3558,6 +3558,11 @@ pub fn add_int_flash_definite(
             val: ir::Val,
             block: String,
             index: usize,
+            /// The bytes the write covers, as a start offset and a
+            /// length. A definite pair comes from one two-byte write,
+            /// so the byte rule needs the range.
+            off: u32,
+            len: u32,
         },
         Copy {
             func: String,
@@ -3574,6 +3579,8 @@ pub fn add_int_flash_definite(
     let mut writes: Vec<Write> = Vec::new();
     // The writes covering each byte, as indices into `writes`.
     let mut writes_by: HashMap<(String, u32), Vec<usize>> = HashMap::new();
+    // The bytes each write covers, as its start offset and its length.
+    let mut write_span: HashMap<usize, (u32, u32)> = HashMap::new();
     // The reads of each byte, with the place of the read, so a write is
     // known to have happened by every read of the byte.
     let mut reads_by: HashMap<(String, u32), Vec<(String, String, usize)>> = HashMap::new();
@@ -3581,18 +3588,17 @@ pub fn add_int_flash_definite(
     // memory may hold it, so no byte is definite.
     let mut void_all = false;
 
-    // The slot a value names, for a memcpy side. A dynamic term makes
-    // the location runtime-dependent, so the copy names no known bytes
-    // and the caller voids the whole memory proof.
+    // The location a memcpy side names. A global names its own bytes; a
+    // pointer value names the memory it points at, which the proof
+    // cannot bound, so a copy from or to one names no known bytes and
+    // the caller voids the whole memory proof. A dynamic term makes the
+    // location runtime-dependent, the same way.
     let val_slot = |func: &str, v: &ir::Val| -> Option<(String, u32)> {
         match v {
             ir::Val::Global(g) => Some((format!("@{g}"), 0)),
             ir::Val::Reg(r) => match resolved.get(&ssa_key(func, r)) {
                 Some((Base::Global(g), k, terms)) if terms.is_empty() => {
                     Some((format!("@{g}"), u32::from(*k)))
-                }
-                Some((Base::Slot(sname, _), k, terms)) if terms.is_empty() => {
-                    Some((ssa_key(func, sname), u32::from(*k)))
                 }
                 _ => None,
             },
@@ -3637,7 +3643,10 @@ pub fn add_int_flash_definite(
                                 val: s.val.clone(),
                                 block: b.label.clone(),
                                 index: inst_index,
+                                off,
+                                len: u32::from(s.ty.bytes()),
                             });
+                            write_span.insert(idx, (off, u32::from(s.ty.bytes())));
                             for k in 0..u32::from(s.ty.bytes()) {
                                 writes_by
                                     .entry((slot.clone(), off + k))
@@ -3667,6 +3676,7 @@ pub fn add_int_flash_definite(
                             block: b.label.clone(),
                             index: inst_index,
                         });
+                        write_span.insert(idx, (doff, u32::from(n)));
                         for k in 0..u32::from(n) {
                             writes_by
                                 .entry((ds.clone(), doff + k))
@@ -3696,7 +3706,10 @@ pub fn add_int_flash_definite(
                                             val: ir::Val::Const(-1),
                                             block: b.label.clone(),
                                             index: inst_index,
+                                            off,
+                                            len: 1,
                                         });
+                                        write_span.insert(idx, (off, 1));
                                         writes_by.entry((slot, off)).or_default().push(idx);
                                     }
                                     Loc::Unknown => void_all = true,
@@ -3798,6 +3811,9 @@ pub fn add_int_flash_definite(
                     Inst::Load(l) => Some(&l.dst),
                     Inst::IntToPtr(p) => Some(&p.dst),
                     Inst::Gep(g) => Some(&g.dst),
+                    Inst::Icmp(c) => Some(&c.dst),
+                    Inst::Alloca(a) => Some(&a.dst),
+                    Inst::VaArg(v) => Some(&v.dst),
                     _ => None,
                 };
                 if let Some(d) = dst {
@@ -3896,8 +3912,30 @@ pub fn add_int_flash_definite(
     };
     // Whether the two bytes a location holds are definite.
     let two_def = |flash_bytes: &HashSet<(String, u32)>, slot: &str, off: u32| -> bool {
-        flash_bytes.contains(&(slot.to_string(), off))
-            && flash_bytes.contains(&(slot.to_string(), off + 1))
+        if !flash_bytes.contains(&(slot.to_string(), off))
+            || !flash_bytes.contains(&(slot.to_string(), off + 1))
+        {
+            return false;
+        }
+        // One write produced both bytes, and nothing else touched
+        // either of them: a second write to either half would leave
+        // the pair holding one value's low byte and another's high
+        // byte, which is not an address.
+        let (Some(lo), Some(hi)) = (
+            writes_by.get(&(slot.to_string(), off)),
+            writes_by.get(&(slot.to_string(), off + 1)),
+        ) else {
+            return false;
+        };
+        if lo.len() != 1 || hi.len() != 1 || lo[0] != hi[0] {
+            return false;
+        }
+        // The write must cover both bytes of the pair. An initializer
+        // covers the two bytes of the const address it names.
+        match write_span.get(&lo[0]) {
+            Some((woff, len)) => *len == 2 && *woff <= off && off + 1 <= *woff + *len,
+            None => matches!(writes[lo[0]], Write::Init { .. }),
+        }
     };
 
     // Whether a call's returned value is definite at this site, with the
@@ -4098,7 +4136,7 @@ pub fn add_int_flash_definite(
         // pointer load, a param, a call result) is definite when the
         // rule holds; the memory writes do not apply to it.
         if let Some(rule) = slot_rule.get(slot) {
-            return match rule {
+            let r = match rule {
                 SlotRule::IntToPtr { func, val } => is_def(flash_val, func, val),
                 SlotRule::Join { func, arms } => {
                     !arms.is_empty() && arms.iter().all(|v| is_def(flash_val, func, v))
@@ -4135,6 +4173,7 @@ pub fn add_int_flash_definite(
                             .all(|(caller, cc)| call_returns_def(flash_val, caller, cc))
                 }
             };
+            return r;
         }
         // Every write to the byte must write a definite value, and
         // every read of the byte must observe one of those writes: a
@@ -4153,8 +4192,19 @@ pub fn add_int_flash_definite(
                 val,
                 block,
                 index,
+                off: woff,
+                len,
             } => {
                 if !is_def(flash_val, func, val) {
+                    return false;
+                }
+                // A definite pair comes from one two-byte write of a
+                // definite value. A wider write spreads the value over
+                // bytes that hold something else, and a narrower one
+                // leaves the pair to two writes whose halves are not one
+                // address. The write must cover this byte and the one
+                // beside it, so the pair is one value.
+                if *len != 2 || (*woff != off && *woff + 1 != off) {
                     return false;
                 }
                 // The write must have happened by every read of the
@@ -4175,6 +4225,13 @@ pub fn add_int_flash_definite(
                 index,
             } => {
                 if !flash_bytes.contains(&(sslot.clone(), soff + (off - doff))) {
+                    return false;
+                }
+                // The copy takes the source's bytes, so the source's
+                // own pair must be one write: a source whose two bytes
+                // come from two writes holds a chimera, and the copy
+                // would launder it into a slot that looks whole.
+                if !two_def(flash_bytes, sslot, *soff) {
                     return false;
                 }
                 match reads {

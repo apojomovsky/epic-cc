@@ -1499,3 +1499,231 @@ fn int_laundered_value_used_before_its_def_is_refused() {
         None,
     );
 }
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_value_redefined_by_an_icmp_is_refused() {
+    // epic-cc#1346 review: the name is redefined by a compare, so the
+    // use observes the compare's result, not the load's value.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %i = load i8 @c\n    %x = icmp eq i8 %i, %i\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("main::x", 0x13),
+            ("main::i", 0x15),
+            ("main::p", 0x17),
+            ("main::v", 0x19),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_high_half_of_a_wide_store_is_refused() {
+    // epic-cc#1346 review: a wide store spreads the value over bytes
+    // that hold something else, so the high half is not the address.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i32\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %w = zext i16 %x to i32\n    %y = add i32 %w, 4194304\n    store i32 %y @h\n    %z = load i16 @h +2\n    %p = inttoptr i16 %z to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x13),
+            ("out", 0x18),
+            ("main::x", 0x19),
+            ("main::w", 0x1B),
+            ("main::y", 0x1F),
+            ("main::z", 0x23),
+            ("main::p", 0x25),
+            ("main::v", 0x27),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_pair_of_byte_stores_is_refused() {
+    // epic-cc#1346 review: two one-byte stores compose a pair whose
+    // halves are each definite but whose value is not an address.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal g2 i16\nglobal h i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    store ptr @c @g2\n    %x = load i16 @g\n    %y = load i16 @g2\n    %a = trunc i16 %x to i8\n    %b = trunc i16 %y to i8\n    store i8 %a @h\n    %h1 = gep @h +1\n    store i8 %b %h1\n    %z = load i16 @h\n    %p = inttoptr i16 %z to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("g2", 0x13),
+            ("h", 0x16),
+            ("out", 0x19),
+            ("main::x", 0x1A),
+            ("main::y", 0x1C),
+            ("main::a", 0x1E),
+            ("main::b", 0x1F),
+            ("main::h1", 0x20),
+            ("main::z", 0x22),
+            ("main::p", 0x24),
+            ("main::v", 0x26),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_pair_of_overlapping_stores_is_refused() {
+    // epic-cc#1346 review: two two-byte stores overlap, so the pair
+    // holds one store's low byte and the other's high byte, which is
+    // not an address.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal g2 i16\nglobal h i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    store ptr @c @g2\n    %x = load i16 @g\n    %y = load i16 @g2\n    store i16 %x @h\n    %h1 = gep @h +1\n    store i16 %y %h1\n    %z = load i16 @h\n    %p = inttoptr i16 %z to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("g2", 0x13),
+            ("h", 0x16),
+            ("out", 0x19),
+            ("main::x", 0x1A),
+            ("main::y", 0x1C),
+            ("main::h1", 0x1E),
+            ("main::z", 0x20),
+            ("main::p", 0x22),
+            ("main::v", 0x24),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_pair_with_a_byte_write_over_it_is_refused() {
+    // The same, with a one-byte write over the high half of a
+    // two-byte store.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal g2 i16\nglobal h i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    store ptr @c @g2\n    %x = load i16 @g\n    %y = load i16 @g2\n    %b = trunc i16 %y to i8\n    store i16 %x @h\n    %h1 = gep @h +1\n    store i8 %b %h1\n    %z = load i16 @h\n    %p = inttoptr i16 %z to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("g2", 0x13),
+            ("h", 0x16),
+            ("out", 0x19),
+            ("main::x", 0x1A),
+            ("main::y", 0x1C),
+            ("main::b", 0x1E),
+            ("main::h1", 0x20),
+            ("main::z", 0x22),
+            ("main::p", 0x24),
+            ("main::v", 0x26),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_pair_copied_from_a_chimera_is_refused() {
+    // epic-cc#1346 review: the copy takes the source's bytes, so a
+    // source whose two bytes come from two writes must not become a
+    // slot that looks whole.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal g2 i16\nglobal h i16\nglobal s i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    store ptr @c @g2\n    %x = load i16 @g\n    %y = load i16 @g2\n    store i16 %x @h\n    %h1 = gep @h +1\n    store i16 %y %h1\n    memcpy @s @h 2\n    %z = load i16 @s\n    %p = inttoptr i16 %z to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("g2", 0x13),
+            ("h", 0x16),
+            ("s", 0x19),
+            ("out", 0x1C),
+            ("main::x", 0x1D),
+            ("main::y", 0x1F),
+            ("main::h1", 0x21),
+            ("main::z", 0x23),
+            ("main::p", 0x25),
+            ("main::v", 0x27),
+        ]),
+        None,
+    );
+}
+
+#[test]
+fn int_laundered_memcpy_from_a_pointer_value_reads_ram() {
+    // epic-cc#1346 review: a memcpy whose source is a pointer value
+    // copies the pointee's content, which the proof cannot bound, so
+    // the copy names no bytes and the laundered value is not an
+    // address. The dereference reads RAM.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %p = load ptr @g\n    memcpy @buf %p 2\n    %y = load i16 @buf\n    %q = inttoptr i16 %y to ptr\n    %v = load i8 %q\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("buf", 0x13),
+            ("out", 0x16),
+            ("main::p", 0x17),
+            ("main::y", 0x19),
+            ("main::q", 0x1B),
+            ("main::v", 0x1D),
+        ]),
+        None,
+    );
+    // The dereference reads RAM, through FSR0, not through TBLPTR.
+    assert!(
+        asm.contains("0xFE9"),
+        "the dereference must go through FSR0:\n{asm}"
+    );
+}
