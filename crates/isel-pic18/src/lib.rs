@@ -16258,6 +16258,11 @@ fn block_dominators(f: &Func) -> HashMap<String, HashSet<String>> {
         let targets: Vec<&str> = match b.insts.last() {
             Some(Inst::Br(br)) => vec![br.target.as_str()],
             Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+            Some(Inst::Switch(sw)) => {
+                let mut v: Vec<&str> = sw.cases.iter().map(|(_, l)| l.as_str()).collect();
+                v.push(sw.default.as_str());
+                v
+            }
             _ => vec![],
         };
         for t in targets {
@@ -20029,5 +20034,79 @@ mod p3_gen_tests {
                 lines.join("\n")
             );
         }
+    }
+}
+
+/// epic-cc#1424: a switch dispatches to every case and to the default, so
+/// those targets are CFG edges like any other. The dominator set of a
+/// block tells the phi-copy ordering whether an edge is a back edge
+/// (`merge` dominates `pred`), so an edge the pass cannot see is an edge
+/// it cannot classify: the target claims to dominate every block, and the
+/// copy order on it flips.
+#[cfg(test)]
+mod switch_dominator_tests {
+    use super::block_dominators;
+    use ir::Func;
+
+    /// A dispatch block whose switch feeds two case blocks, plus a second
+    /// branch the dispatch cannot reach. The case block's dominator set
+    /// must be the dispatch (plus itself), never the unrelated block.
+    fn switch_cfg() -> Func {
+        let m = ir::parse(
+            "global x i8\n\
+             fn main(void) ()\n  block entry:\n    %1 = load i8 @x\n    %2 = icmp eq i8 %1, 0\n    \
+             br i1 %2 dispatch other\n  \
+             block dispatch:\n    switch i8 %1, default %def, cases 0 %c0, 1 %c1\n  \
+             block c0:\n    ret void\n  \
+             block c1:\n    ret void\n  \
+             block def:\n    ret void\n  \
+             block other:\n    ret void\n",
+        );
+        m.funcs.into_iter().next().expect("one function")
+    }
+
+    #[test]
+    fn switch_target_does_not_dominate_an_unrelated_block() {
+        let f = switch_cfg();
+        let doms = block_dominators(&f);
+        let c0 = &doms["c0"];
+        assert!(
+            !c0.contains("other"),
+            "a switch target must not claim to dominate an unreachable block: {c0:?}"
+        );
+        assert!(
+            c0.contains("dispatch"),
+            "the switch's own dispatch block dominates its case target: {c0:?}"
+        );
+        assert!(c0.contains("c0"), "a block dominates itself: {c0:?}");
+    }
+
+    #[test]
+    fn switch_default_target_does_not_dominate_an_unrelated_block() {
+        let f = switch_cfg();
+        let doms = block_dominators(&f);
+        let def = &doms["def"];
+        assert!(
+            !def.contains("other"),
+            "the switch default is a CFG edge too: {def:?}"
+        );
+        assert!(
+            def.contains("dispatch"),
+            "the dispatch block dominates the default target: {def:?}"
+        );
+    }
+
+    #[test]
+    fn switch_target_does_not_dominate_the_dispatch_block() {
+        // The self-loop case: the dispatch block's own dominator set must
+        // not contain a case target, or the dispatch would look like it
+        // sits inside a case block's loop.
+        let f = switch_cfg();
+        let doms = block_dominators(&f);
+        let dispatch = &doms["dispatch"];
+        assert!(
+            !dispatch.contains("c0") && !dispatch.contains("c1"),
+            "a case target does not dominate the dispatch: {dispatch:?}"
+        );
     }
 }
