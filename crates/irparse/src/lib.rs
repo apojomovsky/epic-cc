@@ -1946,10 +1946,13 @@ fn rename_switch_phi_incomings(blocks: &mut [Block], repoints: &[(String, String
             if slots.is_empty() {
                 continue;
             }
-            // A phi entry count that disagrees with the edges is
-            // malformed IR, and the mapping is ambiguous, so the
-            // rename refuses to guess.
-            if slots.len() != new_preds.len() {
+            // The switch may reach the target by edges that still
+            // leave the switch block (a preserved dense run does), so
+            // only the re-pointed edges move and the rest keep naming
+            // the switch block. More re-pointed edges than the phi's
+            // entries is malformed IR, and the mapping is ambiguous, so
+            // the rename refuses to guess.
+            if slots.len() < new_preds.len() {
                 panic!(
                     "irparse: phi {} in block {target} names {old_pred} {} times but the switch reaches it {} times (epic-cc#1417)",
                     p.dst,
