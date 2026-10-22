@@ -1358,3 +1358,33 @@ fn escaped_loop_address_lands_on_the_last_element() {
     let got = (p.ram()[last as usize] as u16) | ((p.ram()[last as usize + 1] as u16) << 8);
     assert_eq!(got, globals["buf"] + 1, "last must be &buf[1]");
 }
+
+/// epic-cc#1421: a pointer laundered through `uintptr_t` lowers as a
+/// same-width `trunc i16 -> i16`, and the backend used to refuse it
+/// ("trunc must narrow"), aborting the compile.
+///
+/// The two shapes that reach the trunc materialize their address
+/// differently: a pointer loaded from a RAM global carries the address in
+/// the global's bytes, while a local's address is the local's own frame
+/// address. The fixture reads the byte back through the laundered
+/// address, so a wrong address reads the wrong byte.
+#[test]
+fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ptrtoint_launder.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the laundered address of a global must read back g's byte"
+    );
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        0x33,
+        "the laundered address of a local must read back the local's byte"
+    );
+}
