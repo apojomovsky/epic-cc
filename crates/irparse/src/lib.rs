@@ -1931,14 +1931,34 @@ fn rename_switch_phi_incomings(blocks: &mut [Block], repoints: &[(String, String
         let mut renamed = false;
         for inst in &mut blocks[idx].insts {
             let Inst::Phi(p) = inst else { continue };
-            // The phi names the switch block once, whatever the number
-            // of cases reaching the target.
-            let Some(pos) = p.incoming.iter().position(|(_, f)| f == &old_pred) else {
+            // LLVM's phi holds one entry per predecessor edge, so a
+            // target reached by two cases of one switch names the
+            // switch block twice. Each entry takes one chain block, so
+            // the count is preserved: the backends gate several loop
+            // and walk shapes on it.
+            let slots: Vec<usize> = p
+                .incoming
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, f))| f == &old_pred)
+                .map(|(i, _)| i)
+                .collect();
+            if slots.is_empty() {
                 continue;
-            };
-            let (val, _) = p.incoming.remove(pos);
-            for new_pred in &new_preds {
-                p.incoming.push((val.clone(), new_pred.clone()));
+            }
+            // A phi entry count that disagrees with the edges is
+            // malformed IR, and the mapping is ambiguous, so the
+            // rename refuses to guess.
+            if slots.len() != new_preds.len() {
+                panic!(
+                    "irparse: phi {} in block {target} names {old_pred} {} times but the switch reaches it {} times (epic-cc#1417)",
+                    p.dst,
+                    slots.len(),
+                    new_preds.len()
+                );
+            }
+            for (slot, new_pred) in slots.iter().zip(&new_preds) {
+                p.incoming[*slot].1 = new_pred.clone();
             }
             renamed = true;
         }
@@ -2214,7 +2234,8 @@ fn lower_switch(
         if is_last {
             // The last chain block's false edge reaches the default, so
             // the default's predecessor is that block now, not the
-            // switch block. Its phi names the switch block the same way.
+            // switch block. Its phi names the switch block the same
+            // way, once per edge that reaches it.
             repoints.push((
                 default_label.clone(),
                 blocks[cur_idx].label.clone(),
