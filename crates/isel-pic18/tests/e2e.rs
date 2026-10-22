@@ -1396,6 +1396,8 @@ fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
 /// The GEP's base is a global and its index is a runtime value, so the
 /// address materializes as the base literal plus the index (the
 /// `[(1, reg)]` term of the folded base), not as a plain slot copy. The
+/// index is chosen so the sum crosses the 0x100 boundary, which runs the
+/// materialization's carry from the low byte into the high byte. The
 /// fixture reads the byte back through the laundered address, so a wrong
 /// address reads the wrong byte.
 #[test]
@@ -1405,14 +1407,21 @@ fn gep_trunc_materializes_the_runtime_indexed_address() {
         "/tests/fixtures/gep_trunc_addr.c"
     );
     let (mut p, globals) = compile(fixture);
-    p.run(5000);
+    // The carry only runs when the base plus the index crosses the page
+    // boundary, so the placement is part of what this test proves.
+    assert!(
+        globals["buf"] as u32 + 254 > 0xFF,
+        "buf at {:#x} plus the index must cross the 0x100 boundary",
+        globals["buf"]
+    );
+    p.run(20_000);
     assert!(p.halted(), "program must halt");
-    // idx == 2, so the laundered address is &buf[2] and the byte there
-    // is 0x33.
+    // idx == 254 and buf[254] == 0x33, so the laundered address is
+    // &buf[254] and the byte there is 0x33.
     assert_eq!(
         p.ram()[globals["out2"] as usize],
         0x33,
-        "the laundered address must carry the runtime index"
+        "the laundered address must carry the runtime index and its carry"
     );
     assert_eq!(
         p.ram()[globals["out"] as usize],
