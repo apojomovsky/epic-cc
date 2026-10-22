@@ -1903,22 +1903,13 @@ fn longest_dense_run(cases: &[(Ty, Val, String)], switch_text: &str) -> Option<(
 
 /// Rewrite the phi incomings of a switch's case targets (epic-cc#1417).
 ///
-/// LLVM gives a case target one predecessor, the switch block, and its
-/// phi names that block. The compare-chain expansion replaces the
-/// switch with fresh blocks, so the target's real predecessor becomes
-/// the chain block, while the phi still names the switch block. The
-/// backends key their per-edge phi copies on the real predecessor, so
-/// the stale label makes the lookup miss and the phi's init copy (a
-/// loop counter's zero init, say) is dropped: the slot keeps whatever
-/// the previous writer left there.
-///
-/// `repoints` holds one `(target, new_pred, old_pred)` per edge the
-/// expansion re-pointed. A target reached by two cases ends up with
-/// two chain predecessors while its phi names the switch block once,
-/// so the one value is duplicated across both edges: the switch
-/// carried the same value on every edge to that target. A phi whose
-/// incoming count does not line up with the re-pointed edges is
-/// malformed IR, and the rename panics rather than guess.
+/// The compare-chain expansion replaces the switch with fresh blocks, so
+/// the target's real predecessor becomes the chain block, while the
+/// phi still names the switch block. The backends key their per-edge
+/// phi copies on the real predecessor, so the stale label makes the
+/// lookup miss and the phi's init copy (a loop counter's zero init,
+/// say) is dropped: the slot keeps whatever the previous writer left
+/// there.
 fn rename_switch_phi_incomings(blocks: &mut [Block], repoints: &[(String, String, String)]) {
     // Group the re-pointed edges by (target, old predecessor): a
     // target reached by two cases of one switch names that switch block
