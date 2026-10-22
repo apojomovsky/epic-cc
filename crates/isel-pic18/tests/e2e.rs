@@ -1388,3 +1388,35 @@ fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
         "the laundered address of a local must read back the local's byte"
     );
 }
+
+/// epic-cc#1426: a runtime-indexed address cast to an integer lowers as a
+/// same-width `trunc i16 -> i16` over a GEP, and the backend used to
+/// refuse it ("trunc must narrow"), aborting the compile.
+///
+/// The GEP's base is a global and its index is a runtime value, so the
+/// address materializes as the base literal plus the index (the
+/// `[(1, reg)]` term of the folded base), not as a plain slot copy. The
+/// fixture reads the byte back through the laundered address, so a wrong
+/// address reads the wrong byte.
+#[test]
+fn gep_trunc_materializes_the_runtime_indexed_address() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gep_trunc_addr.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    // idx == 2, so the laundered address is &buf[2] and the byte there
+    // is 0x33.
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        0x33,
+        "the laundered address must carry the runtime index"
+    );
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the laundered address of a plain pointer must read back g's byte"
+    );
+}
