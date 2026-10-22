@@ -1392,14 +1392,11 @@ fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
 /// epic-cc#1426: a runtime-indexed address cast to an integer lowers as a
 /// same-width `trunc i16 -> i16` over a GEP, and the backend used to
 /// refuse it ("trunc must narrow"), aborting the compile.
-///
 /// The GEP's base is a global and its index is a runtime value, so the
 /// address materializes as the base literal plus the index (the
 /// `[(1, reg)]` term of the folded base), not as a plain slot copy. The
-/// index is chosen so the sum crosses the 0x100 boundary, which runs the
-/// materialization's carry from the low byte into the high byte. The
-/// fixture reads the byte back through the laundered address, so a wrong
-/// address reads the wrong byte.
+/// index crosses the 0x100 boundary, which runs the materialization's
+/// carry into the high byte. The read-back catches a wrong address.
 #[test]
 fn gep_trunc_materializes_the_runtime_indexed_address() {
     let fixture = concat!(
