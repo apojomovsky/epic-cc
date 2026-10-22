@@ -1901,19 +1901,122 @@ fn longest_dense_run(cases: &[(Ty, Val, String)], switch_text: &str) -> Option<(
     best
 }
 
+/// Rewrite the phi incomings of a switch's case targets (epic-cc#1417).
+///
+/// LLVM gives a case target one predecessor, the switch block, and its
+/// phi names that block. The compare-chain expansion replaces the
+/// switch with fresh blocks, so the target's real predecessor becomes
+/// the chain block, while the phi still names the switch block. The
+/// backends key their per-edge phi copies on the real predecessor, so
+/// the stale label makes the lookup miss and the phi's init copy (a
+/// loop counter's zero init, say) is dropped: the slot keeps whatever
+/// the previous writer left there.
+///
+/// `repoints` holds one `(target, new_pred, old_pred)` per edge the
+/// expansion re-pointed. A target reached by two cases ends up with
+/// two chain predecessors while its phi names the switch block once,
+/// so the one value is duplicated across both edges: the switch
+/// carried the same value on every edge to that target. A phi whose
+/// incoming count does not line up with the re-pointed edges is
+/// malformed IR, and the rename panics rather than guess.
+fn rename_switch_phi_incomings(blocks: &mut [Block], repoints: &[(String, String, String)]) {
+    // Group the re-pointed edges by target: one entry per (target, old
+    // predecessor) holds the chain blocks that now branch to it.
+    let mut by_target: HashMap<String, (String, Vec<String>)> = HashMap::new();
+    for (target, new_pred, old_pred) in repoints {
+        let e = by_target
+            .entry(target.clone())
+            .or_insert_with(|| (old_pred.clone(), Vec::new()));
+        e.1.push(new_pred.clone());
+    }
+    for (target, (old_pred, new_preds)) in by_target {
+        let Some(idx) = blocks.iter().position(|b| b.label == target) else {
+            continue;
+        };
+        let label = blocks[idx].label.clone();
+        let mut renamed = false;
+        for inst in &mut blocks[idx].insts {
+            let Inst::Phi(p) = inst else { continue };
+            // The phi names the switch block once, whatever the number
+            // of cases reaching the target.
+            let Some(pos) = p.incoming.iter().position(|(_, f)| f == &old_pred) else {
+                continue;
+            };
+            let (val, _) = p.incoming.remove(pos);
+            for new_pred in &new_preds {
+                p.incoming.push((val.clone(), new_pred.clone()));
+            }
+            renamed = true;
+        }
+        if !renamed {
+            // No phi names the old predecessor, so nothing to rename.
+            continue;
+        }
+        // Every real predecessor of the target must now have an
+        // incoming on every phi, or the edge's copy would go missing
+        // again.
+        let real_preds = block_predecessors(blocks, &label);
+        for inst in &blocks[idx].insts {
+            let Inst::Phi(p) = inst else { continue };
+            for pred in &real_preds {
+                if !p.incoming.iter().any(|(_, f)| f == pred) {
+                    panic!(
+                        "irparse: phi {} in block {label} has no incoming for predecessor {pred} after the switch expansion (epic-cc#1417)",
+                        p.dst
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The blocks that branch to `label`, from their terminators.
+fn block_predecessors(blocks: &[Block], label: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in blocks {
+        let targets: Vec<&str> = match b.insts.last() {
+            Some(Inst::Br(br)) => vec![br.target.as_str()],
+            Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+            Some(Inst::Switch(sw)) => {
+                let mut v: Vec<&str> = sw.cases.iter().map(|(_, l)| l.as_str()).collect();
+                v.push(sw.default.as_str());
+                v
+            }
+            _ => vec![],
+        };
+        for t in targets {
+            if t == label {
+                out.push(b.label.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Lower an LLVM `switch` terminator text into a chain of `icmp eq` +
 /// `brcond` blocks. `switch_text` is the full `switch ... [ ... ]` line(s)
 /// flattened into one string (the aggregator ensures the closing `]` is
 /// present). The current function's `blocks` already contains the entry that
 /// holds the switch; this splices in fresh fallthrough blocks.
+///
+/// `repoints` collects the case targets the expansion re-points: the
+/// chain's block now branches to the target, where the pre-expansion
+/// switch block was the target's predecessor (epic-cc#1417). A target
+/// that carries a phi needs its incoming renamed to that block, or the
+/// backend's per-edge phi copies miss the edge and the phi's init copy
+/// is dropped.
 fn lower_switch(
     blocks: &mut Vec<Block>,
     switch_text: &str,
     fresh: &mut Fresh,
     dbg: &DebugInfoTable,
     preserve_dense: bool,
+    repoints: &mut Vec<(String, String, String)>,
 ) {
     let loc = dbg_loc(switch_text, dbg);
+    // The block holding the switch: the case targets' phis name it as
+    // their predecessor before the expansion re-points them.
+    let switch_owner = blocks.last().map(|b| b.label.clone()).unwrap_or_default();
     let body = switch_text
         .trim_start()
         .strip_prefix("switch")
@@ -2095,11 +2198,29 @@ fn lower_switch(
         blocks[cur_idx].insts.push(Inst::Icmp(icmp));
         blocks[cur_idx].insts.push(Inst::BrCond(BrCond {
             cond: Val::Reg(cmp_dst),
-            t: case_label,
+            t: case_label.clone(),
             f: false_label.clone(),
             loc: loc.clone(),
         }));
-        if !is_last {
+        // The chain block, not the switch block, is the case target's
+        // predecessor now (epic-cc#1417). The phi in that target still
+        // names the switch block, so the rename is recorded here and
+        // applied once the whole function is parsed.
+        repoints.push((
+            case_label,
+            blocks[cur_idx].label.clone(),
+            switch_owner.clone(),
+        ));
+        if is_last {
+            // The last chain block's false edge reaches the default, so
+            // the default's predecessor is that block now, not the
+            // switch block. Its phi names the switch block the same way.
+            repoints.push((
+                default_label.clone(),
+                blocks[cur_idx].label.clone(),
+                switch_owner.clone(),
+            ));
+        } else {
             blocks.push(Block {
                 label: false_label,
                 insts: Vec::new(),
@@ -3195,6 +3316,9 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                 label: entry_placeholder.clone(),
                 insts: Vec::new(),
             }];
+            // Case targets the switch expansion re-points, with the
+            // chain block that now branches to them (epic-cc#1417).
+            let mut repoints: Vec<(String, String, String)> = Vec::new();
             // Handles single-line function definitions with the body on the
             // `define` line, e.g. `define void @foo() { tail call ... ret void }`.
             let mut handled_inline = false;
@@ -3257,6 +3381,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                                     &mut fresh,
                                     &dbg,
                                     preserve_dense_switches,
+                                    &mut repoints,
                                 );
                                 has_code = true;
                                 continue;
@@ -3271,6 +3396,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                         handled_inline = true;
                     }
                     if handled_inline {
+                        rename_switch_phi_incomings(&mut blocks, &repoints);
                         funcs.push(Func {
                             name,
                             ret,
@@ -3321,6 +3447,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                                 &mut fresh,
                                 &dbg,
                                 preserve_dense_switches,
+                                &mut repoints,
                             );
                             has_code = true;
                         } else if let Some(colon) = l.find(':') {
@@ -3429,6 +3556,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                             &mut fresh,
                             &dbg,
                             preserve_dense_switches,
+                            &mut repoints,
                         );
                         has_code = true;
                         if has_trailing_brace {
@@ -3445,6 +3573,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                         break;
                     }
                 }
+                rename_switch_phi_incomings(&mut blocks, &repoints);
                 funcs.push(Func {
                     name,
                     ret,
