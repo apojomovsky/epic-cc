@@ -11677,6 +11677,29 @@ impl<'m> Gen<'m> {
                 // do not separate `trunc i8 -> i1` (narrowing) from a
                 // non-narrowing trunc. Mirrors `isel` ("isel: trunc must
                 // narrow").
+                // A same-width trunc is the `ptrtoint` spelling (epic-cc#1421):
+                // the source is a pointer, so its ADDRESS is the value, and the
+                // shared move path materializes each shape (an alloca's slot
+                // holds the object, a global's its contents).
+                if t.from == t.to {
+                    let dst = self.slot_addr(self.cur_func, &t.dst).direct();
+                    // A pointer source moves its ADDRESS value; a plain
+                    // value source moves its bytes.
+                    let ptr_source = match &t.val {
+                        Val::Reg(r) => self.resolved.contains_key(&ssa_key(self.cur_func, r)),
+                        Val::Global(_) => true,
+                        Val::Const(_) => false,
+                    };
+                    if ptr_source {
+                        self.emit_move_val_to_slot(&t.val, t.to, dst);
+                    } else {
+                        let src = self.val_addr(&t.val).direct();
+                        for i in 0..t.to.bytes() {
+                            self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                        }
+                    }
+                    return;
+                }
                 assert!(
                     t.from.bytes() > t.to.bytes() || (t.to == Ty::I1 && t.from != Ty::I1),
                     "isel-pic18: trunc must narrow (to must be strictly smaller than from)"
