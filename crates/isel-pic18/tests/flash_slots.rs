@@ -1115,13 +1115,39 @@ fn call_result_over_a_clobbered_param_is_refused() {
 fn int_laundered_flash_deref_beside_a_ram_join_reads_flash() {
     // epic-cc#1346 review: a maybe-flash join withdraws the join's
     // result, not the flash arm it joined. A direct dereference
-    // through the arm still reads flash.
-    let asm = laundering_asm(
-        "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal out i8\n\
-         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    %f = load i8 @flag\n    %m = select i1 %f, ptr @buf, ptr %p\n    ret void\n",
-        |_| {},
+    // through the arm still reads the table byte.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    %f = load i8 @flag\n    %m = select i1 %f, ptr @buf, ptr %p\n    ret void\n",
+        ),
+        "c",
+        b"P",
     );
-    assert!(asm.contains("TBLRD*"), "must read flash:\n{asm}");
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("buf", 0x13),
+            ("flag", 0x16),
+            ("out", 0x17),
+            ("main::x", 0x18),
+            ("main::p", 0x1A),
+            ("main::v", 0x1C),
+            ("main::f", 0x1D),
+            ("main::m", 0x1E),
+        ]),
+        None,
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    // The table byte lives only in program memory, so a RAM read
+    // would return something else.
+    assert_eq!(p.ram()[0x17], b'P', "the arm must read the table");
 }
 
 #[test]
@@ -1329,7 +1355,7 @@ fn int_laundered_call_result_looks_up_its_actual_in_the_caller_reads_ram() {
         parse(
             "const c i8\nglobal g i16\nglobal buf i16\nglobal h i16\nglobal h2 i16\nglobal out i8\n\
              fn f(i16) (x=i16)\n  block entry:\n    store ptr @c @g\n    %1 = load i16 @g\n    ret i16 %x\n\
-             fn main(void) ()\n  block entry:\n    store ptr @buf @h\n    %1 = load i16 @h\n    %r = call i16 @f(i16 %1)\n    %q = gep %r +0\n    memcpy @h2 %q 2\n    %y = load i16 @h2\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+             fn main(void) ()\n  block entry:\n    %a = gep @buf +512\n    store ptr %a @h\n    %1 = load i16 @h\n    %r = call i16 @f(i16 %1)\n    %q = gep %r +0\n    memcpy @h2 %q 2\n    %y = load i16 @h2\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
         ),
         "c",
         b"P",
@@ -1354,10 +1380,20 @@ fn int_laundered_call_result_looks_up_its_actual_in_the_caller_reads_ram() {
         ]),
         None,
     );
-    assert!(
-        !asm.contains("TBLRD*"),
-        "the caller's RAM address must not read flash:\n{asm}"
-    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    // The caller's pointer holds a data address the start-up clear
+    // never reaches. That address holds another data address, which
+    // the copy carries over and the dereference reads.
+    p.ram_mut()[0x213] = 0x40;
+    p.ram_mut()[0x214] = 0x00;
+    p.ram_mut()[0x40] = b'R';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    // The table byte lives only in program memory, so a flash read
+    // would return something else.
+    assert_eq!(p.ram()[0x1C], b'R', "the caller's address must read RAM");
 }
 
 #[test]
@@ -1721,9 +1757,16 @@ fn int_laundered_memcpy_from_a_pointer_value_reads_ram() {
         ]),
         None,
     );
-    // The dereference reads RAM, through FSR0, not through TBLPTR.
-    assert!(
-        asm.contains("0xFE9"),
-        "the dereference must go through FSR0:\n{asm}"
-    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    // The copy moved the table's first two bytes into `buf`, so the
+    // laundered value is that content, and the dereference reads RAM
+    // at the address the content holds.
+    p.ram_mut()[0x50] = b'R';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    // The table byte lives only in program memory, so a flash read
+    // would return something else.
+    assert_eq!(p.ram()[0x16], b'R', "the copied content must read RAM");
 }
