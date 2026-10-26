@@ -810,6 +810,18 @@ fn frame_layout(
                         }
                     }
                 }
+                // A trunc of a local object's address is the `ptrtoint`
+                // spelling: the address leaves the pointer domain, so the
+                // object may be read later without any use the intervals
+                // can see (epic-cc#1421). Keep its whole-function interval,
+                // like a stored address.
+                ir::Inst::Trunc(t) => {
+                    if let ir::Val::Reg(r) = &t.val {
+                        if let Some(o) = base_obj(r) {
+                            escaped.insert(o);
+                        }
+                    }
+                }
                 ir::Inst::Ret(Some((_, v)), _) => {
                     if let ir::Val::Reg(r) = v {
                         if let Some(o) = base_obj(r) {

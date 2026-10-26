@@ -685,6 +685,20 @@ fn struct_table_pointer_field_read_as_integer_is_refused() {
 
 #[test]
 #[should_panic(expected = "flash address that passed through integers")]
+fn trunc_spelled_ptrtoint_of_flash_gep_is_refused() {
+    // irparse spells `ptrtoint` as a same-width `trunc`, the shape the
+    // backend now lowers as a copy (epic-cc#1421). Laundering a flash
+    // table address into the integer domain must still be refused at the
+    // `inttoptr` back, so the copy cannot bypass the epic-cc#1284 guard.
+    let _ = laundering_asm(
+        "const c i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %q = gep @c +0\n    %x = trunc i16 %q to i16\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
 fn ptrtoint_of_flash_gep_is_refused() {
     // The IR a `(uintptr_t)"lit"` cast produces: a gep, an integer cast,
     // then inttoptr.
