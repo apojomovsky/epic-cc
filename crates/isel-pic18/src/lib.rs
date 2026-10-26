@@ -7857,6 +7857,31 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// Whether `v` is a GEP result: a `Gep` is virtual (folded by
+    /// `resolve_pointers`, emitted by nothing), so `alloc` gives its dst
+    /// no slot at all. A cast reading it must materialize the folded
+    /// address instead, and must not ask for that slot (epic-cc#1418).
+    fn folded_gep_src(&self, v: &Val) -> bool {
+        let Val::Reg(r) = v else { return false };
+        let key = ssa_key(self.cur_func, r);
+        // Every `Gep` dst resolves, so the map answers the common case
+        // (a cast of an ordinary value) without the scan below.
+        if !self.resolved.contains_key(&key) {
+            return false;
+        }
+        self.m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .is_some_and(|f| {
+                f.blocks.iter().any(|b| {
+                    b.insts
+                        .iter()
+                        .any(|i| matches!(i, Inst::Gep(g) if g.dst == *r))
+                })
+            })
+    }
+
     /// Copy `val` (width `ty.bytes`) into the slot starting at `dst`. A
     /// register/global source uses `MOVFF` (no access bit needed); a
     /// constant has no `MOVFF` literal form: a zero byte writes a
@@ -11473,7 +11498,6 @@ impl<'m> Gen<'m> {
                     z.to.bytes() >= z.from.bytes(),
                     "isel-pic18: zext must not narrow"
                 );
-                let src = self.val_addr(&z.val).direct();
                 // A retval-homed zext (epic-cc#978) computes into the return
                 // bytes directly; the ret arm skips its reload below.
                 let dst = if self.zext_ret.contains(&z.dst) {
@@ -11481,6 +11505,25 @@ impl<'m> Gen<'m> {
                 } else {
                     self.slot_addr(self.cur_func, &z.dst).direct()
                 };
+                // A GEP source has no slot at all (the backend emits
+                // nothing for a `Gep`), so the copy below would launder
+                // whatever was there. The address materializes from the
+                // folded base instead, like every other use of the GEP
+                // (epic-cc#1418).
+                if self.folded_gep_src(&z.val) {
+                    assert_eq!(
+                        z.from.bytes(),
+                        2,
+                        "isel-pic18: a cast of a folded GEP must take the whole 16-bit address (the IR's source width is {:?}); a narrower source is a truncation, which the Trunc arm refuses (epic-cc#1418)",
+                        z.from
+                    );
+                    self.emit_move_val_to_slot(&z.val, Ty::I16, dst);
+                    for i in z.from.bytes()..z.to.bytes() {
+                        self.emit_banked("CLRF", dst + u16::from(i), "");
+                    }
+                    return;
+                }
+                let src = self.val_addr(&z.val).direct();
                 // Dead high lanes (epic-cc#968): the scan proved only
                 // lane 0 is ever read, so the upper source copies and
                 // the zero fill are dead. One lane-0 copy is the whole
@@ -11619,10 +11662,26 @@ impl<'m> Gen<'m> {
                     s.to.bytes() >= s.from.bytes(),
                     "isel-pic18: sext must not narrow"
                 );
-                let src = self.val_addr(&s.val).direct();
+                // A GEP source has no slot (see the `Zext` arm's note,
+                // epic-cc#1418): materialize the folded address instead,
+                // and sign-fill from the byte that wrote.
                 let dst = self.slot_addr(self.cur_func, &s.dst).direct();
-                for i in 0..s.from.bytes() {
-                    self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                let sign_byte;
+                if self.folded_gep_src(&s.val) {
+                    assert_eq!(
+                        s.from.bytes(),
+                        2,
+                        "isel-pic18: a cast of a folded GEP must take the whole 16-bit address (the IR's source width is {:?}); a narrower source is a truncation, which the Trunc arm refuses (epic-cc#1418)",
+                        s.from
+                    );
+                    self.emit_move_val_to_slot(&s.val, Ty::I16, dst);
+                    sign_byte = dst + u16::from(s.from.bytes()) - 1;
+                } else {
+                    let src = self.val_addr(&s.val).direct();
+                    for i in 0..s.from.bytes() {
+                        self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                    }
+                    sign_byte = src + u16::from(s.from.bytes()) - 1;
                 }
                 // An i1 holds exactly 0/1, so widening zero-fills the
                 // high bytes: one CLRF word each, same Z-dead argument
@@ -11641,7 +11700,6 @@ impl<'m> Gen<'m> {
                 // `BTFSC sign_byte,7` conditionally overwrites `W` with
                 // `MOVLW 0xFF` only when that bit is set, so every high
                 // byte gets the same, correctly-derived fill value.
-                let sign_byte = src + u16::from(s.from.bytes()) - 1;
                 for i in s.from.bytes()..s.to.bytes() {
                     self.emit("    MOVLW 0x00".to_string());
                     let (a, f) = self.operand(sign_byte);
