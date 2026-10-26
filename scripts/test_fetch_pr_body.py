@@ -21,12 +21,11 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "fetch_pr_body.sh"
-
 GH_STUB = """\
 #!/usr/bin/env python3
-# Emulate `gh pr view --json body --jq <expr>` for one canned payload:
-# a raw body under --jq, the JSON envelope without it, and the gojq
-# rule that a null body prints empty under `// ""` and "null" without.
+# Emulate `gh pr view --json body --jq <expr>` for one canned payload: a
+# raw body under --jq, the JSON envelope without it. A null body prints
+# as an empty line, as real gh does.
 import json
 import os
 import sys
@@ -37,11 +36,8 @@ if os.environ.get("STUB_FAIL") == "1":
 payload = json.loads(os.environ["STUB_BODY"])
 args = sys.argv[1:]
 if "--jq" in args:
-    expr = args[args.index("--jq") + 1]
     body = payload.get("body")
-    if body is None and "//" in expr:
-        body = ""
-    sys.stdout.write("null" if body is None else body + "\\n")
+    sys.stdout.write(("" if body is None else body) + "\\n")
 else:
     sys.stdout.write(json.dumps(payload) + "\\n")
 """

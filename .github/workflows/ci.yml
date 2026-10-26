@@ -310,9 +310,19 @@ jobs:
       - name: Read the current PR body
         if: steps.noncode.outputs.non_code != 'true'
         env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: bash scripts/fetch_pr_body.sh "$PR_NUMBER" "$RUNNER_TEMP/pr-body.md" "$GITHUB_REPOSITORY"
+        run: |
+          # The fetcher comes from the base commit, like the judge below: a
+          # PR must not supply the body its own growth is judged against.
+          # Bootstrap for bases predating this fix, which have no copy yet.
+          if git cat-file -e "$BASE_SHA:scripts/fetch_pr_body.sh" 2>/dev/null; then
+            git show "$BASE_SHA:scripts/fetch_pr_body.sh" > "$RUNNER_TEMP/fetch_pr_body.sh"
+          else
+            cp scripts/fetch_pr_body.sh "$RUNNER_TEMP/fetch_pr_body.sh"
+          fi
+          bash "$RUNNER_TEMP/fetch_pr_body.sh" "$PR_NUMBER" "$RUNNER_TEMP/pr-body.md" "$GITHUB_REPOSITORY"
 
       - name: Judge head against base measurement
         if: steps.noncode.outputs.non_code != 'true'
