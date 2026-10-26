@@ -31,6 +31,11 @@ name: ci
 on:
   push:
     branches: [master]
+  # `edited` is deliberately absent from the pull_request types: a body edit
+  # must not re-run the canonical matrix, and a second run on the same head
+  # would leave its skipped jobs as the PR's newest checks (SKIPPED reads as
+  # success), hiding a real canonical failure. The baseline judge instead
+  # reads the body at run time, so a re-run sees the edit (epic-cc#1440).
   pull_request:
   workflow_dispatch:
 
@@ -214,6 +219,13 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # The judge reads the body at run time through the API, so this job
+    # needs pull-requests: read. Job-level permissions replace the workflow
+    # block, so the other two scopes are restated, not widened.
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: read
     steps:
       - uses: actions/checkout@v5
         with:
@@ -290,13 +302,22 @@ jobs:
           name: baseline-artifacts
           path: scratch/baseline-artifacts
 
-      # The PR body reaches the script via env, never interpolated into the
-      # shell, so a body containing quotes or $(...) cannot run commands.
+      # The body the judge reads is the one the PR carries now, fetched at
+      # run time: a re-run replays the event payload, whose body predates
+      # any edit that added a `delta-ok:` line (epic-cc#1440). Written
+      # straight to a file, never interpolated into the shell, so quotes
+      # or $(...) in the body cannot run commands.
+      - name: Read the current PR body
+        if: steps.noncode.outputs.non_code != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash scripts/fetch_pr_body.sh "$PR_NUMBER" "$RUNNER_TEMP/pr-body.md" "$GITHUB_REPOSITORY"
+
       - name: Judge head against base measurement
         if: steps.noncode.outputs.non_code != 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           # The rules come from the base commit, not from the PR: a PR cannot
           # relax the thresholds it is judged by. The one exception is the PR
@@ -307,7 +328,6 @@ jobs:
             cp scripts/baseline_delta.py "$RUNNER_TEMP/baseline_delta.py"
           fi
           git show "$BASE_SHA:scripts/add_device.py" > "$RUNNER_TEMP/add_device.py"
-          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
           # Bootstrap for bases predating epic-cc#1135: their judge knows no
           # --base-artifacts flag, so they run without it and judge against
           # the committed TOML, as before. The base copy always rules; a PR

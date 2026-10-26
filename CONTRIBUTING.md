@@ -61,8 +61,11 @@ commit in the same run, and `scripts/baseline_delta.py` judges the head
 against the base measurement: a net win (no total grows, at least one
 shrinks) passes; flash growth up to 8 words or cycle growth up to 1% on a
 single row passes when the PR body names it on a line of its own,
-`delta-ok: <row>`; RAM growth, a larger regression, a net loss, or a
-removed row holds for a human. `-O2` is the speed profile, so a cycle-ladder
+`delta-ok: <row>`, as the body stands when the baseline job runs: after
+adding the line to an already-held pull request, re-run the failed
+`baseline delta (PR)` job (`gh run rerun --failed <run-id>`). The edit
+alone starts nothing, and it never re-runs the canonical matrix; RAM
+growth, a larger regression, a net loss, or a removed row holds for a human. `-O2` is the speed profile, so a cycle-ladder
 `-O2` binary whose cycles shrink at least 1% may also grow flash up to 64
 words per row (named the same way, and not counted against the flash total):
 the speed levers of ADR-045 trade flash for cycles by design. The same
