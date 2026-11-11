@@ -1,9 +1,9 @@
 // Multi-unit memset intrinsic shape (epic-cc#1448): this unit and
-// memset_multi_b.c each emit llvm.memset, and neither includes
+// memset_multi_b.c each emit llvm.memset (48-byte structs), and neither includes
 // <string.h>. One linked memset implementation must serve both.
 // big_a.b[1] is 9 before zeroing, so out == 0 + 2 == 2 only when
 // both units' zero-initializations really run.
-struct BigA { unsigned char b[16]; };
+struct BigA { unsigned char b[48]; };
 
 static struct BigA big_a;
 volatile unsigned char out;
