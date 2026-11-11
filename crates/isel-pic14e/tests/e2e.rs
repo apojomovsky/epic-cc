@@ -352,6 +352,25 @@ fn structs_c_runs_correctly() {
 }
 
 #[test]
+fn multi_term_ptr_arg_c_runs_correctly() {
+    // in == 43 -> i == 3, j == 5 (fixture comment) -> out == 0x95.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/multi_term_ptr_arg.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 43;
+    p.ram_mut()[in_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x95,
+        "out == hand-computed 0x95 for in == 43"
+    );
+    assert!(p.halted());
+}
+
+#[test]
 fn banked_ptr_c_runs_correctly() {
     // in low byte = 3 (high byte stays 0) -> out == 0xB8 (hand trace in
     // the fixture's comment).

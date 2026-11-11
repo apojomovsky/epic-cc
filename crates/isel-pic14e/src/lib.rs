@@ -1057,6 +1057,24 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// Adds every term into the 16-bit address already seeded in the
+    /// param slot at `pa`, one scaled repetition at a time. Each low-byte
+    /// add carries into the high byte before the high bytes add, so any
+    /// term count and scale stays exact (epic-cc#1447).
+    fn emit_add_terms_to_ptr_slot(&mut self, pa: u16, terms: &[(u16, String)]) {
+        for (scale, reg) in terms {
+            let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
+            for _ in 0..*scale {
+                self.emit(format!("    MOVF 0x{ra:02X}, W"));
+                self.emit(format!("    ADDWF 0x{:02X}, F", pa));
+                self.emit("    BTFSC STATUS, 0".to_string());
+                self.emit(format!("    INCF 0x{:02X}, F", pa + 1));
+                self.emit(format!("    MOVF 0x{:02X}, W", ra + 1));
+                self.emit(format!("    ADDWF 0x{:02X}, F", pa + 1));
+            }
+        }
+    }
+
     /// Computes the const-table byte index into W. One scale-1 term keeps
     /// the fast register shape. General sums accumulate in W.
     fn emit_ptr_index_w(&mut self, k: u16, terms: &[(u16, String)], byte_off: u8) {
@@ -2581,9 +2599,15 @@ impl<'m> Gen<'m> {
                                 match terms.as_slice() {
                                     [] => {
                                         let addr = self.ptr_value_addr(name, k);
-                                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                                        self.emit(format!(
+                                            "    MOVLW 0x{:02X}",
+                                            (addr & 0xFF) as u8
+                                        ));
                                         self.emit(format!("    MOVWF 0x{:02X}", pa));
-                                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                                        self.emit(format!(
+                                            "    MOVLW 0x{:02X}",
+                                            ((addr >> 8) & 0xFF) as u8
+                                        ));
                                         self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
                                         continue;
                                     }
@@ -2593,13 +2617,19 @@ impl<'m> Gen<'m> {
                                         // linear region (docs/internals/design/33 §D-2).
                                         let base_addr = self.ptr_value_addr(name, 0);
                                         let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
-                                        self.emit(format!("    MOVLW 0x{:02X}", (base_addr & 0xFF) as u8));
+                                        self.emit(format!(
+                                            "    MOVLW 0x{:02X}",
+                                            (base_addr & 0xFF) as u8
+                                        ));
                                         self.emit(format!("    ADDWF 0x{:02X}, W", ra));
                                         if k_lo != 0 {
                                             self.emit(format!("    ADDLW 0x{k_lo:02X}"));
                                         }
                                         self.emit(format!("    MOVWF 0x{:02X}", pa));
-                                        self.emit(format!("    MOVLW 0x{:02X}", ((base_addr >> 8) & 0xFF) as u8));
+                                        self.emit(format!(
+                                            "    MOVLW 0x{:02X}",
+                                            ((base_addr >> 8) & 0xFF) as u8
+                                        ));
                                         self.emit("    BTFSC STATUS, 0".to_string());
                                         self.emit("    ADDLW 0x01".to_string());
                                         self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
@@ -2609,7 +2639,21 @@ impl<'m> Gen<'m> {
                                         self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
                                         continue;
                                     }
-                                    _ => panic!("isel: plain ptr arg with multiple terms not yet supported: {terms:?}"),
+                                    _ => {
+                                        let addr = self.ptr_value_addr(name, k);
+                                        self.emit(format!(
+                                            "    MOVLW 0x{:02X}",
+                                            (addr & 0xFF) as u8
+                                        ));
+                                        self.emit(format!("    MOVWF 0x{:02X}", pa));
+                                        self.emit(format!(
+                                            "    MOVLW 0x{:02X}",
+                                            ((addr >> 8) & 0xFF) as u8
+                                        ));
+                                        self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                                        self.emit_add_terms_to_ptr_slot(pa, &terms);
+                                        continue;
+                                    }
                                 }
                             }
                             Base::Slot(sname, false) if self.param_holds_addr(sname) => {
@@ -2677,7 +2721,23 @@ impl<'m> Gen<'m> {
                                 }
                                 self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
                             }
-                            _ => panic!("isel: plain ptr arg with multiple terms not yet supported: {terms:?}"),
+                            _ => {
+                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                                if k_lo != 0 {
+                                    self.emit(format!("    ADDLW 0x{k_lo:02X}"));
+                                }
+                                self.emit(format!("    MOVWF 0x{:02X}", pa));
+                                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                                if k_lo != 0 {
+                                    self.emit(format!("    BTFSC STATUS, 0"));
+                                    self.emit(format!("    ADDLW 0x01"));
+                                }
+                                if k_hi != 0 {
+                                    self.emit(format!("    ADDLW 0x{k_hi:02X}"));
+                                }
+                                self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                                self.emit_add_terms_to_ptr_slot(pa, &terms);
+                            }
                         }
                     }
                 }
