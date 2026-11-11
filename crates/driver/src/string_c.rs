@@ -30,7 +30,7 @@ __attribute__((noinline)) void *memmove(void *dest, const void *src, size_t n) {
     return dest;
 }
 
-__attribute__((noinline)) void *memset(void *s, int c, size_t n) {
+__attribute__((noinline, used)) void *memset(void *s, int c, size_t n) {
     unsigned char *p = (unsigned char*)s;
     for (size_t i = 0; i < n; i++) p[i] = (unsigned char)c;
     return s;
@@ -162,4 +162,18 @@ __attribute__((noinline)) char *strstr(const char *haystack, const char *needle)
     return 0;
 }
 
+"#;
+
+/// A memset-only unit, linked when a translation unit emits the
+/// `llvm.memset` intrinsic (struct zero-initialization, `__builtin_memset`)
+/// without including `<string.h>` (epic-cc#1448). Separate from `STRING_C`
+/// so a program defining other string functions itself gains no duplicate
+/// definitions from the rescue unit.
+pub const MEMSET_C: &str = r#"#include <stddef.h>
+
+__attribute__((noinline, used)) void *memset(void *s, int c, size_t n) {
+    unsigned char *p = (unsigned char*)s;
+    for (size_t i = 0; i < n; i++) p[i] = (unsigned char)c;
+    return s;
+}
 "#;
