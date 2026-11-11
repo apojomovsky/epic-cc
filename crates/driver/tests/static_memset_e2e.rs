@@ -180,6 +180,24 @@ __attribute__((noinline)) static void *memset(void *s, int c, unsigned long n) {
 }
 
 #[test]
+fn external_memset_with_zero_init_is_not_rejected() {
+    // An external definition serves the intrinsic (epic-cc#1448), so
+    // the static-memset diagnostic must not fire for it.
+    let body = format!(
+        r#"
+__attribute__((noinline)) void *memset(void *s, int c, unsigned long n) {{
+    unsigned char *p = (unsigned char *)s;
+    for (unsigned long i = 0; i < n; i++) p[i] = (unsigned char)c;
+    return s;
+}}
+{ZERO_INIT}"#
+    );
+    let out = compile("external-memset-zero-init.c", &body);
+    let err = stderr_of(&out);
+    assert!(!err.contains("static memset cannot serve"), "{err}");
+}
+
+#[test]
 fn external_memset_still_compiles() {
     let body = r#"
 __attribute__((noinline)) void *memset(void *s, int c, unsigned long n) {

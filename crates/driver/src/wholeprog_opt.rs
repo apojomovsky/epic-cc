@@ -1154,29 +1154,34 @@ pub fn rejects_static_memset(
     if !memset_intrinsic_reachable(ll_text) {
         return false;
     }
-    let defines_memset = |internal: bool| {
+    // Opt internalizes external definitions before this check runs, so
+    // linkage cannot say whether a body serves the intrinsic. The ABI
+    // can: a library-shaped definition keeps its pointer result and
+    // parameters, while clang's static rewrite is `fastcc` with the
+    // arguments dropped, a body no library-ABI call can reach.
+    let memset_define = |rewritten: bool| {
         ll_text.lines().any(|line| {
             line.starts_with("define")
-                && line.starts_with("define internal") == internal
                 && !line.starts_with("define private")
                 && line
                     .split('@')
                     .nth(1)
                     .is_some_and(|rest| rest.starts_with("memset(") || rest.starts_with("memset "))
+                && line.contains("fastcc") == rewritten
         })
     };
-    if defines_memset(false) {
+    if memset_define(false) {
         return false;
     }
     if source_static_memset {
         return true;
     }
-    defines_memset(true)
+    memset_define(true)
 }
 
 /// Whether an `llvm.memset` call sits in a function reachable from
 /// an entry point (entry functions per `function_spans`, plus any
-/// function named by a global initializer). Call edges are the
+/// address-taken function). Call edges are the
 /// textual `call ... @name(` sites; an intrinsic outside any function
 /// counts as reachable, since no dead-function sweep can remove it.
 fn memset_intrinsic_reachable(ll_text: &str) -> bool {
@@ -1207,13 +1212,20 @@ fn memset_intrinsic_reachable(ll_text: &str) -> bool {
             queue.push(i);
         }
     }
-    for line in &lines {
-        if line.starts_with('@') && line.contains('=') {
-            for (i, span) in spans.iter().enumerate() {
-                if line.contains(&format!("@{}", span.name)) && reachable.insert(i) {
-                    queue.push(i);
-                }
-            }
+    // Address-taken functions can be called indirectly, so any mention
+    // outside their own define line makes them reachable roots too.
+    for (i, span) in spans.iter().enumerate() {
+        let needle = format!("@{}", span.name);
+        let taken = lines.iter().enumerate().any(|(li, line)| {
+            li != span.start
+                && line.split(&needle).nth(1).is_some_and(|rest| {
+                    rest.chars()
+                        .next()
+                        .is_none_or(|c| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '$')))
+                })
+        });
+        if taken && reachable.insert(i) {
+            queue.push(i);
         }
     }
     while let Some(fi) = queue.pop() {
@@ -1410,6 +1422,39 @@ declare void @llvm.memset.p0.i16(ptr, i8, i16, i1) #1
         let internal = format!("define internal fastcc void @memset() #0 {{\n}}\n{intrinsic}");
         assert!(rejects_static_memset(&internal, false, false));
         assert!(rejects_static_memset(intrinsic, true, false));
+    }
+
+    #[test]
+    fn internalized_external_memset_still_serves() {
+        // Post-opt text: opt has internalized the external definition,
+        // but its library ABI is intact, so it serves the intrinsic.
+        let ll = "\
+define dso_local i16 @main() #0 {
+  call void @llvm.memset.p0.i16(ptr %1, i8 0, i16 48, i1 false)
+  ret i16 0
+}
+define internal noundef ptr @memset(ptr %0, i16 %1, i16 %2) #0 {
+}
+declare void @llvm.memset.p0.i16(ptr, i8, i16, i1) #1
+";
+        assert!(!rejects_static_memset(ll, true, false));
+    }
+
+    #[test]
+    fn address_taken_intrinsic_host_is_reachable() {
+        let ll = "\
+define dso_local i16 @main() #0 {
+  store ptr @host, ptr @fp, align 2
+  ret i16 0
+}
+define dso_local void @host() #0 {
+  call void @llvm.memset.p0.i16(ptr %1, i8 0, i16 48, i1 false)
+}
+define internal fastcc void @memset() #0 {
+}
+@fp = global ptr null, align 2
+";
+        assert!(rejects_static_memset(ll, true, false));
     }
 
     #[test]
