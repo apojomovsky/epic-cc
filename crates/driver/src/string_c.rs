@@ -54,20 +54,79 @@ pub fn without_functions(source: &str, names: &std::collections::HashSet<String>
     out
 }
 
-/// Function names a compiled user unit defines at external linkage, read
-/// from its `define` lines. Internal and private definitions are
-/// llvm-link's to rename, never a collision, so they must not make the
-/// injected unit defer to a name nothing else can reference.
-pub fn externally_defined(ll_text: &str) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
+/// Number of parameters in the parenthesised list opening at `open`,
+/// or `None` when it never closes. Nested parens keep their commas.
+fn arity_of(line: &str, open: usize) -> Option<usize> {
+    let inner = &line[open + 1..];
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => {
+                close = Some(i);
+                break;
+            }
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    let inner = &inner[..close?];
+    if inner.trim().is_empty() {
+        return Some(0);
+    }
+    let mut depth = 0i32;
+    let mut count = 1usize;
+    for c in inner.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    Some(count)
+}
+
+/// Parameter counts of every `STRING_C` definition, keyed by name.
+pub fn function_arities(source: &str) -> std::collections::HashMap<String, usize> {
+    let mut out = std::collections::HashMap::new();
+    for line in source.lines() {
+        if let Some(name) = definition_name(line) {
+            if let Some(open) = line.rfind('(') {
+                if let Some(arity) = arity_of(line, open) {
+                    out.insert(name.to_string(), arity);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Function names and parameter counts a compiled user unit defines at
+/// external linkage, read from its `define` lines. Internal, private,
+/// weak and linkonce definitions are not collisions the injected unit
+/// must defer to: llvm-link renames the internal ones and keeps the
+/// strong definition over a weak or linkonce one, so deferring would
+/// invert the linker's own precedence.
+pub fn externally_defined(ll_text: &str) -> std::collections::HashMap<String, usize> {
+    let mut names = std::collections::HashMap::new();
     for line in ll_text.lines() {
         let Some(rest) = line.strip_prefix("define ") else {
             continue;
         };
-        if rest
-            .split_whitespace()
-            .any(|t| t == "internal" || t == "private")
-        {
+        if rest.split_whitespace().any(|t| {
+            matches!(
+                t,
+                "internal"
+                    | "private"
+                    | "weak"
+                    | "extern_weak"
+                    | "linkonce"
+                    | "linkonce_odr"
+                    | "available_externally"
+            )
+        }) {
             continue;
         }
         let Some(at) = rest.find('@') else { continue };
@@ -80,8 +139,14 @@ pub fn externally_defined(ll_text: &str) -> std::collections::HashSet<String> {
                 .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$' | '-'))
                 .collect()
         };
-        if !name.is_empty() {
-            names.insert(name);
+        if name.is_empty() {
+            continue;
+        }
+        let Some(open) = after.find('(') else {
+            continue;
+        };
+        if let Some(arity) = arity_of(after, open) {
+            names.entry(name).or_insert(arity);
         }
     }
     names
@@ -301,11 +366,22 @@ mod tests {
         let ll = "declare ptr @memset(ptr, i16, i16)\n\
                   define dso_local ptr @memset(ptr %s, i16 %c, i16 %n) {\n}\n\
                   define internal ptr @helper(ptr %s) {\n}\n\
+                  define weak ptr @wobble(ptr %s) {\n}\n\
                   define ptr @_Z3fooPc(ptr %s) {\n}\n";
         let names = externally_defined(ll);
-        assert!(names.contains("memset"));
-        assert!(names.contains("_Z3fooPc"));
-        assert!(!names.contains("helper"));
+        assert_eq!(names.get("memset"), Some(&3));
+        assert_eq!(names.get("_Z3fooPc"), Some(&1));
+        assert!(!names.contains_key("helper"));
+        assert!(!names.contains_key("wobble"));
         assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn function_arities_match_the_library_signatures() {
+        let arities = function_arities(STRING_C);
+        assert_eq!(arities.get("memset"), Some(&3));
+        assert_eq!(arities.get("strlen"), Some(&1));
+        assert_eq!(arities.get("strcmp"), Some(&2));
+        assert_eq!(arities.len(), 16);
     }
 }

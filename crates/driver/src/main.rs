@@ -349,7 +349,7 @@ fn main() {
         // Defining a library function beside its header is legal C, so a
         // user definition wins: drop only the colliding names from the
         // injected unit and let its survivors reference the user's.
-        let user_defined: std::collections::HashSet<String> = units
+        let user_defined: std::collections::HashMap<String, usize> = units
             .iter()
             .flat_map(|u| {
                 driver::string_c::externally_defined(
@@ -357,11 +357,16 @@ fn main() {
                 )
             })
             .collect();
+        // A same-named definition only wins with the library arity: a
+        // mismatched signature is a different function sharing a
+        // reserved name, and binding call sites to it silently would
+        // miscompile where llvm-link used to fail loudly.
+        let arities = driver::string_c::function_arities(driver::string_c::STRING_C);
         let colliding: std::collections::HashSet<String> =
             driver::string_c::function_names(driver::string_c::STRING_C)
                 .into_iter()
                 .map(str::to_string)
-                .filter(|n| user_defined.contains(n))
+                .filter(|n| user_defined.get(n) == arities.get(n))
                 .collect();
         let string_source = if colliding.is_empty() {
             driver::string_c::STRING_C.to_string()
