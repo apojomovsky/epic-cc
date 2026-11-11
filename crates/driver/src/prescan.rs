@@ -870,3 +870,45 @@ fn find_delay_in_one_file(file: &str, text: &str) -> Option<DelayUse> {
     }
     None
 }
+
+/// Header paths named by clang `-MD` dependency texts, in first-seen
+/// order. Tokens are whitespace-separated with `\` continuations and a
+/// trailing `:` on targets, so both are trimmed before the extension
+/// test.
+pub fn dep_header_paths(dep_texts: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for text in dep_texts {
+        for tok in text.split_whitespace() {
+            let t = tok.trim_end_matches('\\').trim_end_matches(':');
+            if (t.ends_with(".h") || t.ends_with(".hpp") || t.ends_with(".hh"))
+                && !out.iter().any(|p| p == t)
+            {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dep_header_paths;
+
+    #[test]
+    fn dep_header_paths_extracts_headers_in_order() {
+        let deps = vec![
+            "out.o: src/main.c inc/a.h \\\n  inc/b.hpp /abs/c.hh src/x.c\n".to_string(),
+            "out2.o: inc/a.h inc/d.h\n".to_string(),
+        ];
+        assert_eq!(
+            dep_header_paths(&deps),
+            vec!["inc/a.h", "inc/b.hpp", "/abs/c.hh", "inc/d.h"]
+        );
+    }
+
+    #[test]
+    fn dep_header_paths_ignores_non_headers() {
+        let deps = vec!["out.o: src/main.c src/lib.cpp\n".to_string()];
+        assert!(dep_header_paths(&deps).is_empty());
+    }
+}

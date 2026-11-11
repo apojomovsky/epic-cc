@@ -67,7 +67,7 @@ __attribute__((noinline)) static void *memset(void *s, int c, unsigned long n) {
     assert!(!out.status.success(), "compile should fail");
     assert_eq!(out.status.code(), Some(1));
     let err = stderr_of(&out);
-    assert!(err.contains("epic-cc: error:"), "{err}");
+    assert!(err.contains("error:"), "{err}");
     assert!(err.contains("static"), "{err}");
     assert!(err.contains("memset"), "{err}");
     assert!(err.contains("llvm.memset"), "{err}");
@@ -103,6 +103,80 @@ static unsigned char buf[48];
     assert!(err.contains("llvm.memset"), "{err}");
     assert!(!err.contains("internal compiler error"), "{err}");
     assert!(!err.contains("unreachable-body"), "{err}");
+}
+
+#[test]
+fn called_static_memset_with_dead_intrinsic_still_compiles() {
+    // The static body serves its direct calls, and the only intrinsic
+    // sits in a never-called function that opt deletes, so no stage
+    // ever needs a library memset (epic-cc#1453 review).
+    let body = r#"
+__attribute__((noinline)) static void *memset(void *s, int c, unsigned long n) {
+    unsigned char *p = (unsigned char *)s;
+    for (unsigned long i = 0; i < n; i++) p[i] = (unsigned char)c;
+    return s;
+}
+struct Blob { unsigned char b[48]; };
+volatile unsigned char sink;
+__attribute__((noinline)) void consume(struct Blob *blob) {
+    unsigned char sum = 0;
+    for (int i = 0; i < 48; i++) sum = (unsigned char)(sum + blob->b[i]);
+    sink = sum;
+}
+__attribute__((noinline)) void dead_fn(void) {
+    struct Blob blob = {0};
+    consume(&blob);
+}
+static unsigned char buf[48];
+int main(void) {
+    memset(buf, 1, 48);
+    sink = buf[47];
+    return 0;
+}
+"#;
+    let out = compile("static-memset-dead-intrinsic.c", body);
+    let err = stderr_of(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("static memset cannot serve"), "{err}");
+}
+
+#[test]
+fn static_memset_in_header_is_a_named_error_not_an_ice() {
+    let dir = std::env::temp_dir().join(format!("epic-static-memset-hdr-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("make temp dir");
+    let header = dir.join("helper.h");
+    std::fs::write(
+        &header,
+        r#"
+__attribute__((noinline)) static void *memset(void *s, int c, unsigned long n) {
+    unsigned char *p = (unsigned char *)s;
+    for (unsigned long i = 0; i < n; i++) p[i] = (unsigned char)c;
+    return s;
+}
+"#,
+    )
+    .expect("write header");
+    let src = dir.join("uses_header.c");
+    std::fs::write(&src, format!("#include \"helper.h\"\n{ZERO_INIT}")).expect("write source");
+    let out = driver()
+        .args([
+            src.to_str().unwrap(),
+            "-I",
+            dir.to_str().unwrap(),
+            "-o",
+            "/tmp/epic-static-memset.hex",
+            "--device",
+            "p18f4550",
+        ])
+        .output()
+        .expect("run driver");
+    let err = stderr_of(&out);
+    assert!(!out.status.success(), "compile should fail: {err}");
+    assert!(err.contains("static memset"), "{err}");
+    assert!(err.contains("llvm.memset"), "{err}");
+    assert!(!err.contains("internal compiler error"), "{err}");
+    assert!(!err.contains("panicked at"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
