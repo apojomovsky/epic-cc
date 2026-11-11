@@ -28,6 +28,16 @@ fn run_on(device_name: &str, device: &device::Device) {
 }
 
 fn run_fixture(fixture: &str, tag_name: &str, device_name: &str, device: &device::Device) {
+    run_expected(fixture, tag_name, device_name, device, 0xAA);
+}
+
+fn run_expected(
+    fixture: &str,
+    tag_name: &str,
+    device_name: &str,
+    device: &device::Device,
+    expected: u8,
+) {
     let tag = format!("memset_{tag_name}_{device_name}_{}", std::process::id());
     let hex_path = std::env::temp_dir().join(format!("{tag}.hex"));
     let map_path = std::env::temp_dir().join(format!("{tag}.map"));
@@ -49,7 +59,6 @@ fn run_fixture(fixture: &str, tag_name: &str, device_name: &str, device: &device
     let _ = std::fs::remove_file(&hex_path);
     let _ = std::fs::remove_file(&map_path);
     let out_addr = map_addr(&map, "out");
-    let expected: u8 = 0xAA;
     match device.core {
         device::Core::Pic14 => {
             let mut sim = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
@@ -95,6 +104,57 @@ fn memset_intrinsic_with_string_h_runs_on_p18() {
         "stringh",
         "p18f4550",
         &device::PIC18F4550,
+    );
+}
+
+#[test]
+fn memset_own_strcpy_runs_on_p18() {
+    run_expected(
+        "tests/fixtures/memset_own_strcpy.c",
+        "ownstrcpy",
+        "p18f4550",
+        &device::PIC18F4550,
+        120,
+    );
+}
+
+#[test]
+fn memset_multi_unit_runs_on_p18() {
+    let tag = format!("memset_multi_p18_{}", std::process::id());
+    let hex_path = std::env::temp_dir().join(format!("{tag}.hex"));
+    let map_path = std::env::temp_dir().join(format!("{tag}.map"));
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args(["--device", "p18f4550", "-o"])
+        .arg(&hex_path)
+        .arg("--map")
+        .arg(&map_path)
+        .arg("tests/fixtures/memset_multi_a.c")
+        .arg("tests/fixtures/memset_multi_b.c")
+        .output()
+        .expect("run driver");
+    assert!(
+        out.status.success(),
+        "driver multi: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let map = std::fs::read_to_string(&map_path).unwrap();
+    let _ = std::fs::remove_file(&hex_path);
+    let _ = std::fs::remove_file(&map_path);
+    let mut sim = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    sim.run(200_000);
+    assert!(sim.halted(), "halted multi");
+    assert_eq!(sim.ram()[map_addr(&map, "out")], 2, "out for multi-unit");
+}
+
+#[test]
+fn memset_own_definition_runs_on_p18() {
+    run_expected(
+        "tests/fixtures/memset_own.c",
+        "own",
+        "p18f4550",
+        &device::PIC18F4550,
+        1,
     );
 }
 
