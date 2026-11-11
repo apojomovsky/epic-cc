@@ -3903,7 +3903,28 @@ fn parse_inst(
             let args_str = balanced_inner(&body[open + 1..]).unwrap();
             if func == "__cxa_guard_acquire" || func == "__cxa_guard_release" {
                 lower_guard_call(&func, &args_str, dst.clone(), fresh, cur.clone(), &mut out);
-            } else if func.starts_with("llvm.memcpy.p0.p0") {
+            } else if func.starts_with("llvm.memmove.p0.p0") {
+                // Overlap rules out the forward `Memcpy` copy, so the
+                // intrinsic becomes a plain call to `memmove`: the
+                // driver supplies that body when none is defined, and
+                // whole-program opt keeps a defined body alive for this
+                // call, which only exists from here on.
+                let a = split_top_level(args_str, ',');
+                let args: Vec<CallArg> = a[..3]
+                    .iter()
+                    .map(|ap| parse_call_arg(ap, types, fresh, &mut out, cur.as_ref()))
+                    .collect();
+                out.push(Inst::Call(Call {
+                    dst: None,
+                    ty: None,
+                    func: "memmove".to_string(),
+                    args,
+                    callees: Vec::new(),
+                    loc: cur.clone(),
+                }));
+            } else if func.starts_with("llvm.memcpy.p0.p0")
+                || func.starts_with("llvm.memcpy.inline.p0.p0")
+            {
                 let a = split_top_level(args_str, ',');
                 let dst = parse_call_ptr_val(a[0], types, fresh, &mut out, cur.as_ref());
                 let src = parse_call_ptr_val(a[1], types, fresh, &mut out, cur.as_ref());
@@ -3995,6 +4016,10 @@ fn parse_inst(
                     callees: Vec::new(),
                     loc: cur.clone(),
                 }));
+            } else if func.starts_with("llvm.mem") {
+                panic!(
+                    "irparse: unsupported intrinsic {func}: only llvm.memcpy, llvm.memcpy.inline, llvm.memset and llvm.memmove have lowerings here"
+                );
             } else if func.starts_with("llvm.lifetime.start")
                 || func.starts_with("llvm.lifetime.end")
             {

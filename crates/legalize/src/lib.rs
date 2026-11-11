@@ -4280,10 +4280,18 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
     if c.func == "llvm.assume" {
         return Vec::new();
     }
-    let dst = c
-        .dst
-        .clone()
-        .unwrap_or_else(|| panic!("legalize: intrinsic {} must carry a dst", c.func));
+    if c.func.starts_with("llvm.mem") {
+        panic!(
+            "legalize: unsupported intrinsic {}: void llvm.mem* intrinsics are lowered in irparse, and no other llvm.mem* form has a lowering here",
+            c.func
+        );
+    }
+    let dst = c.dst.clone().unwrap_or_else(|| {
+        panic!(
+            "legalize: unsupported void intrinsic {}: only llvm.assume may return void here",
+            c.func
+        )
+    });
     let ty = match c.func.as_str() {
         // `llvm.bitreverse.i6` carries no parsed result type: its
         // widened type is stated, not read (epic-cc#679).

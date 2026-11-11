@@ -321,19 +321,20 @@ fn main() {
         .iter()
         .map(|p| std::fs::read_to_string(p).unwrap_or_default())
         .collect();
+    let unit_texts: Vec<String> = units
+        .iter()
+        .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+        .collect();
     let need_string = dep_texts
         .iter()
-        .any(|t| driver::header_detect::dep_file_includes(t, "string.h"));
+        .any(|t| driver::header_detect::dep_file_includes(t, "string.h"))
+        || driver::string_c::needs_provided_memmove(&unit_texts);
     // A `llvm.memset` intrinsic (irparse rewrites it to a library call)
     // needs a memset definition even when no unit included <string.h>;
     // a unit defining memset itself already provides it (epic-cc#1448).
     let need_memset = !need_string && {
-        let ll_texts: Vec<String> = units
-            .iter()
-            .map(|p| std::fs::read_to_string(p).unwrap_or_default())
-            .collect();
-        ll_texts.iter().any(|t| t.contains("@llvm.memset."))
-            && !ll_texts.iter().any(|t| {
+        unit_texts.iter().any(|t| t.contains("@llvm.memset."))
+            && !unit_texts.iter().any(|t| {
                 t.lines()
                     .any(|l| l.starts_with("define") && l.contains("@memset("))
             })

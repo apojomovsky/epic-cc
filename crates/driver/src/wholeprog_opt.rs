@@ -144,6 +144,9 @@ fn is_entry_name(name: &str) -> bool {
 }
 
 fn public_api(ll_text: &str) -> Vec<String> {
+    // A `memmove` body looks dead here: its only callers use the
+    // intrinsic, which `irparse` rewrites to a call after this stage.
+    let memmove_intrinsic_only = ll_text.contains("llvm.memmove");
     let mut api = Vec::new();
     let mut defines_memset = false;
     for line in ll_text.lines() {
@@ -163,6 +166,7 @@ fn public_api(ll_text: &str) -> Vec<String> {
             if is_entry_name(name)
                 || line.split_whitespace().any(|t| t == "msp430_intrcc")
                 || variadic
+                || (name == "memmove" && memmove_intrinsic_only)
             {
                 api.push(name.to_string());
             }
@@ -1297,6 +1301,29 @@ declare void @llvm.memset.p0.i16(ptr, i8, i16, i1) #1
         let mut api = public_api(with_direct_call);
         api.sort();
         assert_eq!(api, vec!["main".to_string(), "memset".to_string()]);
+    fn public_api_keeps_memmove_called_only_by_intrinsic() {
+        let ll = "\
+define dso_local i16 @main() #0 {
+  call void @llvm.memmove.p0.p0.i16(ptr %d, ptr %s, i16 4, i1 false)
+}
+define dso_local ptr @memmove(ptr %d, ptr %s, i16 %n) #0 {
+}
+";
+        let mut api = public_api(ll);
+        api.sort();
+        assert_eq!(api, vec!["main".to_string(), "memmove".to_string()]);
+    }
+
+    #[test]
+    fn public_api_does_not_keep_directly_called_memmove() {
+        let ll = "\
+define dso_local i16 @main() #0 {
+  %r = call ptr @memmove(ptr %d, ptr %s, i16 4)
+}
+define dso_local ptr @memmove(ptr %d, ptr %s, i16 %n) #0 {
+}
+";
+        assert_eq!(public_api(ll), vec!["main".to_string()]);
     }
 
     #[test]
