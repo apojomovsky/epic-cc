@@ -1301,6 +1301,9 @@ declare void @llvm.memset.p0.i16(ptr, i8, i16, i1) #1
         let mut api = public_api(with_direct_call);
         api.sort();
         assert_eq!(api, vec!["main".to_string(), "memset".to_string()]);
+    }
+
+    #[test]
     fn public_api_keeps_memmove_called_only_by_intrinsic() {
         let ll = "\
 define dso_local i16 @main() #0 {
