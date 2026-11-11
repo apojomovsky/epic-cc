@@ -7,6 +7,86 @@
 //! keeps as one block over two `phi ptr`: the PIC18 pointer walk's
 //! shape, with the last bytes live for the exit subtract.
 
+/// Names defined by one `STRING_C` definition line, or `None` for any
+/// other line. The source is ours and every definition opens with the
+/// same `__attribute__((noinline))` line, so a line scan is exact here
+/// where it would be fragile on arbitrary C.
+fn definition_name(line: &str) -> Option<&str> {
+    if !line.starts_with("__attribute__((noinline))") {
+        return None;
+    }
+    let before_paren = line.split('(').nth(2)?;
+    let name = before_paren
+        .split_whitespace()
+        .last()?
+        .trim_start_matches('*');
+    (!name.is_empty()).then_some(name)
+}
+
+/// Every function `STRING_C` defines, in source order. `strcmp` appears
+/// twice, once per core branch, so callers deduplicate if they care.
+pub fn function_names(source: &str) -> Vec<&str> {
+    source.lines().filter_map(definition_name).collect()
+}
+
+/// `source` with every definition of a name in `names` removed. The
+/// `#ifdef` lines around the two `strcmp` branches stay, so removing a
+/// name present in both branches still leaves valid preprocessor text,
+/// and surviving definitions call the user's name through the header
+/// declarations as an ordinary external reference.
+pub fn without_functions(source: &str, names: &std::collections::HashSet<String>) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut skipping = false;
+    for line in source.lines() {
+        if skipping {
+            if line == "}" {
+                skipping = false;
+            }
+            continue;
+        }
+        if definition_name(line).is_some_and(|n| names.contains(n)) {
+            skipping = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Function names a compiled user unit defines at external linkage, read
+/// from its `define` lines. Internal and private definitions are
+/// llvm-link's to rename, never a collision, so they must not make the
+/// injected unit defer to a name nothing else can reference.
+pub fn externally_defined(ll_text: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for line in ll_text.lines() {
+        let Some(rest) = line.strip_prefix("define ") else {
+            continue;
+        };
+        if rest
+            .split_whitespace()
+            .any(|t| t == "internal" || t == "private")
+        {
+            continue;
+        }
+        let Some(at) = rest.find('@') else { continue };
+        let after = &rest[at + 1..];
+        let name: String = if let Some(quoted) = after.strip_prefix('"') {
+            quoted.chars().take_while(|c| *c != '"').collect()
+        } else {
+            after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$' | '-'))
+                .collect()
+        };
+        if !name.is_empty() {
+            names.insert(name);
+        }
+    }
+    names
+}
+
 pub const STRING_C: &str = r#"#include <stddef.h>
 #include <string.h>
 
@@ -177,3 +257,55 @@ __attribute__((noinline)) void *memset(void *s, int c, size_t n) {
     return s;
 }
 "#;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn names_cover_every_string_c_definition() {
+        let names = function_names(STRING_C);
+        assert_eq!(names.len(), 17, "{names:?}");
+        for expected in [
+            "memcpy", "memmove", "memset", "memcmp", "strlen", "strnlen", "strcpy", "strncpy",
+            "strcat", "strncat", "strcmp", "strncmp", "memchr", "strchr", "strrchr", "strstr",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn removing_memset_keeps_every_other_definition() {
+        let reduced = without_functions(STRING_C, &HashSet::from(["memset".to_string()]));
+        assert!(!function_names(&reduced).contains(&"memset"));
+        assert_eq!(function_names(&reduced).len(), 16);
+        assert!(reduced.contains("#include <string.h>"));
+    }
+
+    #[test]
+    fn removing_strcmp_removes_both_core_branches() {
+        let reduced = without_functions(STRING_C, &HashSet::from(["strcmp".to_string()]));
+        assert!(!function_names(&reduced).contains(&"strcmp"));
+        assert!(reduced.contains("#ifdef _PIC18"));
+        assert!(reduced.contains("#else"));
+        assert!(reduced.contains("#endif"));
+    }
+
+    #[test]
+    fn removing_nothing_is_byte_identical() {
+        assert_eq!(without_functions(STRING_C, &HashSet::new()), STRING_C);
+    }
+
+    #[test]
+    fn externally_defined_reads_define_lines_only() {
+        let ll = "declare ptr @memset(ptr, i16, i16)\n\
+                  define dso_local ptr @memset(ptr %s, i16 %c, i16 %n) {\n}\n\
+                  define internal ptr @helper(ptr %s) {\n}\n\
+                  define ptr @_Z3fooPc(ptr %s) {\n}\n";
+        let names = externally_defined(ll);
+        assert!(names.contains("memset"));
+        assert!(names.contains("_Z3fooPc"));
+        assert!(!names.contains("helper"));
+        assert_eq!(names.len(), 2);
+    }
+}
