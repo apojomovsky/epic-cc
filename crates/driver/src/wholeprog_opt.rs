@@ -122,6 +122,10 @@ const PASSES_O0: &str = "internalize,ipsccp,instcombine,simplifycfg,dce";
 ///   corrupts (one format byte read as 0), no panic. So the whole function
 ///   stays external, since external-linkage arguments are never specialized
 ///   by `ipsccp` (epic-cc#131).
+/// - A defined `memset` when the module mentions `llvm.memset`: the
+///   intrinsic's callers are invisible here because `irparse` rewrites
+///   it to a library call only after this stage, so an unprotected body
+///   folds to `unreachable` and the later call hangs (epic-cc#1448).
 /// - Every **mutable global variable** (LLVM `global`, not `constant`).
 ///   Also load-bearing: internalizing a plain (non-`const`, non-`volatile`)
 ///   global that nothing in the compiled program ever stores to lets
@@ -141,6 +145,7 @@ fn is_entry_name(name: &str) -> bool {
 
 fn public_api(ll_text: &str) -> Vec<String> {
     let mut api = Vec::new();
+    let mut defines_memset = false;
     for line in ll_text.lines() {
         if line.starts_with("define") {
             let Some(at) = line.find('@') else { continue };
@@ -150,6 +155,9 @@ fn public_api(ll_text: &str) -> Vec<String> {
                 .map(|i| name_start + i)
                 .unwrap_or(line.len());
             let name = &line[name_start..name_end];
+            if name == "memset" {
+                defines_memset = true;
+            }
             let variadic =
                 line.contains(", ...)") || line[name_end..].trim_start().starts_with("(...)");
             if is_entry_name(name)
@@ -168,6 +176,14 @@ fn public_api(ll_text: &str) -> Vec<String> {
                 .unwrap_or(line.len());
             api.push(line[1..name_end].to_string());
         }
+    }
+    // A defined memset whose callers include llvm.memset intrinsics
+    // looks dead at this stage: irparse rewrites the intrinsic to a
+    // call only after opt, so the body must survive until then. Any
+    // direct call, live or dead, is no proof the body survives, so
+    // the intrinsic alone decides (epic-cc#1448).
+    if defines_memset && ll_text.contains("@llvm.memset.") && !api.iter().any(|n| n == "memset") {
+        api.push("memset".to_string());
     }
     api
 }
@@ -1249,6 +1265,38 @@ define dso_local msp430_intrcc void @PIC16_IRQ_Handler() #1 {
             api,
             vec!["PIC16_IRQ_Handler".to_string(), "main".to_string()]
         );
+    }
+
+    #[test]
+    fn public_api_keeps_memset_only_with_intrinsic() {
+        let with_intrinsic = "\
+define dso_local i16 @main() #0 {
+}
+define dso_local ptr @memset(ptr %0, i16 %1, i16 %2) #0 {
+}
+declare void @llvm.memset.p0.i16(ptr, i8, i16, i1) #1
+";
+        let mut api = public_api(with_intrinsic);
+        api.sort();
+        assert_eq!(api, vec!["main".to_string(), "memset".to_string()]);
+        let without_intrinsic = "\
+define dso_local i16 @main() #0 {
+}
+define dso_local ptr @memset(ptr %0, i16 %1, i16 %2) #0 {
+}
+";
+        assert_eq!(public_api(without_intrinsic), vec!["main".to_string()]);
+        let with_direct_call = "\
+define dso_local i16 @main() #0 {
+  %9 = call ptr @memset(ptr %0, i16 0, i16 4)
+}
+define dso_local ptr @memset(ptr %0, i16 %1, i16 %2) #0 {
+}
+declare void @llvm.memset.p0.i16(ptr, i8, i16, i1) #1
+";
+        let mut api = public_api(with_direct_call);
+        api.sort();
+        assert_eq!(api, vec!["main".to_string(), "memset".to_string()]);
     }
 
     #[test]

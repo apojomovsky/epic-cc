@@ -3928,6 +3928,73 @@ fn parse_inst(
                     len,
                     loc: cur.clone(),
                 }));
+            } else if func.starts_with("llvm.memset.p0") {
+                // The intrinsic is a plain library call in disguise: the
+                // driver links its memset implementation whenever one
+                // appears (epic-cc#1448). The fill byte widens to the
+                // i16 `int` parameter; a volatile memset has no library
+                // equivalent and stays a named refusal.
+                let a = split_top_level(args_str, ',');
+                assert!(
+                    a[3].split_whitespace().last() == Some("false"),
+                    "irparse: volatile llvm.memset has no library equivalent"
+                );
+                let dst = parse_call_ptr_val(a[0], types, fresh, &mut out, cur.as_ref());
+                let fill_tok = a[1].split_whitespace().last().unwrap();
+                let fill = if let Some(r) = fill_tok.strip_prefix('%') {
+                    let widened = fresh.reg();
+                    out.push(Inst::Zext(Zext {
+                        dst: widened.clone(),
+                        from: Ty::I8,
+                        val: Val::Reg(r.to_string()),
+                        to: Ty::I16,
+                        loc: cur.clone(),
+                    }));
+                    Val::Reg(widened)
+                } else {
+                    Val::Const(
+                        fill_tok
+                            .parse()
+                            .expect("irparse: memset fill must be an i8 constant"),
+                    )
+                };
+                let len_tok = a[2].split_whitespace().last().unwrap();
+                let len = if let Some(r) = len_tok.strip_prefix('%') {
+                    Val::Reg(r.to_string())
+                } else {
+                    Val::Const(
+                        len_tok
+                            .parse()
+                            .expect("irparse: memset len must be an i16 constant"),
+                    )
+                };
+                out.push(Inst::Call(Call {
+                    dst: None,
+                    ty: None,
+                    func: "memset".to_string(),
+                    args: vec![
+                        CallArg {
+                            ty: None,
+                            val: dst,
+                            byval: None,
+                            sret: false,
+                        },
+                        CallArg {
+                            ty: Some(Ty::I16),
+                            val: fill,
+                            byval: None,
+                            sret: false,
+                        },
+                        CallArg {
+                            ty: Some(Ty::I16),
+                            val: len,
+                            byval: None,
+                            sret: false,
+                        },
+                    ],
+                    callees: Vec::new(),
+                    loc: cur.clone(),
+                }));
             } else if func.starts_with("llvm.lifetime.start")
                 || func.starts_with("llvm.lifetime.end")
             {

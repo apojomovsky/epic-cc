@@ -324,6 +324,20 @@ fn main() {
     let need_string = dep_texts
         .iter()
         .any(|t| driver::header_detect::dep_file_includes(t, "string.h"));
+    // A `llvm.memset` intrinsic (irparse rewrites it to a library call)
+    // needs a memset definition even when no unit included <string.h>;
+    // a unit defining memset itself already provides it (epic-cc#1448).
+    let need_memset = !need_string && {
+        let ll_texts: Vec<String> = units
+            .iter()
+            .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+            .collect();
+        ll_texts.iter().any(|t| t.contains("@llvm.memset."))
+            && !ll_texts.iter().any(|t| {
+                t.lines()
+                    .any(|l| l.starts_with("define") && l.contains("@memset("))
+            })
+    };
     let need_stdio = dep_texts
         .iter()
         .any(|t| driver::header_detect::dep_file_includes(t, "stdio.h"));
@@ -346,6 +360,27 @@ fn main() {
             eprintln!("epic-cc: {cmd:?}");
         }
         let out = cmd.output().expect("run clang for string.c");
+        if !out.status.success() {
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            std::process::exit(1);
+        }
+        units.push(ll_path);
+    }
+    if need_memset {
+        let memset_c_path = tmp.join("__epic_memset.c");
+        std::fs::write(&memset_c_path, driver::string_c::MEMSET_C).expect("write memset.c");
+        let ll_path = tmp.join("__epic_memset.ll");
+        let mut cmd = clang::base_cmd(&clang, &resdir);
+        clang::apply_options(&mut cmd, &clang_opts);
+        cmd.args([
+            "-o",
+            ll_path.to_str().unwrap(),
+            memset_c_path.to_str().unwrap(),
+        ]);
+        if cli.verbose {
+            eprintln!("epic-cc: {cmd:?}");
+        }
+        let out = cmd.output().expect("run clang for memset.c");
         if !out.status.success() {
             eprint!("{}", String::from_utf8_lossy(&out.stderr));
             std::process::exit(1);
