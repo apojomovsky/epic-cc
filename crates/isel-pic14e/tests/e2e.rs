@@ -353,7 +353,7 @@ fn structs_c_runs_correctly() {
 
 #[test]
 fn multi_term_ptr_arg_c_runs_correctly() {
-    // in == 43, in2 == 0xC8C8 (fixture comment) -> out == 0x3A.
+    // in == 43, in2 == 0xC864, in3 == 300 (fixture comment) -> 0x3A.
     let (mut p, globals) = compile(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/multi_term_ptr_arg.c"
@@ -362,13 +362,29 @@ fn multi_term_ptr_arg_c_runs_correctly() {
     p.ram_mut()[in_addr] = 43;
     p.ram_mut()[in_addr + 1] = 0;
     let in2_addr = globals["in2"] as usize;
-    p.ram_mut()[in2_addr] = 0xC8;
+    p.ram_mut()[in2_addr] = 0x64;
     p.ram_mut()[in2_addr + 1] = 0xC8;
+    let in3_addr = globals["in3"] as usize;
+    p.ram_mut()[in3_addr] = 0x2C;
+    p.ram_mut()[in3_addr + 1] = 0x01;
     p.run(2_000_000);
     assert_eq!(
         p.ram()[globals["out"] as usize],
         0x3A,
-        "out == hand-computed 0x3A for in == 43, in2 == 0xC8C8"
+        "out == hand-computed 0x3A for in == 43, in2 == 0xC864, in3 == 300"
+    );
+    // Independent oracle for the offset-400 cell: the physical byte is
+    // computed from the alloc map through the 80-byte GPR windows, not
+    // through any address the compiler emitted, so a dropped carry in
+    // the shared term helper cannot agree with it by construction.
+    let big = globals["big"] as usize;
+    let window = (big & 0x7F) - 0x20;
+    let off = window + 400;
+    let phys = (big & !0x7F) + (off / 80) * 0x80 + 0x20 + (off % 80);
+    assert_eq!(
+        p.ram()[phys],
+        0xA5,
+        "big[400] at physical 0x{phys:03X} holds put_fwd's 0xA5"
     );
     assert!(p.halted());
 }

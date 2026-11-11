@@ -4,11 +4,14 @@
 // so the call site sees both terms (epic-cc#1447). One call chain starts
 // from a global array, the other forwards through a pointer parameter,
 // and the wide array makes both terms scaled. The big array repeats
-// the shape with two 200 offsets, whose sum carries out of the low
-// address byte at any base. Expected for in == 43 and in2 == 0xC8C8:
-// i == 3, j == 5, offset 8, the sum 0x2A + 0x37 + 0x34 + 0xA5 lands in out as 0x3A.
+// the shape at offset 400: from the global, a 16-bit term of 300 plus
+// 100, and through put_fwd two 200 offsets, whose sum carries out of
+// the low address byte at any base. Expected for in == 43,
+// in2 == 0xC864 and in3 == 300: i == 3, j == 5, offset 8, the sum
+// 0x2A + 0x37 + 0x34 + 0xA5 lands in out as 0x3A.
 volatile unsigned short in;
 volatile unsigned short in2;
+volatile unsigned short in3;
 volatile unsigned char out;
 volatile unsigned char buf[16];
 volatile unsigned char buf2[16];
@@ -48,9 +51,9 @@ void main(void) {
     put16(w, 0x1234);
     unsigned char hi = (unsigned char)(in2 & 0xFF);
     unsigned char hj = (unsigned char)((in2 >> 8) & 0xFF);
-    unsigned char *q = big + hi;
-    q += hj;
+    unsigned char *q = big + in3;
+    q += hi;
     put(q, 0x5A);
-    put_fwd(big, hi, hj, 0xA5);
+    put_fwd(big, hj, hj, 0xA5);
     out = (unsigned char)(buf[8] + buf2[8] + (wide[8] & 0xFF) + get(q));
 }
