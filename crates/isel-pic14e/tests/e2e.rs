@@ -353,7 +353,7 @@ fn structs_c_runs_correctly() {
 
 #[test]
 fn multi_term_ptr_arg_c_runs_correctly() {
-    // in == 43 -> i == 3, j == 5 (fixture comment) -> out == 0x95.
+    // in == 43, in2 == 0xC8C8 (fixture comment) -> out == 0x3A.
     let (mut p, globals) = compile(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/multi_term_ptr_arg.c"
@@ -361,11 +361,14 @@ fn multi_term_ptr_arg_c_runs_correctly() {
     let in_addr = globals["in"] as usize;
     p.ram_mut()[in_addr] = 43;
     p.ram_mut()[in_addr + 1] = 0;
+    let in2_addr = globals["in2"] as usize;
+    p.ram_mut()[in2_addr] = 0xC8;
+    p.ram_mut()[in2_addr + 1] = 0xC8;
     p.run(2_000_000);
     assert_eq!(
         p.ram()[globals["out"] as usize],
-        0x95,
-        "out == hand-computed 0x95 for in == 43"
+        0x3A,
+        "out == hand-computed 0x3A for in == 43, in2 == 0xC8C8"
     );
     assert!(p.halted());
 }
