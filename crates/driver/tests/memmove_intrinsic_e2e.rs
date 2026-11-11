@@ -92,3 +92,25 @@ fn builtin_memmove_user_defined_runs_on_p18() {
 fn builtin_memmove_without_header_or_definition_runs_on_p18() {
     check("tests/fixtures/memmove_intrinsic_bare.c", &[(6, 4), (1, 3)]);
 }
+
+#[test]
+fn builtin_memmove_with_user_strlen_runs_on_p18() {
+    let fixture = "tests/fixtures/memmove_own_strlen.c";
+    let (ram, map, halted) = run_p18(fixture);
+    let mut expected = initial();
+    memmove(&mut expected, 6, 4, 5);
+    memmove(&mut expected, 1, 3, 5);
+    let buf = map_addr(&map, "buf");
+    assert_eq!(
+        &ram[buf..buf + 16],
+        &expected[..],
+        "{fixture} buf after moves"
+    );
+    let sum = expected.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    assert_eq!(
+        ram[map_addr(&map, "out")],
+        sum.wrapping_add(0xEE),
+        "{fixture} out == checksum plus the user strlen marker"
+    );
+    assert!(halted, "{fixture} must halt");
+}

@@ -162,6 +162,26 @@ pub fn needs_provided_memmove(ll_texts: &[String]) -> bool {
     uses_intrinsic && !defines_memmove
 }
 
+/// A memmove-only unit, supplied when a unit uses `llvm.memmove` but
+/// no unit defines `memmove` and `<string.h>` was not included
+/// (epic-cc#1451). Only this function is supplied so a program defining
+/// other string functions itself gains no duplicate definitions.
+pub const MEMMOVE_C: &str = r#"#include <stddef.h>
+
+__attribute__((noinline)) void *memmove(void *dest, const void *src, size_t n) {
+    unsigned char *d = (unsigned char*)dest;
+    const unsigned char *s = (const unsigned char*)src;
+    if (n == 0) return dest;
+    if (d < s) {
+        for (size_t i = 0; i < n; i++) d[i] = s[i];
+    } else if (d > s) {
+        size_t i = n;
+        while (i > 0) { i--; d[i] = s[i]; }
+    }
+    return dest;
+}
+"#;
+
 pub const STRING_C: &str = r#"#include <stddef.h>
 #include <string.h>
 
