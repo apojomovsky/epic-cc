@@ -121,6 +121,7 @@ pub fn externally_defined(ll_text: &str) -> std::collections::HashMap<String, us
                 "internal"
                     | "private"
                     | "weak"
+                    | "weak_odr"
                     | "extern_weak"
                     | "linkonce"
                     | "linkonce_odr"
