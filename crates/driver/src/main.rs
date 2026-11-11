@@ -526,6 +526,24 @@ fn main() {
         std::process::exit(1);
     }
 
+    // A static `memset` can never serve an `llvm.memset` call: clang
+    // lowers it to an internal function with a rewritten calling
+    // convention, so the intrinsic has no library-ABI body to reach.
+    // Name that here, where the whole program is first visible, instead
+    // of letting a later stage report its body as dead (epic-cc#1453).
+    if let Ok(merged_text) = std::fs::read_to_string(&merged_path) {
+        let source_static = driver::prescan::find_static_memset(&sources).is_some();
+        if driver::wholeprog_opt::rejects_static_memset(&merged_text, source_static) {
+            diag::error(
+                "static memset cannot serve as the library memset for \
+                 llvm.memset intrinsic calls: a static definition is lowered \
+                 to an internal function with a rewritten calling convention, \
+                 so it has no library memset ABI; declare memset without \
+                 `static`, or rename the static helper",
+            );
+        }
+    }
+
     // 2.5. Whole-program cleanup: each TU's clang invocation cannot see the
     // rest of the call graph, so a call site's constant argument survives
     // raw into every TU's own .ll. Now that llvm-link has merged the

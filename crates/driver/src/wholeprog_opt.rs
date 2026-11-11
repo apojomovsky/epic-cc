@@ -1130,6 +1130,29 @@ fn run_opt(
     std::fs::read_to_string(out).map_err(|e| format!("read {}: {e}", out.display()))
 }
 
+/// Whether the merged module pairs an `llvm.memset` call with a
+/// `memset` definition that cannot serve it. clang lowers a `static`
+/// definition to `define internal fastcc` with rewritten arguments, so
+/// no call using the library `memset` ABI can ever reach its body, and
+/// whole-program folding then proves that body dead (epic-cc#1453).
+/// `source_static_memset` covers the case clang already deleted: an
+/// unused static definition never reaches the merged module at all.
+pub fn rejects_static_memset(ll_text: &str, source_static_memset: bool) -> bool {
+    if !ll_text.contains("@llvm.memset.") {
+        return false;
+    }
+    if source_static_memset {
+        return true;
+    }
+    ll_text.lines().any(|line| {
+        line.starts_with("define internal")
+            && line
+                .split('@')
+                .nth(1)
+                .is_some_and(|rest| rest.starts_with("memset(") || rest.starts_with("memset "))
+    })
+}
+
 /// Run the curated whole-program cleanup over `merged_path` (the
 /// `llvm-link` output), writing the result to `out_path`. Returns the
 /// optimized `.ll` text. The profile selects the pipeline, not clang's
@@ -1301,6 +1324,21 @@ declare void @llvm.memset.p0.i16(ptr, i8, i16, i1) #1
         let mut api = public_api(with_direct_call);
         api.sort();
         assert_eq!(api, vec!["main".to_string(), "memset".to_string()]);
+    fn static_memset_with_intrinsic_is_rejected() {
+        let intrinsic = "  call void @llvm.memset.p0.i16(ptr %1, i8 0, i16 48, i1 false)\n";
+        let internal = format!("define internal fastcc void @memset() #0 {{\n}}\n{intrinsic}");
+        assert!(rejects_static_memset(&internal, false));
+        assert!(rejects_static_memset(intrinsic, true));
+    }
+
+    #[test]
+    fn external_memset_and_no_intrinsic_are_not_rejected() {
+        let intrinsic = "  call void @llvm.memset.p0.i16(ptr %1, i8 0, i16 48, i1 false)\n";
+        let external =
+            format!("define dso_local ptr @memset(ptr %0, i16 %1, i32 %2) #0 {{\n}}\n{intrinsic}");
+        assert!(!rejects_static_memset(&external, false));
+        let internal_only = "define internal fastcc void @memset() #0 {\n}\n";
+        assert!(!rejects_static_memset(internal_only, true));
     }
 
     #[test]
