@@ -30,7 +30,7 @@ __attribute__((noinline)) void *memmove(void *dest, const void *src, size_t n) {
     return dest;
 }
 
-__attribute__((noinline, used)) void *memset(void *s, int c, size_t n) {
+__attribute__((noinline)) void *memset(void *s, int c, size_t n) {
     unsigned char *p = (unsigned char*)s;
     for (size_t i = 0; i < n; i++) p[i] = (unsigned char)c;
     return s;
@@ -171,7 +171,7 @@ __attribute__((noinline)) char *strstr(const char *haystack, const char *needle)
 /// definitions from the rescue unit.
 pub const MEMSET_C: &str = r#"#include <stddef.h>
 
-__attribute__((noinline, used)) void *memset(void *s, int c, size_t n) {
+__attribute__((noinline)) void *memset(void *s, int c, size_t n) {
     unsigned char *p = (unsigned char*)s;
     for (size_t i = 0; i < n; i++) p[i] = (unsigned char)c;
     return s;

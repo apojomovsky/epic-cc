@@ -179,9 +179,18 @@ fn public_api(ll_text: &str) -> Vec<String> {
     }
     // A defined memset whose only callers are llvm.memset intrinsics
     // looks dead at this stage: irparse rewrites the intrinsic to a
-    // call only after opt, so the body must survive until then
+    // call only after opt, so the body must survive until then. A
+    // direct call site already keeps it alive and specialized, so
+    // only the intrinsic-only shape needs the protection
     // (epic-cc#1448).
-    if defines_memset && ll_text.contains("@llvm.memset.") && !api.iter().any(|n| n == "memset") {
+    let direct_call = ll_text
+        .lines()
+        .any(|l| l.contains("call") && l.contains("@memset("));
+    if defines_memset
+        && !direct_call
+        && ll_text.contains("@llvm.memset.")
+        && !api.iter().any(|n| n == "memset")
+    {
         api.push("memset".to_string());
     }
     api
@@ -1285,6 +1294,15 @@ define dso_local ptr @memset(ptr %0, i16 %1, i16 %2) #0 {
 }
 ";
         assert_eq!(public_api(without_intrinsic), vec!["main".to_string()]);
+        let with_direct_call = "\
+define dso_local i16 @main() #0 {
+  %9 = call ptr @memset(ptr %0, i16 0, i16 4)
+}
+define dso_local ptr @memset(ptr %0, i16 %1, i16 %2) #0 {
+}
+declare void @llvm.memset.p0.i16(ptr, i8, i16, i1) #1
+";
+        assert_eq!(public_api(with_direct_call), vec!["main".to_string()]);
     }
 
     #[test]
