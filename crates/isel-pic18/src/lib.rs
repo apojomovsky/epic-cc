@@ -12864,11 +12864,14 @@ impl<'m> Gen<'m> {
     /// A compare with a slotless GEP operand (epic-cc#1479): park each GEP
     /// operand whole (byte 0 then byte 1, uninterrupted, since byte 1 reads
     /// byte 0's carry) before comparing, so no lane re-materializes a GEP
-    /// byte. The left park is PROD (`PHI_COPY_TEMP_LO`, dead at every
-    /// instruction boundary); a second park uses the retval bytes only
-    /// where `retval_park_free` proves them dead, parked first so the PROD
-    /// park lands last. Live-retval `eq`/`ne` keeps the right GEP unparked
-    /// (its `XORWF`/`BNZ` lanes write no carry); ordered there panics.
+    /// byte. Parks live in FSR1 and the retval bytes, never PROD: a later
+    /// `emit_load_w` (a park's own byte 1, or an unparked right side) can
+    /// run `MULWF` and overwrite PROD, while it never writes FSR1 or the
+    /// retval bytes. The copy-loop drain does seed FSR1, so it is off for
+    /// this lowering. A second park uses the retval bytes only where
+    /// `retval_park_free` proves them dead, parked first. Live-retval
+    /// `eq`/`ne` keeps the right GEP unparked (its `XORWF`/`BNZ` lanes
+    /// write no carry); ordered there panics.
     fn emit_icmp_gep(
         &mut self,
         a: Val,
@@ -12887,8 +12890,10 @@ impl<'m> Gen<'m> {
             "isel-pic18: slotless GEP compare wider than the 2-byte park (bytes={bytes})"
         );
         self.flush_copies();
+        let copy_loop = self.copy_loop;
+        self.copy_loop = false;
         let ordered = !matches!(pred, "eq" | "ne");
-        let a_park = self.slotless_gep_value(&a).then_some(PHI_COPY_TEMP_LO);
+        let a_park = self.slotless_gep_value(&a).then_some(GEP_CMP_PARK_LO);
         let b_needs_park = self.slotless_gep_value(&b) || (ordered && self.load_w_writes_carry(&b));
         let mut b_park = None;
         if b_needs_park {
@@ -12901,7 +12906,7 @@ impl<'m> Gen<'m> {
                     );
                 }
             } else {
-                b_park = Some(PHI_COPY_TEMP_LO);
+                b_park = Some(GEP_CMP_PARK_LO);
             }
         }
         if let Some(p) = b_park {
@@ -13008,6 +13013,7 @@ impl<'m> Gen<'m> {
         if let Some(done) = l_done {
             self.emit_materialize_bool(&l_true, &l_false, &done, dst, pre);
         }
+        self.copy_loop = copy_loop;
     }
 
     /// The unsigned borrow chain over parked compare sides: lane `i`
@@ -17000,6 +17006,12 @@ fn exit_bank(ends: &[Option<u8>]) -> Option<u8> {
 /// every block edge where phi copies emit; the ISR prologue saves PROD
 /// whenever its bodies multiply.
 const PHI_COPY_TEMP_LO: u16 = 0xFF3;
+
+/// FSR1L: the slotless-GEP compare park (epic-cc#1479). A park must
+/// survive every later `emit_load_w`, and those write PROD (`MULWF`
+/// scaled terms) and FSR0 but never FSR1, which is dead at every
+/// instruction boundary; the ISR scan saves FSR1 when a body uses it.
+const GEP_CMP_PARK_LO: u16 = 0xFE1;
 
 /// An outer header's seeds label (epic-cc#1204): the entry edge targets
 /// it, the seeds run there, and control falls into the header. The

@@ -1022,6 +1022,52 @@ fn gep_icmp_eq_keeps_a_live_zext_return_value() {
 }
 
 #[test]
+fn gep_icmp_ult_scaled_gep_park_survives_its_own_mulwf() {
+    // Review repro (epic-cc#1479): a scaled GEP's byte-1 load runs
+    // MULWF, whose product must not destroy the parked byte 0:
+    // 0x0110 ult 0x0118 is true.
+    let ir = "global g i16\nglobal idx i8\nglobal out i8\n\
+              fn main(void) ()\n  block entry:\n    %base = load ptr @g\n    %i = load i8 @idx\n    %a = gep %base +0 +2*%i\n    %b = gep %base +40\n    %c = icmp ult ptr %a, %b\n    store i8 %c @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let g = map["g"] as usize;
+    p.ram_mut()[g] = 0xF0;
+    p.ram_mut()[g + 1] = 0x00;
+    p.ram_mut()[map["idx"] as usize] = 16;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(p.ram()[map["out"] as usize], 1, "0x0110 ult 0x0118:\n{asm}");
+}
+
+#[test]
+fn gep_icmp_eq_scaled_geps_keep_a_live_zext_return_value() {
+    // Scaled GEPs beside a zext return (epic-cc#1479): neither
+    // MULWF may destroy a parked byte. The GEPs differ by 256, so
+    // eq is false; the return stays 0x00AB.
+    let ir = "global arr i8\nglobal idx i8\nglobal jdx i8\nglobal src i8\nglobal out i8\nglobal retv i16\n\
+              fn get(i16) ()\n  block entry:\n    %t = load i8 @src\n    %z = zext i8 %t to i16\n    %i = load i8 @idx\n    %j = load i8 @jdx\n    %a = gep @arr +0 +2*%i\n    %b = gep @arr +0 +2*%j\n    %c = icmp eq ptr %a, %b\n    store i8 %c @out\n    ret i16 %z\n\
+              fn main(void) ()\n  block entry:\n    %r = call i16 @get()\n    store i16 %r @retv\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[map["idx"] as usize] = 148;
+    p.ram_mut()[map["jdx"] as usize] = 20;
+    p.ram_mut()[map["src"] as usize] = 0xAB;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(p.ram()[map["out"] as usize], 0, "geps 256 apart eq:\n{asm}");
+    let retv = map["retv"] as usize;
+    assert_eq!(
+        [p.ram()[retv], p.ram()[retv + 1]],
+        [0xAB, 0x00],
+        "the zext return value must survive the GEP compare:\n{asm}"
+    );
+}
+
+#[test]
 fn sext_of_a_gep_materializes_the_address() {
     // The Sext arm shares the source resolution: a folded GEP must
     // materialize its address there too, and sign-fill from the byte
