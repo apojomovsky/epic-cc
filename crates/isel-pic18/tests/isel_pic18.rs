@@ -12591,6 +12591,103 @@ fn store_between_zext_and_ret_stays_staged() {
 }
 
 #[test]
+fn gep_k_plus_term_moved_from_ram_global_derefs_the_exact_address() {
+    // A moved GEP value over a RAM global: base 0x1FE plus k 0x101 plus
+    // the runtime term must carry out of byte 0 into byte 1, landing at
+    // 0x302 for idx 3. Every nearby wrong sum holds a distinct seed, so
+    // dropping k, the term, or its carry reads a different byte.
+    let ir = "global ram i8\n\
+         global pv i16\n\
+         global idx i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +257 +1*%i\n\
+             store ptr %p @pv\n\
+             %r = load ptr @pv\n\
+             %v = load i8 %r\n\
+             store i8 %v @out\n\
+             ret void\n";
+    let map: Vec<(String, u16)> = [
+        ("ram", 0x1FE),
+        ("pv", 0x140),
+        ("idx", 0x142),
+        ("out", 0x143),
+        ("main::i", 0x144),
+        ("main::r", 0x145),
+        ("main::v", 0x147),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), *v))
+    .collect();
+    let seed: Vec<(u16, u8)> = vec![
+        (0x142, 3),
+        (0x302, 0xA1),
+        (0x2FF, 0xB2),
+        (0x201, 0xC3),
+        (0x202, 0xD4),
+    ];
+    let got = sim_run_bytes(ir, &map, &seed, 0x143, 1);
+    assert_eq!(
+        got,
+        vec![0xA1],
+        "moved GEP must address base+k+term exactly"
+    );
+}
+
+#[test]
+fn gep_k_plus_term_moved_from_pointer_param_derefs_the_exact_address() {
+    // The same moved GEP over a pointer parameter: the slot holds the
+    // runtime base address (0x1FE for @ram), so the materialized value
+    // is that address plus k 0x101 plus the term, carrying into byte 1.
+    let ir = "global ram i8\n\
+         global pv i16\n\
+         global idx i8\n\
+         global out i8\n\
+         fn deref(void) (p=ptr, i=i8)\n\
+           block entry:\n\
+             %q = gep %p +257 +1*%i\n\
+             store ptr %q @pv\n\
+             %r = load ptr @pv\n\
+             %v = load i8 %r\n\
+             store i8 %v @out\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             call void @deref(@ram, i8 %i)\n\
+             ret void\n";
+    let map: Vec<(String, u16)> = [
+        ("ram", 0x1FE),
+        ("pv", 0x140),
+        ("idx", 0x142),
+        ("out", 0x143),
+        ("deref::p", 0x150),
+        ("deref::i", 0x152),
+        ("deref::r", 0x153),
+        ("deref::v", 0x155),
+        ("main::i", 0x156),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), *v))
+    .collect();
+    let seed: Vec<(u16, u8)> = vec![
+        (0x142, 3),
+        (0x302, 0xA1),
+        (0x2FF, 0xB2),
+        (0x201, 0xC3),
+        (0x202, 0xD4),
+    ];
+    let got = sim_run_bytes(ir, &map, &seed, 0x143, 1);
+    assert_eq!(
+        got,
+        vec![0xA1],
+        "moved GEP must address base+k+term exactly"
+    );
+}
+
+#[test]
 fn gep_value_escape_keeps_index_terms_whole() {
     // `%p` is read by a pointer `select` with a different base, so it
     // materializes from its dynamic term `%e` at full width. `%e` must keep
