@@ -3027,6 +3027,56 @@ impl<'m> Gen<'m> {
         }
         (fold, mid)
     }
+    /// Whether materializing `%r` can reach `emit_gep_sum_to_fsr1`: a
+    /// slot-base GEP with a constant offset plus terms, or with several
+    /// terms. That sum clobbers FSR1, so no walk may hold a pointer
+    /// across an emission that reads such a value.
+    fn gep_sum_uses_fsr1(g: &Gen, f: &Func, r: &str) -> bool {
+        matches!(
+            g.resolved.get(&iselcore::ssa_key(&f.name, r)),
+            Some((iselcore::Base::Slot(..), k, terms))
+                if (*k != 0 && !terms.is_empty()) || terms.len() > 1
+        )
+    }
+    fn val_gep_sum_uses_fsr1(g: &Gen, f: &Func, v: &Val) -> bool {
+        let Val::Reg(r) = v else { return false };
+        Self::gep_sum_uses_fsr1(g, f, r)
+            || match g.fold_reg(v) {
+                Val::Reg(fr) => fr != *r && Self::gep_sum_uses_fsr1(g, f, &fr),
+                _ => false,
+            }
+    }
+    /// Whether a walk over block `b` would emit an FSR1 GEP sum while its
+    /// pointers are live: an `Emit` body op reading such a GEP, or a
+    /// back-edge phi copy (from `back_label`) carrying one into the latch.
+    fn walk_gep_sum_hazard(
+        g: &Gen,
+        f: &Func,
+        b: &Block,
+        body: &[WalkOp],
+        back_label: &str,
+    ) -> bool {
+        for op in body {
+            if let WalkOp::Emit(ii) = op {
+                if ir::read_vals(&b.insts[*ii])
+                    .iter()
+                    .any(|r| Self::gep_sum_uses_fsr1(g, f, r))
+                {
+                    return true;
+                }
+            }
+        }
+        for inst in &b.insts {
+            if let Inst::Phi(p) = inst {
+                for (v, e) in &p.incoming {
+                    if e == back_label && Self::val_gep_sum_uses_fsr1(g, f, v) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
     /// Walk-loop pre-scan (epic-cc#896): single-block counted loops whose
     /// index feeds only `PLUSW`-shaped accesses, closed by an increment
     /// compared against 1..=255. Runs after every fold so shape checks see
@@ -3465,6 +3515,8 @@ impl<'m> Gen<'m> {
             return None;
         }
         Self::walk_finish(
+            g,
+            f,
             b,
             uses,
             pre,
@@ -3681,6 +3733,8 @@ impl<'m> Gen<'m> {
     /// read nowhere else; every counter read must sit on the pattern;
     /// every pointer must read and write in one direction only.
     fn walk_finish(
+        g: &Gen,
+        f: &Func,
         b: &Block,
         uses: &HashMap<String, Vec<(String, usize)>>,
         pre: String,
@@ -3857,6 +3911,11 @@ impl<'m> Gen<'m> {
             if hits[fsr] != 1 {
                 return None;
             }
+        }
+        // An FSR1 GEP sum in an emitted op or back-edge copy would
+        // clobber a live walk pointer (epic-cc#1473).
+        if !groups.is_empty() && Self::walk_gep_sum_hazard(g, f, b, &paired, &b.label) {
+            return None;
         }
         let ptrs = groups
             .iter()
@@ -4178,14 +4237,24 @@ impl<'m> Gen<'m> {
     /// proxy mirrors the single-block scan's own threshold, and the
     /// counter slot must stay disjoint from the outer down-counter.
     fn outer_middle_ok(
-        _g: &Gen,
-        _f: &Func,
+        g: &Gen,
+        f: &Func,
         m: &Block,
         region: &HashSet<String>,
         header: &str,
         count_slot: u16,
         walks: &HashMap<String, WalkLoop>,
     ) -> Option<()> {
+        // Middle emissions run while the outer pointers are live, so an
+        // FSR1 GEP sum read here would clobber one (epic-cc#1473).
+        for inst in &m.insts {
+            if ir::read_vals(inst)
+                .iter()
+                .any(|r| Self::gep_sum_uses_fsr1(g, f, r))
+            {
+                return None;
+            }
+        }
         let inner = walks.get(&m.label)?;
         if !inner.ptrs.is_empty() {
             return None;
@@ -4468,6 +4537,8 @@ impl<'m> Gen<'m> {
             return None;
         }
         Self::outer_finish(
+            g,
+            f,
             h,
             uses,
             pre,
@@ -4495,6 +4566,8 @@ impl<'m> Gen<'m> {
     /// what keeps the middle quiet: any middle read of either reg fails
     /// here. Every pointer must read and write in one direction only.
     fn outer_finish(
+        g: &Gen,
+        f: &Func,
         h: &Block,
         uses: &HashMap<String, Vec<(String, usize)>>,
         pre: String,
@@ -4663,6 +4736,11 @@ impl<'m> Gen<'m> {
             if hits[fsr] != 1 {
                 return None;
             }
+        }
+        // Same FSR1 hazard as the single-block epilogue: the latch
+        // carries the back-edge copies, so its label names that edge.
+        if Self::walk_gep_sum_hazard(g, f, h, &paired, latch) {
+            return None;
         }
         let ptrs = groups
             .iter()
@@ -8146,10 +8224,28 @@ impl<'m> Gen<'m> {
                     }
                 };
                 let adds_in_byte0 = k != 0 || !terms.is_empty();
-                assert!(
-                    k == 0 || terms.is_empty(),
-                    "isel-pic18: GEP with both k and terms not supported in move"
-                );
+                if (k != 0 && !terms.is_empty()) || terms.len() > 1 {
+                    // The per-byte arms below cannot recover a term's
+                    // carry once a constant offset joins it, so the full
+                    // sum is built in the FSR1 pair first and read back.
+                    // A phi-folded counter's step folds into the constant
+                    // part, as on the global arm above (epic-cc#1271).
+                    let mut held = 0i64;
+                    for (s, r) in &terms {
+                        held += *s as i64 * self.escape_skew(r);
+                    }
+                    self.emit_gep_sum_to_fsr1(sa, k.wrapping_sub(held as u16), &terms);
+                    for i in 0..ty.bytes() {
+                        let sfr = if i == 0 { 0xFE1 } else { 0xFE2 };
+                        let (sa2, sf) = self.operand(sfr);
+                        let sbank = if sa2 == 0 { "A" } else { "B" };
+                        self.emit(format!("    MOVF 0x{sf:03X},W,{sbank}"));
+                        let (a, f) = self.operand(dst + u16::from(i));
+                        let bank = if a == 0 { "A" } else { "B" };
+                        self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                    }
+                    return;
+                }
                 for i in 0..ty.bytes() {
                     match terms.as_slice() {
                         [] => {
@@ -9039,6 +9135,55 @@ impl<'m> Gen<'m> {
         }
         self.fsr0_holds = terms.is_empty().then_some((origin, static_part));
     }
+    /// Build `*slot_addr + k + Σ scale×%reg` in the FSR1 pair
+    /// (0xFE1/0xFE2), for a GEP value materialization that must read the
+    /// finished address back byte by byte. FSR1 is safe scratch here:
+    /// its only other users (memcpy source, staged-copy drains) seed it
+    /// inside their own emission and never hold it across a value load
+    /// or move, and FSR0 may be live for a store destination. Counted
+    /// walks do hold FSR1 across body emissions, so their scans reject
+    /// any op or back-edge copy that could reach this sum (epic-cc#1473).
+    /// The sum
+    /// reuses the indirect-slot forms (MULWF or shift-add chain for a
+    /// large scale, naive carry adds otherwise), so carries stay exact.
+    fn emit_gep_sum_to_fsr1(&mut self, slot_addr: u16, k: u16, terms: &[(u16, String)]) {
+        self.flush_copies();
+        // Chain overhead accounting, as in `emit_fsr0_indirect_slot`.
+        let extra = 2 + if k != 0 { 4 } else { 0 };
+        if let Some((ci, form)) = self.chain_term_index(terms, extra) {
+            let (scale, reg) = &terms[ci];
+            let a = self.slot_addr(self.cur_func, reg).direct();
+            let wide = self.term_wide(reg);
+            match form {
+                Scaled::Mulwf => {
+                    self.emit_copy_byte(slot_addr, 0xFE1);
+                    self.emit_copy_byte(slot_addr + 1, 0xFE2);
+                    if k != 0 {
+                        self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, k);
+                    }
+                    self.emit_mulwf_scale(0xFE1, 0xFE2, *scale, a, wide);
+                }
+                Scaled::Chain => {
+                    self.emit_banked("CLRF", 0xFE1, "");
+                    self.emit_banked("CLRF", 0xFE2, "");
+                    self.emit_scale_chain(0xFE1, 0xFE2, *scale, a, wide);
+                    self.emit_fsr_pair_add_mem16(0xFE1, 0xFE2, slot_addr, slot_addr + 1);
+                    if k != 0 {
+                        self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, k);
+                    }
+                }
+            }
+            self.add_terms_except(terms, Some(ci), 0xFE1, 0xFE2);
+            return;
+        }
+        self.emit_copy_byte(slot_addr, 0xFE1);
+        self.emit_copy_byte(slot_addr + 1, 0xFE2);
+        if k != 0 {
+            self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, k);
+        }
+        self.add_terms_except(terms, None, 0xFE1, 0xFE2);
+    }
+
     /// Add every dynamic term onto `FSR0L`/`FSR0H` with carry, `scale`
     /// times each per term: the naive path for small scales and residual
     /// terms after a chain. Each 4-instruction sequence is a
@@ -13201,10 +13346,20 @@ impl<'m> Gen<'m> {
                         }
                     };
                     let adds_in_byte0 = k != 0 || !terms.is_empty();
-                    assert!(
-                        k == 0 || terms.is_empty(),
-                        "isel-pic18: GEP with both a constant offset and dynamic terms loses the term's carry; not supported"
-                    );
+                    if (k != 0 && !terms.is_empty()) || terms.len() > 1 {
+                        // Same carry problem as the move arm: build the
+                        // full sum in the FSR1 pair, then read the byte.
+                        let mut held = 0i64;
+                        for (s, r) in &terms {
+                            held += *s as i64 * self.escape_skew(r);
+                        }
+                        self.emit_gep_sum_to_fsr1(sa, k.wrapping_sub(held as u16), &terms);
+                        let sfr = if offset == 0 { 0xFE1 } else { 0xFE2 };
+                        let (sa2, sf) = self.operand(sfr);
+                        let sbank = if sa2 == 0 { "A" } else { "B" };
+                        self.emit(format!("    MOVF 0x{sf:03X},W,{sbank}"));
+                        return;
+                    }
                     match terms.as_slice() {
                         [] => {
                             if offset == 0 {
