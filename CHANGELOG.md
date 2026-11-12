@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here, generated from
 Conventional Commits. Dates are UTC.
+## [0.6.1] - 2026-11-12
+ 
+### Fixes
+
+- Judge the edited PR body on a baseline re-run (#1446)
+- Support multi-term plain pointer call arguments (#1450)
+- Lower llvm.memset to a library call (#1454)
+- Support multi-term plain pointer call arguments (#1456)
+- Let user string definitions override the injected unit (#1457)
+- Lower llvm.memmove to a memmove call and reject unsupported llvm.mem forms (#1458)
+- Reject a static memset paired with llvm.memset (#1459)
 ## [0.6.0] - 2026-10-26
  
 ### Features
