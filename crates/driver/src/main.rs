@@ -545,6 +545,37 @@ fn main() {
         Err(msg) => diag::error(&format!("whole-program opt: {msg}")),
     };
 
+    // A static `memset` can never serve an `llvm.memset` call: clang
+    // lowers it to an internal function with a rewritten calling
+    // convention, so the intrinsic has no library-ABI body to reach.
+    // Name that here, on the post-opt module, where only a surviving
+    // intrinsic can still reach a later stage (epic-cc#1453).
+    let mut scan_sources = sources.clone();
+    for header in driver::prescan::dep_header_paths(&dep_texts) {
+        if scan_sources.iter().any(|(f, _)| *f == header) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&header) {
+            scan_sources.push((header, text));
+        }
+    }
+    let static_memset = driver::prescan::find_static_memset(&scan_sources);
+    if driver::wholeprog_opt::rejects_static_memset(
+        &merged_ll_text,
+        static_memset.is_some(),
+        need_string,
+    ) {
+        let msg = "static memset cannot serve as the library memset for \
+                   llvm.memset intrinsic calls: a static definition is lowered \
+                   to an internal function with a rewritten calling convention, \
+                   so it has no library memset ABI; declare memset without \
+                   `static`, or rename the static helper";
+        match static_memset {
+            Some(found) => diag::error_at(&found.file, found.line, found.col, msg),
+            None => diag::error(msg),
+        }
+    }
+
     let ll_text = irparse::sanitize_symbols(&merged_ll_text);
     let canonical_spec = ll_text
         .find("section \".epiccfg.")

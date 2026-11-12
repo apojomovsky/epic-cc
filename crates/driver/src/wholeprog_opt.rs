@@ -1130,6 +1130,122 @@ fn run_opt(
     std::fs::read_to_string(out).map_err(|e| format!("read {}: {e}", out.display()))
 }
 
+/// Whether the merged module pairs an `llvm.memset` call with a
+/// `memset` definition that cannot serve it. clang lowers a `static`
+/// definition to `define internal fastcc` with rewritten arguments, so
+/// no call using the library `memset` ABI can ever reach its body, and
+/// whole-program folding then proves that body dead (epic-cc#1453).
+/// `source_static_memset` covers the case clang already deleted: an
+/// unused static definition never reaches the merged module at all.
+///
+/// The text must be the post-opt module, and only an intrinsic call
+/// reachable from an entry point counts: one in dead code is deleted
+/// before it can reach a later stage. An external definition serves
+/// the intrinsic, as does a driver-injected string unit, so neither
+/// is rejected.
+pub fn rejects_static_memset(
+    ll_text: &str,
+    source_static_memset: bool,
+    driver_provides_memset: bool,
+) -> bool {
+    if driver_provides_memset || !ll_text.contains("@llvm.memset.") {
+        return false;
+    }
+    if !memset_intrinsic_reachable(ll_text) {
+        return false;
+    }
+    // Opt internalizes external definitions before this check runs, so
+    // linkage cannot say whether a body serves the intrinsic. The ABI
+    // can: a library-shaped definition keeps its pointer result and
+    // parameters, while clang's static rewrite is `fastcc` with the
+    // arguments dropped, a body no library-ABI call can reach.
+    let memset_define = |rewritten: bool| {
+        ll_text.lines().any(|line| {
+            line.starts_with("define")
+                && !line.starts_with("define private")
+                && line
+                    .split('@')
+                    .nth(1)
+                    .is_some_and(|rest| rest.starts_with("memset(") || rest.starts_with("memset "))
+                && line.contains("fastcc") == rewritten
+        })
+    };
+    if memset_define(false) {
+        return false;
+    }
+    if source_static_memset {
+        return true;
+    }
+    memset_define(true)
+}
+
+/// Whether an `llvm.memset` call sits in a function reachable from
+/// an entry point (entry functions per `function_spans`, plus any
+/// address-taken function). Call edges are the
+/// textual `call ... @name(` sites; an intrinsic outside any function
+/// counts as reachable, since no dead-function sweep can remove it.
+fn memset_intrinsic_reachable(ll_text: &str) -> bool {
+    let lines: Vec<&str> = ll_text.lines().collect();
+    let spans = function_spans(&lines);
+    let mut owner: Vec<Option<usize>> = vec![None; lines.len()];
+    for (i, span) in spans.iter().enumerate() {
+        for slot in owner.iter_mut().take(span.end + 1).skip(span.start) {
+            *slot = Some(i);
+        }
+    }
+    let callee_of = |line: &str| -> Option<String> {
+        if !line.contains("call") {
+            return None;
+        }
+        let at = line.find('@')?;
+        let rest = &line[at + 1..];
+        let end = rest
+            .find(|c: char| c == '(' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        Some(rest[..end].to_string())
+    };
+    let mut reachable: std::collections::HashSet<usize> = Default::default();
+    let mut queue: Vec<usize> = Vec::new();
+    for (i, span) in spans.iter().enumerate() {
+        if span.is_entry {
+            reachable.insert(i);
+            queue.push(i);
+        }
+    }
+    // Address-taken functions can be called indirectly, so any mention
+    // outside their own define line makes them reachable roots too.
+    for (i, span) in spans.iter().enumerate() {
+        let needle = format!("@{}", span.name);
+        let taken = lines.iter().enumerate().any(|(li, line)| {
+            li != span.start
+                && line.split(&needle).nth(1).is_some_and(|rest| {
+                    rest.chars()
+                        .next()
+                        .is_none_or(|c| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '$')))
+                })
+        });
+        if taken && reachable.insert(i) {
+            queue.push(i);
+        }
+    }
+    while let Some(fi) = queue.pop() {
+        for line in &lines[spans[fi].start..=spans[fi].end] {
+            if let Some(name) = callee_of(line) {
+                if let Some(ti) = spans.iter().position(|s| s.name == name) {
+                    if reachable.insert(ti) {
+                        queue.push(ti);
+                    }
+                }
+            }
+        }
+    }
+    lines.iter().enumerate().any(|(i, line)| {
+        line.contains("call")
+            && line.contains("@llvm.memset.")
+            && owner[i].is_none_or(|fi| reachable.contains(&fi))
+    })
+}
+
 /// Run the curated whole-program cleanup over `merged_path` (the
 /// `llvm-link` output), writing the result to `out_path`. Returns the
 /// optimized `.ll` text. The profile selects the pipeline, not clang's
@@ -1301,6 +1417,74 @@ declare void @llvm.memset.p0.i16(ptr, i8, i16, i1) #1
         let mut api = public_api(with_direct_call);
         api.sort();
         assert_eq!(api, vec!["main".to_string(), "memset".to_string()]);
+    }
+
+    #[test]
+    fn static_memset_with_intrinsic_is_rejected() {
+        let intrinsic = "  call void @llvm.memset.p0.i16(ptr %1, i8 0, i16 48, i1 false)\n";
+        let internal = format!("define internal fastcc void @memset() #0 {{\n}}\n{intrinsic}");
+        assert!(rejects_static_memset(&internal, false, false));
+        assert!(rejects_static_memset(intrinsic, true, false));
+    }
+
+    #[test]
+    fn internalized_external_memset_still_serves() {
+        // Post-opt text: opt has internalized the external definition,
+        // but its library ABI is intact, so it serves the intrinsic.
+        let ll = "\
+define dso_local i16 @main() #0 {
+  call void @llvm.memset.p0.i16(ptr %1, i8 0, i16 48, i1 false)
+  ret i16 0
+}
+define internal noundef ptr @memset(ptr %0, i16 %1, i16 %2) #0 {
+}
+declare void @llvm.memset.p0.i16(ptr, i8, i16, i1) #1
+";
+        assert!(!rejects_static_memset(ll, true, false));
+    }
+
+    #[test]
+    fn address_taken_intrinsic_host_is_reachable() {
+        let ll = "\
+define dso_local i16 @main() #0 {
+  store ptr @host, ptr @fp, align 2
+  ret i16 0
+}
+define dso_local void @host() #0 {
+  call void @llvm.memset.p0.i16(ptr %1, i8 0, i16 48, i1 false)
+}
+define internal fastcc void @memset() #0 {
+}
+@fp = global ptr null, align 2
+";
+        assert!(rejects_static_memset(ll, true, false));
+    }
+
+    #[test]
+    fn dead_intrinsic_does_not_reject() {
+        let ll = "\
+define dso_local i16 @main() #0 {
+  ret i16 0
+}
+define dso_local void @dead_fn() #0 {
+  call void @llvm.memset.p0.i16(ptr %1, i8 0, i16 48, i1 false)
+}
+define internal fastcc void @memset() #0 {
+}
+";
+        assert!(!rejects_static_memset(ll, true, false));
+    }
+
+    #[test]
+    fn external_memset_and_no_intrinsic_are_not_rejected() {
+        let intrinsic = "  call void @llvm.memset.p0.i16(ptr %1, i8 0, i16 48, i1 false)\n";
+        let external =
+            format!("define dso_local ptr @memset(ptr %0, i16 %1, i32 %2) #0 {{\n}}\n{intrinsic}");
+        assert!(!rejects_static_memset(&external, false, false));
+        assert!(!rejects_static_memset(&external, true, false));
+        assert!(!rejects_static_memset(&external, true, true));
+        let internal_only = "define internal fastcc void @memset() #0 {\n}\n";
+        assert!(!rejects_static_memset(internal_only, true, false));
     }
 
     #[test]
