@@ -431,6 +431,10 @@ pub fn fixed_uses(
                         Inst::Icmp(ic) => vec![&ic.a, &ic.b],
                         Inst::Phi(p) => p.incoming.iter().map(|(v, _)| v).collect(),
                         Inst::Select(s) => vec![&s.a, &s.b],
+                        Inst::Zext(z) => vec![&z.val],
+                        Inst::Sext(x) => vec![&x.val],
+                        Inst::Trunc(t) => vec![&t.val],
+                        Inst::Freeze(fr) => vec![&fr.val],
                         _ => vec![],
                     };
                     if vals.iter().any(|v| gep_value_park(res, &f.name, v)) {
