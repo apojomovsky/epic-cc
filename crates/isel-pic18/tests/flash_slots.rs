@@ -1068,6 +1068,44 @@ fn gep_icmp_eq_scaled_geps_keep_a_live_zext_return_value() {
 }
 
 #[test]
+fn walk_body_gep_icmp_falls_back_so_the_walk_pointer_survives() {
+    // Review repro (epic-cc#1479): a counted src->dst copy whose body
+    // compares two preheader GEPs. The compare parks in FSR1, the live
+    // destination walk pointer, so the walk must refuse this body and
+    // lower it the plain way: every copied byte and the compare land.
+    let ir = "global src i8\nglobal dst i8\nglobal arr i8\nglobal idx i8\nglobal cmp i8\n\
+              fn main(void) ()\n  block entry:\n    %xi = load i8 @idx\n    %a = gep @arr +0 +1*%xi\n    %b = gep @arr +40\n    br loop\n  block loop:\n    %i = phi i16 %r loop 0 entry\n    %g1 = gep @src +0 +1*%i\n    %v = load i8 %g1\n    %g2 = gep @dst +0 +1*%i\n    store i8 %v %g2\n    %c = icmp ult ptr %a, %b\n    store i8 %c @cmp\n    %r = add i16 %i, 1\n    %d = icmp eq i16 %r, 11\n    br i1 %d, exit, loop\n  block exit:\n    ret void\n";
+    let (asm, map) = laundry_sim(
+        ir,
+        &[],
+        &[
+            ("src", 0x100),
+            ("dst", 0x180),
+            ("arr", 0x200),
+            ("idx", 0x210),
+            ("cmp", 0x211),
+        ],
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for k in 0..11usize {
+        p.ram_mut()[0x100 + k] = 0x50 + k as u8;
+    }
+    p.ram_mut()[map["idx"] as usize] = 5;
+    p.run(8000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    for k in 0..11usize {
+        assert_eq!(
+            p.ram()[0x180 + k],
+            0x50 + k as u8,
+            "copied byte {k}:\n{asm}"
+        );
+    }
+    assert_eq!(p.ram()[map["cmp"] as usize], 1, "arr+5 ult arr+40:\n{asm}");
+}
+
+#[test]
 fn sext_of_a_gep_materializes_the_address() {
     // The Sext arm shares the source resolution: a folded GEP must
     // materialize its address there too, and sign-fill from the byte

@@ -970,6 +970,14 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// Whether emitting `c` would park a slotless GEP operand in FSR1
+    /// (epic-cc#1479): walk scans refuse such compares, since FSR1 may
+    /// hold a live walk pointer there. Operands fold as at emission.
+    fn icmp_has_slotless_gep(&self, c: &Icmp) -> bool {
+        self.slotless_gep_value(&self.fold_reg(&c.a))
+            || self.slotless_gep_value(&self.fold_reg(&c.b))
+    }
+
     /// Whether the retval bytes may park a compare operand at the
     /// current site: they are dead between instructions except for a
     /// `zext_ret` value, whose live span runs from its `Zext` to the
@@ -3375,6 +3383,14 @@ impl<'m> Gen<'m> {
         let mut term_sites: HashMap<String, Vec<(String, usize)>> = HashMap::new();
         let mut consumed_vadds: HashSet<String> = HashSet::new();
         let mut dead_ops: HashSet<usize> = HashSet::new();
+        // A GEP compare parks in FSR1, a live walk pointer here, so
+        // any such body or latch compare keeps the plain lowering.
+        if b.insts
+            .iter()
+            .any(|i| matches!(i, Inst::Icmp(c) if g.icmp_has_slotless_gep(c)))
+        {
+            return None;
+        }
         // Staged-copy pairs the body may hold when a walk op flushes:
         // at the drain threshold the flush becomes a seeded `POSTINC`
         // loop of its own, which would move live walk pointers.
@@ -4123,6 +4139,9 @@ impl<'m> Gen<'m> {
         if latch_cmp.dst != *cond || latch_cmp.pred != "eq" {
             return None;
         }
+        if g.icmp_has_slotless_gep(&latch_cmp) {
+            return None;
+        }
         // A materialized second use would survive the fused branch; the
         // walk drops the compare, so it must be the branch's alone.
         if uses.get(&latch_cmp.dst).map(|v| v.len()) != Some(1) {
@@ -4331,6 +4350,11 @@ impl<'m> Gen<'m> {
                 Inst::Zext(z) => pairs += usize::from(z.to.bytes()),
                 Inst::Sext(s) => pairs += usize::from(s.to.bytes()),
                 Inst::Icmp(c) => {
+                    // A GEP compare parks in FSR1, which the outer
+                    // walk may hold live across this middle block.
+                    if g.icmp_has_slotless_gep(c) {
+                        return None;
+                    }
                     if latch_dst.as_ref() != Some(&Val::Reg(c.dst.clone())) {
                         pairs += 1;
                     }
@@ -4403,6 +4427,14 @@ impl<'m> Gen<'m> {
         let mut term_sites: HashMap<String, Vec<(String, usize)>> = HashMap::new();
         let mut consumed_vadds: HashSet<String> = HashSet::new();
         let mut dead_ops: HashSet<usize> = HashSet::new();
+        // A GEP compare parks in FSR1, a live walk pointer here, so
+        // any such header compare keeps the plain lowering.
+        if h.insts
+            .iter()
+            .any(|i| matches!(i, Inst::Icmp(c) if g.icmp_has_slotless_gep(c)))
+        {
+            return None;
+        }
         let mut stage_pairs: usize = 0;
         for (ii, inst) in h.insts.iter().enumerate() {
             if ii == last || ii == phi_ii {
@@ -5604,6 +5636,14 @@ impl<'m> Gen<'m> {
         let mut load_dsts: Vec<String> = Vec::new();
         let mut base: Option<u16> = None;
         let mut cursor: u16 = 0;
+        // Same FSR1 park refusal as the counted scan, applied whole
+        // block so the latch compare is covered too.
+        if b.insts
+            .iter()
+            .any(|i| matches!(i, Inst::Icmp(c) if g.icmp_has_slotless_gep(c)))
+        {
+            return None;
+        }
         let mut stage_pairs: usize = 0;
         let here = |ii: usize| (b.label.clone(), ii);
         for (ii, inst) in b.insts.iter().enumerate() {
