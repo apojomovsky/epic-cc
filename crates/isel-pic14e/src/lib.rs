@@ -290,6 +290,20 @@ impl<'m> Gen<'m> {
         )
     }
 
+    /// Whether `v` is a resolved GEP value the allocator folded into
+    /// its uses: it has a resolved (base, k, terms) entry but no slot,
+    /// so a reader must materialize it through `emit_load_byte`
+    /// instead of addressing a slot (epic-cc#1472).
+    fn slotless_gep_value(&self, v: &Val) -> bool {
+        match v {
+            Val::Reg(r) => {
+                let key = ssa_key(self.cur_func, r);
+                self.resolved.contains_key(&key) && !self.addrs.contains_key(&key)
+            }
+            _ => false,
+        }
+    }
+
     /// The byte width of function `func`'s va region: the maximum over its
     /// call sites of the sum of extra-arg widths (the args past the named
     /// params). Mirrors `alloc::va_sizes` exactly, so the boundary assert
@@ -1567,8 +1581,33 @@ impl<'m> Gen<'m> {
     /// plain load leaves the byte addressable, so its load pops as
     /// dead). Only MOVF/XORWF/XORLW/IORWF/MOVWF run here, so C and DC
     /// survive for the equality-then-carry composites.
-    fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty) {
+    fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty, temp: u16) {
         let n = ty.bytes();
+        if self.slotless_gep_value(b) {
+            // A slotless GEP operand has no byte to XORWF against:
+            // park each `a` byte in `temp` (the result slot, dead
+            // until the caller's materialize writes it, and loaded
+            // before the store when it overlays `a`), materialize
+            // the GEP byte, and XOR against the park. The running
+            // OR accumulates in scratch like the path below.
+            for i in 0..n {
+                self.emit_load_byte(a, i);
+                self.emit(format!("    MOVWF 0x{temp:02X}"));
+                self.emit_load_byte(b, i);
+                self.emit(format!("    XORWF 0x{temp:02X}, W"));
+                if n > 1 {
+                    if i == 0 {
+                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    } else {
+                        self.emit(format!("    IORWF 0x{:02X}, W", self.scratch));
+                        if i + 1 < n {
+                            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let pre_load = self.out.len();
         self.emit_load_byte(a, 0);
         let single0 = self.out.len() == pre_load + 1;
@@ -3404,12 +3443,12 @@ impl<'m> Gen<'m> {
                 match ic.pred.as_str() {
                     "eq" => {
                         // Compares equality through XOR and materializes Z.
-                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         self.emit_materialize("Z", da);
                     }
                     "ne" => {
                         // Inverts the equality materialization for ne.
-                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         self.emit_materialize("!Z", da);
                     }
                     pred => {
@@ -3426,7 +3465,7 @@ impl<'m> Gen<'m> {
                         // full equality needs the XOR accumulation, which
                         // preserves C.
                         if need_z && ic.ty.bytes() > 1 {
-                            self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                            self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         }
                         let mat = match pred {
                             "ult" | "slt" => "!C",

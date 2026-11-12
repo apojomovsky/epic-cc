@@ -153,6 +153,24 @@ fn add_c_runs_correctly() {
 }
 
 #[test]
+fn gep_value_icmp_c_runs_correctly() {
+    // in == 6 (fixture comment) -> out == 2, out2 == 1.
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals) = compile("tests/fixtures/gep_value_icmp.c");
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 6;
+    p.ram_mut()[in_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 2, "out == loop trips");
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        1,
+        "out2 == cursor landed on the GEP end"
+    );
+    assert!(p.halted());
+}
+
+#[test]
 fn scalar_c_runs_correctly() {
     let _guard = E2E_LOCK.lock();
     let (mut p, globals) = compile("tests/fixtures/scalar.c");
