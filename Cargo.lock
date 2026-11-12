@@ -230,13 +230,16 @@ dependencies = [
  "alloc",
  "asm",
  "banking",
+ "callgraph",
  "device",
  "ir",
+ "irparse",
  "iselcore",
  "legalize",
  "peephole",
  "pic14-sim",
  "schedule",
+ "wholeprog",
 ]
 
 [[package]]
