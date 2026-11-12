@@ -247,6 +247,20 @@ impl<'m> Gen<'m> {
         )
     }
 
+    /// Whether `v` is a resolved GEP value the allocator folded into
+    /// its uses: it has a resolved (base, k, terms) entry but no slot,
+    /// so a reader must materialize it through `emit_load_byte`
+    /// instead of addressing a slot (epic-cc#1472).
+    fn slotless_gep_value(&self, v: &Val) -> bool {
+        match v {
+            Val::Reg(r) => {
+                let key = ssa_key(self.cur_func, r);
+                self.resolved.contains_key(&key) && !self.addrs.contains_key(&key)
+            }
+            _ => false,
+        }
+    }
+
     /// Resolve an operand value to its base byte address (lo for multi-byte).
     fn val_addr(&self, v: &Val) -> Slot {
         match v {
@@ -536,8 +550,30 @@ impl<'m> Gen<'m> {
     }
 
     /// Set the Z flag to (a == b) without disturbing other flags.
-    fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty) {
+    fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty, temp: u16) {
         let n = ty.bytes();
+        if self.slotless_gep_value(b) {
+            // A slotless GEP operand has no byte to XORWF against:
+            // park each `a` byte in `temp` (the result slot, dead
+            // until the caller's materialize writes it, and loaded
+            // before the store when it overlays `a`), materialize
+            // the GEP byte, and XOR against the park. The running
+            // OR accumulates in scratch like the path below.
+            for i in 0..n {
+                self.emit_load_byte(a, i);
+                self.emit(format!("    MOVWF {}", self.fop(temp)));
+                self.emit_load_byte(b, i);
+                self.emit_bank_select(temp);
+                self.emit(format!("    XORWF {}, W", self.fop(temp)));
+                if i == 0 {
+                    self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
+                } else {
+                    self.emit(format!("    IORWF {}, W", self.fop(self.scratch)));
+                    self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
+                }
+            }
+            return;
+        }
         self.emit_load_byte(a, 0);
         self.emit_xor_byte(b, 0);
         self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
@@ -2037,11 +2073,11 @@ impl<'m> Gen<'m> {
                 let da = self.slot_addr(self.cur_func, &ic.dst).direct();
                 match ic.pred.as_str() {
                     "eq" => {
-                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         self.emit_materialize("Z", da);
                     }
                     "ne" => {
-                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         self.emit_materialize("!Z", da);
                     }
                     pred => {
@@ -2054,7 +2090,7 @@ impl<'m> Gen<'m> {
                         };
                         self.emit_cmp_c(&ic.a, &ic.b, ic.ty, signed);
                         if need_z && ic.ty.bytes() > 1 {
-                            self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                            self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         }
                         let mat = match pred {
                             "ult" | "slt" => "!C",

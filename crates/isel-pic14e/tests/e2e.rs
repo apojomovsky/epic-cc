@@ -392,6 +392,46 @@ fn multi_term_ptr_arg_c_runs_correctly() {
 }
 
 #[test]
+fn gep_value_icmp_c_runs_correctly() {
+    // in == 8 (fixture comment) -> out == 4, out2 == 1.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gep_value_icmp.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 8;
+    p.ram_mut()[in_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 4, "out == loop trips");
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        1,
+        "out2 == cursor landed on the GEP end"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn gep_value_icmp_carry_c_runs_correctly() {
+    // in == 8 (fixture comment) -> out == 5, out2 == 1.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gep_value_icmp_carry.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 8;
+    p.ram_mut()[in_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 5, "out == loop trips");
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        1,
+        "out2 == cursor landed on the GEP end"
+    );
+    assert!(p.halted());
+}
+
+#[test]
 fn gep_k_terms_ptr_value_c_runs_correctly() {
     // in == 23 (fixture comment) -> out == 0x33, out2/out4 == 0x51.
     let (mut p, globals) = compile(concat!(

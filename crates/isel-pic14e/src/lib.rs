@@ -290,6 +290,20 @@ impl<'m> Gen<'m> {
         )
     }
 
+    /// Whether `v` is a resolved GEP value the allocator folded into
+    /// its uses: it has a resolved (base, k, terms) entry but no slot,
+    /// so a reader must materialize it through `emit_load_byte`
+    /// instead of addressing a slot (epic-cc#1472).
+    fn slotless_gep_value(&self, v: &Val) -> bool {
+        match v {
+            Val::Reg(r) => {
+                let key = ssa_key(self.cur_func, r);
+                self.resolved.contains_key(&key) && !self.addrs.contains_key(&key)
+            }
+            _ => false,
+        }
+    }
+
     /// The byte width of function `func`'s va region: the maximum over its
     /// call sites of the sum of extra-arg widths (the args past the named
     /// params). Mirrors `alloc::va_sizes` exactly, so the boundary assert
@@ -1381,20 +1395,8 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
                                 }
                             }
-                            [(1, reg1), (1, reg2)] => {
-                                let ra1 = self.val_addr(&Val::Reg(reg1.clone())).direct();
-                                let ra2 = self.val_addr(&Val::Reg(reg2.clone())).direct();
-                                if idx == 0 {
-                                    self.emit(format!("    MOVLW 0x{lo:02X}"));
-                                    self.emit(format!("    ADDWF 0x{ra1:02X}, W"));
-                                    self.emit(format!("    ADDWF 0x{ra2:02X}, W"));
-                                } else {
-                                    self.emit(format!("    MOVLW 0x{hi:02X}"));
-                                    self.emit("    BTFSC STATUS, 0".to_string());
-                                    self.emit("    ADDLW 0x01".to_string());
-                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra1 + 1));
-                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra2 + 1));
-                                }
+                            [(1, _), (1, _)] => {
+                                self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx)
                             }
                             _ => self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx),
                         }
@@ -1475,35 +1477,10 @@ impl<'m> Gen<'m> {
                                 }
                             }
                         }
-                        [(1, reg1), (1, reg2)] if k == 0 => {
-                            let ra1 = self.val_addr(&Val::Reg(reg1.clone())).direct();
-                            let ra2 = self.val_addr(&Val::Reg(reg2.clone())).direct();
-                            if let Some(addr) = base_lit {
-                                let b = ((addr >> (u32::from(idx) * 8)) & 0xFF) as u8;
-                                self.emit(format!("    MOVLW 0x{b:02X}"));
-                            } else if idx == 0 {
-                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
-                            } else {
-                                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
-                            }
-                            // Byte 0's carry into byte 1 must be consumed
-                            // before byte 1's own adds: both the literal base
-                            // and the runtime slot read leave the low byte's
-                            // carry in STATUS.C, and the two ADDWFs below do
-                            // not (the first ADDWF sets C itself, but only
-                            // after the high byte is already in W).
-                            if idx != 0 {
-                                self.emit("    BTFSC STATUS, 0".to_string());
-                                self.emit("    ADDLW 0x01".to_string());
-                            }
-                            if idx == 0 {
-                                self.emit(format!("    ADDWF 0x{ra1:02X}, W"));
-                                self.emit(format!("    ADDWF 0x{ra2:02X}, W"));
-                            } else {
-                                self.emit(format!("    ADDWF 0x{:02X}, W", ra1 + 1));
-                                self.emit(format!("    ADDWF 0x{:02X}, W", ra2 + 1));
-                            }
-                        }
+                        [(1, _), (1, _)] if k == 0 => match base_lit {
+                            Some(addr) => self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx),
+                            None => self.emit_gep_value_byte(None, sa, k, &terms, idx),
+                        },
                         _ => match base_lit {
                             Some(addr) => self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx),
                             None => self.emit_gep_value_byte(None, sa, k, &terms, idx),
@@ -1567,8 +1544,33 @@ impl<'m> Gen<'m> {
     /// plain load leaves the byte addressable, so its load pops as
     /// dead). Only MOVF/XORWF/XORLW/IORWF/MOVWF run here, so C and DC
     /// survive for the equality-then-carry composites.
-    fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty) {
+    fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty, temp: u16) {
         let n = ty.bytes();
+        if self.slotless_gep_value(b) {
+            // A slotless GEP operand has no byte to XORWF against:
+            // park each `a` byte in `temp` (the result slot, dead
+            // until the caller's materialize writes it, and loaded
+            // before the store when it overlays `a`), materialize
+            // the GEP byte, and XOR against the park. The running
+            // OR accumulates in scratch like the path below.
+            for i in 0..n {
+                self.emit_load_byte(a, i);
+                self.emit(format!("    MOVWF 0x{temp:02X}"));
+                self.emit_load_byte(b, i);
+                self.emit(format!("    XORWF 0x{temp:02X}, W"));
+                if n > 1 {
+                    if i == 0 {
+                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    } else {
+                        self.emit(format!("    IORWF 0x{:02X}, W", self.scratch));
+                        if i + 1 < n {
+                            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let pre_load = self.out.len();
         self.emit_load_byte(a, 0);
         let single0 = self.out.len() == pre_load + 1;
@@ -3404,12 +3406,12 @@ impl<'m> Gen<'m> {
                 match ic.pred.as_str() {
                     "eq" => {
                         // Compares equality through XOR and materializes Z.
-                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         self.emit_materialize("Z", da);
                     }
                     "ne" => {
                         // Inverts the equality materialization for ne.
-                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         self.emit_materialize("!Z", da);
                     }
                     pred => {
@@ -3426,7 +3428,7 @@ impl<'m> Gen<'m> {
                         // full equality needs the XOR accumulation, which
                         // preserves C.
                         if need_z && ic.ty.bytes() > 1 {
-                            self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                            self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         }
                         let mat = match pred {
                             "ult" | "slt" => "!C",
