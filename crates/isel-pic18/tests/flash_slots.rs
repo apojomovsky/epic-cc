@@ -940,6 +940,88 @@ fn scevgep_freeze_trunc_and_null_compare_deref() {
 }
 
 #[test]
+fn gep_icmp_ult_across_a_page_boundary() {
+    // Review repro (epic-cc#1479): 0x0100 < 0x0130 unsigned. The high
+    // byte of the right GEP needs the carry out of its own low byte,
+    // which a lane-0 subtract in between must not destroy.
+    let ir = "global g i16\nglobal out i8\n\
+              fn main(void) ()\n  block entry:\n    %base = load ptr @g\n    %a = gep %base +16\n    %b = gep %base +64\n    %c = icmp ult ptr %a, %b\n    store i8 %c @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let g = map["g"] as usize;
+    p.ram_mut()[g] = 0xF0;
+    p.ram_mut()[g + 1] = 0x00;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(p.ram()[map["out"] as usize], 1, "0x0100 ult 0x0130:\n{asm}");
+}
+
+#[test]
+fn gep_icmp_slt_across_the_sign_boundary() {
+    // Review repro (epic-cc#1479): 0x7FFF is positive, 0x8000 negative,
+    // so the signed less-than is false. The sign pre-read of the right
+    // GEP high byte must not run on a stale carry.
+    let ir = "global g i16\nglobal out i8\n\
+              fn main(void) ()\n  block entry:\n    %base = load ptr @g\n    %a = gep %base +15\n    %b = gep %base +16\n    %c = icmp slt ptr %a, %b\n    store i8 %c @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let g = map["g"] as usize;
+    p.ram_mut()[g] = 0xF0;
+    p.ram_mut()[g + 1] = 0x7F;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(p.ram()[map["out"] as usize], 0, "0x7FFF slt 0x8000:\n{asm}");
+}
+
+#[test]
+fn gep_icmp_ult_gep_on_the_left_against_a_slot() {
+    // Review repro (epic-cc#1479): a slotless GEP on the left must not
+    // be swapped into the carry-checked side: 0x0130 < 0x0100 is false.
+    let ir = "global g i16\nglobal h i16\nglobal out i8\n\
+              fn main(void) ()\n  block entry:\n    %base = load ptr @g\n    %a = gep %base +64\n    %s = load ptr @h\n    %c = icmp ult ptr %a, %s\n    store i8 %c @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let g = map["g"] as usize;
+    p.ram_mut()[g] = 0xF0;
+    p.ram_mut()[g + 1] = 0x00;
+    let h = map["h"] as usize;
+    p.ram_mut()[h] = 0x00;
+    p.ram_mut()[h + 1] = 0x01;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(p.ram()[map["out"] as usize], 0, "0x0130 ult 0x0100:\n{asm}");
+}
+
+#[test]
+fn gep_icmp_eq_keeps_a_live_zext_return_value() {
+    // Review repro (epic-cc#1479): the zext result is homed in the
+    // retval bytes until the ret, so a both-GEP compare in between
+    // must not park there: the return stays 0x00AB.
+    let ir = "global arr i8\nglobal src i8\nglobal out i16\n\
+              fn get(i16) ()\n  block entry:\n    %t = load i8 @src\n    %z = zext i8 %t to i16\n    %a = gep @arr +0\n    %b = gep @arr +1\n    %c = icmp eq ptr %a, %b\n    ret i16 %z\n\
+              fn main(void) ()\n  block entry:\n    %r = call i16 @get()\n    store i16 %r @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[map["src"] as usize] = 0xAB;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    let out = map["out"] as usize;
+    assert_eq!(
+        [p.ram()[out], p.ram()[out + 1]],
+        [0xAB, 0x00],
+        "the zext return value must survive the GEP compare:\n{asm}"
+    );
+}
+
+#[test]
 fn sext_of_a_gep_materializes_the_address() {
     // The Sext arm shares the source resolution: a folded GEP must
     // materialize its address there too, and sign-fill from the byte

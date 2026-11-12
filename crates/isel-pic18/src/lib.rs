@@ -970,31 +970,37 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Put a slotless GEP compare operand on the right where
-    /// `emit_load_w` materializes it: swap the sides and invert the
-    /// predicate when only the left side is slotless. Both slotless
-    /// stays as-is for the dedicated both-GEP compare.
-    fn normalize_gep_icmp(&self, a: Val, b: Val, pred: &str) -> (Val, Val, String) {
-        if self.slotless_gep_value(&a)
-            && !self.slotless_gep_value(&b)
-            && !matches!(b, Val::Const(_))
-        {
-            let inv = match pred {
-                "eq" | "ne" => pred,
-                "ult" => "ugt",
-                "ugt" => "ult",
-                "ule" => "uge",
-                "uge" => "ule",
-                "slt" => "sgt",
-                "sgt" => "slt",
-                "sle" => "sge",
-                "sge" => "sle",
-                other => other,
-            };
-            (b, a, inv.to_string())
-        } else {
-            (a, b, pred.to_string())
+    /// Whether the retval bytes may park a compare operand at the
+    /// current site: they are dead between instructions except for a
+    /// `zext_ret` value, whose live span runs from its `Zext` to the
+    /// `Ret` reading it in the same block (epic-cc#1479).
+    fn retval_park_free(&self) -> bool {
+        if self.zext_ret.is_empty() {
+            return true;
         }
+        let Some(f) = self.m.funcs.iter().find(|f| f.name == self.cur_func) else {
+            return false;
+        };
+        let Some(block) = f.blocks.iter().find(|b| b.label == self.cur_site.0) else {
+            return false;
+        };
+        let site = self.cur_site.1;
+        for r in &self.zext_ret {
+            let def = block
+                .insts
+                .iter()
+                .position(|i| matches!(i, Inst::Zext(z) if z.dst == *r));
+            let use_ = block
+                .insts
+                .iter()
+                .position(|i| matches!(i, Inst::Ret(Some((_, Val::Reg(v))), _) if v == r));
+            if let (Some(d), Some(u)) = (def, use_) {
+                if d < site && site < u {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// The `icmp` a block's terminator can absorb, when that is the
@@ -11645,18 +11651,16 @@ impl<'m> Gen<'m> {
                     n == 1 || n == 2 || n == 4,
                     "isel-pic18: only i8/i16/i32 Icmp implemented so far (n={n})"
                 );
-                let (a, b, pred) =
-                    self.normalize_gep_icmp(self.fold_reg(&c.a), self.fold_reg(&c.b), &c.pred);
-                if self.slotless_gep_value(&a)
-                    && (self.slotless_gep_value(&b) || matches!(b, Val::Const(_)))
-                {
-                    self.emit_icmp_both_gep(a, b, &pred, &c.dst, n, None);
+                let a = self.fold_reg(&c.a);
+                let b = self.fold_reg(&c.b);
+                if self.slotless_gep_value(&a) || self.slotless_gep_value(&b) {
+                    self.emit_icmp_gep(a, b, &c.pred, &c.dst, n, None);
                 } else if n == 1 {
-                    self.emit_icmp_byte(a, b, &pred, &c.dst, None);
+                    self.emit_icmp_byte(a, b, &c.pred, &c.dst, None);
                 } else if n == 2 {
-                    self.emit_icmp_i16(a, b, &pred, &c.dst);
+                    self.emit_icmp_i16(a, b, &c.pred, &c.dst);
                 } else {
-                    self.emit_icmp_i32(a, b, &pred, &c.dst);
+                    self.emit_icmp_i32(a, b, &c.pred, &c.dst);
                 }
             }
             Inst::Zext(z) => {
@@ -12841,12 +12845,31 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// A compare whose left side is a slotless GEP and whose right
-    /// side is another slotless GEP or a constant (epic-cc#1479): park
-    /// the left address in the retval bytes (dead until a `Ret` or a
-    /// call copies them out), then run the usual byte compares with
-    /// the right side materializing through `emit_load_w` per byte.
-    fn emit_icmp_both_gep(
+    /// One compare side after parking: the byte at `park + i` when a
+    /// park address is set, else byte `i` of the original value.
+    fn cmp_side_load_w(&mut self, park: Option<u16>, v: &Val, i: u8) {
+        match park {
+            Some(p) => self.emit_w_load(p + u16::from(i), false),
+            None => self.emit_load_w(v, i, false),
+        }
+    }
+
+    fn cmp_side_addr(&self, park: Option<u16>, v: &Val, i: u8) -> u16 {
+        match park {
+            Some(p) => p + u16::from(i),
+            None => self.val_addr(v).direct() + u16::from(i),
+        }
+    }
+
+    /// A compare with a slotless GEP operand (epic-cc#1479): park each GEP
+    /// operand whole (byte 0 then byte 1, uninterrupted, since byte 1 reads
+    /// byte 0's carry) before comparing, so no lane re-materializes a GEP
+    /// byte. The left park is PROD (`PHI_COPY_TEMP_LO`, dead at every
+    /// instruction boundary); a second park uses the retval bytes only
+    /// where `retval_park_free` proves them dead, parked first so the PROD
+    /// park lands last. Live-retval `eq`/`ne` keeps the right GEP unparked
+    /// (its `XORWF`/`BNZ` lanes write no carry); ordered there panics.
+    fn emit_icmp_gep(
         &mut self,
         a: Val,
         b: Val,
@@ -12856,13 +12879,42 @@ impl<'m> Gen<'m> {
         fuse: Option<(String, String)>,
     ) {
         assert!(
-            bytes <= 4,
-            "isel-pic18: both-GEP compare wider than the park region"
+            !matches!(a, Val::Const(_)),
+            "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
         );
-        let park = self.retval_lo;
-        for i in 0..bytes {
-            self.emit_load_w(&a, i, false);
-            self.emit_w_store(park + u16::from(i));
+        assert!(
+            bytes <= 2,
+            "isel-pic18: slotless GEP compare wider than the 2-byte park (bytes={bytes})"
+        );
+        self.flush_copies();
+        let ordered = !matches!(pred, "eq" | "ne");
+        let a_park = self.slotless_gep_value(&a).then_some(PHI_COPY_TEMP_LO);
+        let b_needs_park = self.slotless_gep_value(&b) || (ordered && self.load_w_writes_carry(&b));
+        let mut b_park = None;
+        if b_needs_park {
+            if a_park.is_some() {
+                if self.retval_park_free() {
+                    b_park = Some(self.retval_lo);
+                } else if ordered {
+                    panic!(
+                        "isel-pic18: ordered icmp on slotless GEP operands needs the retval park, but a zext return value is live there (epic-cc#1479)"
+                    );
+                }
+            } else {
+                b_park = Some(PHI_COPY_TEMP_LO);
+            }
+        }
+        if let Some(p) = b_park {
+            for i in 0..bytes {
+                self.emit_load_w(&b, i, false);
+                self.emit_w_store(p + u16::from(i));
+            }
+        }
+        if let Some(p) = a_park {
+            for i in 0..bytes {
+                self.emit_load_w(&a, i, false);
+                self.emit_w_store(p + u16::from(i));
+            }
         }
         let (l_true, l_false, l_done);
         match fuse {
@@ -12877,11 +12929,42 @@ impl<'m> Gen<'m> {
                 l_done = Some(self.fresh_label());
             }
         }
+        // The result slot may be zeroed up front (the `INCF` join in
+        // `emit_materialize_bool`) only when it overlaps nothing the
+        // compare still reads: the parks, an unparked left slot, or an
+        // unparked right slot with a plain (non-materializing) load.
+        let pre = if l_done.is_some() {
+            let d = self.slot_addr(self.cur_func, dst).direct();
+            let mut read: Vec<u16> = Vec::new();
+            for p in [a_park, b_park].into_iter().flatten() {
+                read.extend(p..p + u16::from(bytes));
+            }
+            if a_park.is_none() {
+                let base = self.val_addr(&a).direct();
+                read.extend(base..base + u16::from(bytes));
+            }
+            let b_plain = b_park.is_some()
+                || matches!(b, Val::Const(_))
+                || (!self.slotless_gep_value(&b)
+                    && !self.load_w_writes_carry(&b)
+                    && !matches!(&b, Val::Reg(r) if self.resolved.contains_key(&ssa_key(self.cur_func, r))));
+            if b_park.is_none() && b_plain && !matches!(b, Val::Const(_)) {
+                let base = self.val_addr(&b).direct();
+                read.extend(base..base + u16::from(bytes));
+            }
+            (b_plain && !read.contains(&d)).then_some(d)
+        } else {
+            None
+        };
+        if let Some(d) = pre {
+            self.emit_banked("CLRF", d, "");
+        }
         if pred == "eq" || pred == "ne" {
             let l_mismatch = if pred == "eq" { &l_false } else { &l_true };
             for i in 0..bytes {
-                self.emit_load_w(&b, i, false);
-                let (acc, af) = self.operand(park + u16::from(i));
+                self.cmp_side_load_w(b_park, &b, i);
+                let av = self.cmp_side_addr(a_park, &a, i);
+                let (acc, af) = self.operand(av);
                 let bank = if acc == 0 { "A" } else { "B" };
                 self.emit(format!("    XORWF 0x{af:03X},W,{bank}"));
                 self.emit(format!("    BNZ {l_mismatch}"));
@@ -12889,43 +12972,17 @@ impl<'m> Gen<'m> {
             let l_all = if pred == "eq" { &l_true } else { &l_false };
             self.emit(format!("    BRA {l_all}"));
         } else if matches!(pred, "ult" | "uge" | "ugt" | "ule") {
-            let (borrow_in, ge_is_true) = Self::chain_shape(pred);
-            let (l_ge, l_lt) = if ge_is_true {
-                (l_true.clone(), l_false.clone())
-            } else {
-                (l_false.clone(), l_true.clone())
-            };
-            if borrow_in {
-                self.emit("    BCF 0xFD8,0,A".to_string());
-            }
-            for i in 0..bytes {
-                self.emit_load_w(&b, i, false);
-                let (acc, af) = self.operand(park + u16::from(i));
-                let bank = if acc == 0 { "A" } else { "B" };
-                let mne = if i == 0 && !borrow_in {
-                    "SUBWF"
-                } else {
-                    "SUBWFB"
-                };
-                self.emit(format!("    {mne} 0x{af:03X},W,{bank}"));
-            }
-            self.emit(format!("    BNC {l_lt}"));
-            self.emit(format!("    BRA {l_ge}"));
+            self.emit_icmp_parked_chain(a_park, &a, b_park, &b, pred, bytes, &l_true, &l_false);
         } else {
             // Signed: differing signs decide by the left sign alone,
-            // equal signs order like the unsigned chain (mirrors
-            // `emit_icmp_signed_chain` with the parked left side).
+            // equal signs order like the unsigned chain. Both high
+            // bytes are read from the parks (or plain slots), never
+            // re-materialized, so no stale carry can enter.
             let (chain_pred, differ_is_a_neg) = match pred {
                 "slt" => ("ult", true),
                 "sle" => ("ule", true),
                 "sgt" => ("ugt", false),
                 _ => ("uge", false),
-            };
-            let (borrow_in, ge_is_true) = Self::chain_shape(chain_pred);
-            let (l_ge, l_lt) = if ge_is_true {
-                (l_true.clone(), l_false.clone())
-            } else {
-                (l_false.clone(), l_true.clone())
             };
             let (l_dtrue, l_dfalse) = if differ_is_a_neg {
                 (l_true.clone(), l_false.clone())
@@ -12933,36 +12990,64 @@ impl<'m> Gen<'m> {
                 (l_false.clone(), l_true.clone())
             };
             let hi = bytes - 1;
-            self.emit_load_w(&b, hi, false);
-            let (acc, af) = self.operand(park + u16::from(hi));
+            self.cmp_side_load_w(b_park, &b, hi);
+            let av = self.cmp_side_addr(a_park, &a, hi);
+            let (acc, af) = self.operand(av);
             let bank = if acc == 0 { "A" } else { "B" };
             self.emit(format!("    XORWF 0x{af:03X},W,{bank}"));
             let l_differ = self.fresh_label();
             self.emit(format!("    BN {l_differ}"));
-            if borrow_in {
-                self.emit("    BCF 0xFD8,0,A".to_string());
-            }
-            for i in 0..bytes {
-                self.emit_load_w(&b, i, false);
-                let (a2, f2) = self.operand(park + u16::from(i));
-                let bank2 = if a2 == 0 { "A" } else { "B" };
-                let mne = if i == 0 && !borrow_in {
-                    "SUBWF"
-                } else {
-                    "SUBWFB"
-                };
-                self.emit(format!("    {mne} 0x{f2:03X},W,{bank2}"));
-            }
-            self.emit(format!("    BNC {l_lt}"));
-            self.emit(format!("    BRA {l_ge}"));
+            self.emit_icmp_parked_chain(
+                a_park, &a, b_park, &b, chain_pred, bytes, &l_true, &l_false,
+            );
             self.emit_label(&l_differ);
             self.emit(format!("    BTFSS 0x{af:03X},7,{bank}"));
             self.emit(format!("    BRA {l_dfalse}"));
             self.emit(format!("    BRA {l_dtrue}"));
         }
         if let Some(done) = l_done {
-            self.emit_materialize_bool(&l_true, &l_false, &done, dst, None);
+            self.emit_materialize_bool(&l_true, &l_false, &done, dst, pre);
         }
+    }
+
+    /// The unsigned borrow chain over parked compare sides: lane `i`
+    /// loads the right byte (a `MOVF` for a park, which writes no
+    /// carry) and subtracts it from the left byte, so `STATUS,C`
+    /// carries only the chain's own borrow from lane to lane.
+    fn emit_icmp_parked_chain(
+        &mut self,
+        a_park: Option<u16>,
+        a: &Val,
+        b_park: Option<u16>,
+        b: &Val,
+        pred: &str,
+        bytes: u8,
+        l_true: &str,
+        l_false: &str,
+    ) {
+        let (borrow_in, ge_is_true) = Self::chain_shape(pred);
+        let (l_ge, l_lt) = if ge_is_true {
+            (l_true, l_false)
+        } else {
+            (l_false, l_true)
+        };
+        if borrow_in {
+            self.emit("    BCF 0xFD8,0,A".to_string());
+        }
+        for i in 0..bytes {
+            self.cmp_side_load_w(b_park, b, i);
+            let av = self.cmp_side_addr(a_park, a, i);
+            let (acc, af) = self.operand(av);
+            let bank = if acc == 0 { "A" } else { "B" };
+            let mne = if i == 0 && !borrow_in {
+                "SUBWF"
+            } else {
+                "SUBWFB"
+            };
+            self.emit(format!("    {mne} 0x{af:03X},W,{bank}"));
+        }
+        self.emit(format!("    BNC {l_lt}"));
+        self.emit(format!("    BRA {l_ge}"));
     }
 
     /// `eq`/`ne` for multi-byte values: true (for `eq`) only when every
@@ -16729,9 +16814,11 @@ fn emit_fused_branch<'m>(
     let l_f = exit(f_copies, lf, f_dom);
     let n = c.ty.bytes();
     let fuse = Some((l_t, l_f));
-    let (a, b, pred) = g.normalize_gep_icmp(c.a.clone(), c.b.clone(), &c.pred);
-    if g.slotless_gep_value(&a) && (g.slotless_gep_value(&b) || matches!(b, Val::Const(_))) {
-        g.emit_icmp_both_gep(a, b, &pred, &c.dst, n, fuse);
+    let a = c.a.clone();
+    let b = c.b.clone();
+    let pred = c.pred.clone();
+    if g.slotless_gep_value(&a) || g.slotless_gep_value(&b) {
+        g.emit_icmp_gep(a, b, &pred, &c.dst, n, fuse);
     } else if pred == "eq" || pred == "ne" {
         g.emit_icmp_eq_ne(a, b, &pred, &c.dst, n, fuse);
     } else if n == 1 {
