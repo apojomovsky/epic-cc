@@ -1048,6 +1048,88 @@ fn parses_volatile_memcpy() {
 // Issue #4: a runtime-length memcpy (`i16 %n`) parses to `MemLen::Reg` — the
 // counted-loop form — instead of panicking on the non-const length.
 #[test]
+fn parses_memmove_as_memmove_call() {
+    let src = r#"
+@b1 = dso_local global [16 x i8] zeroinitializer, align 1
+@b2 = dso_local global [16 x i8] zeroinitializer, align 1
+define dso_local void @main(i16 %n) {
+  call void @llvm.memmove.p0.p0.i16(ptr align 1 @b1, ptr align 1 @b2, i16 %n, i1 false)
+  ret void
+}
+"#;
+    let m = parse_ll(src);
+    let body = &m.funcs[0].blocks[0].insts;
+    assert!(
+        body.iter().any(|i| matches!(i, Inst::Call(c)
+            if c.func == "memmove" && c.dst.is_none() && c.args.len() == 3)),
+        "memmove must become a call to memmove: {body:?}"
+    );
+}
+
+#[test]
+fn parses_memcpy_inline_as_memcpy() {
+    let src = r#"
+@b1 = dso_local global [16 x i8] zeroinitializer, align 1
+@b2 = dso_local global [16 x i8] zeroinitializer, align 1
+define dso_local void @main() {
+  call void @llvm.memcpy.inline.p0.p0.i16(ptr align 1 @b1, ptr align 1 @b2, i16 4, i1 false)
+  ret void
+}
+"#;
+    let m = parse_ll(src);
+    let body = &m.funcs[0].blocks[0].insts;
+    assert!(
+        body.iter()
+            .any(|i| matches!(i, Inst::Memcpy(mm) if mm.len == MemLen::Const(4))),
+        "memcpy.inline must become Memcpy: {body:?}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "irparse: unsupported intrinsic llvm.memset.inline.p0.i16")]
+fn rejects_memset_inline_by_name() {
+    let src = r#"
+@b1 = dso_local global [16 x i8] zeroinitializer, align 1
+define dso_local void @main() {
+  call void @llvm.memset.inline.p0.i16(ptr align 1 @b1, i8 0, i16 4, i1 false)
+  ret void
+}
+"#;
+    let _ = parse_ll(src);
+}
+
+#[test]
+#[should_panic(
+    expected = "irparse: unsupported intrinsic llvm.memset.element.unordered.atomic.p0.i16"
+)]
+fn rejects_atomic_memset_by_name() {
+    let src = r#"
+@b1 = dso_local global [16 x i8] zeroinitializer, align 1
+define dso_local void @main() {
+  call void @llvm.memset.element.unordered.atomic.p0.i16(ptr align 1 @b1, i8 0, i16 4, i32 1)
+  ret void
+}
+"#;
+    let _ = parse_ll(src);
+}
+
+#[test]
+#[should_panic(
+    expected = "irparse: unsupported intrinsic llvm.memcpy.element.unordered.atomic.p0.p0.i16"
+)]
+fn rejects_atomic_memcpy_by_name() {
+    let src = r#"
+@b1 = dso_local global [16 x i8] zeroinitializer, align 1
+@b2 = dso_local global [16 x i8] zeroinitializer, align 1
+define dso_local void @main() {
+  call void @llvm.memcpy.element.unordered.atomic.p0.p0.i16(ptr align 1 @b1, ptr align 1 @b2, i16 4, i32 1)
+  ret void
+}
+"#;
+    let _ = parse_ll(src);
+}
+
+#[test]
 fn parses_runtime_length_memcpy() {
     let src = r#"
 @b1 = dso_local global [16 x i8] zeroinitializer, align 1
