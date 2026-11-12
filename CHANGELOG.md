@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here, generated from
 Conventional Commits. Dates are UTC.
+## [0.7.0] - 2026-11-12
+ 
+### Fixes
+
+- Lower a same-width ptrtoint trunc as a copy on PIC14 (#1465)
+- Materialize GEP pointer values with a constant offset and dynamic terms carry-exactly (#1469)
+- Lower memcpy from a runtime-indexed flash walk (#1470)
 ## [0.6.1] - 2026-11-12
  
 ### Fixes
