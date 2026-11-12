@@ -8560,26 +8560,27 @@ impl<'m> Gen<'m> {
         if let Val::Reg(r) = &mc.src {
             let key = ssa_key(self.cur_func, r);
             if self.prov.flash.contains(&key) || self.slot_flash.contains(&key) {
-                let (sname, k) = match self.resolved.get(&key) {
+                let (sname, k, terms) = match self.resolved.get(&key) {
                     Some((Base::Slot(sname, true), k, terms)) => {
-                        if !terms.is_empty() {
-                            panic!(
-                                "isel-pic18: memcpy from a runtime-indexed walk over flash pointer %{sname} is not supported (epic-cc#1091, epic-cc#1100)"
-                            );
-                        }
-                        (sname.clone(), *k)
+                        (sname.clone(), *k, terms.clone())
                     }
                     Some((Base::Slot(sname, false), k, terms))
-                        if self.slot_is_flash(self.cur_func, sname) && terms.is_empty() =>
+                        if self.slot_is_flash(self.cur_func, sname) =>
                     {
-                        (sname.clone(), *k)
+                        (sname.clone(), *k, terms.clone())
                     }
                     _ => panic!(
                         "isel-pic18: memcpy from flash pointer %{r} with no flash-walk slot is not supported (epic-cc#1100)"
                     ),
                 };
                 let slot = self.slot_addr(self.cur_func, &sname).direct();
+                // Dynamic terms fold into the byte-0 seed once: the copy
+                // walks TBLRD*+ from there, and the terms are loop-invariant
+                // across it like every other walked access.
                 self.emit_flash_tblptr_seed(slot, k.wrapping_add(u16::from(byte_off)));
+                if !terms.is_empty() {
+                    self.add_dynamic_to_tblptr(&terms, None);
+                }
                 return (McSrc::Tblrd, self.emit_ptr_setup(&mc.dst, byte_off));
             }
             if self.prov.mixed.contains(&key) {

@@ -1115,6 +1115,92 @@ fn memcpy_into_mixed_global_is_refused() {
 }
 
 #[test]
+fn memcpy_from_runtime_indexed_flash_walk_copies_table_element() {
+    // A 14-byte element copied from the middle of a flash table: the
+    // source pointer lives in a flash slot and gains a runtime term,
+    // so byte 0 must seed TBLPTR from the slot plus the term and the
+    // remaining bytes walk TBLRD*+ (epic-cc#1462).
+    let bytes: Vec<u8> = (0..42u8)
+        .map(|b| b.wrapping_mul(3).wrapping_add(1))
+        .collect();
+    let m = with_bytes(
+        parse(
+            "const tab i8\nglobal g i16\nglobal idx i8\nglobal buf i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @tab @g\n    %i = load i8 @idx\n    %q = load ptr @g\n    %w = gep %q +0 +14*%i\n    memcpy @buf %w 14\n    ret void\n",
+        ),
+        "tab",
+        &bytes,
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("idx", 0x12),
+            ("buf", 0x100),
+            ("main::i", 0x13),
+            ("main::q", 0x14),
+        ]),
+        None,
+    );
+    assert!(asm.contains("TBLRD*+"), "copy must read flash:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x12] = 1;
+    p.run(2000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        &p.ram()[0x100..0x10E],
+        &bytes[14..28],
+        "buf must hold the second 14-byte table element"
+    );
+}
+
+#[test]
+fn memcpy_from_runtime_indexed_flash_param_copies_table_element() {
+    // The same walk through a flash pointer parameter: its slot is
+    // flash-kind rather than indirect, but the term folds into the
+    // seed the same way (epic-cc#1462).
+    let bytes: Vec<u8> = (0..42u8)
+        .map(|b| b.wrapping_mul(5).wrapping_add(2))
+        .collect();
+    let m = with_bytes(
+        parse(
+            "const tab i8\nglobal idx i8\nglobal buf i8\n\
+             fn copy(void) (p=ptr, i=i8)\n  block entry:\n    %w = gep %p +0 +14*%i\n    memcpy @buf %w 14\n    ret void\n\
+             fn main(void) ()\n  block entry:\n    %i = load i8 @idx\n    call void @copy(ptr @tab, i8 %i)\n    ret void\n",
+        ),
+        "tab",
+        &bytes,
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("idx", 0x10),
+            ("buf", 0x100),
+            ("copy::p", 0x11),
+            ("copy::i", 0x13),
+            ("main::i", 0x14),
+        ]),
+        None,
+    );
+    assert!(asm.contains("TBLRD*+"), "copy must read flash:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 2;
+    p.run(2000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        &p.ram()[0x100..0x10E],
+        &bytes[28..42],
+        "buf must hold the third 14-byte table element"
+    );
+}
+
+#[test]
 fn dynamic_walk_over_mixed_base_keeps_base_tag() {
     // A runtime-indexed walk preserves its base's space: storing it
     // into a shared slot must copy the base's tag, not tag 0, so the
