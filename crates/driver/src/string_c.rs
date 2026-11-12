@@ -151,6 +151,8 @@ pub fn externally_defined(ll_text: &str) -> std::collections::HashMap<String, us
         }
     }
     names
+}
+
 /// Whether the driver must supply `memmove` for these units: some use
 /// `llvm.memmove` and none defines the function it becomes a call to.
 pub fn needs_provided_memmove(ll_texts: &[String]) -> bool {
@@ -413,6 +415,8 @@ mod tests {
         assert_eq!(arities.get("strlen"), Some(&1));
         assert_eq!(arities.get("strcmp"), Some(&2));
         assert_eq!(arities.len(), 16);
+    }
+
     use super::needs_provided_memmove;
 
     #[test]
