@@ -4581,9 +4581,15 @@ fn allocate_inner(
 
         // Survivors stage: direct-only, unpinned, small enough, paying.
         // Asm-named consts never stage: no re-copy precedes asm, so the
-        // substitution would lose its address (epic-cc#1132).
+        // substitution would lose its address (epic-cc#1132). A const in
+        // `const_phi` never stages either: its address escapes into a RAM
+        // slot (store, return, phi) that outlives any re-copy, so it
+        // keeps its RAM copy like the pool gate below already assumes.
         for gname in &const_direct {
-            if const_derived.contains(gname) || demote.contains(gname) || const_asm.contains(gname)
+            if const_derived.contains(gname)
+                || demote.contains(gname)
+                || const_asm.contains(gname)
+                || const_phi.contains(gname)
             {
                 continue;
             }
