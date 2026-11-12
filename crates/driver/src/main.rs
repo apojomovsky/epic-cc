@@ -346,8 +346,35 @@ fn main() {
             || driver::header_detect::dep_file_includes(t, "malloc.h")
     });
     if need_string {
+        // Defining a library function beside its header is legal C, so a
+        // user definition wins: drop only the colliding names from the
+        // injected unit and let its survivors reference the user's.
+        let user_defined: std::collections::HashMap<String, usize> = units
+            .iter()
+            .flat_map(|u| {
+                driver::string_c::externally_defined(
+                    &std::fs::read_to_string(u).unwrap_or_default(),
+                )
+            })
+            .collect();
+        // A same-named definition only wins with the library arity: a
+        // mismatched signature is a different function sharing a
+        // reserved name, and binding call sites to it silently would
+        // miscompile where llvm-link used to fail loudly.
+        let arities = driver::string_c::function_arities(driver::string_c::STRING_C);
+        let colliding: std::collections::HashSet<String> =
+            driver::string_c::function_names(driver::string_c::STRING_C)
+                .into_iter()
+                .map(str::to_string)
+                .filter(|n| user_defined.get(n) == arities.get(n))
+                .collect();
+        let string_source = if colliding.is_empty() {
+            driver::string_c::STRING_C.to_string()
+        } else {
+            driver::string_c::without_functions(driver::string_c::STRING_C, &colliding)
+        };
         let string_c_path = tmp.join("__epic_string.c");
-        std::fs::write(&string_c_path, driver::string_c::STRING_C).expect("write string.c");
+        std::fs::write(&string_c_path, string_source).expect("write string.c");
         let ll_path = tmp.join("__epic_string.ll");
         let mut cmd = clang::base_cmd(&clang, &resdir);
         clang::apply_options(&mut cmd, &clang_opts);

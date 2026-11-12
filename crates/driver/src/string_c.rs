@@ -7,6 +7,152 @@
 //! keeps as one block over two `phi ptr`: the PIC18 pointer walk's
 //! shape, with the last bytes live for the exit subtract.
 
+/// Names defined by one `STRING_C` definition line, or `None` for any
+/// other line. The source is ours and every definition opens with the
+/// same `__attribute__((noinline))` line, so a line scan is exact here
+/// where it would be fragile on arbitrary C.
+fn definition_name(line: &str) -> Option<&str> {
+    if !line.starts_with("__attribute__((noinline))") {
+        return None;
+    }
+    let before_paren = line.split('(').nth(2)?;
+    let name = before_paren
+        .split_whitespace()
+        .last()?
+        .trim_start_matches('*');
+    (!name.is_empty()).then_some(name)
+}
+
+/// Every function `STRING_C` defines, in source order. `strcmp` appears
+/// twice, once per core branch, so callers deduplicate if they care.
+pub fn function_names(source: &str) -> Vec<&str> {
+    source.lines().filter_map(definition_name).collect()
+}
+
+/// `source` with every definition of a name in `names` removed. The
+/// `#ifdef` lines around the two `strcmp` branches stay, so removing a
+/// name present in both branches still leaves valid preprocessor text,
+/// and surviving definitions call the user's name through the header
+/// declarations as an ordinary external reference.
+pub fn without_functions(source: &str, names: &std::collections::HashSet<String>) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut skipping = false;
+    for line in source.lines() {
+        if skipping {
+            if line == "}" {
+                skipping = false;
+            }
+            continue;
+        }
+        if definition_name(line).is_some_and(|n| names.contains(n)) {
+            skipping = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Number of parameters in the parenthesised list opening at `open`,
+/// or `None` when it never closes. Nested parens keep their commas.
+fn arity_of(line: &str, open: usize) -> Option<usize> {
+    let inner = &line[open + 1..];
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => {
+                close = Some(i);
+                break;
+            }
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    let inner = &inner[..close?];
+    if inner.trim().is_empty() {
+        return Some(0);
+    }
+    let mut depth = 0i32;
+    let mut count = 1usize;
+    for c in inner.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    Some(count)
+}
+
+/// Parameter counts of every `STRING_C` definition, keyed by name.
+pub fn function_arities(source: &str) -> std::collections::HashMap<String, usize> {
+    let mut out = std::collections::HashMap::new();
+    for line in source.lines() {
+        if let Some(name) = definition_name(line) {
+            if let Some(open) = line.rfind('(') {
+                if let Some(arity) = arity_of(line, open) {
+                    out.insert(name.to_string(), arity);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Function names and parameter counts a compiled user unit defines at
+/// external linkage, read from its `define` lines. Internal, private,
+/// weak and linkonce definitions are not collisions the injected unit
+/// must defer to: llvm-link renames the internal ones and keeps the
+/// strong definition over a weak or linkonce one, so deferring would
+/// invert the linker's own precedence.
+pub fn externally_defined(ll_text: &str) -> std::collections::HashMap<String, usize> {
+    let mut names = std::collections::HashMap::new();
+    for line in ll_text.lines() {
+        let Some(rest) = line.strip_prefix("define ") else {
+            continue;
+        };
+        if rest.split_whitespace().any(|t| {
+            matches!(
+                t,
+                "internal"
+                    | "private"
+                    | "weak"
+                    | "weak_odr"
+                    | "extern_weak"
+                    | "linkonce"
+                    | "linkonce_odr"
+                    | "available_externally"
+            )
+        }) {
+            continue;
+        }
+        let Some(at) = rest.find('@') else { continue };
+        let after = &rest[at + 1..];
+        let name: String = if let Some(quoted) = after.strip_prefix('"') {
+            quoted.chars().take_while(|c| *c != '"').collect()
+        } else {
+            after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$' | '-'))
+                .collect()
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let Some(open) = after.find('(') else {
+            continue;
+        };
+        if let Some(arity) = arity_of(after, open) {
+            names.entry(name).or_insert(arity);
+        }
+    }
+    names
+}
+
 pub const STRING_C: &str = r#"#include <stddef.h>
 #include <string.h>
 
@@ -177,3 +323,66 @@ __attribute__((noinline)) void *memset(void *s, int c, size_t n) {
     return s;
 }
 "#;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn names_cover_every_string_c_definition() {
+        let names = function_names(STRING_C);
+        assert_eq!(names.len(), 17, "{names:?}");
+        for expected in [
+            "memcpy", "memmove", "memset", "memcmp", "strlen", "strnlen", "strcpy", "strncpy",
+            "strcat", "strncat", "strcmp", "strncmp", "memchr", "strchr", "strrchr", "strstr",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn removing_memset_keeps_every_other_definition() {
+        let reduced = without_functions(STRING_C, &HashSet::from(["memset".to_string()]));
+        assert!(!function_names(&reduced).contains(&"memset"));
+        assert_eq!(function_names(&reduced).len(), 16);
+        assert!(reduced.contains("#include <string.h>"));
+    }
+
+    #[test]
+    fn removing_strcmp_removes_both_core_branches() {
+        let reduced = without_functions(STRING_C, &HashSet::from(["strcmp".to_string()]));
+        assert!(!function_names(&reduced).contains(&"strcmp"));
+        assert!(reduced.contains("#ifdef _PIC18"));
+        assert!(reduced.contains("#else"));
+        assert!(reduced.contains("#endif"));
+    }
+
+    #[test]
+    fn removing_nothing_is_byte_identical() {
+        assert_eq!(without_functions(STRING_C, &HashSet::new()), STRING_C);
+    }
+
+    #[test]
+    fn externally_defined_reads_define_lines_only() {
+        let ll = "declare ptr @memset(ptr, i16, i16)\n\
+                  define dso_local ptr @memset(ptr %s, i16 %c, i16 %n) {\n}\n\
+                  define internal ptr @helper(ptr %s) {\n}\n\
+                  define weak ptr @wobble(ptr %s) {\n}\n\
+                  define ptr @_Z3fooPc(ptr %s) {\n}\n";
+        let names = externally_defined(ll);
+        assert_eq!(names.get("memset"), Some(&3));
+        assert_eq!(names.get("_Z3fooPc"), Some(&1));
+        assert!(!names.contains_key("helper"));
+        assert!(!names.contains_key("wobble"));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn function_arities_match_the_library_signatures() {
+        let arities = function_arities(STRING_C);
+        assert_eq!(arities.get("memset"), Some(&3));
+        assert_eq!(arities.get("strlen"), Some(&1));
+        assert_eq!(arities.get("strcmp"), Some(&2));
+        assert_eq!(arities.len(), 16);
+    }
+}
