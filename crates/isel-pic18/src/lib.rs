@@ -3027,6 +3027,56 @@ impl<'m> Gen<'m> {
         }
         (fold, mid)
     }
+    /// Whether materializing `%r` can reach `emit_gep_sum_to_fsr1`: a
+    /// slot-base GEP with a constant offset plus terms, or with several
+    /// terms. That sum clobbers FSR1, so no walk may hold a pointer
+    /// across an emission that reads such a value.
+    fn gep_sum_uses_fsr1(g: &Gen, f: &Func, r: &str) -> bool {
+        matches!(
+            g.resolved.get(&iselcore::ssa_key(&f.name, r)),
+            Some((iselcore::Base::Slot(..), k, terms))
+                if (*k != 0 && !terms.is_empty()) || terms.len() > 1
+        )
+    }
+    fn val_gep_sum_uses_fsr1(g: &Gen, f: &Func, v: &Val) -> bool {
+        let Val::Reg(r) = v else { return false };
+        Self::gep_sum_uses_fsr1(g, f, r)
+            || match g.fold_reg(v) {
+                Val::Reg(fr) => fr != *r && Self::gep_sum_uses_fsr1(g, f, &fr),
+                _ => false,
+            }
+    }
+    /// Whether a walk over block `b` would emit an FSR1 GEP sum while its
+    /// pointers are live: an `Emit` body op reading such a GEP, or a
+    /// back-edge phi copy (from `back_label`) carrying one into the latch.
+    fn walk_gep_sum_hazard(
+        g: &Gen,
+        f: &Func,
+        b: &Block,
+        body: &[WalkOp],
+        back_label: &str,
+    ) -> bool {
+        for op in body {
+            if let WalkOp::Emit(ii) = op {
+                if ir::read_vals(&b.insts[*ii])
+                    .iter()
+                    .any(|r| Self::gep_sum_uses_fsr1(g, f, r))
+                {
+                    return true;
+                }
+            }
+        }
+        for inst in &b.insts {
+            if let Inst::Phi(p) = inst {
+                for (v, e) in &p.incoming {
+                    if e == back_label && Self::val_gep_sum_uses_fsr1(g, f, v) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
     /// Walk-loop pre-scan (epic-cc#896): single-block counted loops whose
     /// index feeds only `PLUSW`-shaped accesses, closed by an increment
     /// compared against 1..=255. Runs after every fold so shape checks see
@@ -3465,6 +3515,8 @@ impl<'m> Gen<'m> {
             return None;
         }
         Self::walk_finish(
+            g,
+            f,
             b,
             uses,
             pre,
@@ -3681,6 +3733,8 @@ impl<'m> Gen<'m> {
     /// read nowhere else; every counter read must sit on the pattern;
     /// every pointer must read and write in one direction only.
     fn walk_finish(
+        g: &Gen,
+        f: &Func,
         b: &Block,
         uses: &HashMap<String, Vec<(String, usize)>>,
         pre: String,
@@ -3857,6 +3911,11 @@ impl<'m> Gen<'m> {
             if hits[fsr] != 1 {
                 return None;
             }
+        }
+        // An FSR1 GEP sum in an emitted op or back-edge copy would
+        // clobber a live walk pointer (epic-cc#1473).
+        if !groups.is_empty() && Self::walk_gep_sum_hazard(g, f, b, &paired, &b.label) {
+            return None;
         }
         let ptrs = groups
             .iter()
@@ -4178,14 +4237,24 @@ impl<'m> Gen<'m> {
     /// proxy mirrors the single-block scan's own threshold, and the
     /// counter slot must stay disjoint from the outer down-counter.
     fn outer_middle_ok(
-        _g: &Gen,
-        _f: &Func,
+        g: &Gen,
+        f: &Func,
         m: &Block,
         region: &HashSet<String>,
         header: &str,
         count_slot: u16,
         walks: &HashMap<String, WalkLoop>,
     ) -> Option<()> {
+        // Middle emissions run while the outer pointers are live, so an
+        // FSR1 GEP sum read here would clobber one (epic-cc#1473).
+        for inst in &m.insts {
+            if ir::read_vals(inst)
+                .iter()
+                .any(|r| Self::gep_sum_uses_fsr1(g, f, r))
+            {
+                return None;
+            }
+        }
         let inner = walks.get(&m.label)?;
         if !inner.ptrs.is_empty() {
             return None;
@@ -4468,6 +4537,8 @@ impl<'m> Gen<'m> {
             return None;
         }
         Self::outer_finish(
+            g,
+            f,
             h,
             uses,
             pre,
@@ -4495,6 +4566,8 @@ impl<'m> Gen<'m> {
     /// what keeps the middle quiet: any middle read of either reg fails
     /// here. Every pointer must read and write in one direction only.
     fn outer_finish(
+        g: &Gen,
+        f: &Func,
         h: &Block,
         uses: &HashMap<String, Vec<(String, usize)>>,
         pre: String,
@@ -4663,6 +4736,11 @@ impl<'m> Gen<'m> {
             if hits[fsr] != 1 {
                 return None;
             }
+        }
+        // Same FSR1 hazard as the single-block epilogue: the latch
+        // carries the back-edge copies, so its label names that edge.
+        if Self::walk_gep_sum_hazard(g, f, h, &paired, latch) {
+            return None;
         }
         let ptrs = groups
             .iter()
@@ -9062,7 +9140,10 @@ impl<'m> Gen<'m> {
     /// finished address back byte by byte. FSR1 is safe scratch here:
     /// its only other users (memcpy source, staged-copy drains) seed it
     /// inside their own emission and never hold it across a value load
-    /// or move, and FSR0 may be live for a store destination. The sum
+    /// or move, and FSR0 may be live for a store destination. Counted
+    /// walks do hold FSR1 across body emissions, so their scans reject
+    /// any op or back-edge copy that could reach this sum (epic-cc#1473).
+    /// The sum
     /// reuses the indirect-slot forms (MULWF or shift-add chain for a
     /// large scale, naive carry adds otherwise), so carries stay exact.
     fn emit_gep_sum_to_fsr1(&mut self, slot_addr: u16, k: u16, terms: &[(u16, String)]) {
