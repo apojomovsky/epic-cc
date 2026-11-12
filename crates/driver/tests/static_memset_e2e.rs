@@ -53,7 +53,10 @@ int main(void) {
 "#;
 
 #[test]
-fn static_memset_zero_init_is_a_named_error_not_an_ice() {
+fn unused_static_memset_zero_init_compiles() {
+    // The unused static definition is deleted by clang, so the
+    // driver's own memset unit serves the intrinsic and the static
+    // helper never has to (epic-cc#1448, epic-cc#1453).
     let body = format!(
         r#"
 __attribute__((noinline)) static void *memset(void *s, int c, unsigned long n) {{
@@ -64,16 +67,9 @@ __attribute__((noinline)) static void *memset(void *s, int c, unsigned long n) {
 {ZERO_INIT}"#
     );
     let out = compile("static-memset.c", &body);
-    assert!(!out.status.success(), "compile should fail");
-    assert_eq!(out.status.code(), Some(1));
     let err = stderr_of(&out);
-    assert!(err.contains("error:"), "{err}");
-    assert!(err.contains("static"), "{err}");
-    assert!(err.contains("memset"), "{err}");
-    assert!(err.contains("llvm.memset"), "{err}");
-    assert!(!err.contains("internal compiler error"), "{err}");
-    assert!(!err.contains("unreachable-body"), "{err}");
-    assert!(!err.contains("panicked at"), "{err}");
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("static memset cannot serve"), "{err}");
 }
 
 #[test]
@@ -141,7 +137,7 @@ int main(void) {
 }
 
 #[test]
-fn static_memset_in_header_is_a_named_error_not_an_ice() {
+fn static_memset_in_header_compiles() {
     let dir = std::env::temp_dir().join(format!("epic-static-memset-hdr-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("make temp dir");
     let header = dir.join("helper.h");
@@ -170,12 +166,11 @@ __attribute__((noinline)) static void *memset(void *s, int c, unsigned long n) {
         ])
         .output()
         .expect("run driver");
+    // As in the same-TU case, clang deletes the unused header static
+    // per TU, so the driver memset serves the intrinsic.
     let err = stderr_of(&out);
-    assert!(!out.status.success(), "compile should fail: {err}");
-    assert!(err.contains("static memset"), "{err}");
-    assert!(err.contains("llvm.memset"), "{err}");
-    assert!(!err.contains("internal compiler error"), "{err}");
-    assert!(!err.contains("panicked at"), "{err}");
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("static memset cannot serve"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

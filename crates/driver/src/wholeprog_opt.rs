@@ -1417,6 +1417,9 @@ declare void @llvm.memset.p0.i16(ptr, i8, i16, i1) #1
         let mut api = public_api(with_direct_call);
         api.sort();
         assert_eq!(api, vec!["main".to_string(), "memset".to_string()]);
+    }
+
+    #[test]
     fn static_memset_with_intrinsic_is_rejected() {
         let intrinsic = "  call void @llvm.memset.p0.i16(ptr %1, i8 0, i16 48, i1 false)\n";
         let internal = format!("define internal fastcc void @memset() #0 {{\n}}\n{intrinsic}");
