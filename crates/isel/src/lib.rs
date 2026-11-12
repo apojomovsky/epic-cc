@@ -1846,20 +1846,8 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
                                 }
                             }
-                            [(1, reg1), (1, reg2)] => {
-                                let ra1 = self.val_addr(&Val::Reg(reg1.clone())).direct();
-                                let ra2 = self.val_addr(&Val::Reg(reg2.clone())).direct();
-                                if idx == 0 {
-                                    self.emit(format!("    MOVLW 0x{lo:02X}"));
-                                    self.emit(format!("    ADDWF 0x{ra1:02X}, W"));
-                                    self.emit(format!("    ADDWF 0x{ra2:02X}, W"));
-                                } else {
-                                    self.emit(format!("    MOVLW 0x{hi:02X}"));
-                                    self.emit("    BTFSC STATUS, 0".to_string());
-                                    self.emit("    ADDLW 0x01".to_string());
-                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra1 + 1));
-                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra2 + 1));
-                                }
+                            [(1, _), (1, _)] => {
+                                self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx)
                             }
                             _ => self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx),
                         }
@@ -1945,35 +1933,10 @@ impl<'m> Gen<'m> {
                                 }
                             }
                         }
-                        [(1, reg1), (1, reg2)] if k == 0 => {
-                            let ra1 = self.val_addr(&Val::Reg(reg1.clone())).direct();
-                            let ra2 = self.val_addr(&Val::Reg(reg2.clone())).direct();
-                            if let Some(addr) = base_lit {
-                                let b = ((addr >> (u32::from(idx) * 8)) & 0xFF) as u8;
-                                self.emit(format!("    MOVLW 0x{b:02X}"));
-                            } else if idx == 0 {
-                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
-                            } else {
-                                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
-                            }
-                            // Byte 0's carry into byte 1 must be consumed
-                            // before byte 1's own adds: both the literal base
-                            // and the runtime slot read leave the low byte's
-                            // carry in STATUS.C, and the two ADDWFs below do
-                            // not (the first ADDWF sets C itself, but only
-                            // after the high byte is already in W).
-                            if idx != 0 {
-                                self.emit("    BTFSC STATUS, 0".to_string());
-                                self.emit("    ADDLW 0x01".to_string());
-                            }
-                            if idx == 0 {
-                                self.emit(format!("    ADDWF 0x{ra1:02X}, W"));
-                                self.emit(format!("    ADDWF 0x{ra2:02X}, W"));
-                            } else {
-                                self.emit(format!("    ADDWF 0x{:02X}, W", ra1 + 1));
-                                self.emit(format!("    ADDWF 0x{:02X}, W", ra2 + 1));
-                            }
-                        }
+                        [(1, _), (1, _)] if k == 0 => match base_lit {
+                            Some(addr) => self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx),
+                            None => self.emit_gep_value_byte(None, sa, k, &terms, idx),
+                        },
                         _ => match base_lit {
                             Some(addr) => self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx),
                             None => self.emit_gep_value_byte(None, sa, k, &terms, idx),
