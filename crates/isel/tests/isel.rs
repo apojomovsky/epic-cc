@@ -10207,6 +10207,108 @@ fn isr_scratch_use_does_not_corrupt_preempted_main() {
     );
 }
 
+#[test]
+fn isr_gep_value_does_not_corrupt_preempted_main_gep_value() {
+    // Both contexts materialize a scaled GEP pointer value (k + 12*idx)
+    // into a global. The pair holding the half-built sum must survive an
+    // interrupt taken after its low byte is seeded: the ISR builds its
+    // own sum in the same place, so only an ISR save/restore of the pair
+    // (here: the pair lives in the already-saved retval bytes) keeps
+    // main's read-back exact. Main: 0x120 + 6 + 12*23 = 0x23A.
+    // ISR: 0x40 + 6 + 12*1 = 0x52.
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal in i16\nglobal jn i16\nglobal gp i16\nglobal gp2 i16\n\
+         fn main(void) ()\n  block entry:\n    %i = load i16 @in\n    %p = gep @a +6 +12*%i\n    store i16 %p @gp\n    ret void\n\
+         fn isr(void) [isr] ()\n  block entry:\n    %j = load i16 @jn\n    %q = gep @b +6 +12*%j\n    store i16 %q @gp2\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x120),
+        ("b", 0x40),
+        ("in", 0x20),
+        ("jn", 0x22),
+        ("gp", 0x24),
+        ("gp2", 0x26),
+        ("main::i", 0x30),
+        ("main::p", 0x32),
+        ("isr::j", 0x34),
+        ("isr::q", 0x36),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        asm.contains("MOVWF 0x73"),
+        "GEP pair must live in the ISR-saved retval bytes 0x73/0x74:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVWF 0x7E") && !asm.contains("MOVWF 0x7F"),
+        "GEP pair must not use the unsaved 0x7E/0x7F pair:\n{asm}"
+    );
+    use pic14_sim::Pic14;
+    let mut p = Pic14::new(asm::assemble(&asm));
+    p.ram_mut()[0x20] = 23;
+    p.ram_mut()[0x21] = 0;
+    p.ram_mut()[0x22] = 1;
+    p.ram_mut()[0x23] = 0;
+    // Step until main's low seed (0x120 + 6 = 0x26 low byte) lands in the
+    // pair, then fire mid-sequence.
+    let mut steps = 0usize;
+    while p.ram()[0x73] != 0x26 {
+        p.step();
+        steps += 1;
+        assert!(steps < 500, "never seeded the GEP pair (pc={})", p.pc());
+    }
+    p.fire_interrupt();
+    assert_eq!(p.pc(), 4, "the ISR starts at the vector");
+    p.run(500_000);
+    assert!(p.halted(), "program must SLEEP-halt");
+    assert_eq!(p.ram()[0x26], 0x52, "ISR pointer value low byte");
+    assert_eq!(p.ram()[0x27], 0x00, "ISR pointer value high byte");
+    assert_eq!(
+        p.ram()[0x24],
+        0x3A,
+        "main pointer value low byte survives ISR"
+    );
+    assert_eq!(
+        p.ram()[0x25],
+        0x02,
+        "main pointer value high byte survives ISR"
+    );
+}
+
+#[test]
+fn gep_pair_is_derived_from_the_devices_common_ram() {
+    // p16f84a common RAM is 0x40-0x4F: scratch 0x40, retval 0x41-0x44,
+    // so the ISR-saved pair is 0x43/0x44, never 0x7E/0x7F.
+    let m = parse(
+        "global a i8\nglobal in i16\nglobal gp i16\n\
+         fn main(void) ()\n  block entry:\n    %i = load i16 @in\n    %p = gep @a +6 +12*%i\n    store i16 %p @gp\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x30),
+        ("in", 0x20),
+        ("gp", 0x24),
+        ("main::i", 0x28),
+        ("main::p", 0x2A),
+    ]);
+    let asm = select(&device::PIC16F84, &m, &addrs);
+    assert!(
+        asm.contains("MOVWF 0x43"),
+        "p16f84a GEP pair must be its own 0x43/0x44:\n{asm}"
+    );
+    assert!(
+        !asm.contains("0x7E") && !asm.contains("0x7F"),
+        "p16f84a asm must not touch 0x7E/0x7F:\n{asm}"
+    );
+    // And it runs on the part: in == 3 -> gp == 0x30 + 6 + 12*3 = 0x5A.
+    use pic14_sim::Pic14;
+    let mut p = Pic14::with_device(&device::PIC16F84, asm::assemble(&asm));
+    p.ram_mut()[0x20] = 3;
+    p.ram_mut()[0x21] = 0;
+    p.run(500_000);
+    assert!(p.halted(), "program must SLEEP-halt");
+    assert_eq!(p.ram()[0x24], 0x5A, "p16f84a pointer value low byte");
+    assert_eq!(p.ram()[0x25], 0x00, "p16f84a pointer value high byte");
+}
+
 // ---------------------------------------------------------------------------
 // Milestone 15, Task 3: the soft-float runtime routines (isel recipes).
 // ---------------------------------------------------------------------------

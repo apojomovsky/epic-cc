@@ -421,6 +421,73 @@ fn gep_k_terms_ptr_value_c_runs_correctly() {
 }
 
 #[test]
+fn gep_isr_c_preempted_mid_gep_value_stays_correct() {
+    // Fire after main's GEP pair low seed lands; the ISR materializes
+    // its own scaled pointer value in the same pair. Only the ISR
+    // prologue's retval save (the pair is retval bytes 2/3) keeps
+    // main's sum exact: out == 0x51, out2 == 0x52.
+    let (mut p, globals, asm, _locals) = compile_with_layout(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gep_isr.c"
+    ));
+    assert!(
+        asm.contains("MOVWF 0x73"),
+        "GEP pair must live in the ISR-saved retval bytes 0x73/0x74:\n{asm}"
+    );
+    // The low seed literal: the MOVLW right before main's first
+    // pair store (the ISR epilogue also stores 0x73, earlier in the
+    // asm, so the search starts at main's label).
+    let seed = {
+        let mut in_main = false;
+        let mut last_lit = None;
+        let mut found = None;
+        for line in asm.lines() {
+            let t = line.trim();
+            if t == "main:" {
+                in_main = true;
+            }
+            if !in_main {
+                continue;
+            }
+            if let Some(v) = t.strip_prefix("MOVLW 0x") {
+                last_lit = u8::from_str_radix(&v[..2], 16).ok();
+            }
+            if t == "MOVWF 0x73" {
+                found = last_lit;
+                break;
+            }
+        }
+        found.expect("asm seeds the GEP pair in main")
+    };
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 23;
+    p.ram_mut()[in_addr + 1] = 0;
+    let in2_addr = globals["in2"] as usize;
+    p.ram_mut()[in2_addr] = 1;
+    p.ram_mut()[in2_addr + 1] = 0;
+    let mut steps = 0usize;
+    while p.ram()[0x73] != seed {
+        p.step();
+        steps += 1;
+        assert!(steps < 100_000, "never seeded the GEP pair (pc={})", p.pc());
+    }
+    p.fire_interrupt();
+    assert_eq!(p.pc(), 0x0004, "the ISR starts at the vector");
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x51,
+        "out == main sentinel after mid-GEP interrupt"
+    );
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        0x52,
+        "out2 == ISR sentinel"
+    );
+    assert!(p.halted());
+}
+
+#[test]
 fn gep_k_terms_alloca_c_runs_correctly() {
     // in == 23 (fixture comment) -> out == 0x63.
     let (mut p, globals) = compile(concat!(

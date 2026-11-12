@@ -1173,19 +1173,20 @@ impl<'m> Gen<'m> {
     /// Runtime-length memcpy: `len` is a 16-bit SSA register,
     /// SSA-dead after this copy, so the copy may consume it. The loop
     /// copies one byte per iteration; EVERY byte of the loop state lives
-    /// in fixed common RAM: countdown 0x71/0x72 (the retval bytes, dead
-    /// at a memcpy), byte index 0x7E (the documented free byte), held byte
-    /// 0x7F, so the banking pass can never insert a BANKSEL inside the
-    /// loop and the skip-sensitive test/branch pairs keep their targets:
+    /// in fixed common RAM: countdown in the low retval bytes (dead
+    /// at a memcpy), byte index and held byte in the park pair (the
+    /// high retval bytes, ISR-saved like the countdown), so the
+    /// banking pass can never insert a BANKSEL inside the loop and
+    /// the skip-sensitive test/branch pairs keep their targets:
     ///
-    ///   count = len                          ; 0x71 = lo, 0x72 = hi
-    ///   idx = 0                              ; 0x7E
-    ///   l_loop:  if (0x71 | 0x72) == 0 -> l_done
-    ///            FSR = src_base + k + terms + idx; W = INDF; 0x7F = W
-    ///            FSR = dst_base + k + terms + idx; W = 0x7F; INDF = W
-    ///            idx++                       ; INCF 0x7E
-    ///            countdown-- (16-bit)        ; MOVLW 1 / SUBWF 0x71,F /
-    ///                                         ; BTFSS STATUS,0 / SUBWF 0x72,F
+    ///   count = len                          ; retval lo/hi
+    ///   idx = 0                              ; park pair lo
+    ///   l_loop:  if (count) == 0 -> l_done
+    ///            FSR = src_base + k + terms + idx; W = INDF; hold = W
+    ///            FSR = dst_base + k + terms + idx; W = hold; INDF = W
+    ///            idx++                       ; INCF park pair lo
+    ///            countdown-- (16-bit)        ; MOVLW 1 / SUBWF cnt,F /
+    ///                                         ; BTFSS STATUS,0 / SUBWF cnt+1,F
     ///            GOTO l_loop
     ///   l_done:
     ///
@@ -1203,12 +1204,12 @@ impl<'m> Gen<'m> {
     fn emit_memcpy_dynamic(&mut self, dst: &Val, src: &Val, len: &Val) {
         let l_loop = self.fresh_label();
         let l_done = self.fresh_label();
-        let cnt_lo: u16 = self.retval_lo; // 0x71, dead at a memcpy
-        let cnt_hi: u16 = self.retval_lo + 1; // 0x72
-        let idx: u16 = 0x7E; // documented free common byte
-        let hold: u16 = 0x7F; // documented free common byte
-                              // FSR = base + k + terms + idx for one byte of a pointer; the FSR
-                              // must be re-set per byte (one FSR on classic mid-range).
+        let cnt_lo: u16 = self.retval_lo; // dead at a memcpy
+        let cnt_hi: u16 = self.retval_lo + 1;
+        let idx: u16 = self.park_pair(); // ISR-saved retval bytes
+        let hold: u16 = self.park_pair() + 1;
+        // FSR = base + k + terms + idx for one byte of a pointer; the FSR
+        // must be re-set per byte (one FSR on classic mid-range).
         let emit_byte_fsr = |g: &mut Self, ptr: &Val| {
             let (base, k, terms) = match ptr {
                 Val::Reg(r) => g.resolved_for(r),
@@ -1682,14 +1683,35 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// W = byte `idx` of `base + k + terms`, summed in the free common
-    /// pair because a per-byte emission cannot recover the low sum's
+    /// The shared two-byte park pair: the top two retval bytes,
+    /// derived from the device's common-RAM base (`retval_lo` is
+    /// `common_lo + 1`, so the pair is `common_lo + 3/+4`). Both ISR
+    /// prologues already save and restore the whole retval region, so
+    /// a half-built sum or a memcpy index parked here survives an
+    /// interrupt whose handler builds its own sum in the same bytes;
+    /// the old free-tail pair past the ISR save area had no shadow.
+    /// Panics when the device's fixed region cannot supply the pair.
+    fn park_pair(&self) -> u16 {
+        let (lo, hi) = self
+            .device
+            .common_ram
+            .or(self.device.isr_home_window)
+            .expect("isel: park pair needs a common-RAM region or an isr_home_window");
+        let pair = self.retval_lo + 2;
+        assert!(
+            pair + 1 <= hi && pair >= lo,
+            "isel: {} common RAM 0x{lo:02X}-0x{hi:02X} cannot supply a park pair after the fixed scratch/retval/ISR-save layout",
+            self.device.name
+        );
+        pair
+    }
+
+    /// W = byte `idx` of `base + k + terms`, summed in the park pair
+    /// because a per-byte emission cannot recover the low sum's
     /// carry once a term is scaled or a third addend joins: seeding
     /// the pair with the full constant part and adding every term
     /// through the carry-exact slot helper keeps byte 1 exact for
-    /// any scale and term count. The pair already parks bytes for
-    /// memcpy, and no call sits inside the sequence, so nothing can
-    /// observe the half-built sum.
+    /// any scale and term count. No call sits inside the sequence.
     fn emit_gep_value_byte(
         &mut self,
         lit: Option<u16>,
@@ -1698,7 +1720,8 @@ impl<'m> Gen<'m> {
         terms: &[(u16, String)],
         idx: u8,
     ) {
-        let t_lo: u16 = 0x7E;
+        assert!(idx <= 1, "isel: GEP value byte index {idx} out of range");
+        let t_lo: u16 = self.park_pair();
         if let Some(addr) = lit {
             self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
             self.emit(format!("    MOVWF 0x{t_lo:02X}"));
