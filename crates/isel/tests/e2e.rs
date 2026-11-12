@@ -140,6 +140,8 @@ fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
         0x33,
         "the laundered address of a local must read back the local's byte"
     );
+}
+
 #[test]
 fn gep_k_terms_ptr_value_c_runs_correctly() {
     // in == 23 (fixture comment) -> out == 0x33, out2/out4 == 0x51.
