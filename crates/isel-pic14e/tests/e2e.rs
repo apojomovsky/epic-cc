@@ -1028,4 +1028,9 @@ fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
         0x33,
         "the laundered address of a local must read back the local's byte"
     );
+    assert_eq!(
+        p.ram()[globals["out3"] as usize],
+        0x44,
+        "the laundered address of arr[3] must read back its byte"
+    );
 }

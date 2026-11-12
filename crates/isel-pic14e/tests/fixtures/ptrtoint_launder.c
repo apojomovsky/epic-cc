@@ -21,18 +21,26 @@
 // constant-expression `ptrtoint`, which the frontend does not parse yet
 // (epic-cc#1422); that shape is out of scope here.
 //
+// A third shape laundered a runtime-index GEP over a RAM array, whose
+// address is computed, not loaded or a frame literal.
+//
 // Expected: out == 0x5A, the byte `g` holds, read back through the
-// laundered address of `g`; and out2 == 0x33, the byte at the laundered
+// laundered address of `g`; out2 == 0x33, the byte at the laundered
 // address of the local, proving the local's address is the local's own
-// slot and not some other frame address.
+// slot and not some other frame address; out3 == 0x44, arr[3] read
+// back through its computed laundered address.
 typedef unsigned int uintptr_t;
 
 volatile unsigned char g = 0x5A;
 volatile unsigned char out;
 volatile unsigned char out2;
+volatile unsigned char out3;
+volatile unsigned short idx_in = 3;
+volatile unsigned char arr[8];
 
 volatile uintptr_t laundered;
 volatile uintptr_t laundered_local;
+volatile uintptr_t laundered_gep;
 
 void main(void) {
     /* Shape 1: a pointer loaded from a RAM global. */
@@ -44,4 +52,9 @@ void main(void) {
     unsigned char local = 0x33;
     laundered_local = (uintptr_t)&local;
     out2 = *(unsigned char *)laundered_local;
+
+    /* Shape 3: a runtime-index GEP over a RAM array. */
+    arr[3] = 0x44;
+    laundered_gep = (uintptr_t)&arr[idx_in & 7u];
+    out3 = *(unsigned char *)laundered_gep;
 }
