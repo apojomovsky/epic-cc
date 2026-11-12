@@ -113,3 +113,31 @@ fn multi_term_ptr_arg_c_runs_correctly() {
     );
     assert!(p.halted());
 }
+
+/// epic-cc#1433: a pointer laundered through `uintptr_t` lowers as a
+/// same-width `trunc i16 -> i16`, and the backend used to refuse it
+/// ("trunc must narrow"), aborting the compile.
+///
+/// The fixture reads the byte back through the laundered address for
+/// both a loaded-global pointer and a local's address, so a wrong
+/// address reads the wrong byte.
+#[test]
+fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ptrtoint_launder.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the laundered address of a global must read back g's byte"
+    );
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        0x33,
+        "the laundered address of a local must read back the local's byte"
+    );
+}

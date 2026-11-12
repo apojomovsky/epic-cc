@@ -4368,8 +4368,13 @@ impl<'m> Gen<'m> {
             Inst::Trunc(t) => {
                 // i1 and i8 are both one byte, so the byte widths alone do not
                 // separate `trunc i8 -> i1` (narrowing) from a widening trunc.
+                // A same-width trunc is the `ptrtoint` spelling (epic-cc#1433):
+                // `emit_load_byte` materializes a pointer source's address,
+                // so the copy below moves the address, not pointee bytes.
                 assert!(
-                    t.from.bytes() > t.to.bytes() || (t.to == Ty::I1 && t.from != Ty::I1),
+                    t.from.bytes() > t.to.bytes()
+                        || t.from == t.to
+                        || (t.to == Ty::I1 && t.from != Ty::I1),
                     "isel: trunc must narrow"
                 );
                 let da = self.slot_addr(self.cur_func, &t.dst).direct();
