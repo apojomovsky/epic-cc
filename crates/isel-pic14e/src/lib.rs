@@ -113,6 +113,29 @@ fn fsr_base(device: &Device, base_addr: u16, span: u16) -> u16 {
     0x2000 + (bank as u16) * 80 + ((base_addr & 0x7F) - 0x20)
 }
 
+/// Returns the physical address of byte `idx` of an object at `base`:
+/// the placement walk in `alloc`, stepping over the gap between GPR
+/// banks, so a straddling object's tail lands in the next bank instead
+/// of the common-RAM alias window the gap contains.
+fn physical_byte_addr(device: &Device, base: u16, idx: u16) -> u16 {
+    let mut cur = base;
+    let mut remaining = idx;
+    loop {
+        let (start, end) = device
+            .region_for(cur)
+            .expect("isel: global byte outside GPR space");
+        if cur < start {
+            cur = start;
+        }
+        let avail = end - cur + 1;
+        if remaining < avail {
+            return cur + remaining;
+        }
+        remaining -= avail;
+        cur = end + 1;
+    }
+}
+
 /// How a single-byte pointer access completes after `emit_ptr_setup`.
 enum Addr {
     /// A plain file register (the address is statically known).
@@ -8068,7 +8091,10 @@ pub fn select_with_locs(
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
-                    init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
+                    init.push(format!(
+                        "    MOVWF 0x{:02X}",
+                        physical_byte_addr(device, base, i as u16)
+                    ));
                 }
             }
         }
@@ -8124,8 +8150,8 @@ pub fn select_with_locs(
     let mut global_addrs: HashSet<u16> = HashSet::new();
     for g in &m.globals {
         if let Some(&a) = addrs.get(&g.name) {
-            for i in 0..g.size as u16 {
-                global_addrs.insert(a + i);
+            for i in 0..g.size {
+                global_addrs.insert(physical_byte_addr(device, a, i));
             }
         }
     }
@@ -8198,7 +8224,10 @@ pub fn select_with_locs(
                         } else {
                             init.push(format!("    MOVLW 0x{b:02X}"));
                         }
-                        init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
+                        init.push(format!(
+                            "    MOVWF 0x{:02X}",
+                            physical_byte_addr(device, base, i as u16)
+                        ));
                     }
                 }
             }
@@ -8231,7 +8260,10 @@ pub fn select_with_locs(
                             } else {
                                 init.push(format!("    MOVLW 0x{b:02X}"));
                             }
-                            init.push(format!("    MOVWF 0x{:02X}", base + idx as u16));
+                            init.push(format!(
+                                "    MOVWF 0x{:02X}",
+                                physical_byte_addr(device, base, idx as u16)
+                            ));
                         }
                     }
                 }
@@ -8576,7 +8608,10 @@ pub fn select_with_locs(
                                     } else {
                                         init.push(format!("    MOVLW 0x{b:02X}"));
                                     }
-                                    init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
+                                    init.push(format!(
+                                        "    MOVWF 0x{:02X}",
+                                        physical_byte_addr(device, base, i as u16)
+                                    ));
                                 }
                             }
                         }
