@@ -843,6 +843,103 @@ fn zext_of_a_flash_gep_materializes_the_label() {
 }
 
 #[test]
+fn scevgep_icmp_loop_sums_through_deref() {
+    // epic-cc#1479: an LSR walk compares its step GEP against the end
+    // GEP to leave the loop. Both GEP dsts are virtual (no slot), so
+    // the compare must materialize both addresses; the walk itself
+    // dereferences the phi pointer each trip, so the sum proves the
+    // compared values and the dereferenced bytes agree.
+    let ir = "global arr i8\nglobal out i8\n\
+              fn main(void) ()\n  block entry:\n    %b = gep @arr +0\n    br header\n  block header:\n    %p = phi ptr %scevgep header %b entry\n    %acc = phi i8 %acc2 header 0 entry\n    %v = load i8 %p\n    %acc2 = add i8 %acc, %v\n    %scevgep = gep %p +1\n    %end = gep @arr +4\n    %c = icmp eq ptr %scevgep, %end\n    br i1 %c exit header\n  block exit:\n    store i8 %acc2 @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let arr = map["arr"];
+    let out = map["out"];
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for (i, v) in [10u8, 20, 30, 40].iter().enumerate() {
+        p.ram_mut()[arr as usize + i] = *v;
+    }
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(
+        p.ram()[out as usize],
+        100,
+        "the walk must deref arr[0..4] and exit on the GEP compare:\n{asm}"
+    );
+}
+
+#[test]
+fn scevgep_icmp_values_materialize_and_deref() {
+    // The materializing (non-fused) compare forms: both-GEP eq and
+    // ult, plus a GEP on the left against a slotted pointer, which
+    // swaps sides. The deref through the step GEP afterwards proves
+    // the materialized address, not merely that code emitted.
+    let ir = "global arr i8\nglobal g i16\nglobal out i8\nglobal out2 i8\nglobal out3 i8\nglobal out4 i8\n\
+              fn main(void) ()\n  block entry:\n    %q = load ptr @g\n    %scevgep = gep @arr +2\n    %end = gep @arr +4\n    %c1 = icmp eq ptr %scevgep, %scevgep\n    store i8 %c1 @out\n    %c2 = icmp ult ptr %scevgep, %end\n    store i8 %c2 @out2\n    %c3 = icmp eq ptr %scevgep, %q\n    store i8 %c3 @out3\n    %v = load i8 %scevgep\n    store i8 %v @out4\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let arr = map["arr"];
+    let g = map["g"];
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for (i, v) in [10u8, 20, 30, 40].iter().enumerate() {
+        p.ram_mut()[arr as usize + i] = *v;
+    }
+    let want = arr + 2;
+    p.ram_mut()[g as usize] = want as u8;
+    p.ram_mut()[g as usize + 1] = (want >> 8) as u8;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(p.ram()[map["out"] as usize], 1, "gep == itself:\n{asm}");
+    assert_eq!(p.ram()[map["out2"] as usize], 1, "gep < end gep:\n{asm}");
+    assert_eq!(
+        p.ram()[map["out3"] as usize],
+        1,
+        "gep == loaded pointer:\n{asm}"
+    );
+    assert_eq!(
+        p.ram()[map["out4"] as usize],
+        30,
+        "deref through the step GEP reads arr[2]:\n{asm}"
+    );
+}
+
+#[test]
+fn scevgep_freeze_trunc_and_null_compare_deref() {
+    // Same slotless contract at the freeze, narrowing-trunc, and
+    // null-compare uses: each materializes the GEP address, and the
+    // frozen pointer dereferences the stepped element.
+    let ir = "global arr i8\nglobal g i16\nglobal out i8\nglobal out2 i8\nglobal out3 i8\n\
+              fn main(void) ()\n  block entry:\n    %scevgep = gep @arr +2\n    %f = freeze ptr %scevgep\n    store ptr %f @g\n    %q = load ptr @g\n    %v = load i8 %q\n    store i8 %v @out\n    %x = trunc i16 %scevgep to i8\n    store i8 %x @out2\n    %c = icmp eq ptr %scevgep, 0\n    store i8 %c @out3\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let arr = map["arr"];
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for (i, v) in [10u8, 20, 30, 40].iter().enumerate() {
+        p.ram_mut()[arr as usize + i] = *v;
+    }
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(
+        p.ram()[map["out"] as usize],
+        30,
+        "frozen GEP must deref arr[2]:\n{asm}"
+    );
+    assert_eq!(
+        p.ram()[map["out2"] as usize],
+        ((arr + 2) & 0xFF) as u8,
+        "trunc keeps the materialized low byte:\n{asm}"
+    );
+    assert_eq!(
+        p.ram()[map["out3"] as usize],
+        0,
+        "a stepped GEP is not null:\n{asm}"
+    );
+}
+
+#[test]
 fn sext_of_a_gep_materializes_the_address() {
     // The Sext arm shares the source resolution: a folded GEP must
     // materialize its address there too, and sign-fill from the byte
