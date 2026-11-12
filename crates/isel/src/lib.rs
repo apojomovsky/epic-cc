@@ -1682,6 +1682,50 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// W = byte `idx` of `base + k + terms`, summed in the free common
+    /// pair because a per-byte emission cannot recover the low sum's
+    /// carry once a term is scaled or a third addend joins: seeding
+    /// the pair with the full constant part and adding every term
+    /// through the carry-exact slot helper keeps byte 1 exact for
+    /// any scale and term count. The pair already parks bytes for
+    /// memcpy, and no call sits inside the sequence, so nothing can
+    /// observe the half-built sum.
+    fn emit_gep_value_byte(
+        &mut self,
+        lit: Option<u16>,
+        sa: u16,
+        k: u16,
+        terms: &[(u16, String)],
+        idx: u8,
+    ) {
+        let t_lo: u16 = 0x7E;
+        if let Some(addr) = lit {
+            self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+            self.emit(format!("    MOVWF 0x{t_lo:02X}"));
+            self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+            self.emit(format!("    MOVWF 0x{:02X}", t_lo + 1));
+        } else {
+            let k_lo = (k & 0xFF) as u8;
+            let k_hi = (k >> 8) as u8;
+            self.emit(format!("    MOVF 0x{sa:02X}, W"));
+            if k_lo != 0 {
+                self.emit(format!("    ADDLW 0x{k_lo:02X}"));
+            }
+            self.emit(format!("    MOVWF 0x{t_lo:02X}"));
+            self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+            if k_lo != 0 {
+                self.emit("    BTFSC STATUS, 0".to_string());
+                self.emit("    ADDLW 0x01".to_string());
+            }
+            if k_hi != 0 {
+                self.emit(format!("    ADDLW 0x{k_hi:02X}"));
+            }
+            self.emit(format!("    MOVWF 0x{:02X}", t_lo + 1));
+        }
+        self.emit_add_terms_to_ptr_slot(t_lo, terms);
+        self.emit(format!("    MOVF 0x{:02X}, W", t_lo + u16::from(idx)));
+    }
+
     /// W = byte `idx` of `val`.
     fn emit_load_byte(&mut self, val: &Val, idx: u8) {
         match val {
@@ -1765,13 +1809,9 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
                                 }
                             }
-                            _ => {
-                                assert!(
-                                    terms.len() == 2 && terms.iter().all(|(sc, _)| *sc == 1),
-                                    "isel: multi-term GEP load with {terms:?} not supported"
-                                );
-                                let ra1 = self.val_addr(&Val::Reg(terms[0].1.clone())).direct();
-                                let ra2 = self.val_addr(&Val::Reg(terms[1].1.clone())).direct();
+                            [(1, reg1), (1, reg2)] => {
+                                let ra1 = self.val_addr(&Val::Reg(reg1.clone())).direct();
+                                let ra2 = self.val_addr(&Val::Reg(reg2.clone())).direct();
                                 if idx == 0 {
                                     self.emit(format!("    MOVLW 0x{lo:02X}"));
                                     self.emit(format!("    ADDWF 0x{ra1:02X}, W"));
@@ -1784,6 +1824,7 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    ADDWF 0x{:02X}, W", ra2 + 1));
                                 }
                             }
+                            _ => self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx),
                         }
                         return;
                     }
@@ -1815,18 +1856,12 @@ impl<'m> Gen<'m> {
                     // actually adds something: a bare `MOVF` leaves the caller's
                     // carry standing, and propagating that adds a phantom 1.
                     let adds_in_byte0 = k != 0 || !terms.is_empty();
-                    assert!(
-                        k == 0 || terms.is_empty(),
-                        "isel: GEP with both a constant offset and dynamic terms \
-                         loses the term's carry; not supported"
-                    );
                     // An object slot (`alloca`) materializes its frame address
                     // as a LITERAL, exactly like `Base::Global`'s link-time
                     // constant: `sa` is that address, so byte `idx` is a plain
                     // `MOVLW` with `k` folded in. An address-holding slot
                     // (indirect / pointer param) instead reads its two bytes at
-                    // runtime. Terms stay the same shape either way (`k` is zero
-                    // whenever terms are present, per the assert above).
+                    // runtime.
                     let base_lit = (!holds_addr).then(|| sa.wrapping_add(k));
                     match terms.as_slice() {
                         [] => {
@@ -1846,7 +1881,7 @@ impl<'m> Gen<'m> {
                                 }
                             }
                         }
-                        [(1, reg)] => {
+                        [(1, reg)] if k == 0 => {
                             let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                             match (base_lit, idx == 0) {
                                 (Some(addr), true) => {
@@ -1873,13 +1908,9 @@ impl<'m> Gen<'m> {
                                 }
                             }
                         }
-                        _ => {
-                            assert!(
-                                terms.len() == 2 && terms.iter().all(|(sc, _)| *sc == 1),
-                                "isel: multi-term GEP load with {terms:?} not supported"
-                            );
-                            let ra1 = self.val_addr(&Val::Reg(terms[0].1.clone())).direct();
-                            let ra2 = self.val_addr(&Val::Reg(terms[1].1.clone())).direct();
+                        [(1, reg1), (1, reg2)] if k == 0 => {
+                            let ra1 = self.val_addr(&Val::Reg(reg1.clone())).direct();
+                            let ra2 = self.val_addr(&Val::Reg(reg2.clone())).direct();
                             if let Some(addr) = base_lit {
                                 let b = ((addr >> (u32::from(idx) * 8)) & 0xFF) as u8;
                                 self.emit(format!("    MOVLW 0x{b:02X}"));
@@ -1906,6 +1937,10 @@ impl<'m> Gen<'m> {
                                 self.emit(format!("    ADDWF 0x{:02X}, W", ra2 + 1));
                             }
                         }
+                        _ => match base_lit {
+                            Some(addr) => self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx),
+                            None => self.emit_gep_value_byte(None, sa, k, &terms, idx),
+                        },
                     }
                     return;
                 }
@@ -3498,7 +3533,13 @@ impl<'m> Gen<'m> {
                                 // object, so its address is a compile-time
                                 // constant. Materialize it as two literals
                                 // (epic-cc#125, e.g. `store_handle(&h)`).
-                                let addr = self.slot_addr(self.cur_func, sname).direct();
+                                // The constant folds into the literal at
+                                // compile time, so only the terms need
+                                // runtime adds.
+                                let addr = self
+                                    .slot_addr(self.cur_func, sname)
+                                    .direct()
+                                    .wrapping_add(k);
                                 self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                                 self.emit(format!("    MOVWF 0x{:02X}", pa));
                                 self.emit(format!(
@@ -3506,6 +3547,7 @@ impl<'m> Gen<'m> {
                                     ((addr >> 8) & 0xFF) as u8
                                 ));
                                 self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                                self.emit_add_terms_to_ptr_slot(pa, &terms);
                                 continue;
                             }
                             // A runtime-address slot (a seeded pointer

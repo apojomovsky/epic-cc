@@ -392,6 +392,54 @@ fn multi_term_ptr_arg_c_runs_correctly() {
 }
 
 #[test]
+fn gep_k_terms_ptr_value_c_runs_correctly() {
+    // in == 23 (fixture comment) -> out == 0x33, out2/out4 == 0x51.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gep_k_terms_ptr_value.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 23;
+    p.ram_mut()[in_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x33,
+        "out == field read on the small array"
+    );
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        0x51,
+        "out2 == deref of pointer value stored to a global"
+    );
+    assert_eq!(
+        p.ram()[globals["out4"] as usize],
+        0x51,
+        "out4 == deref of pointer-param pointer value stored to a global"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn gep_k_terms_alloca_c_runs_correctly() {
+    // in == 23 (fixture comment) -> out == 0x63.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gep_k_terms_alloca.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 23;
+    p.ram_mut()[in_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x63,
+        "out == deref of alloca pointer value stored to a global"
+    );
+    assert!(p.halted());
+}
+
+#[test]
 fn banked_ptr_c_runs_correctly() {
     // in low byte = 3 (high byte stays 0) -> out == 0xB8 (hand trace in
     // the fixture's comment).
