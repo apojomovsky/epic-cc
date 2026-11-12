@@ -76,6 +76,21 @@ fn cases() -> Vec<Case> {
         fixture: "dynamic_memcpy.c",
         has_isr: false,
     });
+    // A GEP pointer value with k + scaled terms and no memcpy: the
+    // park pair (now retval bytes 2/3) must be counted or the scan
+    // beats the report on both backends.
+    out.push(Case {
+        name: "gep-k-terms",
+        device: "16F877A",
+        fixture: "gep_k_terms_ptr_value.c",
+        has_isr: false,
+    });
+    out.push(Case {
+        name: "gep-k-terms",
+        device: "16F1937",
+        fixture: "gep_k_terms_ptr_value.c",
+        has_isr: false,
+    });
     // ISR rows: the prologue's 4-byte retval save has no IR shape, so
     // these are the rows that fail if the `has_isr` forcing regresses.
     out.push(Case {

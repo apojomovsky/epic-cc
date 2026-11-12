@@ -167,14 +167,17 @@ pub fn var_table_text(device: &Device, layout: &AllocLayout, vars: &DebugVars) -
 /// it only ever raises the count to 1). `scratch` is the PIC14/PIC14E
 /// common-RAM scratch byte; `memcpy_park` is the dynamic-memcpy index
 /// and hold bytes, `memcpy_hold` the constant-memcpy hold byte (PIC14E
-/// parks the byte across an indirect destination setup). PIC18 and
-/// baseline leave all three false: their fixed regions have none.
+/// parks the byte across an indirect destination setup), and
+/// `gep_park` a materialized GEP pointer value's sum. The park bytes
+/// are retval bytes 2/3, so they raise `retval_bytes` to 4 rather
+/// than adding bytes. PIC18 and baseline leave them false.
 pub struct FixedUses {
     pub retval_bytes: u8,
     pub flag: bool,
     pub scratch: bool,
     pub memcpy_park: bool,
     pub memcpy_hold: bool,
+    pub gep_park: bool,
 }
 /// Whether `name` is a flash const table. A const with a RAM copy
 /// lowers through RAM instead, but the copy decision lives in alloc,
@@ -198,6 +201,25 @@ fn param_holds_addr(module: &Module, func: &str, name: &str) -> bool {
 /// Direct bases keep the fast single-register shape for an empty or
 /// single scale-1 term list. An indirect slot has no fast shape on
 /// PIC14 (its setup always accumulates); PIC14E keeps it there too.
+/// Whether materializing a resolved pointer as a value builds its
+/// sum in the park pair (isel's `emit_gep_value_byte`): every shape
+/// outside the per-byte fast arms. A global base folds `k` into the
+/// literal, so its fast arms ignore `k`; a slot base does not.
+fn gep_value_park(resolved: &iselcore::PtrResolution, func: &str, val: &Val) -> bool {
+    let Val::Reg(r) = val else { return false };
+    let Some((base, k, terms)) = resolved.get(&iselcore::ssa_key(func, r)) else {
+        return false;
+    };
+    if terms.is_empty() {
+        return false;
+    }
+    let fast = matches!(terms.as_slice(), [(1, _)] | [(1, _), (1, _)]);
+    match base {
+        iselcore::Base::Global(_) => !fast,
+        iselcore::Base::Slot(..) => !(*k == 0 && fast),
+    }
+}
+
 fn ptr_terms_scratch(core: device::Core, indirect: bool, terms: &[(u16, String)]) -> bool {
     match terms {
         [] => false,
@@ -373,6 +395,7 @@ pub fn fixed_uses(
     let mut scratch = false;
     let mut memcpy_park = false;
     let mut memcpy_hold = false;
+    let mut gep_park = false;
     // The pointer resolution isel lowers through: term shapes decide
     // the fast FSR path (no scratch) from the accumulating one.
     let resolved = match core {
@@ -397,6 +420,27 @@ pub fn fixed_uses(
         }
         for b in &f.blocks {
             for inst in &b.insts {
+                // A GEP reg used as a value (stored, passed, returned,
+                // compared) is materialized through the park pair.
+                if let Some(res) = &resolved {
+                    let vals: Vec<&Val> = match inst {
+                        Inst::Store(s) => vec![&s.val],
+                        Inst::Call(c) => c.args.iter().map(|a| &a.val).collect(),
+                        Inst::Ret(Some((_, v)), _) => vec![v],
+                        Inst::Bin(bin) => vec![&bin.a, &bin.b],
+                        Inst::Icmp(ic) => vec![&ic.a, &ic.b],
+                        Inst::Phi(p) => p.incoming.iter().map(|(v, _)| v).collect(),
+                        Inst::Select(s) => vec![&s.a, &s.b],
+                        Inst::Zext(z) => vec![&z.val],
+                        Inst::Sext(x) => vec![&x.val],
+                        Inst::Trunc(t) => vec![&t.val],
+                        Inst::Freeze(fr) => vec![&fr.val],
+                        _ => vec![],
+                    };
+                    if vals.iter().any(|v| gep_value_park(res, &f.name, v)) {
+                        gep_park = true;
+                    }
+                }
                 match inst {
                     Inst::Ret(Some((t, _)), _) => {
                         if ret_used {
@@ -457,8 +501,8 @@ pub fn fixed_uses(
                         // counters; only the dynamic loop borrows them.
                         if matches!(m.len, MemLen::Reg(_)) {
                             memcpy = true;
-                            // The loop state parks in the 0x7E/0x7F
-                            // common bytes, outside the counted region.
+                            // The loop state parks in retval
+                            // bytes 2/3, counted via retval below.
                             memcpy_park = true;
                             if let Some(res) = &resolved {
                                 for side in [&m.src, &m.dst] {
@@ -541,11 +585,19 @@ pub fn fixed_uses(
             scratch: false,
             memcpy_park: false,
             memcpy_hold: false,
+            gep_park: false,
         },
         device::Core::Pic14 | device::Core::Pic14e => {
             let mut r = retval.max(delay);
             if memcpy {
                 r = r.max(2);
+            }
+            // The park pair is retval bytes 2/3: a dynamic memcpy
+            // (countdown in bytes 0/1 plus the pair), a GEP value
+            // materialization, and a PIC14E constant-memcpy hold all
+            // touch the whole retval region.
+            if memcpy || gep_park || memcpy_hold {
+                r = r.max(4);
             }
             if big_table || wide_icmp {
                 r = r.max(1);
@@ -556,6 +608,7 @@ pub fn fixed_uses(
                 scratch,
                 memcpy_park,
                 memcpy_hold,
+                gep_park,
             }
         }
         device::Core::PicBaseline => FixedUses {
@@ -564,6 +617,7 @@ pub fn fixed_uses(
             scratch: false,
             memcpy_park: false,
             memcpy_hold: false,
+            gep_park: false,
         },
     }
 }
@@ -612,9 +666,10 @@ pub fn walk_latch_regs(
 
 /// The fixed bytes the program occupies outside the overlay: PIC14's
 /// touched scratch byte (0x70) + the touched retval bytes from
-/// `fixed_uses` + the memcpy park bytes (both 0x7E/0x7F for the
-/// dynamic loop, 0x7F alone for a PIC14E constant copy), plus the
-/// ISR save area (9) when the program has an ISR.
+/// `fixed_uses` (the park pair lives in retval bytes 2/3, so a
+/// dynamic memcpy, a GEP value, or a PIC14E constant-memcpy hold
+/// raises that count to 4 instead of adding separate park bytes),
+/// plus the ISR save area (9) when the program has an ISR.
 ///
 /// PIC18's touched retval/flag bytes (the flag shares byte 0), plus the
 /// ISR save area (12) when present. Every ISR prologue saves and
@@ -629,15 +684,7 @@ pub fn fixed_bytes(device: &Device, has_isr: bool, uses: &FixedUses) -> u16 {
         device::Core::Pic14 | device::Core::Pic14e => {
             // The prologue saves scratch alongside retval, so an ISR
             // forces it even when the scan finds no other use.
-            let base = u16::from(uses.scratch || has_isr)
-                + u16::from(touched)
-                + if uses.memcpy_park {
-                    2
-                } else if uses.memcpy_hold {
-                    1
-                } else {
-                    0
-                };
+            let base = u16::from(uses.scratch || has_isr) + u16::from(touched);
             if has_isr {
                 // The ISR save area (W/STATUS/PCLATH/FSR/retval x4/scratch
                 // = 9 bytes) sits right after the retval region.
@@ -971,7 +1018,7 @@ mod tests {
         });
         assert_eq!(
             fixed_uses(&void_main(vec![reg]), pic14(), false, &HashSet::new()).retval_bytes,
-            2
+            4
         );
         let fixed = Inst::Memcpy(Memcpy {
             dst: Val::Reg("d".to_string()),
@@ -1284,6 +1331,47 @@ mod tests {
         let u14e = fixed_uses(&void_main(vec![global]), pic14e(), false, &HashSet::new());
         assert!(u14e.memcpy_park);
         assert!(!u14e.scratch);
+    }
+
+    #[test]
+    fn gep_k_terms_pointer_value_touches_park_pair() {
+        // `gp = &items[idx].g` materializes the pointer value: the
+        // scaled GEP sum is built in the park pair (retval bytes 2/3),
+        // so all 4 retval bytes count even with no memcpy present.
+        let mut m = void_main(vec![
+            Inst::Gep(Gep {
+                dst: "p".to_string(),
+                base: GepBase::Global("items".to_string()),
+                k: 6,
+                terms: vec![(12, "i".to_string())],
+                loc: None,
+            }),
+            Inst::Store(Store {
+                ty: Ty::I16,
+                val: Val::Reg("p".to_string()),
+                ptr: "@gp".to_string(),
+                volatile: false,
+                loc: None,
+            }),
+        ]);
+        for (name, ty) in [("items", Ty::I8), ("gp", Ty::I16)] {
+            m.globals.push(Global {
+                name: name.to_string(),
+                ty,
+                is_const: false,
+                size: 16,
+                bytes: vec![],
+                refs: vec![],
+                addr: None,
+                internal: false,
+            });
+        }
+        for core in [pic14(), pic14e()] {
+            let u = fixed_uses(&m, core, false, &HashSet::new());
+            assert!(u.gep_park, "GEP park pair must be counted");
+            assert_eq!(u.retval_bytes, 4, "park pair is retval bytes 2/3");
+            assert!(!u.memcpy_park, "no memcpy in this program");
+        }
     }
 
     #[test]
