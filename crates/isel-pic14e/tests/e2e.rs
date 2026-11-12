@@ -710,6 +710,36 @@ fn span_c_uses_linear_for_straddling_and_banked_otherwise() {
     assert!(p.halted());
 }
 
+/// epic-cc#1477: startup init of an initialized bank-straddling global
+/// must write each byte at its physical address, skipping the common-RAM
+/// alias gap between banks, as user-code accesses through the linear
+/// region already assume. A contiguous `base + i` walk from bank 2 hits
+/// 0x170, the bank-3 alias of common RAM 0x70, and banking rejects it.
+#[test]
+fn span_init_c_initialized_straddling_global_survives_startup() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/span_init.c"
+    ));
+    let zbig = globals["zbig"];
+    assert_eq!(
+        zbig, 0x120,
+        "span_init.c layout: zbig[90] at 0x{zbig:03X} must start bank 2 and straddle into bank 3"
+    );
+    p.run(200_000);
+    // Bytes past the bank boundary land in bank 3, not the alias gap.
+    assert_eq!(p.ram()[0x120], 0x11, "zbig[0] at its physical byte");
+    assert_eq!(p.ram()[0x16F], 0x22, "zbig[79] at bank 2's last byte");
+    assert_eq!(p.ram()[0x1A0], 0x33, "zbig[80] at bank 3's first byte");
+    assert_eq!(p.ram()[0x1A9], 0x44, "zbig[89] at its physical byte");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0xAA,
+        "out == zbig[0] + zbig[79] + zbig[80] + zbig[89] after startup init"
+    );
+    assert!(p.halted());
+}
+
 // P5 end-to-end acceptance (docs/internals/design/33 section 4, D-4): interrupts. The
 // fixtures are byte-identical to PIC14's except for the SFR addresses
 // (PORTB 0x06 -> 0x0D on the 1937; INTCON stays 0x0B), so the expected
