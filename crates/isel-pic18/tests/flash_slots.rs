@@ -1201,6 +1201,53 @@ fn memcpy_from_runtime_indexed_flash_param_copies_table_element() {
 }
 
 #[test]
+fn memcpy_from_flash_walk_to_indirect_dst_walks_unrolled() {
+    // A destination through a pointer parameter is not a direct
+    // address, so the copy cannot take the counted-loop path and
+    // walks the unrolled TBLRD sequence instead (epic-cc#1462).
+    let bytes: Vec<u8> = (0..42u8)
+        .map(|b| b.wrapping_mul(7).wrapping_add(3))
+        .collect();
+    let m = with_bytes(
+        parse(
+            "const tab i8\nglobal idx i8\nglobal buf i8\n\
+             fn copy(void) (p=ptr, i=i8, d=ptr)\n  block entry:\n    %w = gep %p +0 +14*%i\n    memcpy %d %w 14\n    ret void\n\
+             fn main(void) ()\n  block entry:\n    %i = load i8 @idx\n    call void @copy(ptr @tab, i8 %i, ptr @buf)\n    ret void\n",
+        ),
+        "tab",
+        &bytes,
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("idx", 0x10),
+            ("buf", 0x100),
+            ("copy::p", 0x11),
+            ("copy::i", 0x13),
+            ("copy::d", 0x14),
+            ("main::i", 0x16),
+        ]),
+        None,
+    );
+    assert!(
+        asm.matches("TBLRD*+").count() >= 14,
+        "copy must walk the unrolled read, not a counted loop:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 1;
+    p.run(2000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        &p.ram()[0x100..0x10E],
+        &bytes[14..28],
+        "buf must hold the second 14-byte table element"
+    );
+}
+
+#[test]
 fn dynamic_walk_over_mixed_base_keeps_base_tag() {
     // A runtime-indexed walk preserves its base's space: storing it
     // into a shared slot must copy the base's tag, not tag 0, so the
