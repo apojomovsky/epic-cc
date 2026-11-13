@@ -1103,21 +1103,20 @@ pub fn find_value_folds(
 /// lanes, so a compare whose rhs load writes it keeps the per-lane cascade.
 pub fn load_w_writes_carry(
     fname: &str,
-    params: &[ir::Param],
+    _params: &[ir::Param],
     resolved: &PtrResolution,
     v: &ir::Val,
 ) -> bool {
     let ir::Val::Reg(r) = v else {
         return false;
     };
-    let Some((base, k, terms)) = resolved.get(&ssa_key(fname, r)) else {
+    let Some((_base, k, terms)) = resolved.get(&ssa_key(fname, r)) else {
         return false;
     };
-    let Base::Slot(sname, indirect) = base else {
-        return false;
-    };
-    let holds_addr = *indirect || params.iter().any(|pp| pp.name == *sname && pp.ptr);
-    holds_addr && (*k != 0 || !terms.is_empty())
+    // Every resolved-GEP materialization with an offset or a dynamic
+    // term adds in `W` and so writes `C`, whatever the base kind
+    // (epic-cc#1479 extended the global and local-object bases).
+    *k != 0 || !terms.is_empty()
 }
 
 /// The `icmp` a block's `BrCond` absorbs on PIC18 (epic-cc#862): the block
