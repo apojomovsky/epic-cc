@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here, generated from
 Conventional Commits. Dates are UTC.
+## [0.8.0] - 2026-11-13
+ 
+### Fixes
+
+- Materialize slotless GEP values as icmp eq operands (#1475)
+- Write straddling global init bytes at physical addresses (#1481)
+- Keep RAM copies of const tables whose address escapes into a phi (#1482)
+- Materialize GEP moves with a constant offset and dynamic terms carry-exactly (#1476)
+- Materialize slotless GEP values at icmp and cast uses (#1483)
 ## [0.7.0] - 2026-11-12
  
 ### Fixes
