@@ -262,6 +262,25 @@ fn ptr_probe_c_runs_correctly() {
     assert!(p.halted());
 }
 
+#[test]
+fn ptr_select_c_picks_the_selected_arm() {
+    let _guard = E2E_LOCK.lock();
+    for (input, expected) in [(1u8, 0x22u8), (0u8, 0x11u8)] {
+        let (mut p, globals) = compile("tests/fixtures/ptr_select.c");
+        let buf = globals["buf"] as usize;
+        p.ram_mut()[buf + 1] = 0x11;
+        p.ram_mut()[buf + 2] = 0x22;
+        p.ram_mut()[globals["in"] as usize] = input;
+        p.run(10_000);
+        assert!(p.halted(), "in={input}");
+        assert_eq!(
+            p.ram()[globals["out"] as usize],
+            expected,
+            "in={input} must read through the selected arm"
+        );
+    }
+}
+
 /// P3 array acceptance: a non-const array written and read at a runtime
 /// index, the pure FSR/INDF path. Expected: in = 3 -> buf[3] = 4 -> out =
 /// 4.

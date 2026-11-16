@@ -108,9 +108,10 @@ fn folds_a_pointer_select_over_a_const_base() {
 }
 
 #[test]
-fn folds_a_pointer_select_with_arm_order_swapped() {
-    // `select i1 %c, ptr @addrs, ptr @addrs+4` (the real HAL emits the
-    // offset on the TRUE arm): folds to the same (base, 0, [(4, c)]).
+fn seeds_a_pointer_select_with_a_low_true_arm() {
+    // `select i1 %c, ptr @addrs, ptr @addrs+4`: c = 1 picks the low arm,
+    // which a `(4, c)` term over the low base would invert, so the dst
+    // seeds as an indirect slot and isel materializes the chosen arm.
     let m = parse(
         "global addrs i8\n\
          fn main() ()\n\
@@ -121,9 +122,9 @@ fn folds_a_pointer_select_with_arm_order_swapped() {
     );
     let r = resolve_pointers(&m);
     let (base, k, terms) = r.get("main::s").expect("pointer select must resolve");
-    assert!(matches!(base, Base::Global(n) if n == "addrs"));
+    assert!(matches!(base, Base::Slot(n, true) if n == "s"));
     assert_eq!(*k, 0);
-    assert_eq!(terms, &[(4u16, "c".to_string())]);
+    assert!(terms.is_empty());
 }
 
 #[test]
