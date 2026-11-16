@@ -20,9 +20,9 @@
 //! `gep` and `alloca` emit nothing. The slot size comes from alloc.
 //!
 //! A constant offset accesses the plain file register. Dynamic terms
-//! set FSR to `base + k` plus scaled registers. One scale-1 term keeps
-//! the fast single-register offset shape. General sums accumulate in W
-//! as an `ADDWF %r,W` chain. An indirect base reads its target from the
+//! add into the 16-bit FSR0 one repetition at a time from the folded
+//! static start address, low byte with carry into FSR0H, so a total
+//! past 255 stays exact. An indirect base reads its target from the
 //! slot contents.
 //!
 //! Pointers into const flash load via `CALL __read_<name>` from a RETLW
@@ -980,10 +980,9 @@ impl<'m> Gen<'m> {
     }
 
     /// Sets FSR0 to `base + k + offset + scaled terms` for a spanned object.
-    /// Loads the physical or linear base (docs/internals/design/33 §D-2) into FSR0L and H,
-    /// then adds the offset with carry. One scale-1 term keeps the fast
-    /// register shape. General sums accumulate in W first. The offset
-    /// stays in one byte, so one carry suffices.
+    /// Loads the physical or linear base (docs/internals/design/33 §D-2) into FSR0L and H
+    /// with the static offset folded in, then adds each term into the
+    /// 16-bit FSR0 with carry, so a total past 255 stays exact.
     fn emit_fsr_to(
         &mut self,
         base_addr: u16,
@@ -993,87 +992,62 @@ impl<'m> Gen<'m> {
         span: u16,
     ) {
         let base = fsr_base(self.device, base_addr, span);
-        let kk = u16::from(k) + u16::from(byte_off);
-        assert!(
-            kk <= 0xFF,
-            "isel: FSR offset k {k} + off {byte_off} out of byte range"
-        );
-        // FSR0 = base (16-bit).
-        self.emit(format!("    MOVLW 0x{:02X}", (base & 0xFF) as u8));
+        let addr = base.wrapping_add(k).wrapping_add(u16::from(byte_off));
+        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
         self.emit("    MOVWF FSR0L".to_string());
-        self.emit(format!("    MOVLW 0x{:02X}", ((base >> 8) & 0xFF) as u8));
+        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
         self.emit("    MOVWF FSR0H".to_string());
-        // W = k + byte_off + Σ terms (the offset, 8-bit).
-        match terms {
-            [] => {
-                if kk != 0 {
-                    self.emit(format!("    MOVLW 0x{kk:02X}"));
-                } else {
-                    self.emit("    MOVLW 0x00".to_string());
-                }
-            }
-            [(1, r)] => {
-                let a = self.val_addr(&Val::Reg(r.clone())).direct();
-                self.emit(format!("    MOVF 0x{a:02X}, W"));
-                if kk != 0 {
-                    self.emit(format!("    ADDLW 0x{kk:02X}"));
-                }
-            }
-            _ => {
-                self.emit_accum_terms(terms);
-                if kk != 0 {
-                    self.emit(format!("    ADDLW 0x{kk:02X}"));
-                }
-            }
-        }
-        // FSR0 += W with carry into FSR0H.
-        self.emit("    ADDWF FSR0L, F".to_string());
-        self.emit("    BTFSC STATUS, 0".to_string());
-        self.emit("    INCF FSR0H, F".to_string());
+        self.emit_add_terms_to_fsr0(terms);
     }
 
     /// Sets FSR0 from an indirect slot plus offset and terms. Loads both
-    /// address bytes from the slot, then adds the offset with carry. Uses
-    /// the physical address: sret targets fit one bank by construction.
+    /// address bytes from the slot, then adds the static offset and each
+    /// term into the 16-bit FSR0 with carry. Uses the physical address:
+    /// sret targets fit one bank by construction.
     fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u16, terms: &[(u16, String)], byte_off: u8) {
-        let kk = u16::from(k) + u16::from(byte_off);
-        assert!(
-            kk <= 0xFF,
-            "isel: indirect offset k {k} + off {byte_off} out of byte range"
-        );
+        let kk = k
+            .checked_add(u16::from(byte_off))
+            .unwrap_or_else(|| panic!("isel: indirect offset k {k} + off {byte_off} overflow"));
         let hi = slot_addr + 1;
-        // FSR0 = [slot] (16-bit).
         self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
         self.emit("    MOVWF FSR0L".to_string());
         self.emit(format!("    MOVF 0x{hi:02X}, W"));
         self.emit("    MOVWF FSR0H".to_string());
-        // W = k + byte_off + Σ terms (the offset, 8-bit).
-        match terms {
-            [] => {
-                if kk != 0 {
-                    self.emit(format!("    MOVLW 0x{kk:02X}"));
-                } else {
-                    self.emit("    MOVLW 0x00".to_string());
-                }
+        if kk != 0 {
+            self.emit(format!("    MOVLW 0x{:02X}", (kk & 0xFF) as u8));
+            self.emit("    ADDWF FSR0L, F".to_string());
+            self.emit("    BTFSC STATUS, 0".to_string());
+            self.emit("    INCF FSR0H, F".to_string());
+            if kk > 0xFF {
+                self.emit(format!("    MOVLW 0x{:02X}", ((kk >> 8) & 0xFF) as u8));
+                self.emit("    ADDWF FSR0H, F".to_string());
             }
-            [(1, r)] => {
-                let a = self.val_addr(&Val::Reg(r.clone())).direct();
+        }
+        self.emit_add_terms_to_fsr0(terms);
+    }
+
+    /// Adds every scaled term into FSR0, low byte first with carry into
+    /// FSR0H, then the high byte when the term reg is 16-bit. Wider term
+    /// regs have no exact shape here and panic.
+    fn emit_add_terms_to_fsr0(&mut self, terms: &[(u16, String)]) {
+        for (scale, r) in terms {
+            let a = self.val_addr(&Val::Reg(r.clone())).direct();
+            let bytes = self.reg_bytes(r);
+            assert!(
+                bytes == 1 || bytes == 2,
+                "isel: GEP term %{r} is {bytes} bytes wide, only 1 or 2 supported"
+            );
+            for _ in 0..*scale {
                 self.emit(format!("    MOVF 0x{a:02X}, W"));
-                if kk != 0 {
-                    self.emit(format!("    ADDLW 0x{kk:02X}"));
-                }
-            }
-            _ => {
-                self.emit_accum_terms(terms);
-                if kk != 0 {
-                    self.emit(format!("    ADDLW 0x{kk:02X}"));
+                self.emit("    ADDWF FSR0L, F".to_string());
+                self.emit("    BTFSC STATUS, 0".to_string());
+                self.emit("    INCF FSR0H, F".to_string());
+                if bytes == 2 {
+                    self.emit(format!("    MOVF 0x{:02X}, W", a + 1));
+                    self.emit("    ADDWF FSR0H, F".to_string());
                 }
             }
         }
-        // FSR0 += W with carry into FSR0H.
-        self.emit("    ADDWF FSR0L, F".to_string());
-        self.emit("    BTFSC STATUS, 0".to_string());
-        self.emit("    INCF FSR0H, F".to_string());
     }
 
     /// `W = Σ scale×%reg` (mod 256): the first repetition loads

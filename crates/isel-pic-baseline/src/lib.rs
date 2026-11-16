@@ -1414,7 +1414,14 @@ impl<'m> Gen<'m> {
         // bases like 0x50 to bank-0 0x10, epic-cc#429).
         let width = 5 + self.device.fsr_bank_bits.max(1);
         let mask = (1u16 << width) - 1;
-        let lit = (u16::from(base_addr) + u16::from(k) + u16::from(byte_off)) & mask;
+        // The static part must fit the FSR width outright: masking it
+        // here wrapped a past-width address onto a low bank byte.
+        let static_addr = u32::from(base_addr) + u32::from(k) + u32::from(byte_off);
+        assert!(
+            static_addr <= u32::from(mask),
+            "isel: baseline FSR address 0x{static_addr:X} exceeds the {width}-bit FSR range"
+        );
+        let lit = static_addr as u16 & mask;
         match terms {
             [(1, r)] => {
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();

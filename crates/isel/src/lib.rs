@@ -15,9 +15,9 @@
 //! (RAM or const-flash), `Base::Slot(name, indirect)`: a byval param copy,
 //! an alloca, or an sret slot holding a target address (indirect). A
 //! constant offset (no terms) reads/writes the plain file register; dynamic
-//! terms set `FSR` to `base + k + Σ s×%r` (single scale-1 term keeps the
-//! `MOVF %r,W; ADDLW base+k; MOVWF FSR` fast path; general sums accumulate
-//! in W as an `ADDWF %r,W` chain); an indirect base takes the target address
+//! terms add into `FSR` one repetition at a time from the folded static
+//! start address, each low-byte carry toggling IRP so the 9-bit sum stays
+//! exact; an indirect base takes the target address
 //! from the slot's contents. Pointers into const (flash) globals load via
 //! `CALL __read_<name>`: a RETLW table emitted after the functions, and a
 //! store through a const base panics (ROM is not writable). `memcpy`
@@ -1310,7 +1310,7 @@ impl<'m> Gen<'m> {
                 }
             }
             g.emit(format!("    MOVF 0x{idx:02X}, W"));
-            g.emit("    ADDWF FSR, F".to_string());
+            g.emit_add_w_to_fsr();
         };
         // Length source slot (the SSA reg's own bytes, read once).
         let la = self.val_addr(len).direct();
@@ -1356,13 +1356,12 @@ impl<'m> Gen<'m> {
     /// `span` bytes at `base_addr`. The window check runs first: the whole
     /// object must fit inside its base's GPR window (an unrepresentable
     /// cross-hole address would silently mis-address through INDF, so it
-    /// panics). IRP is then set on EVERY FSR setup: a prior
-    /// bank-2/3 access leaves STATUS bit 7 = 1, so skipping the set on a
-    /// bank-0/1 base would mis-address into bank 2/3. A single scale-1
-    /// term keeps the fast shape (`MOVF %r,W; ADDLW lit; MOVWF FSR`);
-    /// general sums accumulate in W first. The ADDLW
-    /// literal is `(base_addr + k + byte_off) & 0xFF`: FSR holds the low
-    /// byte; IRP carries bit 8.
+    /// panics). The address is 9-bit: FSR holds the low byte and IRP
+    /// carries bit 8, set on EVERY FSR setup because a prior bank-2/3
+    /// access leaves STATUS bit 7 = 1. The static part folds into the
+    /// 9-bit start address at compile time; each term then adds into
+    /// FSR with its carry toggling IRP, so a total past 255 stays exact
+    /// in the 9-bit address space.
     fn emit_fsr_to(
         &mut self,
         base_addr: u16,
@@ -1371,30 +1370,75 @@ impl<'m> Gen<'m> {
         byte_off: u8,
         span: u16,
     ) {
-        let (irp, base_lo) = fsr_window(self.device, base_addr, span);
-        // The sum is modular by design (FSR holds the low byte); irparse
-        // wraps a negative GEP offset into `k`, so a plain `+` can
-        // overflow on loop-reduce's backward walks (epic-cc#645).
-        let lit = u16::from(base_lo)
-            .wrapping_add(k)
-            .wrapping_add(u16::from(byte_off))
-            & 0xFF;
+        fsr_window(self.device, base_addr, span);
+        // Modular by design: irparse wraps a negative GEP offset into
+        // `k`, and the FSR+IRP space is 9 bits (epic-cc#645).
+        let addr = base_addr.wrapping_add(k).wrapping_add(u16::from(byte_off)) & 0x1FF;
+        let irp = addr & 0x100 != 0;
         self.emit(if irp {
             "    BSF STATUS, 7".to_string()
         } else {
             "    BCF STATUS, 7".to_string()
         });
-        match terms {
-            [(1, r)] => {
+        // One 8-bit scale-1 term: the ADDLW carry is exactly the bit-8
+        // toggle, so a conditional IRP set after the FSR store (MOVWF
+        // leaves C alone) keeps this shape two words over the old sum.
+        if let [(1, r)] = terms {
+            if self.reg_bytes(r) == 1 {
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();
+                let lo = (addr & 0xFF) as u8;
                 self.emit(format!("    MOVF 0x{a:02X}, W"));
-                self.emit(format!("    ADDLW 0x{lit:02X}"));
+                if lo != 0 {
+                    self.emit(format!("    ADDLW 0x{lo:02X}"));
+                }
                 self.emit("    MOVWF FSR".to_string());
+                if lo != 0 {
+                    self.emit("    BTFSC STATUS, 0".to_string());
+                    self.emit(if irp {
+                        "    BCF STATUS, 7".to_string()
+                    } else {
+                        "    BSF STATUS, 7".to_string()
+                    });
+                }
+                return;
             }
-            _ => {
-                self.emit_accum_terms(terms);
-                self.emit(format!("    ADDLW 0x{lit:02X}"));
-                self.emit("    MOVWF FSR".to_string());
+        }
+        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+        self.emit("    MOVWF FSR".to_string());
+        self.emit_add_terms_to_fsr(terms);
+    }
+
+    /// Adds the byte in W into the 9-bit FSR+IRP address: the low add
+    /// lands in FSR and a carry out of bit 7 toggles IRP. The `MOVLW`
+    /// between the add and the toggle leaves STATUS alone, and STATUS
+    /// is bank-mirrored, so no BANKSEL can split the skip pair.
+    fn emit_add_w_to_fsr(&mut self) {
+        self.emit("    ADDWF FSR, F".to_string());
+        self.emit("    MOVLW 0x80".to_string());
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit("    XORWF STATUS, F".to_string());
+    }
+
+    /// Adds every scaled term into the 9-bit FSR+IRP address, one
+    /// repetition at a time. A 16-bit term also toggles IRP when its
+    /// high byte is odd: bit 8 of the term is the only high bit the
+    /// 9-bit space keeps. Wider term regs panic.
+    fn emit_add_terms_to_fsr(&mut self, terms: &[(u16, String)]) {
+        for (scale, r) in terms {
+            let a = self.val_addr(&Val::Reg(r.clone())).direct();
+            let bytes = self.reg_bytes(r);
+            assert!(
+                bytes == 1 || bytes == 2,
+                "isel: GEP term %{r} is {bytes} bytes wide, only 1 or 2 supported"
+            );
+            for _ in 0..*scale {
+                self.emit(format!("    MOVF 0x{a:02X}, W"));
+                self.emit_add_w_to_fsr();
+                if bytes == 2 {
+                    self.emit("    MOVLW 0x80".to_string());
+                    self.emit(format!("    BTFSC 0x{:02X}, 0", a + 1));
+                    self.emit("    XORWF STATUS, F".to_string());
+                }
             }
         }
     }
@@ -1407,33 +1451,32 @@ impl<'m> Gen<'m> {
     /// Exactly one of the pair fires: BTFSC skips the BSF when the bit is
     /// 0, BTFSS skips the BCF when it is 1, so IRP always matches the
     /// stored address. IRP is set on EVERY indirect FSR setup (a prior
-    /// bank-2/3 target leaves STATUS bit 7 = 1). The static k + off must
-    /// fit the ADDLW literal.
+    /// bank-2/3 target leaves STATUS bit 7 = 1). The static offset and
+    /// each term then add into the 9-bit address with carry, so a total
+    /// past 255 stays exact in that space.
     fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u16, terms: &[(u16, String)], byte_off: u8) {
-        // `k` can arrive wrapped from a negative GEP, so a plain sum could
-        // overflow past the bound check below; `checked_add` keeps the
-        // rejection honest instead of wrapping into range (epic-cc#645).
+        // `k` can arrive wrapped from a negative GEP, so a plain sum
+        // could overflow u16; `checked_add` keeps that refusal honest
+        // instead of wrapping into range (epic-cc#645).
         let kk = k
             .checked_add(u16::from(byte_off))
-            .filter(|kk| *kk <= 0xFF)
-            .unwrap_or_else(|| {
-                panic!("isel: indirect offset k {k} + off {byte_off} out of byte range")
-            });
+            .unwrap_or_else(|| panic!("isel: indirect offset k {k} + off {byte_off} overflow"));
         let hi = slot_addr + 1;
         self.emit(format!("    BTFSC 0x{hi:02X}, 0"));
         self.emit("    BSF STATUS, 7".to_string());
         self.emit(format!("    BTFSS 0x{hi:02X}, 0"));
         self.emit("    BCF STATUS, 7".to_string());
-        if terms.is_empty() {
-            self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
-            self.emit(format!("    ADDLW 0x{kk:02X}"));
-            self.emit("    MOVWF FSR".to_string());
-        } else {
-            self.emit_accum_terms(terms);
-            self.emit(format!("    ADDWF 0x{slot_addr:02X}, W"));
-            self.emit(format!("    ADDLW 0x{kk:02X}"));
-            self.emit("    MOVWF FSR".to_string());
+        self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
+        self.emit("    MOVWF FSR".to_string());
+        if kk != 0 {
+            self.emit(format!("    MOVLW 0x{:02X}", (kk & 0xFF) as u8));
+            self.emit_add_w_to_fsr();
+            if kk & 0x100 != 0 {
+                self.emit("    MOVLW 0x80".to_string());
+                self.emit("    XORWF STATUS, F".to_string());
+            }
         }
+        self.emit_add_terms_to_fsr(terms);
     }
 
     /// `W = Σ scale×%reg` (mod 256): the first repetition loads

@@ -424,6 +424,42 @@ fn cond_term_ptr_arg_c_runs_correctly() {
 }
 
 #[test]
+fn gep_offset_past_255_load_and_store_are_exact() {
+    // in == 200: store total 400, load total 300 (epic-cc#1466). The
+    // true cell is the 16-bit FSR0 sum; the wrapped cell drops the
+    // carry out of the low byte of the offset sum.
+    for fixture in ["gep_offset_wrap.c", "gep_offset_wrap_ptr.c"] {
+        let (mut p, globals) = compile(&format!(
+            "{}/tests/fixtures/{fixture}",
+            env!("CARGO_MANIFEST_DIR")
+        ));
+        let in_addr = globals["in"] as usize;
+        p.ram_mut()[in_addr] = 200;
+        p.ram_mut()[in_addr + 1] = 0;
+        let big = globals["big"] as usize;
+        p.ram_mut()[big + 300] = 0x3C;
+        p.ram_mut()[big + (300 & 0xFF)] = 0xEE;
+        p.run(2_000_000);
+        assert!(p.halted(), "{fixture} must halt");
+        assert_eq!(
+            p.ram()[globals["out"] as usize],
+            0x3C,
+            "{fixture}: out == byte at big + 300, not its low-byte wrap"
+        );
+        assert_eq!(
+            p.ram()[big + 400],
+            0xA5,
+            "{fixture}: big + 400 holds the stored 0xA5"
+        );
+        assert_ne!(
+            p.ram()[big + (400 & 0xFF)],
+            0xA5,
+            "{fixture}: wrapped store address must not hold 0xA5"
+        );
+    }
+}
+
+#[test]
 fn gep_value_icmp_c_runs_correctly() {
     // in == 8 (fixture comment) -> out == 4, out2 == 1.
     let (mut p, globals) = compile(concat!(
@@ -678,7 +714,12 @@ fn span_memcpy_c_into_straddling_destination_uses_linear_base() {
     // The memcpy destination must be addressed through the linear region:
     // the asm must contain a MOVLW of the linear base's high byte (0x20)
     // before a MOVWF FSR0H, and the base's low byte before a MOVWF FSR0L.
-    let linear_base = 0x2000 + (big & 0x7F) - 0x20;
+    let bank = device::PIC16F1937
+        .ram_banks
+        .iter()
+        .position(|&(s, e)| big >= s && big <= e)
+        .expect("big must start inside a GPR bank") as u16;
+    let linear_base = 0x2000 + bank * 80 + (big & 0x7F) - 0x20;
     let lo = (linear_base & 0xFF) as u8;
     let hi = ((linear_base >> 8) & 0xFF) as u8;
     let lines: Vec<&str> = asm.lines().map(|l| l.trim()).collect();

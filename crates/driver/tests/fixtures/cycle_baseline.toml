@@ -789,8 +789,8 @@ ram_bytes = 52
 name = "speed-strlen-strcmp-16f877a"
 device = "16F877A"
 profile = "O0"
-cycles = 1494
-flash_words = 228
+cycles = 1703
+flash_words = 241
 ram_bytes = 54
 
 [[entry]]
@@ -967,32 +967,32 @@ ram_bytes = 46
 [[entry]]
 name = "speed-struct-scan-16f877a"
 device = "16F877A"
-cycles = 518
-flash_words = 87
+cycles = 686
+flash_words = 108
 ram_bytes = 47
 
 [[entry]]
 name = "speed-struct-scan-16f877a"
 device = "16F877A"
 profile = "O0"
-cycles = 590
-flash_words = 96
+cycles = 1262
+flash_words = 180
 ram_bytes = 47
 
 [[entry]]
 name = "speed-struct-scan-16f877a"
 device = "16F877A"
 profile = "O1"
-cycles = 518
-flash_words = 87
+cycles = 686
+flash_words = 108
 ram_bytes = 47
 
 [[entry]]
 name = "speed-struct-scan-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 518
-flash_words = 87
+cycles = 686
+flash_words = 108
 ram_bytes = 47
 
 [[entry]]
@@ -1029,32 +1029,32 @@ ram_bytes = 23
 [[entry]]
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
-cycles = 2623
-flash_words = 132
+cycles = 2658
+flash_words = 139
 ram_bytes = 29
 
 [[entry]]
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
 profile = "O0"
-cycles = 2623
-flash_words = 132
+cycles = 2658
+flash_words = 139
 ram_bytes = 29
 
 [[entry]]
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
 profile = "O1"
-cycles = 2458
-flash_words = 164
+cycles = 2493
+flash_words = 171
 ram_bytes = 29
 
 [[entry]]
 name = "speed-u16-dec-16f877a"
 device = "16F877A"
 profile = "O2"
-cycles = 1835
-flash_words = 281
+cycles = 1870
+flash_words = 288
 ram_bytes = 29
 
 [[entry]]

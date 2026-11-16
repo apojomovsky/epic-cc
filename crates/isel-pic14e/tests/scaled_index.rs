@@ -1,6 +1,6 @@
-//! Scaled GEP index terms accumulate in W as a `MOVF %r,W` then
-//! `ADDWF %r,W` chain, never through the scratch byte. Each test runs the
-//! emitted program in the PIC16F1937 simulator, so a lost or extra
+//! Scaled GEP index terms add into FSR0 once per repetition, low byte
+//! with carry into FSR0H, never through the scratch byte. Each test runs
+//! the emitted program in the PIC16F1937 simulator, so a lost or extra
 //! repetition addresses a neighbouring element and fails the byte check.
 
 use device::PIC16F1937;
@@ -52,8 +52,13 @@ fn stride_five_ram_index_reads_each_record() {
         ]),
     );
     assert!(
-        asm.contains("MOVF 0x29, W\n    ADDWF 0x29, W\n    ADDWF 0x29, W\n    ADDWF 0x29, W\n    ADDWF 0x29, W\n    ADDLW 0x03\n    ADDWF FSR0L, F"),
-        "scale-5 term is one load plus four adds in W:\n{asm}"
+        asm.contains("MOVLW 0x43\n    MOVWF FSR0L\n    MOVLW 0x00\n    MOVWF FSR0H\n    MOVF 0x29, W\n    ADDWF FSR0L, F"),
+        "scale-5 term adds into FSR0 starting at a + 3:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVF 0x29, W").count(),
+        5,
+        "scale-5 term loads %i once per repetition:\n{asm}"
     );
     assert!(
         !asm.contains("0x70"),
@@ -143,8 +148,13 @@ fn sret_slot_with_scaled_index_stores_at_the_right_byte() {
         ]),
     );
     assert!(
-        asm.contains("MOVF 0x27, W\n    ADDWF 0x27, W\n    ADDLW 0x01\n    ADDWF FSR0L, F"),
-        "scaled sum accumulates in W before the FSR0 add:\n{asm}"
+        asm.contains("MOVLW 0x01\n    ADDWF FSR0L, F\n    BTFSC STATUS, 0\n    INCF FSR0H, F\n    MOVF 0x27, W\n    ADDWF FSR0L, F"),
+        "static offset adds into FSR0 with carry before the scaled term:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVF 0x27, W").count(),
+        2,
+        "scale-2 term loads %i once per repetition:\n{asm}"
     );
     for i in 0u8..3 {
         let p = run(&asm, &[(0x20, i)]);
