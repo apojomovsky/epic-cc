@@ -489,9 +489,14 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
                             );
                             let mut terms = tt.clone();
                             terms.extend(g.terms.clone());
-                            let k = g.k.checked_add(kk).unwrap_or_else(|| {
-                                panic!("iselcore: gep offset overflow in {key}")
-                            });
+                            // Offsets are signed byte offsets held as u16
+                            // patterns (irparse folds -1 to 65535), and the
+                            // backends add k to a 16-bit base address with
+                            // wrapping arithmetic throughout. The chain sum
+                            // wraps the same way, so a reassociated
+                            // `(base + len) - 1` lands back in range instead
+                            // of overflowing (epic-cc#1487).
+                            let k = g.k.wrapping_add(kk);
                             resolved.insert(key, (b, k, terms));
                             progressed = true;
                         } else if geps.contains_key(&rkey) || selects.contains_key(&rkey) {
