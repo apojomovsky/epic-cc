@@ -310,7 +310,7 @@ fn try_place_at(device: &Device, addr: u16, width: u16) -> Option<u16> {
     }
 }
 
-/// Place a `width`-byte global contiguously starting at the aligned `addr`,
+/// Place a `width`-byte global contiguously starting at or after `addr`,
 /// stepping across GPR bank boundaries (skipping common RAM) so the object
 /// may straddle two banks. Returns the start address, or `None` past the
 /// device's last bank. The object's bytes all land in GPR banks; the
@@ -320,19 +320,29 @@ fn try_place_at(device: &Device, addr: u16, width: u16) -> Option<u16> {
 fn try_place_straddle(device: &Device, addr: u16, width: u16) -> Option<u16> {
     let mut cur = addr;
     let mut remaining = u16::from(width);
+    // The first placed byte: `addr` may sit in a gap (a width >= 2 base
+    // alignment-bumped off a bank's last byte), so the snapped cursor of
+    // the first region walked is what callers must see as the start
+    // (epic-cc#1480).
+    let mut first = addr;
+    let mut snapped = false;
     while remaining > 0 {
         let (start, end) = device.region_for(cur)?;
         if cur < start {
             cur = start; // skip common RAM / unimplemented gap
         }
+        if !snapped {
+            first = cur;
+            snapped = true;
+        }
         let avail = end - cur + 1;
         if remaining <= avail {
-            return Some(addr);
+            return Some(first);
         }
         remaining -= avail;
         cur = end + 1;
     }
-    Some(addr)
+    Some(first)
 }
 
 /// The start address for a `width`-byte local placed contiguously at the next
@@ -5349,6 +5359,24 @@ pub fn map_text(l: &AllocLayout) -> String {
 mod tests {
     use super::*;
     use device::PIC16F877A;
+
+    /// epic-cc#1480: a width >= 2 candidate on a bank's last byte is
+    /// alignment-bumped into the common-RAM gap (0x16F -> 0x170); the
+    /// first placed byte of a straddle starting there is the next
+    /// bank's first byte, not the gap address.
+    #[test]
+    fn try_place_at_snaps_a_straddle_off_the_common_ram_gap() {
+        let dev = device::resolve("p16f1938").expect("p16f1938 is a known device");
+        assert_eq!(try_place_at(dev, 0x16F, 90), Some(0x1A0));
+        // A width-2 candidate in the gap fits the next bank whole.
+        assert_eq!(try_place_at(dev, 0x170, 2), Some(0x1A0));
+        assert_eq!(try_place_at(dev, 0x16F, 2), Some(0x1A0));
+        // A candidate already at a region start is untouched.
+        assert_eq!(try_place_at(dev, 0x1A0, 90), Some(0x1A0));
+        // Width == region size never straddles; the next bank is used
+        // wholesale.
+        assert_eq!(try_place_at(dev, 0x16F, 80), Some(0x1A0));
+    }
 
     #[test]
     fn try_place_at_returns_none_instead_of_panicking_past_the_last_bank() {
