@@ -6759,7 +6759,9 @@ pub fn verify_page_fit_split(m: &Module, asm: &str, chunks: &HashMap<String, Vec
         if let Some(rest) = line.strip_prefix("org ") {
             let target = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             if let Some((name, s)) = &cur {
-                check(name, *s, target);
+                // Close at the pre-jump address: a backward target would
+                // clamp spilled words out of the extent (epic-cc#1486).
+                check(name, *s, org);
             }
             cur = None;
             org = target;
@@ -6917,11 +6919,13 @@ fn assess_fit(
         if let Some(rest) = line.strip_prefix("org ") {
             let target = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
             if let Some((name, s)) = cur.take() {
-                if target > s {
+                // Close at the pre-jump address, as classic isel does: a
+                // backward target would clamp the spiller out of its size.
+                if org > s {
                     extents.push(FitExtent {
                         name,
                         start: s,
-                        end: target,
+                        end: org,
                     });
                 }
             }
@@ -8874,6 +8878,40 @@ mod fit_repair_tests {
             FitVerdict::Broken(msg) => panic!("measured blocks must re-split: {msg}"),
             FitVerdict::NoConverge(msg) => panic!("first drift must not fail: {msg}"),
         }
+    }
+
+    #[test]
+    fn backward_org_spiller_is_measured_at_its_real_end() {
+        // main runs 2 words past the page end, so the next page-aligned
+        // anchor jumps backward. Closing main at the anchor target would
+        // clamp those words away and ship a layout the assembler rejects.
+        let text = format!(
+            "    org 0x0700\nmain:\n{}    org 0x0800\nbig:\n{}    GOTO big\n    end\n",
+            words(0x81),
+            words(10),
+        );
+        let m = two_func_module();
+        match assess_with(&m, &text, &HashMap::new(), &Repair::default()) {
+            FitVerdict::Again(next) => assert_eq!(
+                next.func_sizes.get("main"),
+                Some(&0x102),
+                "the spiller re-places at its measured real size"
+            ),
+            FitVerdict::Fit => panic!("a backward .org layout must need repair, got Fit"),
+            FitVerdict::Broken(msg) => panic!("a fitting spiller must re-place: {msg}"),
+            FitVerdict::NoConverge(msg) => panic!("first drift must not fail: {msg}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "spans pages")]
+    fn verify_rejects_a_spiller_hidden_by_a_backward_org() {
+        let text = format!(
+            "    org 0x0700\nmain:\n{}    org 0x0800\nbig:\n{}    GOTO big\n    end\n",
+            words(0x81),
+            words(10),
+        );
+        super::verify_page_fit_split(&two_func_module(), &text, &HashMap::new());
     }
 
     #[test]
