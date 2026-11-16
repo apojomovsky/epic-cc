@@ -2514,31 +2514,33 @@ fn parse_ptr_operand(
     }
 }
 
-/// Compute the byte stride contributed by one GEP index and the type to
-/// descend into. Level 0 treats the source type as an array-of-itself
-/// (stride = its size); a scalar (i1/i8/i16) strides by its size with no
-/// further descent. Struct-typed sources are handled in `fold_gep` directly.
-fn stride_and_next(cur: &str, types: &StructTypes) -> (i64, String) {
+/// Element type of an array type string.
+fn array_elem(cur: &str) -> String {
     let cur = cur.trim();
-    if cur.starts_with('[') {
-        // Balanced match: a nested element (`[6 x [17 x i8]]`) contains
-        // inner brackets a first-`]` cut would mistake for the end.
-        let close = matching_bracket(cur)
-            .unwrap_or_else(|| panic!("irparse: unbalanced array type {cur:?}"));
-        let inner = &cur[1..close];
-        let (sz, _) = ty_size_align(cur, types, None);
-        // Element follows the count and `x` (`6 x [17 x i8]`); the count
-        // itself never contains `x`, so splitting there is sound even
-        // when the element nests further.
-        let x = inner
-            .find('x')
-            .unwrap_or_else(|| panic!("irparse: malformed array type {cur:?}"));
-        let elem = inner[x + 1..].trim().to_string();
-        (i64::from(sz), elem)
-    } else {
-        // scalar (i1/i8/i16): stride = its size, no further descent
-        let (sz, _) = ty_size_align(cur, types, None);
-        (i64::from(sz), cur.to_string())
+    // Balanced match: a nested element (`[6 x [17 x i8]]`) contains
+    // inner brackets a first-`]` cut would mistake for the end.
+    let close =
+        matching_bracket(cur).unwrap_or_else(|| panic!("irparse: unbalanced array type {cur:?}"));
+    let inner = &cur[1..close];
+    // Element follows the count and `x` (`6 x [17 x i8]`); the count
+    // itself never contains `x`, so splitting there is sound even
+    // when the element nests further.
+    let x = inner
+        .find('x')
+        .unwrap_or_else(|| panic!("irparse: malformed array type {cur:?}"));
+    inner[x + 1..].trim().to_string()
+}
+
+/// Add one scaled GEP index: constants fold into `k`, registers become terms.
+fn add_gep_index(k: &mut i64, terms: &mut Vec<(u16, String)>, idx: &Val, stride: i64) {
+    match idx {
+        Val::Const(c) => *k += c * stride,
+        Val::Reg(r) => terms.push((
+            u16::try_from(stride)
+                .unwrap_or_else(|_| panic!("irparse: gep stride {stride} out of range")),
+            r.clone(),
+        )),
+        Val::Global(_) => panic!("irparse: gep index cannot be a global"),
     }
 }
 
@@ -2605,48 +2607,27 @@ fn fold_gep(
     let mut k: i64 = 0;
     let mut terms: Vec<(u16, String)> = Vec::new();
     let mut cur = source_ty.trim().to_string();
-    // True when the previous GEP level was an array: a struct cur is then
-    // the array's ELEMENT type, so this index is an element selector
-    // (stride = struct size). Without it, a struct index is a FIELD selector.
-    let mut from_array = false;
-    // For direct struct sources (`%struct.X` or `{...}`) the first index is
-    // the pointer/array offset into the struct array (like `i32 0` in
-    // `getelementptr %struct.Desc, ptr @s, i32 0, i32 1`). Track whether that
-    // first array-like index has been consumed so the next struct index is
-    // treated as a field selector.
-    let mut struct_array_done = false;
-    for ip in index_parts {
+    // The first index strides over the source type itself. Each later
+    // index descends into `cur`: an array index strides over its element,
+    // a struct index selects a field. Descending into a field must not
+    // reset the descent, or the next array index would stride over the
+    // whole field instead of one element.
+    for (pos, ip) in index_parts.iter().enumerate() {
         let ip = ip.trim();
         let idx = parse_val(ip.split_whitespace().last().unwrap());
+        if pos == 0 {
+            let (sz, _) = ty_size_align(&cur, types, None);
+            add_gep_index(&mut k, &mut terms, &idx, i64::from(sz));
+            continue;
+        }
+        if cur.starts_with('[') {
+            let elem = array_elem(&cur);
+            let (sz, _) = ty_size_align(&elem, types, None);
+            add_gep_index(&mut k, &mut terms, &idx, i64::from(sz));
+            cur = elem;
+            continue;
+        }
         if cur.starts_with('%') || cur.starts_with('{') || cur.starts_with("<{") {
-            if from_array {
-                // `[N x %struct.S], i16 0, i16 %i`: the index after an
-                // array-of-struct descent strides by sizeof(%struct.S)
-                let (sz, _) = ty_size_align(&cur, types, None);
-                match &idx {
-                    Val::Const(c) => k += c * i64::from(sz),
-                    Val::Reg(r) => terms.push((sz, r.clone())),
-                    Val::Global(_) => panic!("irparse: gep index cannot be a global"),
-                }
-                from_array = false;
-                // Element selector consumed; next struct index is a field
-                // selector (offset within the element).
-                struct_array_done = true;
-                continue;
-            }
-            if !struct_array_done {
-                // First index into a struct-typed pointer is the array offset
-                // (`0` in `getelementptr %struct.Desc, ptr @s, i32 0, i32 1`).
-                let (sz, _) = ty_size_align(&cur, types, None);
-                match &idx {
-                    Val::Const(c) => k += c * i64::from(sz),
-                    Val::Reg(r) => terms.push((sz, r.clone())),
-                    Val::Global(_) => panic!("irparse: gep index cannot be a global"),
-                }
-                struct_array_done = true;
-                continue;
-            }
-            // Field selector: `i32 2` selects field 2 of the struct.
             let field_idx = match &idx {
                 Val::Const(c) => {
                     assert!(*c >= 0, "irparse: negative struct field index {c}");
@@ -2658,25 +2639,9 @@ fn fold_gep(
             let (off, field_ty) = struct_field(&cur, field_idx, types);
             k += i64::from(off);
             cur = field_ty;
-            // After descending into a field, the next index is not a struct
-            // field selector unless the field itself is a struct/array.
-            struct_array_done = false;
-            from_array = false;
             continue;
         }
-        let (stride, next) = stride_and_next(&cur, types);
-        from_array = cur.starts_with('[');
-        match &idx {
-            Val::Const(c) => k += c * stride,
-            Val::Reg(r) => terms.push((
-                u16::try_from(stride)
-                    .unwrap_or_else(|_| panic!("irparse: gep stride {stride} out of range")),
-                r.clone(),
-            )),
-            Val::Global(_) => panic!("irparse: gep index cannot be a global"),
-        }
-        cur = next;
-        struct_array_done = false;
+        panic!("irparse: gep index descends into scalar type {cur}");
     }
     assert!(
         k >= -128 && k <= 65535,
