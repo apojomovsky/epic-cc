@@ -793,6 +793,7 @@ impl<'m> Gen<'m> {
                     Inst::Select(s) if s.dst == name => s.ty.bytes(),
                     Inst::Phi(p) if p.dst == name => p.ty.bytes(),
                     Inst::Freeze(fr) if fr.dst == name => fr.ty.bytes(),
+                    Inst::VaArg(v) if v.dst == name => v.ty.bytes(),
                     Inst::Call(c) if c.dst.as_deref() == Some(name) => {
                         c.ty.map(|t| t.bytes()).unwrap_or(1)
                     }
@@ -809,6 +810,13 @@ impl<'m> Gen<'m> {
             }
         }
         panic!("isel: no definition of %{name} in {}", self.cur_func);
+    }
+
+    /// Whether a pointer term reg has a high byte to add into a 16-bit
+    /// address. A 1-byte term (a folded pointer select's icmp condition)
+    /// zero-extends: the byte past its slot is a neighbour's, not its own.
+    fn term_has_hi(&self, reg: &str) -> bool {
+        self.reg_bytes(reg) > 1
     }
 
     /// The byte span of a resolved FSR base: the whole object a pointer
@@ -1419,8 +1427,10 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    ADDWF 0x{pa:02X}, F"));
                 self.emit("    BTFSC STATUS, 0".to_string());
                 self.emit(format!("    INCF 0x{:02X}, F", pa + 1));
-                self.emit(format!("    MOVF 0x{:02X}, W", ra + 1));
-                self.emit(format!("    ADDWF 0x{:02X}, F", pa + 1));
+                if self.term_has_hi(reg) {
+                    self.emit(format!("    MOVF 0x{:02X}, W", ra + 1));
+                    self.emit(format!("    ADDWF 0x{:02X}, F", pa + 1));
+                }
             }
         }
     }
@@ -1843,7 +1853,9 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    MOVLW 0x{hi:02X}"));
                                     self.emit("    BTFSC STATUS, 0".to_string());
                                     self.emit("    ADDLW 0x01".to_string());
-                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                    if self.term_has_hi(reg) {
+                                        self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                    }
                                 }
                             }
                             [(1, _), (1, _)] => {
@@ -1919,7 +1931,9 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    MOVLW 0x{b:02X}"));
                                     self.emit("    BTFSC STATUS, 0".to_string());
                                     self.emit("    ADDLW 0x01".to_string());
-                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                    if self.term_has_hi(reg) {
+                                        self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                    }
                                 }
                                 (None, true) => {
                                     self.emit(format!("    MOVF 0x{sa:02X}, W"));
@@ -1929,7 +1943,9 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
                                     self.emit("    BTFSC STATUS, 0".to_string());
                                     self.emit("    ADDLW 0x01".to_string());
-                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                    if self.term_has_hi(reg) {
+                                        self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                    }
                                 }
                             }
                         }
@@ -3526,7 +3542,9 @@ impl<'m> Gen<'m> {
                                         ));
                                         self.emit("    BTFSC STATUS, 0".to_string());
                                         self.emit("    ADDLW 0x01".to_string());
-                                        self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                        if self.term_has_hi(reg) {
+                                            self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                        }
                                         if k_hi != 0 {
                                             self.emit(format!("    ADDLW 0x{k_hi:02X}"));
                                         }
@@ -3619,7 +3637,9 @@ impl<'m> Gen<'m> {
                                 self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
                                 self.emit(format!("    BTFSC STATUS, 0"));
                                 self.emit(format!("    ADDLW 0x01"));
-                                self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                if self.term_has_hi(reg) {
+                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                }
                                 if k_hi != 0 {
                                     self.emit(format!("    ADDLW 0x{k_hi:02X}"));
                                 }
