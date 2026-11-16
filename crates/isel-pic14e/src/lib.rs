@@ -1103,7 +1103,7 @@ impl<'m> Gen<'m> {
     }
 
     /// Adds every term into the 16-bit address already seeded in the
-    /// param slot at `pa`, one scaled repetition at a time. Each low-byte
+    /// slot at `pa`, one scaled repetition at a time. Each low-byte
     /// add carries into the high byte before the high bytes add, so any
     /// term count and scale stays exact (epic-cc#1447).
     fn emit_add_terms_to_ptr_slot(&mut self, pa: u16, terms: &[(u16, String)]) {
@@ -1114,12 +1114,45 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    ADDWF 0x{:02X}, F", pa));
                 self.emit("    BTFSC STATUS, 0".to_string());
                 self.emit(format!("    INCF 0x{:02X}, F", pa + 1));
+                // A 1-byte term has no high byte: the next slot is a
+                // neighbour, not part of the value, so it is never read.
                 if self.term_has_hi(reg) {
                     self.emit(format!("    MOVF 0x{:02X}, W", ra + 1));
                     self.emit(format!("    ADDWF 0x{:02X}, F", pa + 1));
                 }
             }
         }
+    }
+
+    /// The slot a multi-term pointer argument is summed into: the
+    /// park pair when a term byte or the base byte range overlaps
+    /// the param slot at `pa`, so seeding cannot overwrite a value
+    /// before it is consumed, else `pa` itself. The park pair sits
+    /// in common RAM, which no local or param slot occupies.
+    fn ptr_arg_dest(&self, pa: u16, terms: &[(u16, String)], base: Option<u16>) -> u16 {
+        let overlaps = |lo: u16, hi: u16| lo <= pa + 1 && pa <= hi;
+        let base_danger = base.is_some_and(|sa| overlaps(sa, sa + 1));
+        let term_danger = terms.iter().any(|(_, reg)| {
+            let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
+            overlaps(ra, ra + u16::from(self.reg_bytes(reg).max(1)) - 1)
+        });
+        if base_danger || term_danger {
+            self.park_pair()
+        } else {
+            pa
+        }
+    }
+
+    /// Copies a park-pair sum into the param slot at `pa`. A sum
+    /// built directly in `pa` needs no copy.
+    fn emit_finish_ptr_arg(&mut self, pa: u16, t_lo: u16) {
+        if t_lo == pa {
+            return;
+        }
+        self.emit(format!("    MOVF 0x{t_lo:02X}, W"));
+        self.emit(format!("    MOVWF 0x{pa:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", t_lo + 1));
+        self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
     }
 
     /// Computes the const-table byte index into W. One scale-1 term keeps
@@ -2741,17 +2774,19 @@ impl<'m> Gen<'m> {
                                     }
                                     _ => {
                                         let addr = self.ptr_value_addr(name, k);
+                                        let t_lo = self.ptr_arg_dest(pa, &terms, None);
                                         self.emit(format!(
                                             "    MOVLW 0x{:02X}",
                                             (addr & 0xFF) as u8
                                         ));
-                                        self.emit(format!("    MOVWF 0x{:02X}", pa));
+                                        self.emit(format!("    MOVWF 0x{t_lo:02X}"));
                                         self.emit(format!(
                                             "    MOVLW 0x{:02X}",
                                             ((addr >> 8) & 0xFF) as u8
                                         ));
-                                        self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
-                                        self.emit_add_terms_to_ptr_slot(pa, &terms);
+                                        self.emit(format!("    MOVWF 0x{:02X}", t_lo + 1));
+                                        self.emit_add_terms_to_ptr_slot(t_lo, &terms);
+                                        self.emit_finish_ptr_arg(pa, t_lo);
                                         continue;
                                     }
                                 }
@@ -2768,14 +2803,16 @@ impl<'m> Gen<'m> {
                                     .slot_addr(self.cur_func, sname)
                                     .direct()
                                     .wrapping_add(k);
+                                let t_lo = self.ptr_arg_dest(pa, &terms, None);
                                 self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
-                                self.emit(format!("    MOVWF 0x{:02X}", pa));
+                                self.emit(format!("    MOVWF 0x{t_lo:02X}"));
                                 self.emit(format!(
                                     "    MOVLW 0x{:02X}",
                                     ((addr >> 8) & 0xFF) as u8
                                 ));
-                                self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
-                                self.emit_add_terms_to_ptr_slot(pa, &terms);
+                                self.emit(format!("    MOVWF 0x{:02X}", t_lo + 1));
+                                self.emit_add_terms_to_ptr_slot(t_lo, &terms);
+                                self.emit_finish_ptr_arg(pa, t_lo);
                                 continue;
                             }
                             // Passes runtime address bytes through
@@ -2830,11 +2867,12 @@ impl<'m> Gen<'m> {
                                 self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
                             }
                             _ => {
+                                let t_lo = self.ptr_arg_dest(pa, &terms, Some(sa));
                                 self.emit(format!("    MOVF 0x{sa:02X}, W"));
                                 if k_lo != 0 {
                                     self.emit(format!("    ADDLW 0x{k_lo:02X}"));
                                 }
-                                self.emit(format!("    MOVWF 0x{:02X}", pa));
+                                self.emit(format!("    MOVWF 0x{t_lo:02X}"));
                                 self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
                                 if k_lo != 0 {
                                     self.emit(format!("    BTFSC STATUS, 0"));
@@ -2843,8 +2881,9 @@ impl<'m> Gen<'m> {
                                 if k_hi != 0 {
                                     self.emit(format!("    ADDLW 0x{k_hi:02X}"));
                                 }
-                                self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
-                                self.emit_add_terms_to_ptr_slot(pa, &terms);
+                                self.emit(format!("    MOVWF 0x{:02X}", t_lo + 1));
+                                self.emit_add_terms_to_ptr_slot(t_lo, &terms);
+                                self.emit_finish_ptr_arg(pa, t_lo);
                             }
                         }
                     }
