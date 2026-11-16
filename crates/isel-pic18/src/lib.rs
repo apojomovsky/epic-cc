@@ -9568,12 +9568,16 @@ impl<'m> Gen<'m> {
             self.emit(format!("    MOVWF 0x{reg:02X},A"));
         }
         let static_part = k.wrapping_add(u16::from(byte_off));
+        // `k` is a signed offset held as a u16 pattern, so a negative
+        // static part sign-extends into TBLPTRU (mirroring
+        // `emit_flash_tblptr_seed`); zero-extending it would add 64 KB.
         if static_part != 0 {
             self.emit(format!("    MOVLW 0x{:02X}", static_part & 0xFF));
             self.emit("    ADDWF 0xF6,F,A".to_string()); // TBLPTRL
             self.emit(format!("    MOVLW 0x{:02X}", static_part >> 8));
             self.emit("    ADDWFC 0xF7,F,A".to_string()); // TBLPTRH
-            self.emit("    MOVLW 0x00".to_string());
+            let top = if (static_part as i16) < 0 { 0xFF } else { 0x00 };
+            self.emit(format!("    MOVLW 0x{top:02X}"));
             self.emit("    ADDWFC 0xF8,F,A".to_string()); // TBLPTRU
         }
     }
@@ -9775,7 +9779,10 @@ impl<'m> Gen<'m> {
             self.emit("    ADDWF 0xF6,F,A".to_string());
             self.emit(format!("    MOVLW 0x{:02X}", static_part >> 8));
             self.emit("    ADDWFC 0xF7,F,A".to_string());
-            self.emit("    MOVLW 0x00".to_string());
+            // Sign-extend as in `emit_tblptr_static`: a negative static
+            // part must subtract from the 21-bit TBLPTR, not add 64 KB.
+            let top = if (static_part as i16) < 0 { 0xFF } else { 0x00 };
+            self.emit(format!("    MOVLW 0x{top:02X}"));
             self.emit("    ADDWFC 0xF8,F,A".to_string());
         }
     }

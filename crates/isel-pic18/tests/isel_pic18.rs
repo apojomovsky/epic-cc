@@ -5896,6 +5896,87 @@ fn a_width1_const_index_chains_on_tblptr_in_sim() {
 }
 
 #[test]
+fn a_negative_gep_chain_const_read_sign_extends_into_tblptru_in_sim() {
+    // epic-cc#1487 review: the chain +5 then -7 folds to k = 65534
+    // (-2), and idx = 4 brings the read back to tab[2]. Zero-extending
+    // k into the 21-bit TBLPTR reads tab + 65538 instead.
+    let m = with_bytes(
+        parse(
+            "const tab i8\n\
+             global idx i8\n\
+             global out i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i8 @idx\n\
+                 %base = gep @tab +5\n\
+                 %p = gep %base +65529 +1*%i\n\
+                 %v = load i8 %p\n\
+                 store i8 %v @out\n\
+                 ret void\n",
+        ),
+        "tab",
+        &[0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87],
+    );
+    let addrs = addrs(&[
+        ("idx", 0x150),
+        ("out", 0x151),
+        ("main::i", 0x152),
+        ("main::v", 0x153),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x150] = 4;
+    p.run(1000);
+    assert_eq!(p.ram()[0x151], 0x32, "out must be tab[5 - 7 + 4]:\n{asm}");
+}
+
+#[test]
+fn a_negative_static_part_rejoins_the_tblptr_chain_sign_extended_in_sim() {
+    // Same sign extension on the dynamic-chain site: +1 then -3 folds
+    // to static_part = 65534 (-2), and 9*idx with idx = 1 lands on
+    // tab[7]. The chain re-adds the static part after the table base.
+    let mut bytes = vec![0u8; 16];
+    bytes[7] = 0x7E;
+    bytes[9] = 0xE7;
+    let m = with_bytes(
+        parse(
+            "const tab i8\n\
+             global idx i8\n\
+             global out i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i8 @idx\n\
+                 %base = gep @tab +1\n\
+                 %p = gep %base +65533 +9*%i\n\
+                 %v = load i8 %p\n\
+                 store i8 %v @out\n\
+                 ret void\n",
+        ),
+        "tab",
+        &bytes,
+    );
+    let addrs = addrs(&[
+        ("idx", 0x150),
+        ("out", 0x151),
+        ("main::i", 0x152),
+        ("main::v", 0x153),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("CLRF 0xF6,A"),
+        "stride 9 must take the TBLPTR chain:\n{asm}"
+    );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x150] = 1;
+    p.run(1000);
+    assert_eq!(p.ram()[0x151], 0x7E, "out must be tab[1 - 3 + 9]:\n{asm}");
+}
+
+#[test]
 fn a_width2_const_index_reads_the_high_byte_in_sim() {
     // The flash-side miscompile proof: tab is 2323 bytes, idx = 0x0102,
     // scale 9 -> byte offset 0x912 (2322), the table's last byte. A

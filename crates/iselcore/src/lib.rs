@@ -490,12 +490,13 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
                             let mut terms = tt.clone();
                             terms.extend(g.terms.clone());
                             // Offsets are signed byte offsets held as u16
-                            // patterns (irparse folds -1 to 65535), and the
-                            // backends add k to a 16-bit base address with
-                            // wrapping arithmetic throughout. The chain sum
-                            // wraps the same way, so a reassociated
-                            // `(base + len) - 1` lands back in range instead
-                            // of overflowing (epic-cc#1487).
+                            // patterns (irparse folds -1 to 65535). The RAM
+                            // backends add k to a 16-bit base with wrapping
+                            // arithmetic, and PIC18 flash-const reads
+                            // sign-extend k into the 21-bit TBLPTR, so the
+                            // chain sum wraps in 16 bits the same way and a
+                            // reassociated `(base + len) - 1` lands back in
+                            // range instead of overflowing (epic-cc#1487).
                             let k = g.k.wrapping_add(kk);
                             resolved.insert(key, (b, k, terms));
                             progressed = true;
