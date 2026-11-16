@@ -47,6 +47,28 @@ fn folds_a_two_link_gep_chain() {
 }
 
 #[test]
+fn folds_a_gep_chain_through_a_negative_offset() {
+    // clang reassociates `buf[len - 1]` over a field base into
+    // `(base + 1 + len) - 1`: the -1 arrives as its u16 bit pattern
+    // 65535, so the chain sum must wrap in the 16-bit address space
+    // the backends address, not overflow (epic-cc#1487).
+    let m = parse(
+        "global framer i8\n\
+         fn poll(void) ()\n\
+           block entry:\n\
+             %base = gep @framer +1\n\
+             %end = gep %base +0 +1*%len\n\
+             %last = gep %end +65535\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("poll::last").expect("chained gep must resolve");
+    assert!(matches!(base, Base::Global(n) if n == "framer"));
+    assert_eq!(*k, 0);
+    assert_eq!(terms, &[(1u16, "len".to_string())]);
+}
+
+#[test]
 fn seeds_alloca_and_byval_sret_params_as_slots() {
     let m = parse(
         "fn f(void) (p=byval2, r=sret)\n\
