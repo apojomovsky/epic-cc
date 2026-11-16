@@ -126,7 +126,7 @@ ram_bytes = 95
 [[entry]]
 name = "bench-struct-scan-16f877a"
 device = "16F877A"
-flash_words = 157
+flash_words = 248
 ram_bytes = 104
 
 [[entry]]
@@ -186,7 +186,7 @@ ram_bytes = 277
 [[entry]]
 name = "hal-pic16-encoder-sim-16f877a"
 device = "16F877A"
-flash_words = 4605
+flash_words = 4861
 ram_bytes = 231
 
 [[entry]]
@@ -280,21 +280,21 @@ ram_bytes = 95
 name = "bench-struct-scan-16f877a@O0"
 device = "16F877A"
 profile = "O0"
-flash_words = 300
+flash_words = 1392
 ram_bytes = 104
 
 [[entry]]
 name = "bench-struct-scan-16f877a@O1"
 device = "16F877A"
 profile = "O1"
-flash_words = 157
+flash_words = 248
 ram_bytes = 104
 
 [[entry]]
 name = "bench-struct-scan-16f877a@O2"
 device = "16F877A"
 profile = "O2"
-flash_words = 157
+flash_words = 248
 ram_bytes = 104
 
 [[entry]]
@@ -315,7 +315,7 @@ ram_bytes = 279
 name = "hal-pic16-encoder-full-16f877a@O2"
 device = "16F877A"
 profile = "O2"
-flash_words = 3805
+flash_words = 3864
 ram_bytes = 275
 
 [[entry]]

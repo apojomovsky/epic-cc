@@ -144,6 +144,56 @@ fn span_init_c_initialized_straddling_global_survives_startup() {
     assert!(p.halted());
 }
 
+#[test]
+fn gep_offset_past_255_load_and_store_are_exact() {
+    // in == 200: store total 400, load total 300 (epic-cc#1466).
+    for fixture in ["gep_offset_wrap.c", "gep_offset_wrap_ptr.c"] {
+        let (mut p, globals) = compile(&format!(
+            "{}/tests/fixtures/{fixture}",
+            env!("CARGO_MANIFEST_DIR")
+        ));
+        let in_addr = globals["in"] as usize;
+        p.ram_mut()[in_addr] = 200;
+        p.ram_mut()[in_addr + 1] = 0;
+        let big = globals["big"] as usize;
+        let phys_of = |offset: usize| {
+            let a = (big + offset) & 0x1FF;
+            if (0x70..=0x7F).contains(&(a & 0xFF)) {
+                a & 0xFF
+            } else {
+                a
+            }
+        };
+        let wrapped_of = |offset: usize| {
+            let a = (big & 0x100) | ((big + offset) & 0xFF);
+            if (0x70..=0x7F).contains(&(a & 0xFF)) {
+                a & 0xFF
+            } else {
+                a
+            }
+        };
+        p.ram_mut()[phys_of(300)] = 0x3C;
+        p.ram_mut()[wrapped_of(300)] = 0xEE;
+        p.run(2_000_000);
+        assert!(p.halted(), "{fixture} must halt");
+        assert_eq!(
+            p.ram()[globals["out"] as usize],
+            0x3C,
+            "{fixture}: out == byte at big + 300, not its low-byte wrap"
+        );
+        assert_eq!(
+            p.ram()[phys_of(400)],
+            0xA5,
+            "{fixture}: big + 400 holds the stored 0xA5"
+        );
+        assert_ne!(
+            p.ram()[wrapped_of(400)],
+            0xA5,
+            "{fixture}: wrapped store address must not hold 0xA5"
+        );
+    }
+}
+
 /// epic-cc#1433: a pointer laundered through `uintptr_t` lowers as a
 /// same-width `trunc i16 -> i16`, and the backend used to refuse it
 /// ("trunc must narrow"), aborting the compile.

@@ -1415,7 +1415,16 @@ impl<'m> Gen<'m> {
         // bases like 0x50 to bank-0 0x10, epic-cc#429).
         let width = 5 + self.device.fsr_bank_bits.max(1);
         let mask = (1u16 << width) - 1;
-        let lit = (u16::from(base_addr) + u16::from(k) + u16::from(byte_off)) & mask;
+        // `k` holds a signed offset as a u16 pattern, so the sum wraps
+        // in 16 bits first (the classic `& 0x1FF` fold): a wrapped
+        // negative offset whose true address lands in range is legal.
+        // Only the wrapped result must fit the FSR width outright.
+        let wrapped = base_addr.wrapping_add(k).wrapping_add(u16::from(byte_off));
+        assert!(
+            wrapped <= mask,
+            "isel: baseline FSR address 0x{wrapped:X} exceeds the {width}-bit FSR range"
+        );
+        let lit = wrapped & mask;
         match terms {
             [(1, r)] => {
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();

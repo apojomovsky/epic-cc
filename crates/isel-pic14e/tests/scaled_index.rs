@@ -1,6 +1,6 @@
-//! Scaled GEP index terms accumulate in W as a `MOVF %r,W` then
-//! `ADDWF %r,W` chain, never through the scratch byte. Each test runs the
-//! emitted program in the PIC16F1937 simulator, so a lost or extra
+//! Scaled GEP index terms add into FSR0 once per repetition, low byte
+//! with carry into FSR0H, never through the scratch byte. Each test runs
+//! the emitted program in the PIC16F1937 simulator, so a lost or extra
 //! repetition addresses a neighbouring element and fails the byte check.
 
 use device::PIC16F1937;
@@ -52,8 +52,13 @@ fn stride_five_ram_index_reads_each_record() {
         ]),
     );
     assert!(
-        asm.contains("MOVF 0x29, W\n    ADDWF 0x29, W\n    ADDWF 0x29, W\n    ADDWF 0x29, W\n    ADDWF 0x29, W\n    ADDLW 0x03\n    ADDWF FSR0L, F"),
-        "scale-5 term is one load plus four adds in W:\n{asm}"
+        asm.contains("MOVLW 0x43\n    MOVWF FSR0L\n    MOVLW 0x00\n    MOVWF FSR0H\n    MOVF 0x29, W\n    ADDWF FSR0L, F"),
+        "scale-5 term adds into FSR0 starting at a + 3:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVF 0x29, W").count(),
+        5,
+        "scale-5 term loads %i once per repetition:\n{asm}"
     );
     assert!(
         !asm.contains("0x70"),
@@ -143,8 +148,13 @@ fn sret_slot_with_scaled_index_stores_at_the_right_byte() {
         ]),
     );
     assert!(
-        asm.contains("MOVF 0x27, W\n    ADDWF 0x27, W\n    ADDLW 0x01\n    ADDWF FSR0L, F"),
-        "scaled sum accumulates in W before the FSR0 add:\n{asm}"
+        asm.contains("MOVLW 0x01\n    ADDWF FSR0L, F\n    BTFSC STATUS, 0\n    INCF FSR0H, F\n    MOVF 0x27, W\n    ADDWF FSR0L, F"),
+        "static offset adds into FSR0 with carry before the scaled term:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVF 0x27, W").count(),
+        2,
+        "scale-2 term loads %i once per repetition:\n{asm}"
     );
     for i in 0u8..3 {
         let p = run(&asm, &[(0x20, i)]);
@@ -153,4 +163,56 @@ fn sret_slot_with_scaled_index_stores_at_the_right_byte() {
             assert_eq!(p.ram()[0x30 + n], want, "buf[{n}] with i={i}");
         }
     }
+}
+
+#[test]
+fn gep_i16_term_high_byte_carries_into_fsr0h_in_sim() {
+    // A 16-bit term of 256 or 257: only its high byte (0x01) raises
+    // FSR0H past the low-byte wrap.
+    let ir = "global in i16\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i16 @in\n    %p = gep @a +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
+    let asm = select(
+        &PIC16F1937,
+        &parse(ir),
+        &addrs(&[
+            ("in", 0x20),
+            ("out", 0x22),
+            ("a", 0x40),
+            ("main::i", 0x29),
+            ("main::v", 0x2B),
+        ]),
+    );
+    for (i, want) in [(256u16, 0x7Eu8), (257, 0x7F)] {
+        let p = run(
+            &asm,
+            &[
+                (0x20, (i & 0xFF) as u8),
+                (0x21, (i >> 8) as u8),
+                (0x40, 0xEE),
+                (0x41, 0xEE),
+                (0x140, 0x7E),
+                (0x141, 0x7F),
+            ],
+        );
+        assert_eq!(p.ram()[0x22], want, "a[{i}] via i16 term");
+    }
+}
+
+#[test]
+fn gep_exact_256_total_carries_into_fsr0h_in_sim() {
+    // Static 56 plus an 8-bit term of 200 totals exactly 256: the low
+    // byte wraps to the base byte and the carry alone raises FSR0H.
+    let ir = "global in i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @a +56 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
+    let asm = select(
+        &PIC16F1937,
+        &parse(ir),
+        &addrs(&[
+            ("in", 0x20),
+            ("out", 0x21),
+            ("a", 0x40),
+            ("main::i", 0x29),
+            ("main::v", 0x2A),
+        ]),
+    );
+    let p = run(&asm, &[(0x20, 200), (0x60, 0xEE), (0x140, 0x3C)]);
+    assert_eq!(p.ram()[0x21], 0x3C, "a[256] exact total");
 }

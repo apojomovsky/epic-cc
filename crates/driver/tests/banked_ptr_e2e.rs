@@ -86,12 +86,12 @@ fn banked_ptr_asm_uses_irp_across_banks() {
         asm.lines().any(|l| l.trim() == "BCF STATUS, 7"),
         "bank-0/1 FSR access must clear IRP (BCF STATUS, 7):\n{asm}"
     );
-    // arrB2's FSR base literal is the & 0xFF low byte of its bank-2 address.
-    // Bank 2 GPR starts at 0x110, so that is 0x10; without the M9 IRP path
-    // this setup would not exist (a bank-0-only compiler would emit ADDLW
-    // 0x32).
+    // arrB2's FSR start literal is the & 0xFF low byte of its bank-2
+    // address. Bank 2 GPR starts at 0x110, so that is 0x10; without the
+    // M9 IRP path this setup would not exist (a bank-0-only compiler
+    // would start FSR at 0x32 instead).
     assert!(
-        asm.lines().any(|l| l.trim() == "ADDLW 0x10"),
+        asm.lines().any(|l| l.trim() == "MOVLW 0x10"),
         "bank-2 FSR base must be the & 0xFF literal 0x10 (0x110 & 0xFF):\n{asm}"
     );
 }
