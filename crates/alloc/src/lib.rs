@@ -5368,6 +5368,14 @@ mod tests {
     fn try_place_at_snaps_a_straddle_off_the_common_ram_gap() {
         let dev = device::resolve("p16f1938").expect("p16f1938 is a known device");
         assert_eq!(try_place_at(dev, 0x16F, 90), Some(0x1A0));
+        // A width-2 candidate in the gap fits the next bank whole.
+        assert_eq!(try_place_at(dev, 0x170, 2), Some(0x1A0));
+        assert_eq!(try_place_at(dev, 0x16F, 2), Some(0x1A0));
+        // A candidate already at a region start is untouched.
+        assert_eq!(try_place_at(dev, 0x1A0, 90), Some(0x1A0));
+        // Width == region size never straddles; the next bank is used
+        // wholesale.
+        assert_eq!(try_place_at(dev, 0x16F, 80), Some(0x1A0));
     }
 
     #[test]
