@@ -164,3 +164,55 @@ fn sret_slot_with_scaled_index_stores_at_the_right_byte() {
         }
     }
 }
+
+#[test]
+fn gep_i16_term_high_byte_carries_into_fsr0h_in_sim() {
+    // A 16-bit term of 256 or 257: only its high byte (0x01) raises
+    // FSR0H past the low-byte wrap.
+    let ir = "global in i16\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i16 @in\n    %p = gep @a +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
+    let asm = select(
+        &PIC16F1937,
+        &parse(ir),
+        &addrs(&[
+            ("in", 0x20),
+            ("out", 0x22),
+            ("a", 0x40),
+            ("main::i", 0x29),
+            ("main::v", 0x2B),
+        ]),
+    );
+    for (i, want) in [(256u16, 0x7Eu8), (257, 0x7F)] {
+        let p = run(
+            &asm,
+            &[
+                (0x20, (i & 0xFF) as u8),
+                (0x21, (i >> 8) as u8),
+                (0x40, 0xEE),
+                (0x41, 0xEE),
+                (0x140, 0x7E),
+                (0x141, 0x7F),
+            ],
+        );
+        assert_eq!(p.ram()[0x22], want, "a[{i}] via i16 term");
+    }
+}
+
+#[test]
+fn gep_exact_256_total_carries_into_fsr0h_in_sim() {
+    // Static 56 plus an 8-bit term of 200 totals exactly 256: the low
+    // byte wraps to the base byte and the carry alone raises FSR0H.
+    let ir = "global in i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @a +56 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
+    let asm = select(
+        &PIC16F1937,
+        &parse(ir),
+        &addrs(&[
+            ("in", 0x20),
+            ("out", 0x21),
+            ("a", 0x40),
+            ("main::i", 0x29),
+            ("main::v", 0x2A),
+        ]),
+    );
+    let p = run(&asm, &[(0x20, 200), (0x60, 0xEE), (0x140, 0x3C)]);
+    assert_eq!(p.ram()[0x21], 0x3C, "a[256] exact total");
+}

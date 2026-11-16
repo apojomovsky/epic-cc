@@ -1442,6 +1442,47 @@ fn gep_stride_five_ram_index_reads_each_record_in_sim() {
 }
 
 #[test]
+fn gep_i16_term_high_byte_carries_into_irp_in_sim() {
+    // A 16-bit term of 256 or 257: only its high byte (0x01) sets bit 8
+    // of the 9-bit address, toggling IRP past the low-byte wrap.
+    let ir = "global in i16\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i16 @in\n    %p = gep @a +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
+    let map = [
+        ("in", 0x20u16),
+        ("out", 0x22),
+        ("a", 0x40),
+        ("main::i", 0x29),
+        ("main::v", 0x2B),
+    ];
+    for (i, want) in [(256u16, 0x7Eu8), (257, 0x7F)] {
+        let seed = [
+            (0x20u16, (i & 0xFF) as u8),
+            (0x21, (i >> 8) as u8),
+            (0x40, 0xEE),
+            (0x41, 0xEE),
+            (0x140, 0x7E),
+            (0x141, 0x7F),
+        ];
+        assert_eq!(sim_run(ir, &map, &seed, 0x22), want, "a[{i}] via i16 term");
+    }
+}
+
+#[test]
+fn gep_exact_256_total_carries_into_irp_in_sim() {
+    // Static 56 plus an 8-bit term of 200 totals exactly 256: the low
+    // byte wraps to the base byte and the carry alone sets IRP.
+    let ir = "global in i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @a +56 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
+    let map = [
+        ("in", 0x20u16),
+        ("out", 0x21),
+        ("a", 0x40),
+        ("main::i", 0x29),
+        ("main::v", 0x2A),
+    ];
+    let seed = [(0x20u16, 200u8), (0x60, 0xEE), (0x140, 0x3C)];
+    assert_eq!(sim_run(ir, &map, &seed, 0x21), 0x3C, "a[256] exact total");
+}
+
+#[test]
 fn const_table_scaled_two_term_index_reads_each_element_in_sim() {
     // The flash-table index W = k + 3*%i + 2*%j accumulates in W before the
     // reader CALL. Every (i, j) pair names a distinct byte, so a dropped

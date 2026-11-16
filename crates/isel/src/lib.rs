@@ -24,7 +24,9 @@
 //! lowers to a byte loop of the same pointer machinery; `alloca` is virtual
 //! like `gep` (the slot is sized by alloc). Static FSR bases reach all four
 //! GPR banks via the IRP bit: every FSR setup emits `BCF/BSF STATUS, 7`
-//! (IRP = base bit 8) first, then loads FSR with `(base + k + off) & 0xFF`.
+//! first (IRP = bit 8 of the wrapped 9-bit address
+//! `(base + k + off) & 0x1FF`), then loads FSR with that low byte.
+//! Dynamic terms then add into FSR, each carry toggling IRP.
 //! The FSR-accessed object fits inside one GPR window
 //! `[0x20,0x80)` `[0xA0,0xF0)` `[0x120,0x170)` `[0x1A0,0x1F0)`: crossing an
 //! SFR hole would silently mis-address, so emission panics when the span
