@@ -3101,10 +3101,29 @@ impl<'m> Gen<'m> {
                 _ => false,
             }
     }
-    /// Whether a walk over block `b` would emit an FSR1 GEP sum while its
-    /// pointers are live: an `Emit` body op reading such a GEP, or a
-    /// back-edge phi copy (from `back_label`) carrying one into the latch.
-    fn walk_gep_sum_hazard(
+    /// Whether materializing `%r` can seed FSR0: a GEP with a scaled or
+    /// multi-term index builds its full address in FSR0 for a value move
+    /// or a byte load, whatever its base. That seed clobbers a walk
+    /// pointer, so no walk may hold one across such an emission.
+    fn gep_uses_fsr0(g: &Gen, f: &Func, r: &str) -> bool {
+        matches!(
+            g.resolved.get(&iselcore::ssa_key(&f.name, r)),
+            Some((_, _, terms)) if terms.len() > 1 || (terms.len() == 1 && terms[0].0 != 1)
+        )
+    }
+    fn val_gep_uses_fsr0(g: &Gen, f: &Func, v: &Val) -> bool {
+        let Val::Reg(r) = v else { return false };
+        Self::gep_uses_fsr0(g, f, r)
+            || match g.fold_reg(v) {
+                Val::Reg(fr) => fr != *r && Self::gep_uses_fsr0(g, f, &fr),
+                _ => false,
+            }
+    }
+    /// Whether a walk over block `b` would emit an FSR-clobbering GEP
+    /// materialization while its pointers are live: an `Emit` body op
+    /// reading such a GEP, or a back-edge phi copy (from `back_label`)
+    /// carrying one into the latch.
+    fn walk_gep_fsr_hazard(
         g: &Gen,
         f: &Func,
         b: &Block,
@@ -3115,7 +3134,7 @@ impl<'m> Gen<'m> {
             if let WalkOp::Emit(ii) = op {
                 if ir::read_vals(&b.insts[*ii])
                     .iter()
-                    .any(|r| Self::gep_sum_uses_fsr1(g, f, r))
+                    .any(|r| Self::gep_sum_uses_fsr1(g, f, r) || Self::gep_uses_fsr0(g, f, r))
                 {
                     return true;
                 }
@@ -3124,7 +3143,10 @@ impl<'m> Gen<'m> {
         for inst in &b.insts {
             if let Inst::Phi(p) = inst {
                 for (v, e) in &p.incoming {
-                    if e == back_label && Self::val_gep_sum_uses_fsr1(g, f, v) {
+                    if e == back_label
+                        && (Self::val_gep_sum_uses_fsr1(g, f, v)
+                            || Self::val_gep_uses_fsr0(g, f, v))
+                    {
                         return true;
                     }
                 }
@@ -3975,9 +3997,9 @@ impl<'m> Gen<'m> {
                 return None;
             }
         }
-        // An FSR1 GEP sum in an emitted op or back-edge copy would
-        // clobber a live walk pointer (epic-cc#1473).
-        if !groups.is_empty() && Self::walk_gep_sum_hazard(g, f, b, &paired, &b.label) {
+        // An FSR-clobbering GEP materialization in an emitted op or
+        // back-edge copy would clobber a live walk pointer.
+        if !groups.is_empty() && Self::walk_gep_fsr_hazard(g, f, b, &paired, &b.label) {
             return None;
         }
         let ptrs = groups
@@ -4312,11 +4334,11 @@ impl<'m> Gen<'m> {
         walks: &HashMap<String, WalkLoop>,
     ) -> Option<()> {
         // Middle emissions run while the outer pointers are live, so an
-        // FSR1 GEP sum read here would clobber one (epic-cc#1473).
+        // FSR-clobbering GEP materialization read here would clobber one.
         for inst in &m.insts {
             if ir::read_vals(inst)
                 .iter()
-                .any(|r| Self::gep_sum_uses_fsr1(g, f, r))
+                .any(|r| Self::gep_sum_uses_fsr1(g, f, r) || Self::gep_uses_fsr0(g, f, r))
             {
                 return None;
             }
@@ -4816,9 +4838,9 @@ impl<'m> Gen<'m> {
                 return None;
             }
         }
-        // Same FSR1 hazard as the single-block epilogue: the latch
+        // Same FSR hazard as the single-block epilogue: the latch
         // carries the back-edge copies, so its label names that edge.
-        if Self::walk_gep_sum_hazard(g, f, h, &paired, latch) {
+        if Self::walk_gep_fsr_hazard(g, f, h, &paired, latch) {
             return None;
         }
         let ptrs = groups
@@ -5838,6 +5860,11 @@ impl<'m> Gen<'m> {
             }
         }
         if pairs >= COPY_LOOP_MIN_PAIRS {
+            return None;
+        }
+        // An FSR-clobbering GEP materialization in an emitted op or
+        // back-edge copy would clobber the walked FSR0 pointer.
+        if Self::walk_gep_fsr_hazard(g, f, b, &body, &b.label) {
             return None;
         }
         Some(WalkLoop {
