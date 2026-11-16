@@ -143,6 +143,21 @@ fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
 }
 
 #[test]
+fn va_arg_gep_index_c_runs_correctly() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/va_arg_gep_index.c"
+    ));
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "out == byte written through the va_arg-indexed pointer"
+    );
+    assert!(p.halted());
+}
+
+#[test]
 fn cond_term_ptr_arg_c_runs_correctly() {
     // in == 1 (fixture comment) -> out == 0x5A.
     let (mut p, globals) = compile(concat!(

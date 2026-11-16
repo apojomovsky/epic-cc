@@ -793,6 +793,7 @@ impl<'m> Gen<'m> {
                     Inst::Select(s) if s.dst == name => s.ty.bytes(),
                     Inst::Phi(p) if p.dst == name => p.ty.bytes(),
                     Inst::Freeze(fr) if fr.dst == name => fr.ty.bytes(),
+                    Inst::VaArg(v) if v.dst == name => v.ty.bytes(),
                     Inst::Call(c) if c.dst.as_deref() == Some(name) => {
                         c.ty.map(|t| t.bytes()).unwrap_or(1)
                     }
