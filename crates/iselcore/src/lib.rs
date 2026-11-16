@@ -614,9 +614,10 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
 
 /// Fold a pointer-typed select whose two arms resolve to the same base with
 /// identical term sets: `select i1 c, base+kA, base+kB` becomes
-/// `(base, min(kA,kB), terms + (|kA-kB|, c))`. The cond's 0/1 polarity picks
-/// the arm, so no inversion is needed. Returns `None` when the arms do not
-/// fold to a common base, the term sets differ, or the cond is not a reg.
+/// `(base, min(kA,kB), terms + (|kA-kB|, c))` only when kA is the high
+/// offset, since c = 1 picks the true arm and adds the difference.
+/// Returns `None` when the arms do not fold to a common base, the term
+/// sets differ, the true arm is the low one, or the cond is not a reg.
 fn fold_select(
     s: &ir::Select,
     resolved: &PtrResolution,
@@ -659,6 +660,13 @@ fn fold_select(
         ir::Val::Reg(c) => c.clone(),
         _ => return None,
     };
+    // The term adds d when c is 1, and c = 1 picks the true arm, so the
+    // fold only holds when the true arm is the high one. A low true arm
+    // would need the complement of c, which no term expresses: leave it
+    // to the indirect-slot seeding below, which materializes the arm.
+    if d != 0 && va.1 != hi {
+        return None;
+    }
     if d == 0 {
         // Both arms are the same pointer: the select is a no-op.
         return Some((va.0.clone(), lo, va.2.clone()));
