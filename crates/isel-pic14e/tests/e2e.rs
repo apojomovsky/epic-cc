@@ -392,6 +392,23 @@ fn multi_term_ptr_arg_c_runs_correctly() {
 }
 
 #[test]
+fn cond_term_ptr_arg_c_runs_correctly() {
+    // in == 1 (fixture comment) -> out == 0x5A.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/cond_term_ptr_arg.c"
+    ));
+    p.ram_mut()[globals["in"] as usize] = 1;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "out == byte written through the selected pointer"
+    );
+    assert!(p.halted());
+}
+
+#[test]
 fn gep_value_icmp_c_runs_correctly() {
     // in == 8 (fixture comment) -> out == 4, out2 == 1.
     let (mut p, globals) = compile(concat!(
