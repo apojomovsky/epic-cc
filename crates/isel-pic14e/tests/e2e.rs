@@ -1251,3 +1251,22 @@ fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
         "the laundered address of arr[3] must read back its byte"
     );
 }
+
+#[test]
+fn term_alias_ptr_arg_c_runs_correctly() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/term_alias_ptr_arg.c"
+    ));
+    p.ram_mut()[globals["in"] as usize] = 1;
+    let in2_addr = globals["in2"] as usize;
+    p.ram_mut()[in2_addr] = 0;
+    p.ram_mut()[in2_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "out == 0x5A for in == 1, in2 == 0"
+    );
+    assert!(p.halted());
+}
