@@ -10317,6 +10317,79 @@ fn walk_copy_storing_moved_invariant_gep_keeps_walk_pointers() {
 }
 
 #[test]
+fn walk_copy_storing_global_gep_value_keeps_walk_pointers() {
+    // A counted copy walks FSR0/FSR1, but the body also stores a moved
+    // global-base GEP with a scaled term. Materializing it seeds FSR0,
+    // which would clobber the source walk pointer, so this loop must
+    // not walk: every copied byte and the stored pointer stay exact.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global ram i8\n\
+         global pv i16\n\
+         global idx i8\n\
+         global out i8\n\
+         fn work(void) (n=i8)\n\
+           block entry:\n\
+             %p = gep @ram +0 +2*%n\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %g1 = gep @src +0 +1*%i\n\
+             %v = load i8 %g1\n\
+             %g2 = gep @dst +0 +1*%i\n\
+             store i8 %v %g2\n\
+             store ptr %p @pv\n\
+             %r = add i16 %i, 1\n\
+             %c = icmp eq i16 %r, 11\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             call void @work(i8 %i)\n\
+             %r = load ptr @pv\n\
+             %v = load i8 %r\n\
+             store i8 %v @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x020),
+        ("dst", 0x030),
+        ("ram", 0x1FE),
+        ("pv", 0x140),
+        ("idx", 0x142),
+        ("out", 0x143),
+        ("work::n", 0x150),
+        ("work::i", 0x152),
+        ("work::v", 0x154),
+        ("work::r", 0x155),
+        ("work::c", 0x157),
+        ("main::i", 0x158),
+        ("main::r", 0x159),
+        ("main::v", 0x15B),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for k in 0..11u8 {
+        p.ram_mut()[0x20 + usize::from(k)] = 0x50 + k;
+    }
+    p.ram_mut()[0x142] = 3;
+    p.ram_mut()[0x204] = 0xA1;
+    p.run(10000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    for k in 0..11u8 {
+        assert_eq!(p.ram()[0x30 + usize::from(k)], 0x50 + k, "copied byte {k}");
+    }
+    assert_eq!(p.ram()[0x140], 0x04, "stored pointer low byte");
+    assert_eq!(p.ram()[0x141], 0x02, "stored pointer high byte");
+    assert_eq!(p.ram()[0x143], 0xA1, "stored pointer derefs its target");
+}
+
+#[test]
 fn walk_copy_with_gep_backedge_phi_keeps_walk_pointers() {
     // Same hazard through the latch: a carried pointer phi whose
     // back-edge incoming is the moved invariant GEP. Its phi copy runs
