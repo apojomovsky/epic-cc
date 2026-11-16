@@ -1441,7 +1441,8 @@ impl<'m> Gen<'m> {
     /// park pair when a term byte or the base byte range overlaps
     /// the param slot at `pa`, so seeding cannot overwrite a value
     /// before it is consumed, else `pa` itself. The park pair sits
-    /// in common RAM, which no local or param slot occupies.
+    /// in common RAM, or in the banked `isr_home_window` on the
+    /// PIC16F74, which no local or param slot occupies.
     fn ptr_arg_dest(&self, pa: u16, terms: &[(u16, String)], base: Option<u16>) -> u16 {
         let overlaps = |lo: u16, hi: u16| lo <= pa + 1 && pa <= hi;
         let base_danger = base.is_some_and(|sa| overlaps(sa, sa + 1));
