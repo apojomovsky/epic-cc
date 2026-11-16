@@ -114,6 +114,36 @@ fn multi_term_ptr_arg_c_runs_correctly() {
     assert!(p.halted());
 }
 
+/// epic-cc#1468: startup init of an initialized bank-straddling global
+/// must write each byte at its physical address, skipping the common-RAM
+/// alias gap between banks, as user-code accesses already assume. A
+/// contiguous `base + i` walk from bank 2 hits 0x170, the bank-3 alias
+/// of common RAM 0x70, and banking rejects it.
+#[test]
+fn span_init_c_initialized_straddling_global_survives_startup() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/span_init.c"
+    ));
+    let zbig = globals["zbig"];
+    assert_eq!(
+        zbig, 0x160,
+        "span_init.c layout: zbig[90] at 0x{zbig:03X} must start near the end of bank 2 and straddle into bank 3"
+    );
+    p.run(200_000);
+    // Bytes past the bank boundary land in bank 3, not the alias gap.
+    assert_eq!(p.ram()[0x160], 0x11, "zbig[0] at its physical byte");
+    assert_eq!(p.ram()[0x16F], 0x22, "zbig[15] at bank 2's last byte");
+    assert_eq!(p.ram()[0x190], 0x33, "zbig[16] at bank 3's first byte");
+    assert_eq!(p.ram()[0x1D9], 0x44, "zbig[89] at its physical byte");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0xAA,
+        "out == zbig[0] + zbig[15] + zbig[16] + zbig[89] after startup init"
+    );
+    assert!(p.halted());
+}
+
 /// epic-cc#1433: a pointer laundered through `uintptr_t` lowers as a
 /// same-width `trunc i16 -> i16`, and the backend used to refuse it
 /// ("trunc must narrow"), aborting the compile.

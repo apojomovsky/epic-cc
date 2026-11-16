@@ -81,6 +81,42 @@ fn literal_ptr_addr(ptr: &str) -> u16 {
         .unwrap_or_else(|_| panic!("isel: malformed literal pointer {ptr:?}"))
 }
 
+/// Returns the physical address of byte `idx` of an object at `base`:
+/// the placement walk in `alloc`, stepping over the gap between GPR
+/// banks, so a straddling object's tail lands in the next bank instead
+/// of the common-RAM alias window the gap contains.
+/// Whether an object at `base_addr` of `span` bytes crosses its bank end.
+fn object_straddles(device: &Device, base_addr: u16, span: u16) -> bool {
+    let (_, end) = device
+        .region_for(base_addr)
+        .expect("isel: global base outside GPR space");
+    base_addr + span - 1 > end
+}
+
+fn physical_byte_addr(device: &Device, base: u16, idx: u16) -> u16 {
+    if let Some((lo, hi)) = device.common_ram {
+        if base >= lo && base <= hi {
+            return base + idx;
+        }
+    }
+    let mut cur = base;
+    let mut remaining = idx;
+    loop {
+        let (start, end) = device
+            .region_for(cur)
+            .expect("isel: global byte outside GPR space");
+        if cur < start {
+            cur = start;
+        }
+        let avail = end - cur + 1;
+        if remaining < avail {
+            return cur + remaining;
+        }
+        remaining -= avail;
+        cur = end + 1;
+    }
+}
+
 /// The GPR windows reachable through FSR+IRP, derived from the device's
 /// `ram_banks` and `common_ram`. Each bank's window is the GPR bank itself
 /// plus, for the first bank, the common RAM that is bank-mirrored. The
@@ -886,7 +922,14 @@ impl<'m> Gen<'m> {
                     !self.global_is_const(g),
                     "isel: store to const (flash) global @{g}"
                 );
-                Addr::Direct(self.global_addr(g) + u16::from(byte_off))
+                let base = self.global_addr(g);
+                Addr::Direct(
+                    if object_straddles(self.device, base, self.global_size(g)) {
+                        physical_byte_addr(self.device, base, u16::from(byte_off))
+                    } else {
+                        base + u16::from(byte_off)
+                    },
+                )
             }
             Val::Reg(r) => {
                 let (base, k, terms) = self.resolved_for(r);
@@ -898,11 +941,17 @@ impl<'m> Gen<'m> {
                         );
                         if terms.is_empty() {
                             // Constant offset only: the address is statically
-                            // known, a plain file-register access, no FSR.
+                            // known, a plain file-register access, no FSR. A
+                            // straddling object maps the offset through the
+                            // physical bank walk, skipping the alias gap.
+                            let gbase = self.global_addr(name);
+                            let off = k.wrapping_add(u16::from(byte_off));
                             Addr::Direct(
-                                self.global_addr(name)
-                                    .wrapping_add(k)
-                                    .wrapping_add(u16::from(byte_off)),
+                                if object_straddles(self.device, gbase, self.object_span(&base)) {
+                                    physical_byte_addr(self.device, gbase, off)
+                                } else {
+                                    gbase.wrapping_add(off)
+                                },
                             )
                         } else {
                             let span = self.object_span(&base);
@@ -14361,7 +14410,10 @@ pub fn select_with_opts(
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
-                    init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
+                    init.push(format!(
+                        "    MOVWF 0x{:02X}",
+                        physical_byte_addr(device, base, i as u16)
+                    ));
                 }
             }
         }
@@ -14422,8 +14474,8 @@ pub fn select_with_opts(
     let mut global_addrs: HashSet<u16> = HashSet::new();
     for g in &m.globals {
         if let Some(&a) = addrs.get(&g.name) {
-            for i in 0..g.size as u16 {
-                global_addrs.insert(a + i);
+            for i in 0..g.size {
+                global_addrs.insert(physical_byte_addr(device, a, i));
             }
         }
     }
@@ -14526,7 +14578,10 @@ pub fn select_with_opts(
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
-                    init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
+                    init.push(format!(
+                        "    MOVWF 0x{:02X}",
+                        physical_byte_addr(device, base, i as u16)
+                    ));
                 }
             }
         }
@@ -14561,7 +14616,10 @@ pub fn select_with_opts(
                         } else {
                             init.push(format!("    MOVLW 0x{b:02X}"));
                         }
-                        init.push(format!("    MOVWF 0x{:02X}", base + idx as u16));
+                        init.push(format!(
+                            "    MOVWF 0x{:02X}",
+                            physical_byte_addr(device, base, idx as u16)
+                        ));
                     }
                 }
             }
@@ -15082,7 +15140,7 @@ pub fn select_with_opts(
                                             }
                                             init.push(format!(
                                                 "    MOVWF 0x{:02X}",
-                                                base + i as u16
+                                                physical_byte_addr(device, base, i as u16)
                                             ));
                                         }
                                     }
