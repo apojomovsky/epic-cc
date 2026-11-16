@@ -1100,3 +1100,40 @@ fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
         "the laundered address of a local must read back the local's byte"
     );
 }
+
+#[test]
+fn byval_gep_launder_reads_back_field_byte() {
+    let _guard = E2E_LOCK.lock();
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/byval_gep_launder.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(10_000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the laundered byval field address must read back s.b"
+    );
+}
+
+#[test]
+fn gep_as_direct_call_arg_reads_back_byte() {
+    let _guard = E2E_LOCK.lock();
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/gep_call_arg.c");
+    let (mut p, globals) = compile(fixture);
+    p.ram_mut()[globals["in"] as usize] = 3;
+    p.run(10_000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the GEP call arg must address buf[3]"
+    );
+    assert_eq!(
+        p.ram()[globals["buf"] as usize],
+        0,
+        "buf[0] must stay untouched"
+    );
+}

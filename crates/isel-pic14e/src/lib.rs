@@ -286,7 +286,7 @@ impl<'m> Gen<'m> {
     }
 
     /// Whether `name` is a local object in the current function: an
-    /// `alloca`'s slot IS the object, so a pointer to it is that slot's
+    /// `alloca` or byval param's slot IS the object, so a pointer to it is that slot's
     /// own frame address rather than an address value stored in the slot
     /// (epic-cc#647).
     fn is_local_object(&self, name: &str) -> bool {
@@ -295,11 +295,12 @@ impl<'m> Gen<'m> {
             .iter()
             .find(|f| f.name == self.cur_func)
             .map(|f| {
-                f.blocks.iter().any(|b| {
-                    b.insts
-                        .iter()
-                        .any(|i| matches!(i, ir::Inst::Alloca(a) if a.dst == name))
-                })
+                f.params.iter().any(|p| p.name == name && p.byval.is_some())
+                    || f.blocks.iter().any(|b| {
+                        b.insts
+                            .iter()
+                            .any(|i| matches!(i, ir::Inst::Alloca(a) if a.dst == name))
+                    })
             })
             .unwrap_or(false)
     }

@@ -173,6 +173,22 @@ fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
 }
 
 #[test]
+fn byval_gep_launder_reads_back_field_byte() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/byval_gep_launder.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the laundered byval field address must read back s.b"
+    );
+}
+
+#[test]
 fn va_arg_gep_index_c_runs_correctly() {
     let (mut p, globals) = compile(concat!(
         env!("CARGO_MANIFEST_DIR"),
