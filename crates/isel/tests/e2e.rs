@@ -280,3 +280,27 @@ fn term_alias_ptr_arg_c_runs_correctly() {
     );
     assert!(p.halted());
 }
+
+#[test]
+fn term_alias_stacked_arg_c_runs_correctly() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/term_alias_stacked_arg.c"
+    ));
+    p.ram_mut()[globals["in"] as usize] = 1;
+    let in2_addr = globals["in2"] as usize;
+    p.ram_mut()[in2_addr] = 5;
+    p.ram_mut()[in2_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "out == 0x5A for in == 1, in2 == 5"
+    );
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        5,
+        "out2 == stacked term value 5"
+    );
+    assert!(p.halted());
+}
