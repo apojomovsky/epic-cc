@@ -186,6 +186,27 @@ fn overlay_slack_includes_a_frame_at_exactly_64_bytes() {
 }
 
 #[test]
+fn overlay_slack_ignores_the_isr_region_above_the_main_top() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             call void @big()\n\
+             ret void\n\
+         fn big(void) ()\n\
+           block entry:\n\
+             %buf = alloca 96\n\
+             ret void\n\
+         fn handler(void) [isr] ()\n\
+           block entry:\n\
+             %buf = alloca 8\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main big\ndepth 2\n");
+    assert!(out.has_isr);
+    assert_eq!(out.overlay_slack, Vec::<(String, u16)>::new());
+}
+
+#[test]
 fn params_are_frame_locals_too() {
     let m = parse(
         "fn f(void) (p0=byval2, p1=i8)\n\

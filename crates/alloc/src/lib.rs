@@ -5241,18 +5241,20 @@ fn allocate_inner(
     // Overlay slack (epic-cc#1355): main-context frames at or above 64B
     // ending below the binding top. The ISR context is disjoint and binds
     // its own region, so its frames never count as main-context slack.
+    let isr_roots: Vec<&String> = topo
+        .iter()
+        .filter(|f| !callers.contains_key(*f) && isr_names.contains(f.as_str()))
+        .collect();
+    let isr_ctx: HashSet<String> = isr_roots
+        .iter()
+        .flat_map(|r| reachable(&[r.as_str()], &edges))
+        .collect();
     let binding_top = base
         .iter()
+        .filter(|(f, _)| !isr_ctx.contains(*f))
         .map(|(f, &b)| frame_end(device, b, &locals_widths[f]))
         .max()
         .unwrap_or(0);
-    let isr_roots: Vec<&str> = m
-        .funcs
-        .iter()
-        .filter(|f| f.isr)
-        .map(|f| f.name.as_str())
-        .collect();
-    let isr_ctx = reachable(&isr_roots, &edges);
     let mut overlay_slack: Vec<(String, u16)> = m
         .funcs
         .iter()
