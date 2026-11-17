@@ -244,15 +244,9 @@ pub(crate) fn chunk_slice(
     (out, out_locs)
 }
 
-/// Places a unit of `size` words first-fit into the lowest page tail with
-/// room (`page_next[p]` is page `p`'s next free address), else opens the
-/// next page. Returns `(page, start)`. Panics past the device flash.
-pub(crate) fn place_unit(
-    device: &Device,
-    name: &str,
-    size: usize,
-    page_next: &mut Vec<usize>,
-) -> (usize, usize) {
+/// First-fit into the lowest page tail with room, else a new page.
+/// Shared by bounded and unbounded placement so both pack identically.
+fn first_fit(size: usize, page_next: &mut Vec<usize>) -> (usize, usize) {
     for (pi, next) in page_next.iter_mut().enumerate() {
         if *next + size <= (pi + 1) * 0x800 {
             let start = *next;
@@ -260,18 +254,47 @@ pub(crate) fn place_unit(
             return (pi, start);
         }
     }
-    // Ceiling division: a device narrower than one page still has one.
     let pi = page_next.len();
-    let num_pages = device.flash_words.div_ceil(0x800);
-    let last_page = num_pages - 1;
-    if pi as u32 >= num_pages {
-        panic!(
-            "isel: function @{name} would start at 0x{:04X}, beyond page {last_page} (device flash is {:#06x} words)",
-            pi * 0x800,
-            device.flash_words
-        );
-    }
     let start = pi * 0x800;
     page_next.push(start + size);
     (pi, start)
+}
+
+/// Places a unit without the device bound, for sizing an oversize program.
+pub(crate) fn place_unit_unbounded(size: usize, page_next: &mut Vec<usize>) -> (usize, usize) {
+    first_fit(size, page_next)
+}
+
+/// Places a unit of `size` words first-fit into the lowest page tail with
+/// room (`page_next[p]` is page `p`'s next free address), else opens the
+/// next page. Returns `(page, start)`. Panics past the device flash,
+/// naming the whole program's `total_words` and the `unplaced_words`
+/// (this unit, later units, and the const section) still to place.
+pub(crate) fn place_unit(
+    device: &Device,
+    name: &str,
+    size: usize,
+    page_next: &mut Vec<usize>,
+    total_words: usize,
+    unplaced_words: usize,
+) -> (usize, usize) {
+    // Ceiling division: a device narrower than one page still has one.
+    let num_pages = device.flash_words.div_ceil(0x800);
+    if page_next.len() as u32 <= num_pages {
+        let placed = first_fit(size, page_next);
+        if placed.0 as u32 >= num_pages {
+            // Opened a page past the device flash: fall through.
+        } else {
+            return placed;
+        }
+    }
+    let pi = page_next.len().saturating_sub(1).max(num_pages as usize);
+    let last_page = num_pages - 1;
+    panic!(
+        "isel: function @{name} would start at 0x{:04X}, beyond page {last_page} (device flash is {:#06x} words): program needs {total_words} words in total ({} words over the {}-word limit), {unplaced_words} words still unplaced",
+        pi * 0x800,
+        device.flash_words,
+        total_words.saturating_sub(device.flash_words as usize),
+        device.flash_words
+    );
 }

@@ -54,8 +54,8 @@ use std::collections::{HashMap, HashSet};
 
 mod chunk;
 use chunk::{
-    block_asm_labels, chunk_slice, insert_goto_sets, place_unit, plan_chunks, post_extents,
-    rewrite_restores, slice_banked_lines, CHUNK_LINK_WORDS,
+    block_asm_labels, chunk_slice, insert_goto_sets, place_unit, place_unit_unbounded, plan_chunks,
+    post_extents, rewrite_restores, slice_banked_lines, CHUNK_LINK_WORDS,
 };
 
 /// Returns the recipe for a runtime routine name, or `None` for other names.
@@ -8420,6 +8420,54 @@ pub fn select_with_locs(
         } else {
             5 + word_size(&modasm_lines) + init_words
         }];
+        // Oversize totals (epic-cc#1484): replay placement unbounded and
+        // lay the const section at that end, so a failure names the whole
+        // program instead of only the first unplaced function.
+        let mut consts: Vec<&ir::Global> = m
+            .globals
+            .iter()
+            .filter(|g| g.is_const && !addrs.contains_key(&g.name))
+            .collect();
+        consts.sort_by_key(|g| g.name.clone());
+        let mut sim_next = page_next.clone();
+        let mut placeable_words = 0usize;
+        for (name, _) in &bodies {
+            let size = post[name];
+            if has_isr && name == &isr_names[0] {
+                sim_next[0] = 4 + size + 4 + init_words;
+            } else if let Some(plan) = split_plans.get(name) {
+                let last = plan.len() - 1;
+                for (k, (_, words)) in plan.iter().enumerate() {
+                    let unit = if k < last {
+                        *words + CHUNK_LINK_WORDS
+                    } else {
+                        *words
+                    };
+                    placeable_words += unit;
+                    place_unit_unbounded(unit, &mut sim_next);
+                }
+            } else {
+                placeable_words += size;
+                place_unit_unbounded(size, &mut sim_next);
+            }
+        }
+        let func_end = sim_next.last().copied().unwrap_or(0);
+        let total_words = if consts.is_empty() {
+            func_end
+        } else {
+            let places = place_consts(&consts, staged, &HashMap::new(), func_end);
+            places
+                .iter()
+                .zip(consts.iter())
+                .filter_map(|(p, g)| {
+                    p.chunks
+                        .last()
+                        .map(|c| c.base_at + (g.bytes.len() - 256 * (p.chunks.len() - 1)))
+                })
+                .max()
+                .unwrap_or(func_end)
+        };
+        let mut unplaced_words = placeable_words + (total_words - func_end);
         for (name, _) in &bodies {
             let size = post[name];
             if has_isr && name == isr_names[0] {
@@ -8442,7 +8490,15 @@ pub fn select_with_locs(
                     } else {
                         *words
                     };
-                    let (page, start) = place_unit(device, name, unit, &mut page_next);
+                    let (page, start) = place_unit(
+                        device,
+                        name,
+                        unit,
+                        &mut page_next,
+                        total_words,
+                        unplaced_words,
+                    );
+                    unplaced_words -= unit;
                     // Anchors page-aligned chunk starts with `.org`, as for
                     // whole functions below.
                     if start & 0x7FF == 0 {
@@ -8456,7 +8512,15 @@ pub fn select_with_locs(
                         "isel: function @{name} of {size} words exceeds a 2048-word page (0x800)"
                     );
                 }
-                let (page, start) = place_unit(device, name, size, &mut page_next);
+                let (page, start) = place_unit(
+                    device,
+                    name,
+                    size,
+                    &mut page_next,
+                    total_words,
+                    unplaced_words,
+                );
+                unplaced_words -= size;
                 pages.insert(name.clone(), page);
                 // Anchors page-aligned starts with `.org`: without it, pass-B
                 // shrinkage slides the function below the boundary and its label
@@ -8469,12 +8533,6 @@ pub fn select_with_locs(
         }
         // Maps const readers to post-call pages. Pins the section start, so the
         // map holds in the final text.
-        let mut consts: Vec<&ir::Global> = m
-            .globals
-            .iter()
-            .filter(|g| g.is_const && !addrs.contains_key(&g.name))
-            .collect();
-        consts.sort_by_key(|g| g.name.clone());
         let table_start = page_next
             .last()
             .copied()
