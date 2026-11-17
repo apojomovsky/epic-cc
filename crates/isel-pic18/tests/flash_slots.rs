@@ -1584,6 +1584,45 @@ fn memcpy_into_mixed_global_is_refused() {
 }
 
 #[test]
+#[should_panic(expected = "maybe-flash destination")]
+fn flash_memcpy_call_into_a_flash_slot_is_refused() {
+    // epic-cc#1435: a `memcpy` call from a flash pointer copies the
+    // table's content, so the destination slot it lands in holds
+    // content, not the address its initializer held. The call marks
+    // the slot the way the `Memcpy` instruction does, so the copy
+    // into the now maybe-flash slot is refused instead of leaving a
+    // later pointer load to read program memory at the content.
+    let mut m = with_bytes(
+        parse(
+            "const table i8\nglobal srcp i16\nglobal h i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @table @srcp\n    %p = load ptr @srcp\n    call void @memcpy(ptr @h, ptr %p, 2)\n    %q = load ptr @h\n    %w = load i8 %q\n    store i8 %w @out\n    ret void\n",
+        ),
+        "table",
+        &[0x40, 0, 0, 0],
+    );
+    for g in &mut m.globals {
+        if g.name == "h" {
+            g.bytes = vec![0, 0];
+            g.refs = vec![(0, "table".to_string(), 0)];
+            g.size = 2;
+        }
+    }
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("srcp", 0x10),
+            ("h", 0x13),
+            ("out", 0x16),
+            ("main::p", 0x17),
+            ("main::q", 0x19),
+            ("main::w", 0x1b),
+        ]),
+        None,
+    );
+}
+
+#[test]
 fn memcpy_from_runtime_indexed_flash_walk_copies_table_element() {
     // A 14-byte element copied from the middle of a flash table: the
     // source pointer lives in a flash slot and gains a runtime term,
@@ -2496,4 +2535,75 @@ fn int_laundered_memcpy_from_a_pointer_value_reads_ram() {
     // The table byte lives only in program memory, so a flash read
     // would return something else.
     assert_eq!(p.ram()[0x16], b'R', "the copied content must read RAM");
+}
+
+#[test]
+fn flash_memcpy_content_via_second_memcpy_reads_ram() {
+    // epic-cc#1435: a memcpy from a flash pointer copies the table's
+    // content into RAM, and a second memcpy moves those bytes on: they
+    // stay content, so the inttoptr dereference reads RAM.
+    let m = with_bytes(
+        parse(
+            "const table i8\nglobal srcp i16\nglobal buf i8\nglobal v i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @table @srcp\n    %p = load ptr @srcp\n    memcpy @buf %p 4\n    memcpy @v @buf 2\n    %y = load i16 @v\n    %q = inttoptr i16 %y to ptr\n    %w = load i8 %q\n    store i8 %w @out\n    ret void\n",
+        ),
+        "table",
+        &[0x40, 0, 0, 0],
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("srcp", 0x10),
+            ("buf", 0x13),
+            ("v", 0x18),
+            ("out", 0x1B),
+            ("main::p", 0x1C),
+            ("main::y", 0x1E),
+            ("main::q", 0x20),
+            ("main::w", 0x22),
+        ]),
+        None,
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x40] = b'R';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x1B], b'R', "the copied content must read RAM");
+}
+
+#[test]
+fn flash_memcpy_content_read_as_pointer_reads_ram() {
+    // epic-cc#1435: the bytes a flash memcpy lands are content, so a
+    // pointer load of them holds a RAM address.
+    let m = with_bytes(
+        parse(
+            "const table i8\nglobal srcp i16\nglobal buf i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @table @srcp\n    %p = load ptr @srcp\n    memcpy @buf %p 4\n    %q = load ptr @buf\n    %w = load i8 %q\n    store i8 %w @out\n    ret void\n",
+        ),
+        "table",
+        &[0x40, 0, 0, 0],
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("srcp", 0x10),
+            ("buf", 0x13),
+            ("out", 0x18),
+            ("main::p", 0x19),
+            ("main::q", 0x1B),
+            ("main::w", 0x1D),
+        ]),
+        None,
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x40] = b'R';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x18], b'R', "the copied content must read RAM");
 }

@@ -2564,6 +2564,31 @@ pub fn flash_slot_spaces_ex(
                         }
                     }
                     Inst::Call(c) => {
+                        // A direct `memcpy` call copies bytes like the
+                        // `Memcpy` instruction (the PIC18 backend lowers
+                        // a flash one the same way), so its destination
+                        // is overwritten with content, not an address
+                        // (epic-cc#1435).
+                        if c.func == "memcpy" && c.callees.is_empty() {
+                            if let Some(dst) = c.args.first() {
+                                let space = match &dst.val {
+                                    ir::Val::Global(g) => DstSpace::Global(g.clone()),
+                                    ir::Val::Reg(r) => dst_space(&f.name, &format!("%{r}")),
+                                    ir::Val::Const(_) => DstSpace::Unknown,
+                                };
+                                match space {
+                                    DstSpace::Global(g) => {
+                                        if m.globals.iter().any(|x| x.name == g && !x.is_const) {
+                                            push(format!("@{g}"), SlotWriter::Bad);
+                                        }
+                                    }
+                                    DstSpace::Object => {}
+                                    DstSpace::Unknown => {
+                                        unknown_write = true;
+                                    }
+                                }
+                            }
+                        }
                         if c.callees.is_empty() {
                             if let Some(callee) = m.funcs.iter().find(|x| x.name == c.func) {
                                 for (p, arg) in callee.params.iter().zip(c.args.iter()) {
@@ -3341,6 +3366,45 @@ pub fn add_flash_laundering(
                             }
                         }
                         Inst::Call(c) => {
+                            // A direct `memcpy` call moves bytes like the
+                            // `Memcpy` instruction, so taint in the source
+                            // bytes reaches the destination (epic-cc#1435).
+                            if c.func == "memcpy" && c.callees.is_empty() {
+                                if let (Some(src), Some(dst)) = (
+                                    c.args.get(1).map(|a| &a.val),
+                                    c.args.first().map(|a| &a.val),
+                                ) {
+                                    if let (Some((ss, so, _)), Some((ds, dof, dfake))) =
+                                        (val_loc(&f.name, src), val_loc(&f.name, dst))
+                                    {
+                                        let n = match c.args.get(2).map(|a| &a.val) {
+                                            Some(ir::Val::Const(n)) => u32::try_from(*n).ok(),
+                                            _ => None,
+                                        };
+                                        match n {
+                                            Some(n)
+                                                if so.1 == 0
+                                                    && dof.1 == 0
+                                                    && !mt.wide.contains(&ss) =>
+                                            {
+                                                for k in 0..n {
+                                                    if mt.bytes.contains(&(ss.clone(), so.0 + k)) {
+                                                        mt.mark(&ds, (dof.0 + k, 0), 1);
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                if mt.query(&ss, (0, 1), 1) {
+                                                    mt.mark(&ds, (0, 1), 1);
+                                                }
+                                            }
+                                        }
+                                        if dfake && mt.bytes.iter().any(|(s, _)| s == &ss) {
+                                            mt.all = true;
+                                        }
+                                    }
+                                }
+                            }
                             // Context-sensitive (epic-cc#1324): each result
                             // substitutes the callee params it depends on
                             // with this site's actual argument states, so a
@@ -3795,6 +3859,44 @@ pub fn add_int_flash_definite(
                         );
                     }
                     Inst::Call(c) => {
+                        // A direct `memcpy` call writes its destination
+                        // like the `Memcpy` instruction: the bytes it
+                        // lands are the source's content, so they keep
+                        // no address proof of their own (epic-cc#1435).
+                        if c.func == "memcpy" && c.callees.is_empty() {
+                            let side =
+                                |idx: usize| c.args.get(idx).and_then(|a| val_slot(&func, &a.val));
+                            let len = match c.args.get(2).map(|a| &a.val) {
+                                Some(ir::Val::Const(n)) => u8::try_from(*n).ok().map(u32::from),
+                                _ => None,
+                            };
+                            match (side(1), side(0), len) {
+                                (Some((ss, so)), Some((ds, doff)), Some(n)) => {
+                                    let idx = writes.len();
+                                    writes.push(Write::Copy {
+                                        func: func.clone(),
+                                        sslot: ss.clone(),
+                                        soff: so,
+                                        doff,
+                                        block: b.label.clone(),
+                                        index: inst_index,
+                                    });
+                                    write_span.insert(idx, (doff, n));
+                                    for k in 0..n {
+                                        writes_by
+                                            .entry((ds.clone(), doff + k))
+                                            .or_default()
+                                            .push(idx);
+                                        reads_by.entry((ss.clone(), so + k)).or_default().push((
+                                            func.clone(),
+                                            b.label.clone(),
+                                            inst_index,
+                                        ));
+                                    }
+                                }
+                                _ => void_all = true,
+                            }
+                        }
                         // A call result used in pointer position is a
                         // pointer value: its slot holds the returned
                         // address.
