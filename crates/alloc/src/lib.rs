@@ -224,6 +224,12 @@ pub struct AllocLayout {
     /// its own region so the two ISRs' areas stay disjoint. `Some` only in
     /// priority mode. (epic-cc#477, epic-cc#641)
     pub isr_hi_save: Option<u16>,
+    /// Main-context frames of at least 64 bytes whose physical end sits
+    /// strictly below the binding top (the highest frame end in the
+    /// layout): shrinking one saves 0B on the total until a binding top
+    /// drops onto it (epic-cc#1355). `(function, frame bytes)`, largest
+    /// first, then by name. Recording only: no total reads this list.
+    pub overlay_slack: Vec<(String, u16)>,
 }
 
 /// Inclusive physical-address range of the GPR region that contains `addr`,
@@ -5232,6 +5238,33 @@ fn allocate_inner(
         .max()
         .unwrap_or(0);
 
+    // Overlay slack (epic-cc#1355): main-context frames at or above 64B
+    // ending below the binding top. The ISR context is disjoint and binds
+    // its own region, so its frames never count as main-context slack.
+    let binding_top = base
+        .iter()
+        .map(|(f, &b)| frame_end(device, b, &locals_widths[f]))
+        .max()
+        .unwrap_or(0);
+    let isr_roots: Vec<&str> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr)
+        .map(|f| f.name.as_str())
+        .collect();
+    let isr_ctx = reachable(&isr_roots, &edges);
+    let mut overlay_slack: Vec<(String, u16)> = m
+        .funcs
+        .iter()
+        .filter(|f| !isr_ctx.contains(&f.name))
+        .filter(|f| {
+            locals_size[&f.name] >= 64
+                && frame_end(device, base[&f.name], &locals_widths[&f.name]) < binding_top
+        })
+        .map(|f| (f.name.clone(), locals_size[&f.name]))
+        .collect();
+    overlay_slack.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
     (
         AllocLayout {
             globals,
@@ -5247,6 +5280,7 @@ fn allocate_inner(
             isr_low_save,
             isr_save,
             isr_hi_save,
+            overlay_slack,
         },
         frames_fit,
         base,
@@ -5351,6 +5385,9 @@ pub fn map_text(l: &AllocLayout) -> String {
             .split_once("::")
             .expect("alloc: malformed local key {key}");
         out.push_str(&format!("local {func} {name} 0x{:02X}\n", l.locals[key]));
+    }
+    for (func, size) in &l.overlay_slack {
+        out.push_str(&format!("overlay-slack {func} {size}\n"));
     }
     out
 }

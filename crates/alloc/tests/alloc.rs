@@ -127,6 +127,65 @@ fn map_text_emits_global_and_local_lines() {
 }
 
 #[test]
+fn overlay_slack_records_large_frames_below_the_binding_top() {
+    // big (79B) and small (63B) are siblings under main; top (96B) sets the
+    // binding top, so only big is slack and the total stays top's span.
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             call void @big()\n\
+             call void @small()\n\
+             call void @top()\n\
+             ret void\n\
+         fn big(void) ()\n\
+           block entry:\n\
+             %buf = alloca 79\n\
+             ret void\n\
+         fn small(void) ()\n\
+           block entry:\n\
+             %buf = alloca 63\n\
+             ret void\n\
+         fn top(void) ()\n\
+           block entry:\n\
+             %buf = alloca 96\n\
+             ret void\n",
+    );
+    let out = allocate(
+        &PIC18F4550,
+        &m,
+        "edge main big\nedge main small\nedge main top\ndepth 2\n",
+    );
+    assert_eq!(out.overlay_slack, vec![("big".to_string(), 79)]);
+    assert_eq!(out.total_bank0, 96);
+    assert!(
+        map_text(&out).contains("overlay-slack big 79\n"),
+        "{}",
+        map_text(&out)
+    );
+}
+
+#[test]
+fn overlay_slack_includes_a_frame_at_exactly_64_bytes() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             call void @big()\n\
+             call void @top()\n\
+             ret void\n\
+         fn big(void) ()\n\
+           block entry:\n\
+             %buf = alloca 64\n\
+             ret void\n\
+         fn top(void) ()\n\
+           block entry:\n\
+             %buf = alloca 96\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main big\nedge main top\ndepth 2\n");
+    assert_eq!(out.overlay_slack, vec![("big".to_string(), 64)]);
+}
+
+#[test]
 fn params_are_frame_locals_too() {
     let m = parse(
         "fn f(void) (p0=byval2, p1=i8)\n\
