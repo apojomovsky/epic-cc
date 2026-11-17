@@ -18315,12 +18315,11 @@ pub fn select_with_opts(
     });
     // The integer-domain space proof (epic-cc#1346): an integer that
     // certainly carries a flash address keeps its space through the
-    // int domain. The `inttoptr` dsts it proves stay out of the slot
-    // proof's writer set: a slot joining one of them with a RAM value
-    // is maybe-flash, and a maybe-flash slot needs the 3-byte tagged
-    // form, which `alloc` sizes from its own slot proof. Keeping the
-    // dsts here leaves that slot RAM-only, so the maybe case keeps the
-    // int_flash refusal instead of widening.
+    // int domain. The `inttoptr` dsts it proves are flash writers in
+    // the slot proof below (epic-cc#1419), so a slot joining one of
+    // them with a RAM value is maybe-flash in both proofs: `alloc`
+    // sizes the 3-byte tagged form from the same writer set, and the
+    // select writes the picked arm's tag.
     add_int_flash_definite(&mut prov, m, &resolved, |n| {
         !n.starts_with("_ZTV") && is_flash_const_global(m, addrs, n)
     });
