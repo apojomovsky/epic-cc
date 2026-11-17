@@ -1406,6 +1406,48 @@ impl<'m> Gen<'m> {
                 return;
             }
         }
+        // Shape 1 (epic-cc#1505): when repetitions make it cheaper,
+        // accumulate the low byte in W and count carries in FSR
+        // (parity only: INCF wraps keep bit 0 exact), then flip IRP
+        // once. A 2-byte term also counts its high byte bit 0 per
+        // repetition, a 256-multiple in the 9-bit space.
+        let mut old_cost = 3usize;
+        let mut new_cost = 6usize;
+        for (scale, r) in terms {
+            let bytes = self.reg_bytes(r);
+            assert!(
+                bytes == 1 || bytes == 2,
+                "isel: GEP term %{r} is {bytes} bytes wide, only 1 or 2 supported"
+            );
+            let s = usize::from(*scale);
+            old_cost += s * if bytes == 2 { 8 } else { 5 };
+            new_cost += s * if bytes == 2 { 5 } else { 3 };
+        }
+        if new_cost < old_cost {
+            self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+            self.emit("    CLRF FSR".to_string());
+            for (scale, r) in terms {
+                let a = self.val_addr(&Val::Reg(r.clone())).direct();
+                let bytes = self.reg_bytes(r);
+                for _ in 0..*scale {
+                    self.emit(format!("    ADDWF 0x{a:02X}, W"));
+                    self.emit("    BTFSC STATUS, 0".to_string());
+                    self.emit("    INCF FSR, F".to_string());
+                    if bytes == 2 {
+                        self.emit(format!("    BTFSC 0x{:02X}, 0", a + 1));
+                        self.emit("    INCF FSR, F".to_string());
+                    }
+                }
+            }
+            self.emit("    BTFSC FSR, 0".to_string());
+            self.emit(if irp {
+                "    BCF STATUS, 7".to_string()
+            } else {
+                "    BSF STATUS, 7".to_string()
+            });
+            self.emit("    MOVWF FSR".to_string());
+            return;
+        }
         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
         self.emit("    MOVWF FSR".to_string());
         self.emit_add_terms_to_fsr(terms);
