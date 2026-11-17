@@ -329,7 +329,7 @@ ram_bytes = 641
 name = "hal-pic18-menu-demo-18f4550@O1"
 device = "18F4550"
 profile = "O1"
-flash_words = 7907
+flash_words = 7908
 ram_bytes = 595
 
 [[entry]]
