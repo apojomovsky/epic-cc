@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here, generated from
 Conventional Commits. Dates are UTC.
+## [0.8.1] - 2026-11-17
+ 
+### Fixes
+
+- Return the snapped first byte from try_place_straddle (#1490)
+- Measure page extents at the pre-org address (#1492)
+- Wrap GEP chain offsets in the 16-bit address space (#1493)
+- Keep FSR0 GEP materializations out of counted walks (#1495)
+- Zero-extend one-byte pointer terms in 16-bit address adds (#1497)
+- Park multi-term pointer args that alias the callee param slot (#1498)
+- Fold multi-index GEPs by element stride (#1499)
+- Keep pointer select fold from inverting a low true arm (#1502)
+- Write straddling global init bytes at physical addresses (#1504)
+- Materialize GEP values over byval params and as baseline call args (#1503)
+- Carry GEP offsets past 255 into the high address byte (#1500)
 ## [0.8.0] - 2026-11-13
  
 ### Fixes
