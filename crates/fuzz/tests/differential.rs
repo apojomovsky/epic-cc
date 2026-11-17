@@ -263,6 +263,102 @@ fn switch_corpus_spans_dispatch_shapes() {
     }
 }
 
+/// Re-seed a generated program's `in0` (epic-cc#1427): the PIC side
+/// reads the initializer in the source, the host side re-seeds from
+/// `inputs`, so both must move together.
+fn with_in0(mut prog: Program, value: u32) -> Program {
+    for text in [&mut prog.c_source, &mut prog.prologue] {
+        let marker = "volatile u8 in0 = ";
+        if let Some(at) = text.find(marker) {
+            let start = at + marker.len();
+            let end = start + text[start..].find(';').expect("in0 initializer");
+            text.replace_range(start..end, &format!("0x{value:X}u"));
+        }
+    }
+    for input in &mut prog.inputs {
+        if input.name == "in0" {
+            input.value = value;
+        }
+    }
+    prog
+}
+
+#[test]
+fn switch_seeds_compile_and_dispatch_per_shape() {
+    // epic-cc#1427: substring coverage cannot catch a backend that drops
+    // switch preservation, so one generated seed per dispatch shape goes
+    // through the real pipeline (clang, driver, simulator versus host),
+    // re-seeded to hit the loop case, the fallthrough pair, and default.
+    // A misdispatched case changes the checksum fold on the PIC side only.
+    let shapes: [(&str, &str, &[u32]); 3] = [
+        ("dense", "u8 swv = (u8)(in0 & 7u);", &[0, 2, 3, 6]),
+        ("sparse", "u8 swv = (u8)(in0 & 31u);", &[0, 21, 30, 5]),
+        ("dense-with-outlier", "u8 swv = (u8)in0;", &[0, 2, 3, 42]),
+    ];
+    for (what, marker, targets) in shapes {
+        let seed = (0..200u64)
+            .find(|&s| generate(s).c_source.contains(marker))
+            .unwrap_or_else(|| panic!("no corpus seed exercises {what} (marker {marker:?})"));
+        let base = generate(seed);
+        assert!(
+            base.c_source.contains("default:") && base.c_source.contains("/* fallthrough */"),
+            "{what} seed {seed} lost its default or fallthrough arm"
+        );
+        let mut checksums = std::collections::BTreeSet::new();
+        for &value in targets {
+            let prog = with_in0(base.clone(), value);
+            let got = run_differential(&prog, &device::PIC16F877A).unwrap_or_else(|e| {
+                panic!("{what} switch seed {seed} with in0={value} not differential-clean: {e}")
+            });
+            checksums.insert(got);
+        }
+        assert!(
+            checksums.len() >= 3,
+            "{what} seed {seed}: dispatch targets {targets:?} gave only {checksums:?}, \
+             so case selection is not observable in the checksum"
+        );
+    }
+}
+
+#[test]
+fn switch_dispatch_matches_hand_computed_checksums() {
+    // Each arm folds a distinct constant, the fallthrough entry folds
+    // both, so any case mix-up moves the PIC checksum off these values.
+    let cases: [(u32, u32); 5] = [(0, 0x05), (1, 0x09), (2, 0x23), (3, 0x03), (99, 0x77)];
+    for (in0, expect) in cases {
+        let c_source = format!(
+            "{TYPEDEF_PROLOGUE}\
+             volatile u8 in0 = {in0}u;\n\
+             volatile u8 checksum;\n\
+             void main(void) {{\n\
+               switch (in0) {{\n\
+                 case 0: checksum = (u8)(checksum ^ 0x05u); break;\n\
+                 case 1: checksum = (u8)(checksum ^ 0x09u); break;\n\
+                 case 2: checksum = (u8)(checksum ^ 0x20u);\n\
+                 case 3: checksum = (u8)(checksum ^ 0x03u); break;\n\
+                 default: checksum = (u8)(checksum ^ 0x77u); break;\n\
+               }}\n\
+             }}\n"
+        );
+        let prog = Program {
+            c_source: c_source.clone(),
+            inputs: vec![Input {
+                name: "in0".into(),
+                value: in0,
+                width: 8,
+                is_float: false,
+            }],
+            checksum_name: "checksum".into(),
+            seed: 0,
+            statements: Vec::new(),
+            prologue: c_source,
+        };
+        let got = run_differential(&prog, &device::PIC16F877A)
+            .unwrap_or_else(|e| panic!("switch in0={in0} not differential-clean: {e}"));
+        assert_eq!(got, expect, "switch dispatch for in0={in0}");
+    }
+}
+
 #[test]
 #[ignore = "full 200-seed corpus (slow)"]
 fn full_corpus_differential_clean() {
