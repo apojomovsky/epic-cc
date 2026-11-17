@@ -2607,3 +2607,48 @@ fn flash_memcpy_content_read_as_pointer_reads_ram() {
     assert!(p.halted(), "program must halt");
     assert_eq!(p.ram()[0x18], b'R', "the copied content must read RAM");
 }
+
+#[test]
+fn flash_memcpy_call_content_read_as_pointer_reads_ram() {
+    // epic-cc#1435: the Call form of a flash memcpy lands content in
+    // the RAM buffer just like the instruction form. The buffer's
+    // initializer held a flash address, so without the Call marking
+    // its bytes as content a pointer load of them still names flash
+    // and the dereference reads program memory instead of RAM.
+    let mut m = with_bytes(
+        parse(
+            "const table i8\nglobal srcp i16\nglobal buf i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @table @srcp\n    %p = load ptr @srcp\n    %b = gep @buf +0\n    call void @memcpy(ptr %b, ptr %p, 4)\n    %q = load ptr @buf\n    %w = load i8 %q\n    store i8 %w @out\n    ret void\n",
+        ),
+        "table",
+        &[0x40, 0, 0, 0],
+    );
+    for g in &mut m.globals {
+        if g.name == "buf" {
+            g.bytes = vec![0, 0, 0, 0];
+            g.refs = vec![(0, "table".to_string(), 0)];
+            g.size = 4;
+        }
+    }
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("srcp", 0x10),
+            ("buf", 0x13),
+            ("out", 0x18),
+            ("main::p", 0x19),
+            ("main::b", 0x1B),
+            ("main::q", 0x1D),
+            ("main::w", 0x1F),
+        ]),
+        None,
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x40] = b'R';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x18], b'R', "the copied content must read RAM");
+}
