@@ -4519,6 +4519,52 @@ fn stored_alloca_address_keeps_full_interval() {
     assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
 }
 
+/// A trunc of a local object's address is the `ptrtoint` spelling
+/// (epic-cc#1421): the address leaves the pointer domain, so the object
+/// can be read later with no use the intervals can see. It keeps its
+/// full-function interval on PIC14, like a stored address. The result
+/// is consumed as an integer, so no other escape arm sees the pointer.
+#[test]
+fn trunc_escaped_alloca_keeps_full_interval() {
+    let m = parse(
+        "global addr i16\n\
+         global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             %a = trunc ptr %g to i16\n\
+             %b = add i16 %a, 1\n\
+             store i16 %b @addr\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// The sibling without the trunc stays in the pointer domain: its last
+/// use precedes the mid-body value, so the two share one slot. This is
+/// the short interval the trunc-escaped object above must not get.
+#[test]
+fn non_escaped_alloca_gets_short_interval() {
+    let m = parse(
+        "global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
 /// A pointer phi over an alloca reseeds as a fresh slot: uses past the
 /// merge resolve elsewhere, so the alloca arm escapes and keeps its
 /// full-function interval, or the store through the phi would clobber a
