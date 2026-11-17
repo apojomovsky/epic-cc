@@ -217,6 +217,10 @@ const SURFACE: &[(&str, &str)] = &[
     ("noinline call", "helper"),
     ("array", "arr["),
     ("struct", "s."),
+    ("switch", "switch (swv)"),
+    ("switch case", "case 0:"),
+    ("switch default", "default:"),
+    ("switch fallthrough", "/* fallthrough */"),
 ];
 
 #[test]
@@ -228,6 +232,33 @@ fn fast_corpus_spans_the_generation_surface() {
         assert!(
             srcs.iter().any(|s| s.contains(marker)),
             "fast corpus (seeds 0..8) does not exercise {what} (marker {marker:?})"
+        );
+    }
+}
+
+#[test]
+fn switch_corpus_spans_dispatch_shapes() {
+    // epic-cc#1427: the corpus must carry every switch shape the PIC
+    // backends lower, not just a token case label.
+    let srcs: Vec<String> = (0..200u64).map(|s| generate(s).c_source).collect();
+    let with_switch: Vec<&String> = srcs.iter().filter(|s| s.contains("switch (swv)")).collect();
+    assert!(
+        with_switch.len() >= 40,
+        "switch appears in only {}/200 corpus seeds",
+        with_switch.len()
+    );
+    for (what, marker) in [
+        ("dense switch", "u8 swv = (u8)(in0 & 7u);"),
+        ("sparse switch", "u8 swv = (u8)(in0 & 31u);"),
+        ("dense-with-outlier switch", "u8 swv = (u8)in0;"),
+        (
+            "case loop over the array",
+            "checksum = (u8)(checksum ^ (u8)(arr[i] ^ i ^ 0xA5u));",
+        ),
+    ] {
+        assert!(
+            with_switch.iter().any(|s| s.contains(marker)),
+            "no corpus seed exercises {what} (marker {marker:?})"
         );
     }
 }

@@ -954,6 +954,117 @@ impl Gen {
         true
     }
 
+    /// A switch over an input-derived value (epic-cc#1427): at least two
+    /// cases plus a default, one case body a counted loop over `arr` whose
+    /// header is the case target, and a fallthrough pair. The `live` local
+    /// is read in the default arm but not on the loop path, and the `pad`
+    /// local is dead once the dispatch starts, so either can overlay the
+    /// loop counter in the allocator's coloring.
+    fn emit_switch(&mut self) -> bool {
+        if self.baseline {
+            return false;
+        }
+        // Loop phi web plus dispatch compares plus the live local: about
+        // 26 main-frame bytes by the loop and if estimates above.
+        if !self.fit(26, 3, true, false) {
+            return false;
+        }
+        self.frame_est += 26;
+        self.worst_routine = self.worst_routine.max(3);
+        self.used_array = true;
+        self.used_fold16 = true;
+        let k1 = 1 + self.below(200);
+        let k2 = 1 + self.below(200);
+        // The counter is initialized before the switch and the case is a
+        // do-while, so the loop header is the case target itself and its
+        // counter phi names the switch block: the epic-cc#1417 shape.
+        // The bound is at least 3, so the do-while runs exactly the
+        // counted iterations. The per-iteration 0xA5 fold makes even a
+        // counter starting at 1 instead of 0 change the checksum.
+        let loop_case = "\
+        do {\n\
+          checksum = (u8)(checksum ^ (u8)(arr[i] ^ i ^ 0xA5u));\n\
+          i = (u8)(i + 1u);\n\
+        } while (i < (u8)(3u + (u8)(in0 & 3u)));";
+        let (scrut, cases) = match self.below(3) {
+            0 => (
+                "(u8)(in0 & 7u)",
+                format!(
+                    "    case 0: {{\n{loop_case}\n      break;\n    }}\n\
+                     \x20   case 1:\n\
+                     \x20     checksum = (u8)(checksum ^ (u8)(live + {k1}u));\n\
+                     \x20     break;\n\
+                     \x20   case 2:\n\
+                     \x20     checksum = (u8)(checksum ^ {k2}u);\n\
+                     \x20     /* fallthrough */\n\
+                     \x20   case 3:\n\
+                     \x20     checksum = (u8)(checksum ^ 0x33u);\n\
+                     \x20     break;\n\
+                     \x20   case 4:\n\
+                     \x20     checksum = (u8)(checksum ^ 0x44u);\n\
+                     \x20     break;\n\
+                     \x20   case 5:\n\
+                     \x20     checksum = (u8)(checksum ^ 0x55u);\n\
+                     \x20     break;\n"
+                ),
+            ),
+            1 => (
+                "(u8)(in0 & 31u)",
+                format!(
+                    "    case 0: {{\n{loop_case}\n      break;\n    }}\n\
+                     \x20   case 9:\n\
+                     \x20     checksum = (u8)(checksum ^ (u8)(live + {k1}u));\n\
+                     \x20     break;\n\
+                     \x20   case 21:\n\
+                     \x20     checksum = (u8)(checksum ^ {k2}u);\n\
+                     \x20     /* fallthrough */\n\
+                     \x20   case 30:\n\
+                     \x20     checksum = (u8)(checksum ^ 0x1Eu);\n\
+                     \x20     break;\n"
+                ),
+            ),
+            _ => (
+                "(u8)in0",
+                format!(
+                    "    case 0: {{\n{loop_case}\n      break;\n    }}\n\
+                     \x20   case 1:\n\
+                     \x20     checksum = (u8)(checksum ^ (u8)(live + {k1}u));\n\
+                     \x20     break;\n\
+                     \x20   case 2:\n\
+                     \x20     checksum = (u8)(checksum ^ {k2}u);\n\
+                     \x20     /* fallthrough */\n\
+                     \x20   case 3:\n\
+                     \x20     checksum = (u8)(checksum ^ 0x33u);\n\
+                     \x20     break;\n\
+                     \x20   case 4:\n\
+                     \x20     checksum = (u8)(checksum ^ 0x44u);\n\
+                     \x20     break;\n\
+                     \x20   case 5:\n\
+                     \x20     checksum = (u8)(checksum ^ 0x55u);\n\
+                     \x20     break;\n\
+                     \x20   case 100:\n\
+                     \x20     checksum = (u8)(checksum ^ 0x64u);\n\
+                     \x20     break;\n"
+                ),
+            ),
+        };
+        self.body.push(format!(
+            "  {{\n\
+             \x20   u8 live = (u8)((u8)in0 ^ 0x5Au);\n\
+             \x20   u8 swv = {scrut};\n\
+             \x20   u8 i = 0u;\n\
+             \x20   u16 pad = (u16)((u16)in1 ^ (u16)live);\n\
+             \x20   checksum = (u8)(checksum ^ fold16(pad) ^ live);\n\
+             \x20   switch (swv) {{\n{cases}\
+             \x20   default:\n\
+             \x20     checksum = (u8)(checksum ^ (u8)(live ^ 0x3Cu));\n\
+             \x20     break;\n\
+             \x20   }}\n\
+             \x20 }}"
+        ));
+        true
+    }
+
     /// A noinline call: `t = helper(args);` (0–3 unsigned params), folded.
     fn emit_call(&mut self, helpers: &[Helper]) -> bool {
         // Main-frame cost is the single u8 result local plus fold: 5 defs.
@@ -1550,8 +1661,11 @@ fn arith_cost(w: u8, op: BinOp) -> (u32, u32) {
 /// The full integer surface: scalar arithmetic (+ - * / % & | ^ << >> on
 /// u8, u16, u32 with the discipline guards), comparisons, if and else,
 /// bounded loops, noinline calls (0..3 unsigned params), arrays (small,
-/// dynamic `i % N` index), and structs (u8, u16, u32 fields, field-wise
-/// access), all folded into the `u8` checksum with explicit width casts.
+/// dynamic `i % N` index), structs (u8, u16, u32 fields, field-wise
+/// access), and switches over an input-derived value (dense, sparse, and
+/// dense-with-outlier case lists, a fallthrough pair, a default, and a
+/// counted loop over the array in one case), all folded into the `u8`
+/// checksum with explicit width casts.
 /// Three fixed-width volatile inputs seed identically on both sides. Every
 /// random choice comes from the seeded RNG in order, so `seed` determines
 /// the program.
@@ -1574,10 +1688,11 @@ fn generate_impl(seed: u64, baseline: bool) -> Program {
     // Baseline draws one flag: the 509's 41-byte GPR file reliably holds a
     // single heavy construct, and the force() contract demands certainty.
     let nflags = if baseline { 1 } else { 2 };
-    let mut flags = [false; 8];
-    // Baseline drops the struct flag (index 7): its 24-byte frame and
-    // 8-byte global cannot fit the 509 alongside anything else.
-    let mut pool: Vec<u8> = (0..if baseline { 7 } else { 8 }).collect();
+    let mut flags = [false; 9];
+    // Baseline drops the struct flag (index 7) and the switch flag
+    // (index 8): their frames and globals cannot fit the 509 alongside
+    // anything else.
+    let mut pool: Vec<u8> = (0..if baseline { 7 } else { 9 }).collect();
     for _ in 0..nflags {
         let i = (rng.next_u64() as usize) % pool.len();
         flags[pool.remove(i) as usize] = true;
@@ -1590,6 +1705,7 @@ fn generate_impl(seed: u64, baseline: bool) -> Program {
     let want_call = flags[5];
     let want_array = flags[6];
     let want_struct = flags[7];
+    let want_switch = flags[8];
 
     // Inputs: a fixed u8/u16/u32 mix so every program exercises all three
     // widths (and u32 values beyond 2^16 in every run).
@@ -1634,7 +1750,8 @@ fn generate_impl(seed: u64, baseline: bool) -> Program {
             4 => g.emit_loop(),
             5 => g.emit_call(&helpers),
             6 => g.emit_array(),
-            _ => g.emit_struct(),
+            7 => g.emit_struct(),
+            _ => g.emit_switch(),
         }
     };
     g.forced = true;
@@ -1647,6 +1764,7 @@ fn generate_impl(seed: u64, baseline: bool) -> Program {
         want_call,
         want_array,
         want_struct,
+        want_switch,
     ]
     .iter()
     .enumerate()
@@ -1668,7 +1786,7 @@ fn generate_impl(seed: u64, baseline: bool) -> Program {
     }
     g.forced = false;
     let stmt_kind = |g: &mut Gen| -> usize {
-        // returns 0..4 (if/loop/call/array/struct) or 5/6 (arith/cmp)
+        // returns 0..4 (if/loop/call/array/struct), 5/6 (arith/cmp), 7 switch
         let r = g.below(100);
         match r {
             0..=9 => 0,   // ifelse 10%
@@ -1677,20 +1795,26 @@ fn generate_impl(seed: u64, baseline: bool) -> Program {
             34..=40 => 3, // array 7%
             41..=47 => 4, // struct 7%
             48..=81 => 5, // arith 34%
-            _ => 6,       // cmp 18%
+            82..=89 => 7, // switch 8%
+            _ => 6,       // cmp 10%
         }
     };
     for _ in 0..14 {
         let kind = stmt_kind(&mut g);
-        // Baseline remaps struct draws to arith (see the flag pool).
-        let ok = match if baseline && kind == 4 { 5 } else { kind } {
+        // Baseline remaps struct and switch draws to arith (see the flag pool).
+        let ok = match if baseline && (kind == 4 || kind == 7) {
+            5
+        } else {
+            kind
+        } {
             0 => g.emit_ifelse(),
             1 => g.emit_loop(),
             2 => g.emit_call(&helpers),
             3 => g.emit_array(),
             4 => g.emit_struct(),
             5 => g.emit_arith(),
-            _ => g.emit_cmp(),
+            6 => g.emit_cmp(),
+            _ => g.emit_switch(),
         };
         if !ok {
             break; // the frame budget is exhausted
