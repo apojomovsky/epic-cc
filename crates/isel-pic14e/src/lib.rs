@@ -6900,9 +6900,10 @@ struct FitExtent {
 /// ship it, repair it, or fail loudly. Over-limit unsplit functions join
 /// `force_split` (the next pass plans their chunks), over-limit chunks are
 /// re-split from real block sizes, and page-level overflow re-places
-/// everything with the measured reals. A repeated repair state splits one
-/// participant first (the escalation below) and only fails when nothing
-/// splittable remains.
+/// everything with the measured reals. A backward `.org` that no repair
+/// triggers on fails loudly instead of shipping as a fit. A repeated repair
+/// state splits one participant first (the escalation below) and only fails
+/// when nothing splittable remains.
 fn assess_fit(
     device: &Device,
     m: &Module,
@@ -6945,6 +6946,7 @@ fn assess_fit(
     let mut labels: HashMap<String, usize> = HashMap::new();
     let mut org = 0usize;
     let mut cur: Option<(String, usize)> = None;
+    let mut backward_org: Option<(usize, usize)> = None;
     for raw in probe.lines() {
         let line = code_of(raw);
         if line.is_empty() || is_directive(line, "list") || is_directive(line, "radix") {
@@ -6952,6 +6954,9 @@ fn assess_fit(
         }
         if let Some(rest) = line.strip_prefix("org ") {
             let target = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
+            if target < org && backward_org.is_none() {
+                backward_org = Some((target, org));
+            }
             if let Some((name, s)) = cur.take() {
                 // Close at the pre-jump address, as classic isel does: a
                 // backward target would clamp the spiller out of its size.
@@ -7204,6 +7209,14 @@ fn assess_fit(
         }
     }
     if next.force_split == rep.force_split && next.entries == rep.entries && !replace {
+        // No repair above can measure this layout away: extents close at
+        // the pre-jump address, so a backward .org with no page crossing
+        // looks like a fit while the assembler refuses it (epic-cc#1491).
+        if let Some((target, at)) = backward_org {
+            return FitVerdict::Broken(format!(
+                "isel: page-fit repair cannot ship a layout with a backward .org to 0x{target:04X} at 0x{at:04X}: no extent crosses a page boundary, so the layout is unmeasurable here and the assembler would refuse it"
+            ));
+        }
         return FitVerdict::Fit;
     }
     let mut keys: Vec<String> = next.force_split.iter().cloned().collect();
@@ -8933,6 +8946,28 @@ mod fit_repair_tests {
             ),
             FitVerdict::Fit => panic!("a backward .org layout must need repair, got Fit"),
             FitVerdict::Broken(msg) => panic!("a fitting spiller must re-place: {msg}"),
+            FitVerdict::NoConverge(msg) => panic!("first drift must not fail: {msg}"),
+        }
+    }
+
+    #[test]
+    fn backward_org_without_a_page_crossing_is_not_fit() {
+        // main sits wholly in page 0, then an anchor below its end jumps
+        // backward: no extent crosses 0x800, so the straddle walk alone
+        // ships a layout the assembler refuses (epic-cc#1491).
+        let text = format!(
+            "    org 0x0100\nmain:\n{}    org 0x0080\nbig:\n{}    GOTO big\n    end\n",
+            words(0x10),
+            words(10),
+        );
+        let m = two_func_module();
+        match assess_with(&m, &text, &HashMap::new(), &Repair::default()) {
+            FitVerdict::Broken(msg) => assert!(
+                msg.contains("backward .org"),
+                "the refusal must name the backward .org: {msg}"
+            ),
+            FitVerdict::Fit => panic!("a backward .org layout must not ship, got Fit"),
+            FitVerdict::Again(_) => panic!("an unmeasurable layout must not repair, got Again"),
             FitVerdict::NoConverge(msg) => panic!("first drift must not fail: {msg}"),
         }
     }
