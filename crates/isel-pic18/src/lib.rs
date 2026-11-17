@@ -16951,64 +16951,6 @@ fn emit_fused_branch<'m>(
     }
 }
 
-/// Computes classic iterative dominator sets to classify phi-copy edges:
-/// `pred -> merge` is a back edge exactly when `merge` dominates `pred`,
-/// so the merge slots on that edge hold current-iteration values. The
-/// routine stays private to `isel`, so this crate duplicates the
-/// algorithm. Covers self-loops and separate-latch back edges.
-fn block_dominators(f: &Func) -> HashMap<String, HashSet<String>> {
-    let entry = &f.blocks[0].label;
-    let all: HashSet<String> = f.blocks.iter().map(|b| b.label.clone()).collect();
-    // Predecessor lists from the terminators' targets (the terminator is
-    // the last inst of every block).
-    let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
-    for b in &f.blocks {
-        let targets: Vec<&str> = match b.insts.last() {
-            Some(Inst::Br(br)) => vec![br.target.as_str()],
-            Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
-            Some(Inst::Switch(sw)) => {
-                let mut v: Vec<&str> = sw.cases.iter().map(|(_, l)| l.as_str()).collect();
-                v.push(sw.default.as_str());
-                v
-            }
-            _ => vec![],
-        };
-        for t in targets {
-            preds.entry(t).or_default().push(b.label.as_str());
-        }
-    }
-    let mut dom: HashMap<String, HashSet<String>> = HashMap::new();
-    dom.insert(entry.clone(), HashSet::from([entry.clone()]));
-    for b in &f.blocks {
-        if b.label != *entry {
-            dom.insert(b.label.clone(), all.clone());
-        }
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in &f.blocks {
-            if b.label == *entry {
-                continue;
-            }
-            let mut new: HashSet<String> = match preds.get(b.label.as_str()) {
-                Some(ps) => ps
-                    .iter()
-                    .map(|p| dom[*p].clone())
-                    .reduce(|a, c| a.intersection(&c).cloned().collect())
-                    .unwrap_or_else(|| all.clone()),
-                None => all.clone(),
-            };
-            new.insert(b.label.clone());
-            if new != dom[&b.label] {
-                dom.insert(b.label.clone(), new);
-                changed = true;
-            }
-        }
-    }
-    dom
-}
-
 /// Direct and indirect call edges between module functions, for the
 /// emission ordering. Recipes and naked bodies make no calls and take
 /// no `Gen` run in pass A, so they are neither sources nor targets
@@ -18717,7 +18659,7 @@ pub fn select_with_opts(
                 }
             }
         }
-        let doms = block_dominators(f);
+        let doms = iselcore::func_dominators(f);
         // Join-bank tracking (epic-cc#534): predecessor labels per block
         // from terminator targets. Every block ends with a terminator
         // (the match below panics otherwise), so no fall-through edges
@@ -20759,8 +20701,8 @@ mod p3_gen_tests {
 /// copy order on it flips.
 #[cfg(test)]
 mod switch_dominator_tests {
-    use super::block_dominators;
     use ir::Func;
+    use iselcore::func_dominators;
 
     /// A dispatch block whose switch feeds two case blocks, plus a second
     /// branch the dispatch cannot reach. The case block's dominator set
@@ -20782,7 +20724,7 @@ mod switch_dominator_tests {
     #[test]
     fn switch_target_does_not_dominate_an_unrelated_block() {
         let f = switch_cfg();
-        let doms = block_dominators(&f);
+        let doms = func_dominators(&f);
         let c0 = &doms["c0"];
         assert!(
             !c0.contains("other"),
@@ -20798,7 +20740,7 @@ mod switch_dominator_tests {
     #[test]
     fn switch_default_target_does_not_dominate_an_unrelated_block() {
         let f = switch_cfg();
-        let doms = block_dominators(&f);
+        let doms = func_dominators(&f);
         let def = &doms["def"];
         assert!(
             !def.contains("other"),
@@ -20816,7 +20758,7 @@ mod switch_dominator_tests {
         // not contain a case target, or the dispatch would look like it
         // sits inside a case block's loop.
         let f = switch_cfg();
-        let doms = block_dominators(&f);
+        let doms = func_dominators(&f);
         let dispatch = &doms["dispatch"];
         assert!(
             !dispatch.contains("c0") && !dispatch.contains("c1"),

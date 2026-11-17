@@ -6324,62 +6324,6 @@ impl<'m> Gen<'m> {
     }
 }
 
-/// Computes dominator sets for a function CFG. Classifies phi-copy edges:
-/// an edge is a back edge when the merge dominates the predecessor, so the
-/// predecessor sits in the merge loop and phi slots hold current values.
-/// Covers self-loops and separate latch edges.
-fn block_dominators(f: &ir::Func) -> HashMap<String, HashSet<String>> {
-    let entry = &f.blocks[0].label;
-    let all: HashSet<String> = f.blocks.iter().map(|b| b.label.clone()).collect();
-    // Builds predecessor lists from terminator targets at block ends.
-    let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
-    for b in &f.blocks {
-        let targets: Vec<&str> = match b.insts.last() {
-            Some(Inst::Br(br)) => vec![br.target.as_str()],
-            Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
-            Some(Inst::Switch(sw)) => {
-                let mut v: Vec<&str> = sw.cases.iter().map(|(_, l)| l.as_str()).collect();
-                v.push(sw.default.as_str());
-                v
-            }
-            _ => vec![],
-        };
-        for t in targets {
-            preds.entry(t).or_default().push(b.label.as_str());
-        }
-    }
-    let mut dom: HashMap<String, HashSet<String>> = HashMap::new();
-    dom.insert(entry.clone(), HashSet::from([entry.clone()]));
-    for b in &f.blocks {
-        if b.label != *entry {
-            dom.insert(b.label.clone(), all.clone());
-        }
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in &f.blocks {
-            if b.label == *entry {
-                continue;
-            }
-            let mut new: HashSet<String> = match preds.get(b.label.as_str()) {
-                Some(ps) => ps
-                    .iter()
-                    .map(|p| dom[*p].clone())
-                    .reduce(|a, c| a.intersection(&c).cloned().collect())
-                    .unwrap_or_else(|| all.clone()),
-                None => all.clone(),
-            };
-            new.insert(b.label.clone());
-            if new != dom[&b.label] {
-                dom.insert(b.label.clone(), new);
-                changed = true;
-            }
-        }
-    }
-    dom
-}
-
 /// Emits one function body into the output. Routes runtime routines to
 /// recipes and ordinary functions to labels, phi copies, and terminators.
 /// Serves both passes: pass A measures with all restores, pass B skips
@@ -6458,7 +6402,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     }
     // Classifies back edges by dominance: merge slots hold current values
     // there, so readers run first.
-    let doms = block_dominators(f);
+    let doms = iselcore::func_dominators(f);
     for (i, b) in f.blocks.iter().enumerate() {
         g.emit(format!("{}:", labels[&b.label]));
         if i == 0 && f.isr {
@@ -9119,7 +9063,7 @@ mod fit_repair_tests {
 /// copy order on it flips.
 #[cfg(test)]
 mod switch_dominator_tests {
-    use super::block_dominators;
+    use iselcore::func_dominators;
 
     /// A dispatch block whose switch feeds two case blocks, plus a second
     /// branch the dispatch cannot reach. The case block's dominator set
@@ -9141,7 +9085,7 @@ mod switch_dominator_tests {
     #[test]
     fn switch_target_does_not_dominate_an_unrelated_block() {
         let f = switch_cfg();
-        let doms = block_dominators(&f);
+        let doms = func_dominators(&f);
         let c0 = &doms["c0"];
         assert!(
             !c0.contains("other"),
@@ -9157,7 +9101,7 @@ mod switch_dominator_tests {
     #[test]
     fn switch_default_target_does_not_dominate_an_unrelated_block() {
         let f = switch_cfg();
-        let doms = block_dominators(&f);
+        let doms = func_dominators(&f);
         let def = &doms["def"];
         assert!(
             !def.contains("other"),
@@ -9175,7 +9119,7 @@ mod switch_dominator_tests {
         // not contain a case target, or the dispatch would look like it
         // sits inside a case block's loop.
         let f = switch_cfg();
-        let doms = block_dominators(&f);
+        let doms = func_dominators(&f);
         let dispatch = &doms["dispatch"];
         assert!(
             !dispatch.contains("c0") && !dispatch.contains("c1"),
