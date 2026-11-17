@@ -767,6 +767,453 @@ fn ptrtoint_of_flash_gep_is_refused() {
     );
 }
 
+/// Compile `ir` with the address map `alloc` would build: `global`
+/// declarations and params get a slot, and so does every `%reg =` def
+/// except a `Gep` dst, which defines no value needing one. Handing a
+/// GEP dst a slot here would hide the defect this covers.
+fn laundry_sim(
+    ir: &str,
+    consts: &[(&str, &[u8])],
+    overrides: &[(&str, u16)],
+) -> (String, HashMap<String, u16>) {
+    let mut m = parse(ir);
+    for (name, bytes) in consts {
+        m = with_bytes(m, name, bytes);
+    }
+    let mut map: HashMap<String, u16> = HashMap::new();
+    let mut next = 0x20u16;
+    let mut func = String::new();
+    for line in ir.split('\n') {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("global ") {
+            let name = rest.split_whitespace().next().unwrap();
+            map.insert(name.to_string(), next);
+            next += 8;
+        } else if let Some(rest) = t.strip_prefix("fn ") {
+            func = rest
+                .split(|c: char| c == '(' || c.is_whitespace())
+                .next()
+                .unwrap()
+                .to_string();
+            if let Some(params) = rest.rsplit_once(") (").map(|x| x.1.trim_end_matches(')')) {
+                for prm in params.split(',') {
+                    if let Some((n, _)) = prm.trim().split_once('=') {
+                        map.insert(format!("{func}::{n}"), next);
+                        next += 8;
+                    }
+                }
+            }
+        } else if let Some(rest) = t.strip_prefix('%') {
+            if let Some((name, rhs)) = rest.split_once(" =") {
+                if !rhs.trim_start().starts_with("gep ") {
+                    map.insert(format!("{func}::{name}"), next);
+                    next += 8;
+                }
+            }
+        }
+    }
+    for (name, addr) in overrides {
+        map.insert((*name).to_string(), *addr);
+    }
+    (select(&PIC18F4550, &m, &map, None), map)
+}
+
+/// The byte address of a const table's bytes in the program image: the
+/// label sits right before its `db` line, so the bytes' position is
+/// the label's address.
+fn table_addr(words: &[u16], bytes: &[u8]) -> u16 {
+    let image: Vec<u8> = words
+        .iter()
+        .flat_map(|w| [*w as u8, (*w >> 8) as u8])
+        .collect();
+    let at = image
+        .windows(bytes.len())
+        .position(|w| w == bytes)
+        .expect("the table must sit in the program image");
+    assert_eq!(
+        image.windows(bytes.len()).filter(|w| *w == bytes).count(),
+        1,
+        "the table bytes must be unique in the image"
+    );
+    at as u16
+}
+
+#[test]
+fn zext_of_a_gep_reads_the_ram_table() {
+    // epic-cc#1418: a `Gep` is virtual, so its dst has no slot and a
+    // cast that copied that slot would launder whatever the RAM byte
+    // held. The address materializes from the folded base instead, so
+    // a dereference through the laundered integer reads the table.
+    let ir = "global tab i8\nglobal out i8\n\
+              fn main(void) ()\n  block entry:\n    %q = gep @tab +1\n    %x = zext i16 %q to i16\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let tab = map["tab"];
+    let out = map["out"];
+    assert!(
+        asm.contains(&format!("MOVLW 0x{:02X}", (tab + 1) & 0xFF)),
+        "the zext must materialize the folded address, not copy a slot:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[tab as usize] = b'A';
+    p.ram_mut()[tab as usize + 1] = b'B';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[out as usize],
+        b'B',
+        "the laundered address must read tab[1]:\n{asm}"
+    );
+}
+
+#[test]
+fn zext_of_a_flash_gep_materializes_the_label() {
+    // Same shape over a flash const: LOW/HIGH of the table label, the
+    // form every other use of the GEP takes (#193, #645), never a copy
+    // of the GEP's nonexistent slot. The GEP's `+1` must ride along: the
+    // address of `c[1]`, not of `c`.
+    let ir = "const c i8\nglobal out i16\n\
+              fn main(void) ()\n  block entry:\n    %q = gep @c +1\n    %x = zext i16 %q to i16\n    store i16 %x @out\n    ret void\n";
+    let (asm, _) = laundry_sim(ir, &[("c", b"PQ")], &[]);
+    assert!(
+        asm.contains("MOVLW LOW(c)") && asm.contains("MOVLW HIGH(c)"),
+        "a flash const GEP must materialize its label:\n{asm}"
+    );
+    // The offset rides on the low byte, and its carry into the high
+    // byte, so `ADDLW 0x01` must be there.
+    assert!(
+        asm.contains("ADDLW 0x01"),
+        "the GEP's constant offset must be added:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let base = table_addr(&words, b"PQ") as u32;
+    let want = base + 1;
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        [p.ram()[0x20], p.ram()[0x21]],
+        [(want & 0xFF) as u8, ((want >> 8) & 0xFF) as u8],
+        "the laundered integer must be the address of c[1]:\n{asm}"
+    );
+}
+
+#[test]
+fn scevgep_icmp_loop_sums_through_deref() {
+    // epic-cc#1479: an LSR walk compares its step GEP against the end
+    // GEP to leave the loop. Both GEP dsts are virtual (no slot), so
+    // the compare must materialize both addresses; the walk itself
+    // dereferences the phi pointer each trip, so the sum proves the
+    // compared values and the dereferenced bytes agree.
+    let ir = "global arr i8\nglobal out i8\n\
+              fn main(void) ()\n  block entry:\n    %b = gep @arr +0\n    br header\n  block header:\n    %p = phi ptr %scevgep header %b entry\n    %acc = phi i8 %acc2 header 0 entry\n    %v = load i8 %p\n    %acc2 = add i8 %acc, %v\n    %scevgep = gep %p +1\n    %end = gep @arr +4\n    %c = icmp eq ptr %scevgep, %end\n    br i1 %c exit header\n  block exit:\n    store i8 %acc2 @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let arr = map["arr"];
+    let out = map["out"];
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for (i, v) in [10u8, 20, 30, 40].iter().enumerate() {
+        p.ram_mut()[arr as usize + i] = *v;
+    }
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(
+        p.ram()[out as usize],
+        100,
+        "the walk must deref arr[0..4] and exit on the GEP compare:\n{asm}"
+    );
+}
+
+#[test]
+fn scevgep_icmp_values_materialize_and_deref() {
+    // The materializing (non-fused) compare forms: both-GEP eq and
+    // ult, plus a GEP on the left against a slotted pointer, which
+    // swaps sides. The deref through the step GEP afterwards proves
+    // the materialized address, not merely that code emitted.
+    let ir = "global arr i8\nglobal g i16\nglobal out i8\nglobal out2 i8\nglobal out3 i8\nglobal out4 i8\n\
+              fn main(void) ()\n  block entry:\n    %q = load ptr @g\n    %scevgep = gep @arr +2\n    %end = gep @arr +4\n    %c1 = icmp eq ptr %scevgep, %scevgep\n    store i8 %c1 @out\n    %c2 = icmp ult ptr %scevgep, %end\n    store i8 %c2 @out2\n    %c3 = icmp eq ptr %scevgep, %q\n    store i8 %c3 @out3\n    %v = load i8 %scevgep\n    store i8 %v @out4\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let arr = map["arr"];
+    let g = map["g"];
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for (i, v) in [10u8, 20, 30, 40].iter().enumerate() {
+        p.ram_mut()[arr as usize + i] = *v;
+    }
+    let want = arr + 2;
+    p.ram_mut()[g as usize] = want as u8;
+    p.ram_mut()[g as usize + 1] = (want >> 8) as u8;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(p.ram()[map["out"] as usize], 1, "gep == itself:\n{asm}");
+    assert_eq!(p.ram()[map["out2"] as usize], 1, "gep < end gep:\n{asm}");
+    assert_eq!(
+        p.ram()[map["out3"] as usize],
+        1,
+        "gep == loaded pointer:\n{asm}"
+    );
+    assert_eq!(
+        p.ram()[map["out4"] as usize],
+        30,
+        "deref through the step GEP reads arr[2]:\n{asm}"
+    );
+}
+
+#[test]
+fn scevgep_freeze_trunc_and_null_compare_deref() {
+    // Same slotless contract at the freeze, narrowing-trunc, and
+    // null-compare uses: each materializes the GEP address, and the
+    // frozen pointer dereferences the stepped element.
+    let ir = "global arr i8\nglobal g i16\nglobal out i8\nglobal out2 i8\nglobal out3 i8\n\
+              fn main(void) ()\n  block entry:\n    %scevgep = gep @arr +2\n    %f = freeze ptr %scevgep\n    store ptr %f @g\n    %q = load ptr @g\n    %v = load i8 %q\n    store i8 %v @out\n    %x = trunc i16 %scevgep to i8\n    store i8 %x @out2\n    %c = icmp eq ptr %scevgep, 0\n    store i8 %c @out3\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let arr = map["arr"];
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for (i, v) in [10u8, 20, 30, 40].iter().enumerate() {
+        p.ram_mut()[arr as usize + i] = *v;
+    }
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(
+        p.ram()[map["out"] as usize],
+        30,
+        "frozen GEP must deref arr[2]:\n{asm}"
+    );
+    assert_eq!(
+        p.ram()[map["out2"] as usize],
+        ((arr + 2) & 0xFF) as u8,
+        "trunc keeps the materialized low byte:\n{asm}"
+    );
+    assert_eq!(
+        p.ram()[map["out3"] as usize],
+        0,
+        "a stepped GEP is not null:\n{asm}"
+    );
+}
+
+#[test]
+fn gep_icmp_ult_across_a_page_boundary() {
+    // Review repro (epic-cc#1479): 0x0100 < 0x0130 unsigned. The high
+    // byte of the right GEP needs the carry out of its own low byte,
+    // which a lane-0 subtract in between must not destroy.
+    let ir = "global g i16\nglobal out i8\n\
+              fn main(void) ()\n  block entry:\n    %base = load ptr @g\n    %a = gep %base +16\n    %b = gep %base +64\n    %c = icmp ult ptr %a, %b\n    store i8 %c @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let g = map["g"] as usize;
+    p.ram_mut()[g] = 0xF0;
+    p.ram_mut()[g + 1] = 0x00;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(p.ram()[map["out"] as usize], 1, "0x0100 ult 0x0130:\n{asm}");
+}
+
+#[test]
+fn gep_icmp_slt_across_the_sign_boundary() {
+    // Review repro (epic-cc#1479): 0x7FFF is positive, 0x8000 negative,
+    // so the signed less-than is false. The sign pre-read of the right
+    // GEP high byte must not run on a stale carry.
+    let ir = "global g i16\nglobal out i8\n\
+              fn main(void) ()\n  block entry:\n    %base = load ptr @g\n    %a = gep %base +15\n    %b = gep %base +16\n    %c = icmp slt ptr %a, %b\n    store i8 %c @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let g = map["g"] as usize;
+    p.ram_mut()[g] = 0xF0;
+    p.ram_mut()[g + 1] = 0x7F;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(p.ram()[map["out"] as usize], 0, "0x7FFF slt 0x8000:\n{asm}");
+}
+
+#[test]
+fn gep_icmp_ult_gep_on_the_left_against_a_slot() {
+    // Review repro (epic-cc#1479): a slotless GEP on the left must not
+    // be swapped into the carry-checked side: 0x0130 < 0x0100 is false.
+    let ir = "global g i16\nglobal h i16\nglobal out i8\n\
+              fn main(void) ()\n  block entry:\n    %base = load ptr @g\n    %a = gep %base +64\n    %s = load ptr @h\n    %c = icmp ult ptr %a, %s\n    store i8 %c @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let g = map["g"] as usize;
+    p.ram_mut()[g] = 0xF0;
+    p.ram_mut()[g + 1] = 0x00;
+    let h = map["h"] as usize;
+    p.ram_mut()[h] = 0x00;
+    p.ram_mut()[h + 1] = 0x01;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(p.ram()[map["out"] as usize], 0, "0x0130 ult 0x0100:\n{asm}");
+}
+
+#[test]
+fn gep_icmp_eq_keeps_a_live_zext_return_value() {
+    // Review repro (epic-cc#1479): the zext result is homed in the
+    // retval bytes until the ret, so a both-GEP compare in between
+    // must not park there: the return stays 0x00AB.
+    let ir = "global arr i8\nglobal src i8\nglobal out i16\n\
+              fn get(i16) ()\n  block entry:\n    %t = load i8 @src\n    %z = zext i8 %t to i16\n    %a = gep @arr +0\n    %b = gep @arr +1\n    %c = icmp eq ptr %a, %b\n    ret i16 %z\n\
+              fn main(void) ()\n  block entry:\n    %r = call i16 @get()\n    store i16 %r @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[map["src"] as usize] = 0xAB;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    let out = map["out"] as usize;
+    assert_eq!(
+        [p.ram()[out], p.ram()[out + 1]],
+        [0xAB, 0x00],
+        "the zext return value must survive the GEP compare:\n{asm}"
+    );
+}
+
+#[test]
+fn gep_icmp_ult_scaled_gep_park_survives_its_own_mulwf() {
+    // Review repro (epic-cc#1479): a scaled GEP's byte-1 load runs
+    // MULWF, whose product must not destroy the parked byte 0:
+    // 0x0110 ult 0x0118 is true.
+    let ir = "global g i16\nglobal idx i8\nglobal out i8\n\
+              fn main(void) ()\n  block entry:\n    %base = load ptr @g\n    %i = load i8 @idx\n    %a = gep %base +0 +2*%i\n    %b = gep %base +40\n    %c = icmp ult ptr %a, %b\n    store i8 %c @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    let g = map["g"] as usize;
+    p.ram_mut()[g] = 0xF0;
+    p.ram_mut()[g + 1] = 0x00;
+    p.ram_mut()[map["idx"] as usize] = 16;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(p.ram()[map["out"] as usize], 1, "0x0110 ult 0x0118:\n{asm}");
+}
+
+#[test]
+fn gep_icmp_eq_scaled_geps_keep_a_live_zext_return_value() {
+    // Scaled GEPs beside a zext return (epic-cc#1479): neither
+    // MULWF may destroy a parked byte. The GEPs differ by 256, so
+    // eq is false; the return stays 0x00AB.
+    let ir = "global arr i8\nglobal idx i8\nglobal jdx i8\nglobal src i8\nglobal out i8\nglobal retv i16\n\
+              fn get(i16) ()\n  block entry:\n    %t = load i8 @src\n    %z = zext i8 %t to i16\n    %i = load i8 @idx\n    %j = load i8 @jdx\n    %a = gep @arr +0 +2*%i\n    %b = gep @arr +0 +2*%j\n    %c = icmp eq ptr %a, %b\n    store i8 %c @out\n    ret i16 %z\n\
+              fn main(void) ()\n  block entry:\n    %r = call i16 @get()\n    store i16 %r @retv\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[map["idx"] as usize] = 148;
+    p.ram_mut()[map["jdx"] as usize] = 20;
+    p.ram_mut()[map["src"] as usize] = 0xAB;
+    p.run(2000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    assert_eq!(p.ram()[map["out"] as usize], 0, "geps 256 apart eq:\n{asm}");
+    let retv = map["retv"] as usize;
+    assert_eq!(
+        [p.ram()[retv], p.ram()[retv + 1]],
+        [0xAB, 0x00],
+        "the zext return value must survive the GEP compare:\n{asm}"
+    );
+}
+
+#[test]
+fn walk_body_gep_icmp_falls_back_so_the_walk_pointer_survives() {
+    // Review repro (epic-cc#1479): a counted src->dst copy whose body
+    // compares two preheader GEPs. The compare parks in FSR1, the live
+    // destination walk pointer, so the walk must refuse this body and
+    // lower it the plain way: every copied byte and the compare land.
+    let ir = "global src i8\nglobal dst i8\nglobal arr i8\nglobal idx i8\nglobal cmp i8\n\
+              fn main(void) ()\n  block entry:\n    %xi = load i8 @idx\n    %a = gep @arr +0 +1*%xi\n    %b = gep @arr +40\n    br loop\n  block loop:\n    %i = phi i16 %r loop 0 entry\n    %g1 = gep @src +0 +1*%i\n    %v = load i8 %g1\n    %g2 = gep @dst +0 +1*%i\n    store i8 %v %g2\n    %c = icmp ult ptr %a, %b\n    store i8 %c @cmp\n    %r = add i16 %i, 1\n    %d = icmp eq i16 %r, 11\n    br i1 %d, exit, loop\n  block exit:\n    ret void\n";
+    let (asm, map) = laundry_sim(
+        ir,
+        &[],
+        &[
+            ("src", 0x100),
+            ("dst", 0x180),
+            ("arr", 0x200),
+            ("idx", 0x210),
+            ("cmp", 0x211),
+        ],
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for k in 0..11usize {
+        p.ram_mut()[0x100 + k] = 0x50 + k as u8;
+    }
+    p.ram_mut()[map["idx"] as usize] = 5;
+    p.run(8000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    for k in 0..11usize {
+        assert_eq!(
+            p.ram()[0x180 + k],
+            0x50 + k as u8,
+            "copied byte {k}:\n{asm}"
+        );
+    }
+    assert_eq!(p.ram()[map["cmp"] as usize], 1, "arr+5 ult arr+40:\n{asm}");
+}
+
+#[test]
+fn sext_of_a_gep_materializes_the_address() {
+    // The Sext arm shares the source resolution: a folded GEP must
+    // materialize its address there too, and sign-fill from the byte
+    // the materialization wrote (epic-cc#1418).
+    let ir = "global tab i8\nglobal out i32\n\
+              fn main(void) ()\n  block entry:\n    %q = gep @tab +1\n    %x = sext i16 %q to i32\n    store i32 %x @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let tab = map["tab"];
+    let out = map["out"];
+    assert!(
+        asm.contains(&format!("MOVLW 0x{:02X}", (tab + 1) & 0xFF)),
+        "the sext must materialize the folded address:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    let base = tab + 1;
+    assert_eq!(
+        [p.ram()[out as usize], p.ram()[out as usize + 1]],
+        [base as u8, (base >> 8) as u8],
+        "the low address bytes must land in the sext dst:\n{asm}"
+    );
+    assert_eq!(
+        [p.ram()[out as usize + 2], p.ram()[out as usize + 3]],
+        [0, 0],
+        "a low address sign-fills with zeros:\n{asm}"
+    );
+    // The sign fill comes from bit 7 of the materialized high byte, so
+    // an address with that bit set fills the upper bytes with 0xFF.
+    let (asm, map) = laundry_sim(ir, &[], &[("tab", 0x807F)]);
+    let out = map["out"];
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        [
+            p.ram()[out as usize],
+            p.ram()[out as usize + 1],
+            p.ram()[out as usize + 2],
+            p.ram()[out as usize + 3],
+        ],
+        [0x80, 0x80, 0xFF, 0xFF],
+        "a high address must sign-fill the upper bytes:\n{asm}"
+    );
+}
+
 #[test]
 fn memcpy_of_tainted_slot_reads_flash() {
     // The copy moves the flash address's bytes, so the laundered value
@@ -1000,6 +1447,139 @@ fn memcpy_into_mixed_global_is_refused() {
             ("main::p", 0x19),
         ]),
         None,
+    );
+}
+
+#[test]
+fn memcpy_from_runtime_indexed_flash_walk_copies_table_element() {
+    // A 14-byte element copied from the middle of a flash table: the
+    // source pointer lives in a flash slot and gains a runtime term,
+    // so byte 0 must seed TBLPTR from the slot plus the term and the
+    // remaining bytes walk TBLRD*+ (epic-cc#1462).
+    let bytes: Vec<u8> = (0..42u8)
+        .map(|b| b.wrapping_mul(3).wrapping_add(1))
+        .collect();
+    let m = with_bytes(
+        parse(
+            "const tab i8\nglobal g i16\nglobal idx i8\nglobal buf i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @tab @g\n    %i = load i8 @idx\n    %q = load ptr @g\n    %w = gep %q +0 +14*%i\n    memcpy @buf %w 14\n    ret void\n",
+        ),
+        "tab",
+        &bytes,
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("idx", 0x12),
+            ("buf", 0x100),
+            ("main::i", 0x13),
+            ("main::q", 0x14),
+        ]),
+        None,
+    );
+    assert!(asm.contains("TBLRD*+"), "copy must read flash:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x12] = 1;
+    p.run(2000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        &p.ram()[0x100..0x10E],
+        &bytes[14..28],
+        "buf must hold the second 14-byte table element"
+    );
+}
+
+#[test]
+fn memcpy_from_runtime_indexed_flash_param_copies_table_element() {
+    // The same walk through a flash pointer parameter: its slot is
+    // flash-kind rather than indirect, but the term folds into the
+    // seed the same way (epic-cc#1462).
+    let bytes: Vec<u8> = (0..42u8)
+        .map(|b| b.wrapping_mul(5).wrapping_add(2))
+        .collect();
+    let m = with_bytes(
+        parse(
+            "const tab i8\nglobal idx i8\nglobal buf i8\n\
+             fn copy(void) (p=ptr, i=i8)\n  block entry:\n    %w = gep %p +0 +14*%i\n    memcpy @buf %w 14\n    ret void\n\
+             fn main(void) ()\n  block entry:\n    %i = load i8 @idx\n    call void @copy(ptr @tab, i8 %i)\n    ret void\n",
+        ),
+        "tab",
+        &bytes,
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("idx", 0x10),
+            ("buf", 0x100),
+            ("copy::p", 0x11),
+            ("copy::i", 0x13),
+            ("main::i", 0x14),
+        ]),
+        None,
+    );
+    assert!(asm.contains("TBLRD*+"), "copy must read flash:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 2;
+    p.run(2000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        &p.ram()[0x100..0x10E],
+        &bytes[28..42],
+        "buf must hold the third 14-byte table element"
+    );
+}
+
+#[test]
+fn memcpy_from_flash_walk_to_indirect_dst_walks_unrolled() {
+    // A destination through a pointer parameter is not a direct
+    // address, so the copy cannot take the counted-loop path and
+    // walks the unrolled TBLRD sequence instead (epic-cc#1462).
+    let bytes: Vec<u8> = (0..42u8)
+        .map(|b| b.wrapping_mul(7).wrapping_add(3))
+        .collect();
+    let m = with_bytes(
+        parse(
+            "const tab i8\nglobal idx i8\nglobal buf i8\n\
+             fn copy(void) (p=ptr, i=i8, d=ptr)\n  block entry:\n    %w = gep %p +0 +14*%i\n    memcpy %d %w 14\n    ret void\n\
+             fn main(void) ()\n  block entry:\n    %i = load i8 @idx\n    call void @copy(ptr @tab, i8 %i, ptr @buf)\n    ret void\n",
+        ),
+        "tab",
+        &bytes,
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("idx", 0x10),
+            ("buf", 0x100),
+            ("copy::p", 0x11),
+            ("copy::i", 0x13),
+            ("copy::d", 0x14),
+            ("main::i", 0x16),
+        ]),
+        None,
+    );
+    assert!(
+        asm.matches("TBLRD*+").count() >= 14,
+        "copy must walk the unrolled read, not a counted loop:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = 1;
+    p.run(2000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        &p.ram()[0x100..0x10E],
+        &bytes[14..28],
+        "buf must hold the second 14-byte table element"
     );
 }
 

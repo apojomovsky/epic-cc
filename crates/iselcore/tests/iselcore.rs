@@ -47,6 +47,28 @@ fn folds_a_two_link_gep_chain() {
 }
 
 #[test]
+fn folds_a_gep_chain_through_a_negative_offset() {
+    // clang reassociates `buf[len - 1]` over a field base into
+    // `(base + 1 + len) - 1`: the -1 arrives as its u16 bit pattern
+    // 65535, so the chain sum must wrap in the 16-bit address space
+    // the backends address, not overflow (epic-cc#1487).
+    let m = parse(
+        "global framer i8\n\
+         fn poll(void) ()\n\
+           block entry:\n\
+             %base = gep @framer +1\n\
+             %end = gep %base +0 +1*%len\n\
+             %last = gep %end +65535\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("poll::last").expect("chained gep must resolve");
+    assert!(matches!(base, Base::Global(n) if n == "framer"));
+    assert_eq!(*k, 0);
+    assert_eq!(terms, &[(1u16, "len".to_string())]);
+}
+
+#[test]
 fn seeds_alloca_and_byval_sret_params_as_slots() {
     let m = parse(
         "fn f(void) (p=byval2, r=sret)\n\
@@ -86,9 +108,10 @@ fn folds_a_pointer_select_over_a_const_base() {
 }
 
 #[test]
-fn folds_a_pointer_select_with_arm_order_swapped() {
-    // `select i1 %c, ptr @addrs, ptr @addrs+4` (the real HAL emits the
-    // offset on the TRUE arm): folds to the same (base, 0, [(4, c)]).
+fn seeds_a_pointer_select_with_a_low_true_arm() {
+    // `select i1 %c, ptr @addrs, ptr @addrs+4`: c = 1 picks the low arm,
+    // which a `(4, c)` term over the low base would invert, so the dst
+    // seeds as an indirect slot and isel materializes the chosen arm.
     let m = parse(
         "global addrs i8\n\
          fn main() ()\n\
@@ -99,9 +122,9 @@ fn folds_a_pointer_select_with_arm_order_swapped() {
     );
     let r = resolve_pointers(&m);
     let (base, k, terms) = r.get("main::s").expect("pointer select must resolve");
-    assert!(matches!(base, Base::Global(n) if n == "addrs"));
+    assert!(matches!(base, Base::Slot(n, true) if n == "s"));
     assert_eq!(*k, 0);
-    assert_eq!(terms, &[(4u16, "c".to_string())]);
+    assert!(terms.is_empty());
 }
 
 #[test]

@@ -956,6 +956,61 @@ impl<'m> Gen<'m> {
         )
     }
 
+    /// Whether `v` is a resolved GEP value the allocator folded into
+    /// its uses: it has a resolved (base, k, terms) entry but no slot,
+    /// so a reader must materialize it through `emit_load_w` instead
+    /// of addressing a slot (epic-cc#1479).
+    fn slotless_gep_value(&self, v: &Val) -> bool {
+        match v {
+            Val::Reg(r) => {
+                let key = ssa_key(self.cur_func, r);
+                self.resolved.contains_key(&key) && !self.addrs.contains_key(&key)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether emitting `c` would park a slotless GEP operand in FSR1
+    /// (epic-cc#1479): walk scans refuse such compares, since FSR1 may
+    /// hold a live walk pointer there. Operands fold as at emission.
+    fn icmp_has_slotless_gep(&self, c: &Icmp) -> bool {
+        self.slotless_gep_value(&self.fold_reg(&c.a))
+            || self.slotless_gep_value(&self.fold_reg(&c.b))
+    }
+
+    /// Whether the retval bytes may park a compare operand at the
+    /// current site: they are dead between instructions except for a
+    /// `zext_ret` value, whose live span runs from its `Zext` to the
+    /// `Ret` reading it in the same block (epic-cc#1479).
+    fn retval_park_free(&self) -> bool {
+        if self.zext_ret.is_empty() {
+            return true;
+        }
+        let Some(f) = self.m.funcs.iter().find(|f| f.name == self.cur_func) else {
+            return false;
+        };
+        let Some(block) = f.blocks.iter().find(|b| b.label == self.cur_site.0) else {
+            return false;
+        };
+        let site = self.cur_site.1;
+        for r in &self.zext_ret {
+            let def = block
+                .insts
+                .iter()
+                .position(|i| matches!(i, Inst::Zext(z) if z.dst == *r));
+            let use_ = block
+                .insts
+                .iter()
+                .position(|i| matches!(i, Inst::Ret(Some((_, Val::Reg(v))), _) if v == r));
+            if let (Some(d), Some(u)) = (def, use_) {
+                if d < site && site < u {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// The `icmp` a block's terminator can absorb, when that is the
     /// compare's only use in the function (shape rules in
     /// `iselcore::fusable_icmp`, shared with `alloc` so a dropped slot is
@@ -3027,6 +3082,78 @@ impl<'m> Gen<'m> {
         }
         (fold, mid)
     }
+    /// Whether materializing `%r` can reach `emit_gep_sum_to_fsr1`: a
+    /// slot-base GEP with a constant offset plus terms, or with several
+    /// terms. That sum clobbers FSR1, so no walk may hold a pointer
+    /// across an emission that reads such a value.
+    fn gep_sum_uses_fsr1(g: &Gen, f: &Func, r: &str) -> bool {
+        matches!(
+            g.resolved.get(&iselcore::ssa_key(&f.name, r)),
+            Some((iselcore::Base::Slot(..), k, terms))
+                if (*k != 0 && !terms.is_empty()) || terms.len() > 1
+        )
+    }
+    fn val_gep_sum_uses_fsr1(g: &Gen, f: &Func, v: &Val) -> bool {
+        let Val::Reg(r) = v else { return false };
+        Self::gep_sum_uses_fsr1(g, f, r)
+            || match g.fold_reg(v) {
+                Val::Reg(fr) => fr != *r && Self::gep_sum_uses_fsr1(g, f, &fr),
+                _ => false,
+            }
+    }
+    /// Whether materializing `%r` can seed FSR0: a GEP with a scaled or
+    /// multi-term index builds its full address in FSR0 for a value move
+    /// or a byte load, whatever its base. That seed clobbers a walk
+    /// pointer, so no walk may hold one across such an emission.
+    fn gep_uses_fsr0(g: &Gen, f: &Func, r: &str) -> bool {
+        matches!(
+            g.resolved.get(&iselcore::ssa_key(&f.name, r)),
+            Some((_, _, terms)) if terms.len() > 1 || (terms.len() == 1 && terms[0].0 != 1)
+        )
+    }
+    fn val_gep_uses_fsr0(g: &Gen, f: &Func, v: &Val) -> bool {
+        let Val::Reg(r) = v else { return false };
+        Self::gep_uses_fsr0(g, f, r)
+            || match g.fold_reg(v) {
+                Val::Reg(fr) => fr != *r && Self::gep_uses_fsr0(g, f, &fr),
+                _ => false,
+            }
+    }
+    /// Whether a walk over block `b` would emit an FSR-clobbering GEP
+    /// materialization while its pointers are live: an `Emit` body op
+    /// reading such a GEP, or a back-edge phi copy (from `back_label`)
+    /// carrying one into the latch.
+    fn walk_gep_fsr_hazard(
+        g: &Gen,
+        f: &Func,
+        b: &Block,
+        body: &[WalkOp],
+        back_label: &str,
+    ) -> bool {
+        for op in body {
+            if let WalkOp::Emit(ii) = op {
+                if ir::read_vals(&b.insts[*ii])
+                    .iter()
+                    .any(|r| Self::gep_sum_uses_fsr1(g, f, r) || Self::gep_uses_fsr0(g, f, r))
+                {
+                    return true;
+                }
+            }
+        }
+        for inst in &b.insts {
+            if let Inst::Phi(p) = inst {
+                for (v, e) in &p.incoming {
+                    if e == back_label
+                        && (Self::val_gep_sum_uses_fsr1(g, f, v)
+                            || Self::val_gep_uses_fsr0(g, f, v))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
     /// Walk-loop pre-scan (epic-cc#896): single-block counted loops whose
     /// index feeds only `PLUSW`-shaped accesses, closed by an increment
     /// compared against 1..=255. Runs after every fold so shape checks see
@@ -3278,6 +3405,14 @@ impl<'m> Gen<'m> {
         let mut term_sites: HashMap<String, Vec<(String, usize)>> = HashMap::new();
         let mut consumed_vadds: HashSet<String> = HashSet::new();
         let mut dead_ops: HashSet<usize> = HashSet::new();
+        // A GEP compare parks in FSR1, a live walk pointer here, so
+        // any such body or latch compare keeps the plain lowering.
+        if b.insts
+            .iter()
+            .any(|i| matches!(i, Inst::Icmp(c) if g.icmp_has_slotless_gep(c)))
+        {
+            return None;
+        }
         // Staged-copy pairs the body may hold when a walk op flushes:
         // at the drain threshold the flush becomes a seeded `POSTINC`
         // loop of its own, which would move live walk pointers.
@@ -3465,6 +3600,8 @@ impl<'m> Gen<'m> {
             return None;
         }
         Self::walk_finish(
+            g,
+            f,
             b,
             uses,
             pre,
@@ -3681,6 +3818,8 @@ impl<'m> Gen<'m> {
     /// read nowhere else; every counter read must sit on the pattern;
     /// every pointer must read and write in one direction only.
     fn walk_finish(
+        g: &Gen,
+        f: &Func,
         b: &Block,
         uses: &HashMap<String, Vec<(String, usize)>>,
         pre: String,
@@ -3858,6 +3997,11 @@ impl<'m> Gen<'m> {
                 return None;
             }
         }
+        // An FSR-clobbering GEP materialization in an emitted op or
+        // back-edge copy would clobber a live walk pointer.
+        if !groups.is_empty() && Self::walk_gep_fsr_hazard(g, f, b, &paired, &b.label) {
+            return None;
+        }
         let ptrs = groups
             .iter()
             .enumerate()
@@ -4015,6 +4159,9 @@ impl<'m> Gen<'m> {
             return None;
         };
         if latch_cmp.dst != *cond || latch_cmp.pred != "eq" {
+            return None;
+        }
+        if g.icmp_has_slotless_gep(&latch_cmp) {
             return None;
         }
         // A materialized second use would survive the fused branch; the
@@ -4178,14 +4325,24 @@ impl<'m> Gen<'m> {
     /// proxy mirrors the single-block scan's own threshold, and the
     /// counter slot must stay disjoint from the outer down-counter.
     fn outer_middle_ok(
-        _g: &Gen,
-        _f: &Func,
+        g: &Gen,
+        f: &Func,
         m: &Block,
         region: &HashSet<String>,
         header: &str,
         count_slot: u16,
         walks: &HashMap<String, WalkLoop>,
     ) -> Option<()> {
+        // Middle emissions run while the outer pointers are live, so an
+        // FSR-clobbering GEP materialization read here would clobber one.
+        for inst in &m.insts {
+            if ir::read_vals(inst)
+                .iter()
+                .any(|r| Self::gep_sum_uses_fsr1(g, f, r) || Self::gep_uses_fsr0(g, f, r))
+            {
+                return None;
+            }
+        }
         let inner = walks.get(&m.label)?;
         if !inner.ptrs.is_empty() {
             return None;
@@ -4215,6 +4372,11 @@ impl<'m> Gen<'m> {
                 Inst::Zext(z) => pairs += usize::from(z.to.bytes()),
                 Inst::Sext(s) => pairs += usize::from(s.to.bytes()),
                 Inst::Icmp(c) => {
+                    // A GEP compare parks in FSR1, which the outer
+                    // walk may hold live across this middle block.
+                    if g.icmp_has_slotless_gep(c) {
+                        return None;
+                    }
                     if latch_dst.as_ref() != Some(&Val::Reg(c.dst.clone())) {
                         pairs += 1;
                     }
@@ -4287,6 +4449,14 @@ impl<'m> Gen<'m> {
         let mut term_sites: HashMap<String, Vec<(String, usize)>> = HashMap::new();
         let mut consumed_vadds: HashSet<String> = HashSet::new();
         let mut dead_ops: HashSet<usize> = HashSet::new();
+        // A GEP compare parks in FSR1, a live walk pointer here, so
+        // any such header compare keeps the plain lowering.
+        if h.insts
+            .iter()
+            .any(|i| matches!(i, Inst::Icmp(c) if g.icmp_has_slotless_gep(c)))
+        {
+            return None;
+        }
         let mut stage_pairs: usize = 0;
         for (ii, inst) in h.insts.iter().enumerate() {
             if ii == last || ii == phi_ii {
@@ -4468,6 +4638,8 @@ impl<'m> Gen<'m> {
             return None;
         }
         Self::outer_finish(
+            g,
+            f,
             h,
             uses,
             pre,
@@ -4495,6 +4667,8 @@ impl<'m> Gen<'m> {
     /// what keeps the middle quiet: any middle read of either reg fails
     /// here. Every pointer must read and write in one direction only.
     fn outer_finish(
+        g: &Gen,
+        f: &Func,
         h: &Block,
         uses: &HashMap<String, Vec<(String, usize)>>,
         pre: String,
@@ -4663,6 +4837,11 @@ impl<'m> Gen<'m> {
             if hits[fsr] != 1 {
                 return None;
             }
+        }
+        // Same FSR hazard as the single-block epilogue: the latch
+        // carries the back-edge copies, so its label names that edge.
+        if Self::walk_gep_fsr_hazard(g, f, h, &paired, latch) {
+            return None;
         }
         let ptrs = groups
             .iter()
@@ -5479,6 +5658,14 @@ impl<'m> Gen<'m> {
         let mut load_dsts: Vec<String> = Vec::new();
         let mut base: Option<u16> = None;
         let mut cursor: u16 = 0;
+        // Same FSR1 park refusal as the counted scan, applied whole
+        // block so the latch compare is covered too.
+        if b.insts
+            .iter()
+            .any(|i| matches!(i, Inst::Icmp(c) if g.icmp_has_slotless_gep(c)))
+        {
+            return None;
+        }
         let mut stage_pairs: usize = 0;
         let here = |ii: usize| (b.label.clone(), ii);
         for (ii, inst) in b.insts.iter().enumerate() {
@@ -5673,6 +5860,11 @@ impl<'m> Gen<'m> {
             }
         }
         if pairs >= COPY_LOOP_MIN_PAIRS {
+            return None;
+        }
+        // An FSR-clobbering GEP materialization in an emitted op or
+        // back-edge copy would clobber the walked FSR0 pointer.
+        if Self::walk_gep_fsr_hazard(g, f, b, &body, &b.label) {
             return None;
         }
         Some(WalkLoop {
@@ -7857,6 +8049,31 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// Whether `v` is a GEP result: a `Gep` is virtual (folded by
+    /// `resolve_pointers`, emitted by nothing), so `alloc` gives its dst
+    /// no slot at all. A cast reading it must materialize the folded
+    /// address instead, and must not ask for that slot (epic-cc#1418).
+    fn folded_gep_src(&self, v: &Val) -> bool {
+        let Val::Reg(r) = v else { return false };
+        let key = ssa_key(self.cur_func, r);
+        // Every `Gep` dst resolves, so the map answers the common case
+        // (a cast of an ordinary value) without the scan below.
+        if !self.resolved.contains_key(&key) {
+            return false;
+        }
+        self.m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .is_some_and(|f| {
+                f.blocks.iter().any(|b| {
+                    b.insts
+                        .iter()
+                        .any(|i| matches!(i, Inst::Gep(g) if g.dst == *r))
+                })
+            })
+    }
+
     /// Copy `val` (width `ty.bytes`) into the slot starting at `dst`. A
     /// register/global source uses `MOVFF` (no access bit needed); a
     /// constant has no `MOVFF` literal form: a zero byte writes a
@@ -8121,10 +8338,28 @@ impl<'m> Gen<'m> {
                     }
                 };
                 let adds_in_byte0 = k != 0 || !terms.is_empty();
-                assert!(
-                    k == 0 || terms.is_empty(),
-                    "isel-pic18: GEP with both k and terms not supported in move"
-                );
+                if (k != 0 && !terms.is_empty()) || terms.len() > 1 {
+                    // The per-byte arms below cannot recover a term's
+                    // carry once a constant offset joins it, so the full
+                    // sum is built in the FSR1 pair first and read back.
+                    // A phi-folded counter's step folds into the constant
+                    // part, as on the global arm above (epic-cc#1271).
+                    let mut held = 0i64;
+                    for (s, r) in &terms {
+                        held += *s as i64 * self.escape_skew(r);
+                    }
+                    self.emit_gep_sum_to_fsr1(sa, k.wrapping_sub(held as u16), &terms);
+                    for i in 0..ty.bytes() {
+                        let sfr = if i == 0 { 0xFE1 } else { 0xFE2 };
+                        let (sa2, sf) = self.operand(sfr);
+                        let sbank = if sa2 == 0 { "A" } else { "B" };
+                        self.emit(format!("    MOVF 0x{sf:03X},W,{sbank}"));
+                        let (a, f) = self.operand(dst + u16::from(i));
+                        let bank = if a == 0 { "A" } else { "B" };
+                        self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                    }
+                    return;
+                }
                 for i in 0..ty.bytes() {
                     match terms.as_slice() {
                         [] => {
@@ -8535,26 +8770,27 @@ impl<'m> Gen<'m> {
         if let Val::Reg(r) = &mc.src {
             let key = ssa_key(self.cur_func, r);
             if self.prov.flash.contains(&key) || self.slot_flash.contains(&key) {
-                let (sname, k) = match self.resolved.get(&key) {
+                let (sname, k, terms) = match self.resolved.get(&key) {
                     Some((Base::Slot(sname, true), k, terms)) => {
-                        if !terms.is_empty() {
-                            panic!(
-                                "isel-pic18: memcpy from a runtime-indexed walk over flash pointer %{sname} is not supported (epic-cc#1091, epic-cc#1100)"
-                            );
-                        }
-                        (sname.clone(), *k)
+                        (sname.clone(), *k, terms.clone())
                     }
                     Some((Base::Slot(sname, false), k, terms))
-                        if self.slot_is_flash(self.cur_func, sname) && terms.is_empty() =>
+                        if self.slot_is_flash(self.cur_func, sname) =>
                     {
-                        (sname.clone(), *k)
+                        (sname.clone(), *k, terms.clone())
                     }
                     _ => panic!(
                         "isel-pic18: memcpy from flash pointer %{r} with no flash-walk slot is not supported (epic-cc#1100)"
                     ),
                 };
                 let slot = self.slot_addr(self.cur_func, &sname).direct();
+                // Dynamic terms fold into the byte-0 seed once: the copy
+                // walks TBLRD*+ from there, and the terms are loop-invariant
+                // across it like every other walked access.
                 self.emit_flash_tblptr_seed(slot, k.wrapping_add(u16::from(byte_off)));
+                if !terms.is_empty() {
+                    self.add_dynamic_to_tblptr(&terms, None);
+                }
                 return (McSrc::Tblrd, self.emit_ptr_setup(&mc.dst, byte_off));
             }
             if self.prov.mixed.contains(&key) {
@@ -9013,6 +9249,55 @@ impl<'m> Gen<'m> {
         }
         self.fsr0_holds = terms.is_empty().then_some((origin, static_part));
     }
+    /// Build `*slot_addr + k + Σ scale×%reg` in the FSR1 pair
+    /// (0xFE1/0xFE2), for a GEP value materialization that must read the
+    /// finished address back byte by byte. FSR1 is safe scratch here:
+    /// its only other users (memcpy source, staged-copy drains) seed it
+    /// inside their own emission and never hold it across a value load
+    /// or move, and FSR0 may be live for a store destination. Counted
+    /// walks do hold FSR1 across body emissions, so their scans reject
+    /// any op or back-edge copy that could reach this sum (epic-cc#1473).
+    /// The sum
+    /// reuses the indirect-slot forms (MULWF or shift-add chain for a
+    /// large scale, naive carry adds otherwise), so carries stay exact.
+    fn emit_gep_sum_to_fsr1(&mut self, slot_addr: u16, k: u16, terms: &[(u16, String)]) {
+        self.flush_copies();
+        // Chain overhead accounting, as in `emit_fsr0_indirect_slot`.
+        let extra = 2 + if k != 0 { 4 } else { 0 };
+        if let Some((ci, form)) = self.chain_term_index(terms, extra) {
+            let (scale, reg) = &terms[ci];
+            let a = self.slot_addr(self.cur_func, reg).direct();
+            let wide = self.term_wide(reg);
+            match form {
+                Scaled::Mulwf => {
+                    self.emit_copy_byte(slot_addr, 0xFE1);
+                    self.emit_copy_byte(slot_addr + 1, 0xFE2);
+                    if k != 0 {
+                        self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, k);
+                    }
+                    self.emit_mulwf_scale(0xFE1, 0xFE2, *scale, a, wide);
+                }
+                Scaled::Chain => {
+                    self.emit_banked("CLRF", 0xFE1, "");
+                    self.emit_banked("CLRF", 0xFE2, "");
+                    self.emit_scale_chain(0xFE1, 0xFE2, *scale, a, wide);
+                    self.emit_fsr_pair_add_mem16(0xFE1, 0xFE2, slot_addr, slot_addr + 1);
+                    if k != 0 {
+                        self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, k);
+                    }
+                }
+            }
+            self.add_terms_except(terms, Some(ci), 0xFE1, 0xFE2);
+            return;
+        }
+        self.emit_copy_byte(slot_addr, 0xFE1);
+        self.emit_copy_byte(slot_addr + 1, 0xFE2);
+        if k != 0 {
+            self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, k);
+        }
+        self.add_terms_except(terms, None, 0xFE1, 0xFE2);
+    }
+
     /// Add every dynamic term onto `FSR0L`/`FSR0H` with carry, `scale`
     /// times each per term: the naive path for small scales and residual
     /// terms after a chain. Each 4-instruction sequence is a
@@ -9310,12 +9595,16 @@ impl<'m> Gen<'m> {
             self.emit(format!("    MOVWF 0x{reg:02X},A"));
         }
         let static_part = k.wrapping_add(u16::from(byte_off));
+        // `k` is a signed offset held as a u16 pattern, so a negative
+        // static part sign-extends into TBLPTRU (mirroring
+        // `emit_flash_tblptr_seed`); zero-extending it would add 64 KB.
         if static_part != 0 {
             self.emit(format!("    MOVLW 0x{:02X}", static_part & 0xFF));
             self.emit("    ADDWF 0xF6,F,A".to_string()); // TBLPTRL
             self.emit(format!("    MOVLW 0x{:02X}", static_part >> 8));
             self.emit("    ADDWFC 0xF7,F,A".to_string()); // TBLPTRH
-            self.emit("    MOVLW 0x00".to_string());
+            let top = if (static_part as i16) < 0 { 0xFF } else { 0x00 };
+            self.emit(format!("    MOVLW 0x{top:02X}"));
             self.emit("    ADDWFC 0xF8,F,A".to_string()); // TBLPTRU
         }
     }
@@ -9517,7 +9806,10 @@ impl<'m> Gen<'m> {
             self.emit("    ADDWF 0xF6,F,A".to_string());
             self.emit(format!("    MOVLW 0x{:02X}", static_part >> 8));
             self.emit("    ADDWFC 0xF7,F,A".to_string());
-            self.emit("    MOVLW 0x00".to_string());
+            // Sign-extend as in `emit_tblptr_static`: a negative static
+            // part must subtract from the 21-bit TBLPTR, not add 64 KB.
+            let top = if (static_part as i16) < 0 { 0xFF } else { 0x00 };
+            self.emit(format!("    MOVLW 0x{top:02X}"));
             self.emit("    ADDWFC 0xF8,F,A".to_string());
         }
     }
@@ -11433,18 +11725,16 @@ impl<'m> Gen<'m> {
                     n == 1 || n == 2 || n == 4,
                     "isel-pic18: only i8/i16/i32 Icmp implemented so far (n={n})"
                 );
-                if n == 1 {
-                    self.emit_icmp_byte(
-                        self.fold_reg(&c.a),
-                        self.fold_reg(&c.b),
-                        &c.pred,
-                        &c.dst,
-                        None,
-                    );
+                let a = self.fold_reg(&c.a);
+                let b = self.fold_reg(&c.b);
+                if self.slotless_gep_value(&a) || self.slotless_gep_value(&b) {
+                    self.emit_icmp_gep(a, b, &c.pred, &c.dst, n, None);
+                } else if n == 1 {
+                    self.emit_icmp_byte(a, b, &c.pred, &c.dst, None);
                 } else if n == 2 {
-                    self.emit_icmp_i16(self.fold_reg(&c.a), self.fold_reg(&c.b), &c.pred, &c.dst);
+                    self.emit_icmp_i16(a, b, &c.pred, &c.dst);
                 } else {
-                    self.emit_icmp_i32(self.fold_reg(&c.a), self.fold_reg(&c.b), &c.pred, &c.dst);
+                    self.emit_icmp_i32(a, b, &c.pred, &c.dst);
                 }
             }
             Inst::Zext(z) => {
@@ -11473,7 +11763,6 @@ impl<'m> Gen<'m> {
                     z.to.bytes() >= z.from.bytes(),
                     "isel-pic18: zext must not narrow"
                 );
-                let src = self.val_addr(&z.val).direct();
                 // A retval-homed zext (epic-cc#978) computes into the return
                 // bytes directly; the ret arm skips its reload below.
                 let dst = if self.zext_ret.contains(&z.dst) {
@@ -11481,6 +11770,25 @@ impl<'m> Gen<'m> {
                 } else {
                     self.slot_addr(self.cur_func, &z.dst).direct()
                 };
+                // A GEP source has no slot at all (the backend emits
+                // nothing for a `Gep`), so the copy below would launder
+                // whatever was there. The address materializes from the
+                // folded base instead, like every other use of the GEP
+                // (epic-cc#1418).
+                if self.folded_gep_src(&z.val) {
+                    assert_eq!(
+                        z.from.bytes(),
+                        2,
+                        "isel-pic18: a cast of a folded GEP must take the whole 16-bit address (the IR's source width is {:?}); a narrower source is a truncation, which the Trunc arm refuses (epic-cc#1418)",
+                        z.from
+                    );
+                    self.emit_move_val_to_slot(&z.val, Ty::I16, dst);
+                    for i in z.from.bytes()..z.to.bytes() {
+                        self.emit_banked("CLRF", dst + u16::from(i), "");
+                    }
+                    return;
+                }
+                let src = self.val_addr(&z.val).direct();
                 // Dead high lanes (epic-cc#968): the scan proved only
                 // lane 0 is ever read, so the upper source copies and
                 // the zero fill are dead. One lane-0 copy is the whole
@@ -11561,8 +11869,14 @@ impl<'m> Gen<'m> {
                     self.emit_ptr_join_store(&f.val, f.ty, dst);
                     return;
                 }
-                let src = self.val_addr(&f.val).direct();
                 let dst = self.slot_addr(self.cur_func, &f.dst).direct();
+                // A slotless GEP source materializes its address
+                // instead of copying a slot it never had (epic-cc#1479).
+                if self.folded_gep_src(&f.val) {
+                    self.emit_move_val_to_slot(&f.val, f.ty, dst);
+                    return;
+                }
+                let src = self.val_addr(&f.val).direct();
                 for i in 0..f.ty.bytes() {
                     self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
                 }
@@ -11628,10 +11942,26 @@ impl<'m> Gen<'m> {
                     s.to.bytes() >= s.from.bytes(),
                     "isel-pic18: sext must not narrow"
                 );
-                let src = self.val_addr(&s.val).direct();
+                // A GEP source has no slot (see the `Zext` arm's note,
+                // epic-cc#1418): materialize the folded address instead,
+                // and sign-fill from the byte that wrote.
                 let dst = self.slot_addr(self.cur_func, &s.dst).direct();
-                for i in 0..s.from.bytes() {
-                    self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                let sign_byte;
+                if self.folded_gep_src(&s.val) {
+                    assert_eq!(
+                        s.from.bytes(),
+                        2,
+                        "isel-pic18: a cast of a folded GEP must take the whole 16-bit address (the IR's source width is {:?}); a narrower source is a truncation, which the Trunc arm refuses (epic-cc#1418)",
+                        s.from
+                    );
+                    self.emit_move_val_to_slot(&s.val, Ty::I16, dst);
+                    sign_byte = dst + u16::from(s.from.bytes()) - 1;
+                } else {
+                    let src = self.val_addr(&s.val).direct();
+                    for i in 0..s.from.bytes() {
+                        self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                    }
+                    sign_byte = src + u16::from(s.from.bytes()) - 1;
                 }
                 // An i1 holds exactly 0/1, so widening zero-fills the
                 // high bytes: one CLRF word each, same Z-dead argument
@@ -11650,7 +11980,6 @@ impl<'m> Gen<'m> {
                 // `BTFSC sign_byte,7` conditionally overwrites `W` with
                 // `MOVLW 0xFF` only when that bit is set, so every high
                 // byte gets the same, correctly-derived fill value.
-                let sign_byte = src + u16::from(s.from.bytes()) - 1;
                 for i in s.from.bytes()..s.to.bytes() {
                     self.emit("    MOVLW 0x00".to_string());
                     let (a, f) = self.operand(sign_byte);
@@ -11704,10 +12033,19 @@ impl<'m> Gen<'m> {
                     t.from.bytes() > t.to.bytes() || (t.to == Ty::I1 && t.from != Ty::I1),
                     "isel-pic18: trunc must narrow (to must be strictly smaller than from)"
                 );
-                let src = self.val_addr(&t.val).direct();
                 let dst = self.slot_addr(self.cur_func, &t.dst).direct();
-                for i in 0..t.to.bytes() {
-                    self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                // A slotless GEP source has no slot to copy: its low
+                // bytes materialize through `emit_load_w` (epic-cc#1479).
+                if self.folded_gep_src(&t.val) {
+                    for i in 0..t.to.bytes() {
+                        self.emit_load_w(&t.val, i, false);
+                        self.emit_w_store(dst + u16::from(i));
+                    }
+                } else {
+                    let src = self.val_addr(&t.val).direct();
+                    for i in 0..t.to.bytes() {
+                        self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                    }
                 }
                 if t.to == Ty::I1 {
                     // Every `i1` consumer tests the whole byte for nonzero,
@@ -12379,6 +12717,9 @@ impl<'m> Gen<'m> {
     /// single-read cascade. GPR slots and globals read the same bytes the
     /// cascade would, one extra pass over the top byte only.
     fn signed_chain_ok(&self, a: &Val, b: &Val, hi: u8) -> bool {
+        if self.slotless_gep_value(a) {
+            return false;
+        }
         if self.load_w_writes_carry(b) {
             return false;
         }
@@ -12585,6 +12926,217 @@ impl<'m> Gen<'m> {
         if let Some(done) = l_done {
             self.emit_materialize_bool(&l_true, &l_false, &done, dst, pre);
         }
+    }
+
+    /// One compare side after parking: the byte at `park + i` when a
+    /// park address is set, else byte `i` of the original value.
+    fn cmp_side_load_w(&mut self, park: Option<u16>, v: &Val, i: u8) {
+        match park {
+            Some(p) => self.emit_w_load(p + u16::from(i), false),
+            None => self.emit_load_w(v, i, false),
+        }
+    }
+
+    fn cmp_side_addr(&self, park: Option<u16>, v: &Val, i: u8) -> u16 {
+        match park {
+            Some(p) => p + u16::from(i),
+            None => self.val_addr(v).direct() + u16::from(i),
+        }
+    }
+
+    /// A compare with a slotless GEP operand (epic-cc#1479): park each GEP
+    /// operand whole (byte 0 then byte 1, uninterrupted, since byte 1 reads
+    /// byte 0's carry) before comparing, so no lane re-materializes a GEP
+    /// byte. Parks live in FSR1 and the retval bytes, never PROD: a later
+    /// `emit_load_w` (a park's own byte 1, or an unparked right side) can
+    /// run `MULWF` and overwrite PROD, while it never writes FSR1 or the
+    /// retval bytes. The copy-loop drain does seed FSR1, so it is off for
+    /// this lowering. A second park uses the retval bytes only where
+    /// `retval_park_free` proves them dead, parked first. Live-retval
+    /// `eq`/`ne` keeps the right GEP unparked (its `XORWF`/`BNZ` lanes
+    /// write no carry); ordered there panics.
+    fn emit_icmp_gep(
+        &mut self,
+        a: Val,
+        b: Val,
+        pred: &str,
+        dst: &str,
+        bytes: u8,
+        fuse: Option<(String, String)>,
+    ) {
+        assert!(
+            !matches!(a, Val::Const(_)),
+            "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
+        );
+        assert!(
+            bytes <= 2,
+            "isel-pic18: slotless GEP compare wider than the 2-byte park (bytes={bytes})"
+        );
+        self.flush_copies();
+        let copy_loop = self.copy_loop;
+        self.copy_loop = false;
+        let ordered = !matches!(pred, "eq" | "ne");
+        let a_park = self.slotless_gep_value(&a).then_some(GEP_CMP_PARK_LO);
+        let b_needs_park = self.slotless_gep_value(&b) || (ordered && self.load_w_writes_carry(&b));
+        let mut b_park = None;
+        if b_needs_park {
+            if a_park.is_some() {
+                if self.retval_park_free() {
+                    b_park = Some(self.retval_lo);
+                } else if ordered {
+                    panic!(
+                        "isel-pic18: ordered icmp on slotless GEP operands needs the retval park, but a zext return value is live there (epic-cc#1479)"
+                    );
+                }
+            } else {
+                b_park = Some(GEP_CMP_PARK_LO);
+            }
+        }
+        if let Some(p) = b_park {
+            for i in 0..bytes {
+                self.emit_load_w(&b, i, false);
+                self.emit_w_store(p + u16::from(i));
+            }
+        }
+        if let Some(p) = a_park {
+            for i in 0..bytes {
+                self.emit_load_w(&a, i, false);
+                self.emit_w_store(p + u16::from(i));
+            }
+        }
+        let (l_true, l_false, l_done);
+        match fuse {
+            Some((t, f)) => {
+                l_true = t;
+                l_false = f;
+                l_done = None;
+            }
+            None => {
+                l_true = self.fresh_label();
+                l_false = self.fresh_label();
+                l_done = Some(self.fresh_label());
+            }
+        }
+        // The result slot may be zeroed up front (the `INCF` join in
+        // `emit_materialize_bool`) only when it overlaps nothing the
+        // compare still reads: the parks, an unparked left slot, or an
+        // unparked right slot with a plain (non-materializing) load.
+        let pre = if l_done.is_some() {
+            let d = self.slot_addr(self.cur_func, dst).direct();
+            let mut read: Vec<u16> = Vec::new();
+            for p in [a_park, b_park].into_iter().flatten() {
+                read.extend(p..p + u16::from(bytes));
+            }
+            if a_park.is_none() {
+                let base = self.val_addr(&a).direct();
+                read.extend(base..base + u16::from(bytes));
+            }
+            let b_plain = b_park.is_some()
+                || matches!(b, Val::Const(_))
+                || (!self.slotless_gep_value(&b)
+                    && !self.load_w_writes_carry(&b)
+                    && !matches!(&b, Val::Reg(r) if self.resolved.contains_key(&ssa_key(self.cur_func, r))));
+            if b_park.is_none() && b_plain && !matches!(b, Val::Const(_)) {
+                let base = self.val_addr(&b).direct();
+                read.extend(base..base + u16::from(bytes));
+            }
+            (b_plain && !read.contains(&d)).then_some(d)
+        } else {
+            None
+        };
+        if let Some(d) = pre {
+            self.emit_banked("CLRF", d, "");
+        }
+        if pred == "eq" || pred == "ne" {
+            let l_mismatch = if pred == "eq" { &l_false } else { &l_true };
+            for i in 0..bytes {
+                self.cmp_side_load_w(b_park, &b, i);
+                let av = self.cmp_side_addr(a_park, &a, i);
+                let (acc, af) = self.operand(av);
+                let bank = if acc == 0 { "A" } else { "B" };
+                self.emit(format!("    XORWF 0x{af:03X},W,{bank}"));
+                self.emit(format!("    BNZ {l_mismatch}"));
+            }
+            let l_all = if pred == "eq" { &l_true } else { &l_false };
+            self.emit(format!("    BRA {l_all}"));
+        } else if matches!(pred, "ult" | "uge" | "ugt" | "ule") {
+            self.emit_icmp_parked_chain(a_park, &a, b_park, &b, pred, bytes, &l_true, &l_false);
+        } else {
+            // Signed: differing signs decide by the left sign alone,
+            // equal signs order like the unsigned chain. Both high
+            // bytes are read from the parks (or plain slots), never
+            // re-materialized, so no stale carry can enter.
+            let (chain_pred, differ_is_a_neg) = match pred {
+                "slt" => ("ult", true),
+                "sle" => ("ule", true),
+                "sgt" => ("ugt", false),
+                _ => ("uge", false),
+            };
+            let (l_dtrue, l_dfalse) = if differ_is_a_neg {
+                (l_true.clone(), l_false.clone())
+            } else {
+                (l_false.clone(), l_true.clone())
+            };
+            let hi = bytes - 1;
+            self.cmp_side_load_w(b_park, &b, hi);
+            let av = self.cmp_side_addr(a_park, &a, hi);
+            let (acc, af) = self.operand(av);
+            let bank = if acc == 0 { "A" } else { "B" };
+            self.emit(format!("    XORWF 0x{af:03X},W,{bank}"));
+            let l_differ = self.fresh_label();
+            self.emit(format!("    BN {l_differ}"));
+            self.emit_icmp_parked_chain(
+                a_park, &a, b_park, &b, chain_pred, bytes, &l_true, &l_false,
+            );
+            self.emit_label(&l_differ);
+            self.emit(format!("    BTFSS 0x{af:03X},7,{bank}"));
+            self.emit(format!("    BRA {l_dfalse}"));
+            self.emit(format!("    BRA {l_dtrue}"));
+        }
+        if let Some(done) = l_done {
+            self.emit_materialize_bool(&l_true, &l_false, &done, dst, pre);
+        }
+        self.copy_loop = copy_loop;
+    }
+
+    /// The unsigned borrow chain over parked compare sides: lane `i`
+    /// loads the right byte (a `MOVF` for a park, which writes no
+    /// carry) and subtracts it from the left byte, so `STATUS,C`
+    /// carries only the chain's own borrow from lane to lane.
+    fn emit_icmp_parked_chain(
+        &mut self,
+        a_park: Option<u16>,
+        a: &Val,
+        b_park: Option<u16>,
+        b: &Val,
+        pred: &str,
+        bytes: u8,
+        l_true: &str,
+        l_false: &str,
+    ) {
+        let (borrow_in, ge_is_true) = Self::chain_shape(pred);
+        let (l_ge, l_lt) = if ge_is_true {
+            (l_true, l_false)
+        } else {
+            (l_false, l_true)
+        };
+        if borrow_in {
+            self.emit("    BCF 0xFD8,0,A".to_string());
+        }
+        for i in 0..bytes {
+            self.cmp_side_load_w(b_park, b, i);
+            let av = self.cmp_side_addr(a_park, a, i);
+            let (acc, af) = self.operand(av);
+            let bank = if acc == 0 { "A" } else { "B" };
+            let mne = if i == 0 && !borrow_in {
+                "SUBWF"
+            } else {
+                "SUBWFB"
+            };
+            self.emit(format!("    {mne} 0x{af:03X},W,{bank}"));
+        }
+        self.emit(format!("    BNC {l_lt}"));
+        self.emit(format!("    BRA {l_ge}"));
     }
 
     /// `eq`/`ne` for multi-byte values: true (for `eq`) only when every
@@ -12986,6 +13538,9 @@ impl<'m> Gen<'m> {
     /// clearing such a slot would destroy the operand before it is ever
     /// compared.
     fn bool_result_preclear(&self, a: &Val, b: &Val, dst: &str, bytes: u8) -> Option<u16> {
+        if self.slotless_gep_value(a) {
+            return None;
+        }
         /// The bytes `v` is read from, or `None` when that cannot be
         /// pinned to one base: a literal and a function label read no
         /// memory at all, while a GEP-derived pointer is read through its
@@ -13101,6 +13656,81 @@ impl<'m> Gen<'m> {
     /// `BrCond`/`Select`/switch selectors) passes `true` so the reload is
     /// never elided. A caller feeding an ALU op passes `false`, since
     /// that op sets its own flags.
+    /// One byte of a GEP over a static address (a RAM global or a
+    /// local object) into `W`: the literal byte, plus a scale-1 term
+    /// added in `W`, or the `FSR0` seed for scaled and multi terms.
+    fn emit_load_w_static_gep(&mut self, addr: u16, k: u16, terms: &[(u16, String)], offset: u8) {
+        match terms {
+            [] => {
+                let byte = ((addr.wrapping_add(k) >> (u32::from(offset) * 8)) & 0xFF) as u8;
+                self.emit(format!("    MOVLW 0x{byte:02X}"));
+            }
+            [(1, reg)] => {
+                let lit = addr
+                    .wrapping_add(k)
+                    .wrapping_sub(self.escape_skew(reg) as u16);
+                let byte = ((lit >> (u32::from(offset) * 8)) & 0xFF) as u8;
+                let ra = self.val_addr(&Val::Reg(reg.clone())).direct() + u16::from(offset);
+                let (ra_a, ra_f) = self.operand(ra);
+                let ra_bank = if ra_a == 0 { "A" } else { "B" };
+                self.emit(format!("    MOVLW 0x{byte:02X}"));
+                if offset != 0 {
+                    self.emit("    BTFSC 0xFD8,0,A".to_string());
+                    self.emit("    ADDLW 0x01".to_string());
+                }
+                self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+            }
+            _ => {
+                self.emit_fsr0_dynamic(addr, k, terms, 0);
+                let sfr = if offset == 0 { 0xFE9 } else { 0xFEA };
+                let (a, f) = self.operand(sfr);
+                self.emit(format!(
+                    "    MOVF 0x{f:03X},W,{}",
+                    if a == 0 { "A" } else { "B" }
+                ));
+            }
+        }
+    }
+
+    /// One byte of a GEP over a flash const into `W`: `LOW`/`HIGH` of
+    /// the table label, with the constant offset and a scale-1 term
+    /// added in sequence so the final carry feeds the high byte.
+    fn emit_load_w_flash_gep(&mut self, name: &str, k: u16, terms: &[(u16, String)], offset: u8) {
+        let lit = if offset == 0 { "LOW" } else { "HIGH" };
+        self.emit(format!("    MOVLW {lit}({name})"));
+        match terms {
+            [] => {
+                let kb = ((k >> (u32::from(offset) * 8)) & 0xFF) as u8;
+                if offset != 0 && (k & 0xFF) != 0 {
+                    self.emit("    BTFSC 0xFD8,0,A".to_string());
+                    self.emit("    ADDLW 0x01".to_string());
+                }
+                if kb != 0 {
+                    self.emit(format!("    ADDLW 0x{kb:02X}"));
+                }
+            }
+            [(1, reg)] => {
+                let skew = self.escape_skew(reg);
+                let kk = k.wrapping_sub(skew as u16);
+                let ra = self.val_addr(&Val::Reg(reg.clone())).direct() + u16::from(offset);
+                let (ra_a, ra_f) = self.operand(ra);
+                let ra_bank = if ra_a == 0 { "A" } else { "B" };
+                if offset != 0 {
+                    self.emit("    BTFSC 0xFD8,0,A".to_string());
+                    self.emit("    ADDLW 0x01".to_string());
+                }
+                self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                let kb = ((kk >> (u32::from(offset) * 8)) & 0xFF) as u8;
+                if kb != 0 {
+                    self.emit(format!("    ADDLW 0x{kb:02X}"));
+                }
+            }
+            _ => panic!(
+                "isel-pic18: flash-const `{name}` with a scaled, multi-term, or offset runtime index has no RAM address (epic-cc#1101)"
+            ),
+        }
+    }
+
     fn emit_load_w(&mut self, v: &Val, offset: u8, need_z: bool) {
         match v {
             Val::Const(k) => {
@@ -13122,12 +13752,19 @@ impl<'m> Gen<'m> {
                     .cloned()
                 {
                     // GEP pointer value materialization for returns and scalar
-                    // pointer copies. Two base kinds hold runtime address
-                    // bytes: a plain pointer param's slot and a
-                    // runtime-address slot (an IntToPtr or const-arm select
-                    // dst); both read as `base + k + terms`. Literal bases
-                    // panic (their address is a link-time
-                    // constant).
+                    // pointer copies (epic-cc#1479): every base kind reads
+                    // as `base + k + terms`, from runtime slot bytes for a
+                    // pointer slot and from the link-time address for a
+                    // global or local object.
+                    if let iselcore::Base::Global(name) = &base {
+                        if self.global_is_const(name) {
+                            self.emit_load_w_flash_gep(name, k, &terms, offset);
+                        } else {
+                            let addr = self.global_addr(name);
+                            self.emit_load_w_static_gep(addr, k, &terms, offset);
+                        }
+                        return;
+                    }
                     let sa = match &base {
                         iselcore::Base::Slot(sname, indirect) => {
                             let holds_addr = if *indirect {
@@ -13140,21 +13777,46 @@ impl<'m> Gen<'m> {
                                     .map(|f| f.params.iter().any(|pp| pp.name == *sname && pp.ptr))
                                     .unwrap_or(false)
                             };
-                            assert!(
-                                holds_addr,
-                                "isel-pic18: cannot take the value of a GEP over {base:?}"
-                            );
+                            if !holds_addr {
+                                // A local object: the slot IS the object,
+                                // so its address is the slot address itself.
+                                let addr = self.slot_addr(self.cur_func, sname).direct();
+                                self.emit_load_w_static_gep(addr, k, &terms, offset);
+                                return;
+                            }
                             self.slot_addr(self.cur_func, sname).direct()
                         }
                         other => {
                             panic!("isel-pic18: cannot take the value of a GEP over {other:?}")
                         }
                     };
+                    if !terms.is_empty() && !matches!(terms.as_slice(), [(1, _)]) {
+                        // Scaled or multi-term: seed FSR0 with the full
+                        // address and read its low bytes back.
+                        self.emit_fsr0_indirect_slot(sa, k, &terms, 0);
+                        let sfr = if offset == 0 { 0xFE9 } else { 0xFEA };
+                        let (a, f) = self.operand(sfr);
+                        self.emit(format!(
+                            "    MOVF 0x{f:03X},W,{}",
+                            if a == 0 { "A" } else { "B" }
+                        ));
+                        return;
+                    }
                     let adds_in_byte0 = k != 0 || !terms.is_empty();
-                    assert!(
-                        k == 0 || terms.is_empty(),
-                        "isel-pic18: GEP with both a constant offset and dynamic terms loses the term's carry; not supported"
-                    );
+                    if (k != 0 && !terms.is_empty()) || terms.len() > 1 {
+                        // Same carry problem as the move arm: build the
+                        // full sum in the FSR1 pair, then read the byte.
+                        let mut held = 0i64;
+                        for (s, r) in &terms {
+                            held += *s as i64 * self.escape_skew(r);
+                        }
+                        self.emit_gep_sum_to_fsr1(sa, k.wrapping_sub(held as u16), &terms);
+                        let sfr = if offset == 0 { 0xFE1 } else { 0xFE2 };
+                        let (sa2, sf) = self.operand(sfr);
+                        let sbank = if sa2 == 0 { "A" } else { "B" };
+                        self.emit(format!("    MOVF 0x{sf:03X},W,{sbank}"));
+                        return;
+                    }
                     match terms.as_slice() {
                         [] => {
                             if offset == 0 {
@@ -16241,23 +16903,28 @@ fn emit_fused_branch<'m>(
     let l_f = exit(f_copies, lf, f_dom);
     let n = c.ty.bytes();
     let fuse = Some((l_t, l_f));
-    if c.pred == "eq" || c.pred == "ne" {
-        g.emit_icmp_eq_ne(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
+    let a = c.a.clone();
+    let b = c.b.clone();
+    let pred = c.pred.clone();
+    if g.slotless_gep_value(&a) || g.slotless_gep_value(&b) {
+        g.emit_icmp_gep(a, b, &pred, &c.dst, n, fuse);
+    } else if pred == "eq" || pred == "ne" {
+        g.emit_icmp_eq_ne(a, b, &pred, &c.dst, n, fuse);
     } else if n == 1 {
         // Single-byte orderings never reach the borrow chain: one lane
         // has no carry to hold, so the lane branches straight to the
         // exits with equality bound to its final answer.
-        g.emit_icmp_byte(c.a.clone(), c.b.clone(), &c.pred, &c.dst, fuse);
-    } else if matches!(c.pred.as_str(), "slt" | "sge")
-        && matches!(c.b, Val::Const(0))
-        && g.sign_zero_ok(&c.a, &c.pred, &c.b, n - 1)
+        g.emit_icmp_byte(a, b, &pred, &c.dst, fuse);
+    } else if matches!(pred.as_str(), "slt" | "sge")
+        && matches!(b, Val::Const(0))
+        && g.sign_zero_ok(&a, &pred, &b, n - 1)
     {
-        g.emit_icmp_sign_zero(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
-    } else if matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge") {
-        g.emit_icmp_signed_chain(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
+        g.emit_icmp_sign_zero(a, b, &pred, &c.dst, n, fuse);
+    } else if matches!(pred.as_str(), "slt" | "sle" | "sgt" | "sge") {
+        g.emit_icmp_signed_chain(a, b, &pred, &c.dst, n, fuse);
     } else {
-        debug_assert!(matches!(c.pred.as_str(), "ult" | "uge" | "ugt" | "ule"));
-        g.emit_icmp_chain(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
+        debug_assert!(matches!(pred.as_str(), "ult" | "uge" | "ugt" | "ule"));
+        g.emit_icmp_chain(a, b, &pred, &c.dst, n, fuse);
     }
     for (l, copies, dom, target) in tramps {
         g.emit_label(&l);
@@ -16422,6 +17089,12 @@ fn exit_bank(ends: &[Option<u8>]) -> Option<u8> {
 /// every block edge where phi copies emit; the ISR prologue saves PROD
 /// whenever its bodies multiply.
 const PHI_COPY_TEMP_LO: u16 = 0xFF3;
+
+/// FSR1L: the slotless-GEP compare park (epic-cc#1479). A park must
+/// survive every later `emit_load_w`, and those write PROD (`MULWF`
+/// scaled terms) and FSR0 but never FSR1, which is dead at every
+/// instruction boundary; the ISR scan saves FSR1 when a body uses it.
+const GEP_CMP_PARK_LO: u16 = 0xFE1;
 
 /// An outer header's seeds label (epic-cc#1204): the entry edge targets
 /// it, the seeds run there, and control falls into the header. The

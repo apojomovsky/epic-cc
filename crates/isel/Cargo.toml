@@ -13,6 +13,9 @@ peephole = { path = "../peephole" }
 schedule = { path = "../schedule" }
 
 [dev-dependencies]
+irparse = { path = "../irparse" }
+wholeprog = { path = "../wholeprog" }
+callgraph = { path = "../callgraph" }
 alloc = { path = "../alloc" }
 pic14-sim = { path = "../sim" }
 asm = { path = "../asm" }

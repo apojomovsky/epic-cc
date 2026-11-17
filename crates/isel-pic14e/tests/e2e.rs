@@ -352,6 +352,269 @@ fn structs_c_runs_correctly() {
 }
 
 #[test]
+fn multi_term_ptr_arg_c_runs_correctly() {
+    // in == 43, in2 == 0xC864, in3 == 260 (fixture comment) -> 0xB6.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/multi_term_ptr_arg.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 43;
+    p.ram_mut()[in_addr + 1] = 0;
+    let in2_addr = globals["in2"] as usize;
+    p.ram_mut()[in2_addr] = 0x64;
+    p.ram_mut()[in2_addr + 1] = 0xC8;
+    let in3_addr = globals["in3"] as usize;
+    p.ram_mut()[in3_addr] = 0x04;
+    p.ram_mut()[in3_addr + 1] = 0x01;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0xB6,
+        "out == hand-computed 0xB6 for in == 43, in2 == 0xC864, in3 == 260"
+    );
+    // Independent oracle for the two big cells: the physical byte is
+    // computed from the alloc map through the 80-byte GPR windows, not
+    // through any address the compiler emitted, so a dropped carry or
+    // term high byte in the shared helper cannot agree with it.
+    let big = globals["big"] as usize;
+    let phys_of = |offset: usize| {
+        let off = (big & 0x7F) - 0x20 + offset;
+        (big & !0x7F) + (off / 80) * 0x80 + 0x20 + (off % 80)
+    };
+    assert_eq!(p.ram()[phys_of(400)], 0xA5, "big[400] holds put_fwd's 0xA5");
+    assert_eq!(
+        p.ram()[phys_of(300)],
+        0x7C,
+        "big[300] holds put_fwd16's 0x7C"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn va_arg_gep_index_c_runs_correctly() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/va_arg_gep_index.c"
+    ));
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "out == byte written through the va_arg-indexed pointer"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn cond_term_ptr_arg_c_runs_correctly() {
+    // in == 1 (fixture comment) -> out == 0x5A.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/cond_term_ptr_arg.c"
+    ));
+    p.ram_mut()[globals["in"] as usize] = 1;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "out == byte written through the selected pointer"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn gep_offset_past_255_load_and_store_are_exact() {
+    // in == 200: store total 400, load total 300 (epic-cc#1466). The
+    // true cell is the 16-bit FSR0 sum; the wrapped cell drops the
+    // carry out of the low byte of the offset sum.
+    for fixture in ["gep_offset_wrap.c", "gep_offset_wrap_ptr.c"] {
+        let (mut p, globals) = compile(&format!(
+            "{}/tests/fixtures/{fixture}",
+            env!("CARGO_MANIFEST_DIR")
+        ));
+        let in_addr = globals["in"] as usize;
+        p.ram_mut()[in_addr] = 200;
+        p.ram_mut()[in_addr + 1] = 0;
+        let big = globals["big"] as usize;
+        p.ram_mut()[big + 300] = 0x3C;
+        p.ram_mut()[big + (300 & 0xFF)] = 0xEE;
+        p.run(2_000_000);
+        assert!(p.halted(), "{fixture} must halt");
+        assert_eq!(
+            p.ram()[globals["out"] as usize],
+            0x3C,
+            "{fixture}: out == byte at big + 300, not its low-byte wrap"
+        );
+        assert_eq!(
+            p.ram()[big + 400],
+            0xA5,
+            "{fixture}: big + 400 holds the stored 0xA5"
+        );
+        assert_ne!(
+            p.ram()[big + (400 & 0xFF)],
+            0xA5,
+            "{fixture}: wrapped store address must not hold 0xA5"
+        );
+    }
+}
+
+#[test]
+fn gep_value_icmp_c_runs_correctly() {
+    // in == 8 (fixture comment) -> out == 4, out2 == 1.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gep_value_icmp.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 8;
+    p.ram_mut()[in_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 4, "out == loop trips");
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        1,
+        "out2 == cursor landed on the GEP end"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn gep_value_icmp_carry_c_runs_correctly() {
+    // in == 8 (fixture comment) -> out == 5, out2 == 1.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gep_value_icmp_carry.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 8;
+    p.ram_mut()[in_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 5, "out == loop trips");
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        1,
+        "out2 == cursor landed on the GEP end"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn gep_k_terms_ptr_value_c_runs_correctly() {
+    // in == 23 (fixture comment) -> out == 0x33, out2/out4 == 0x51.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gep_k_terms_ptr_value.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 23;
+    p.ram_mut()[in_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x33,
+        "out == field read on the small array"
+    );
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        0x51,
+        "out2 == deref of pointer value stored to a global"
+    );
+    assert_eq!(
+        p.ram()[globals["out4"] as usize],
+        0x51,
+        "out4 == deref of pointer-param pointer value stored to a global"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn gep_isr_c_preempted_mid_gep_value_stays_correct() {
+    // Fire after main's GEP pair low seed lands; the ISR materializes
+    // its own scaled pointer value in the same pair. Only the ISR
+    // prologue's retval save (the pair is retval bytes 2/3) keeps
+    // main's sum exact: out == 0x51, out2 == 0x52.
+    let (mut p, globals, asm, _locals) = compile_with_layout(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gep_isr.c"
+    ));
+    assert!(
+        asm.contains("MOVWF 0x73"),
+        "GEP pair must live in the ISR-saved retval bytes 0x73/0x74:\n{asm}"
+    );
+    // The low seed literal: the MOVLW right before main's first
+    // pair store (the ISR epilogue also stores 0x73, earlier in the
+    // asm, so the search starts at main's label).
+    let seed = {
+        let mut in_main = false;
+        let mut last_lit = None;
+        let mut found = None;
+        for line in asm.lines() {
+            let t = line.trim();
+            if t == "main:" {
+                in_main = true;
+            }
+            if !in_main {
+                continue;
+            }
+            if let Some(v) = t.strip_prefix("MOVLW 0x") {
+                last_lit = u8::from_str_radix(&v[..2], 16).ok();
+            }
+            if t == "MOVWF 0x73" {
+                found = last_lit;
+                break;
+            }
+        }
+        found.expect("asm seeds the GEP pair in main")
+    };
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 23;
+    p.ram_mut()[in_addr + 1] = 0;
+    let in2_addr = globals["in2"] as usize;
+    p.ram_mut()[in2_addr] = 1;
+    p.ram_mut()[in2_addr + 1] = 0;
+    let mut steps = 0usize;
+    while p.ram()[0x73] != seed {
+        p.step();
+        steps += 1;
+        assert!(steps < 100_000, "never seeded the GEP pair (pc={})", p.pc());
+    }
+    p.fire_interrupt();
+    assert_eq!(p.pc(), 0x0004, "the ISR starts at the vector");
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x51,
+        "out == main sentinel after mid-GEP interrupt"
+    );
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        0x52,
+        "out2 == ISR sentinel"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn gep_k_terms_alloca_c_runs_correctly() {
+    // in == 23 (fixture comment) -> out == 0x63.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gep_k_terms_alloca.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 23;
+    p.ram_mut()[in_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x63,
+        "out == deref of alloca pointer value stored to a global"
+    );
+    assert!(p.halted());
+}
+
+#[test]
 fn banked_ptr_c_runs_correctly() {
     // in low byte = 3 (high byte stays 0) -> out == 0xB8 (hand trace in
     // the fixture's comment).
@@ -451,7 +714,12 @@ fn span_memcpy_c_into_straddling_destination_uses_linear_base() {
     // The memcpy destination must be addressed through the linear region:
     // the asm must contain a MOVLW of the linear base's high byte (0x20)
     // before a MOVWF FSR0H, and the base's low byte before a MOVWF FSR0L.
-    let linear_base = 0x2000 + (big & 0x7F) - 0x20;
+    let bank = device::PIC16F1937
+        .ram_banks
+        .iter()
+        .position(|&(s, e)| big >= s && big <= e)
+        .expect("big must start inside a GPR bank") as u16;
+    let linear_base = 0x2000 + bank * 80 + (big & 0x7F) - 0x20;
     let lo = (linear_base & 0xFF) as u8;
     let hi = ((linear_base >> 8) & 0xFF) as u8;
     let lines: Vec<&str> = asm.lines().map(|l| l.trim()).collect();
@@ -551,6 +819,36 @@ fn span_c_uses_linear_for_straddling_and_banked_otherwise() {
         p.ram()[globals["out"] as usize],
         0x66,
         "out == 0x11 + 0x22 + 0x33 for in == 3"
+    );
+    assert!(p.halted());
+}
+
+/// epic-cc#1477: startup init of an initialized bank-straddling global
+/// must write each byte at its physical address, skipping the common-RAM
+/// alias gap between banks, as user-code accesses through the linear
+/// region already assume. A contiguous `base + i` walk from bank 2 hits
+/// 0x170, the bank-3 alias of common RAM 0x70, and banking rejects it.
+#[test]
+fn span_init_c_initialized_straddling_global_survives_startup() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/span_init.c"
+    ));
+    let zbig = globals["zbig"];
+    assert_eq!(
+        zbig, 0x120,
+        "span_init.c layout: zbig[90] at 0x{zbig:03X} must start bank 2 and straddle into bank 3"
+    );
+    p.run(200_000);
+    // Bytes past the bank boundary land in bank 3, not the alias gap.
+    assert_eq!(p.ram()[0x120], 0x11, "zbig[0] at its physical byte");
+    assert_eq!(p.ram()[0x16F], 0x22, "zbig[79] at bank 2's last byte");
+    assert_eq!(p.ram()[0x1A0], 0x33, "zbig[80] at bank 3's first byte");
+    assert_eq!(p.ram()[0x1A9], 0x44, "zbig[89] at its physical byte");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0xAA,
+        "out == zbig[0] + zbig[79] + zbig[80] + zbig[89] after startup init"
     );
     assert!(p.halted());
 }
@@ -959,4 +1257,114 @@ fn mul_edges_u32_wraps_and_exits_on_zero() {
         ]);
         assert_eq!(got, a.wrapping_mul(b), "u32 {a:#010x} * {b:#010x} mod 2^32");
     }
+}
+
+/// epic-cc#1433: a pointer laundered through `uintptr_t` lowers as a
+/// same-width `trunc i16 -> i16`, and the backend used to refuse it
+/// ("trunc must narrow"), aborting the compile.
+///
+/// The fixture reads the byte back through the laundered address for
+/// both a loaded-global pointer and a local's address, so a wrong
+/// address reads the wrong byte.
+#[test]
+fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
+    let _guard = E2E_LOCK.lock();
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ptrtoint_launder.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the laundered address of a global must read back g's byte"
+    );
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        0x33,
+        "the laundered address of a local must read back the local's byte"
+    );
+    assert_eq!(
+        p.ram()[globals["out3"] as usize],
+        0x44,
+        "the laundered address of arr[3] must read back its byte"
+    );
+}
+
+#[test]
+fn term_alias_ptr_arg_c_runs_correctly() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/term_alias_ptr_arg.c"
+    ));
+    p.ram_mut()[globals["in"] as usize] = 1;
+    let in2_addr = globals["in2"] as usize;
+    p.ram_mut()[in2_addr] = 0;
+    p.ram_mut()[in2_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "out == 0x5A for in == 1, in2 == 0"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn term_alias_stacked_arg_c_runs_correctly() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/term_alias_stacked_arg.c"
+    ));
+    p.ram_mut()[globals["in"] as usize] = 1;
+    let in2_addr = globals["in2"] as usize;
+    p.ram_mut()[in2_addr] = 5;
+    p.ram_mut()[in2_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "out == 0x5A for in == 1, in2 == 5"
+    );
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        5,
+        "out2 == stacked term value 5"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn term_alias_va_arg_c_runs_correctly() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/term_alias_va_arg.c"
+    ));
+    p.ram_mut()[globals["in"] as usize] = 1;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "out == 0x5A for in == 1, va_arg == 5"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn byval_gep_launder_reads_back_field_byte() {
+    let _guard = E2E_LOCK.lock();
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/byval_gep_launder.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the laundered byval field address must read back s.b"
+    );
 }

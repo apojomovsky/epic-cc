@@ -2,6 +2,118 @@
 
 All notable changes to this project are documented here, generated from
 Conventional Commits. Dates are UTC.
+## [0.8.1] - 2026-11-17
+ 
+### Fixes
+
+- Return the snapped first byte from try_place_straddle (#1490)
+- Measure page extents at the pre-org address (#1492)
+- Wrap GEP chain offsets in the 16-bit address space (#1493)
+- Keep FSR0 GEP materializations out of counted walks (#1495)
+- Zero-extend one-byte pointer terms in 16-bit address adds (#1497)
+- Park multi-term pointer args that alias the callee param slot (#1498)
+- Fold multi-index GEPs by element stride (#1499)
+- Keep pointer select fold from inverting a low true arm (#1502)
+- Write straddling global init bytes at physical addresses (#1504)
+- Materialize GEP values over byval params and as baseline call args (#1503)
+- Carry GEP offsets past 255 into the high address byte (#1500)
+## [0.8.0] - 2026-11-13
+ 
+### Fixes
+
+- Materialize slotless GEP values as icmp eq operands (#1475)
+- Write straddling global init bytes at physical addresses (#1481)
+- Keep RAM copies of const tables whose address escapes into a phi (#1482)
+- Materialize GEP moves with a constant offset and dynamic terms carry-exactly (#1476)
+- Materialize slotless GEP values at icmp and cast uses (#1483)
+## [0.7.0] - 2026-11-12
+ 
+### Fixes
+
+- Lower a same-width ptrtoint trunc as a copy on PIC14 (#1465)
+- Materialize GEP pointer values with a constant offset and dynamic terms carry-exactly (#1469)
+- Lower memcpy from a runtime-indexed flash walk (#1470)
+## [0.6.1] - 2026-11-12
+ 
+### Fixes
+
+- Judge the edited PR body on a baseline re-run (#1446)
+- Support multi-term plain pointer call arguments (#1450)
+- Lower llvm.memset to a library call (#1454)
+- Support multi-term plain pointer call arguments (#1456)
+- Let user string definitions override the injected unit (#1457)
+- Lower llvm.memmove to a memmove call and reject unsupported llvm.mem forms (#1458)
+- Reject a static memset paired with llvm.memset (#1459)
+## [0.6.0] - 2026-10-26
+ 
+### Features
+
+- Source-level debugging for PIC14E parts (#1331)
+- Source-level debugging for PIC12 baseline parts (#1334)
+- Port classic chunk repair loop to PIC14E placement (#1335)
+- Runtime-tagged fallback for maybe-flash pointers (#1350)
+- Fold crc feedback select and whole-byte shl on PIC14 (#1363)
+- Model Timer0 on PIC14 and PIC14E (#1365)
+- Hardware write watchpoints over RSP (#1368)
+- Strip unread params and dead pure defs (#1372)
+- Model Timer0 counting on PIC18 (#1380)
+- Suggest the nearest flag on unknown option (#1384)
+- No-hang ADC and comparator stubs on PIC14 and PIC14E (#1398)
+- Serve loop accepts next session after detach (#1397)
+- Help and version plus error-UX parity with driver (#1400)
+- Set TO/PD cause bits on SLEEP and CLRWDT (#1399)
+- POR image for PIC14 and PIC14E STATUS and TRIS latches (#1406)
+- Model the PIC18 USB SIE endpoint 0 and walk CDC enumeration (#1420)
+
+### Fixes
+
+- Context-sensitive int-laundered flash call taint (#1332)
+- Reject --emit ll/ir/asm combined with artifact flags (#1367)
+- Refuse mixed memcpy dst and tag dynamic walks by base (#1353)
+- Ripple the inter-group carry out of __mul_u32 (#1412)
+- Decline walk match on pool variant index slots (#1413)
+- The block dominators see the switch terminator (#1431)
+- Lower a same-width ptrtoint trunc as a copy (#1432)
+- Name the switch chain block in a case target's phi incoming (#1438)
+- Materialize a GEP source in the zext/sext arms (#1444)
+
+### Performance
+
+- Narrow shift count copy and add the u32 half-word stage at -Os (#1387)
+- Trim O2 divide flash within the 64-word allowance (#1388)
+- Unrolled O2 u16 multiply on PIC14 (#1405)
+- Narrow widening multiplies through MULWF __mul_s16 (#1408)
+- Walk-aware temp homes for 32-byte copy loops (83B to 70B) (#1410)
+
+### Documentation
+
+- Pin the hub sha256 in the check (#1333)
+- Document --sidecar in help, CLI reference, VS Code launch page (#1369)
+- Capture epic-cc-gdbserver in CLI reference (#1386)
+- Refresh stale scope and status statements (#1403)
+
+### Miscellaneous
+
+- Read PIC16F1XXXX_DFP ARG in hal image tag (#1330)
+- Ship epic-cc-gdbserver.exe in the Windows bundle (#1349)
+- Run scoped gputils cross-check per touched device TOML (#1385)
+- Run the ignored fuzz-long corpus as a non-blocking job (#1404)
+
+### Testing
+
+- Pin PIC18 line rows to the two-word layout (#1345)
+- Pin O0/O1 ladder rows for size and cycle baselines (#1354)
+- Unit tests for catalog, ci_noncode_check, hal-fixture-drift (#1364)
+- Gate pack-name drift with device_names --check (#1371)
+- Cover PIC18 TBLWT forms with a no-write model (#1366)
+- Scope the gputils cross-check to one device (#1381)
+- Cross-check Timer0 counts against gpsim on PIC14 (#1382)
+- Prove write watchpoints on PIC18, PIC14E, baseline (#1383)
+- Run device_names SFR-alias step from add-device.sh (#1402)
+- Re-baseline speed-mul-u16-16f877a@O2 for unrolled u16 multiply (#1414)
+- Cover the SIE's refusal of a buffer outside USB RAM (#1423)
+- Cover the OUT token guard and the USB RAM window's edges (#1425)
+- Cover the runtime-indexed gep trunc materialization (#1439)
 ## [0.5.0] - 2026-10-17
  
 ### Breaking

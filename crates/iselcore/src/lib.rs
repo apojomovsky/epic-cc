@@ -553,9 +553,15 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
                             );
                             let mut terms = tt.clone();
                             terms.extend(g.terms.clone());
-                            let k = g.k.checked_add(kk).unwrap_or_else(|| {
-                                panic!("iselcore: gep offset overflow in {key}")
-                            });
+                            // Offsets are signed byte offsets held as u16
+                            // patterns (irparse folds -1 to 65535). The RAM
+                            // backends add k to a 16-bit base with wrapping
+                            // arithmetic, and PIC18 flash-const reads
+                            // sign-extend k into the 21-bit TBLPTR, so the
+                            // chain sum wraps in 16 bits the same way and a
+                            // reassociated `(base + len) - 1` lands back in
+                            // range instead of overflowing (epic-cc#1487).
+                            let k = g.k.wrapping_add(kk);
                             resolved.insert(key, (b, k, terms));
                             progressed = true;
                         } else if geps.contains_key(&rkey) || selects.contains_key(&rkey) {
@@ -672,9 +678,10 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
 
 /// Fold a pointer-typed select whose two arms resolve to the same base with
 /// identical term sets: `select i1 c, base+kA, base+kB` becomes
-/// `(base, min(kA,kB), terms + (|kA-kB|, c))`. The cond's 0/1 polarity picks
-/// the arm, so no inversion is needed. Returns `None` when the arms do not
-/// fold to a common base, the term sets differ, or the cond is not a reg.
+/// `(base, min(kA,kB), terms + (|kA-kB|, c))` only when kA is the high
+/// offset, since c = 1 picks the true arm and adds the difference.
+/// Returns `None` when the arms do not fold to a common base, the term
+/// sets differ, the true arm is the low one, or the cond is not a reg.
 fn fold_select(
     s: &ir::Select,
     resolved: &PtrResolution,
@@ -717,6 +724,13 @@ fn fold_select(
         ir::Val::Reg(c) => c.clone(),
         _ => return None,
     };
+    // The term adds d when c is 1, and c = 1 picks the true arm, so the
+    // fold only holds when the true arm is the high one. A low true arm
+    // would need the complement of c, which no term expresses: leave it
+    // to the indirect-slot seeding below, which materializes the arm.
+    if d != 0 && va.1 != hi {
+        return None;
+    }
     if d == 0 {
         // Both arms are the same pointer: the select is a no-op.
         return Some((va.0.clone(), lo, va.2.clone()));
@@ -1167,21 +1181,20 @@ pub fn find_value_folds(
 /// lanes, so a compare whose rhs load writes it keeps the per-lane cascade.
 pub fn load_w_writes_carry(
     fname: &str,
-    params: &[ir::Param],
+    _params: &[ir::Param],
     resolved: &PtrResolution,
     v: &ir::Val,
 ) -> bool {
     let ir::Val::Reg(r) = v else {
         return false;
     };
-    let Some((base, k, terms)) = resolved.get(&ssa_key(fname, r)) else {
+    let Some((_base, k, terms)) = resolved.get(&ssa_key(fname, r)) else {
         return false;
     };
-    let Base::Slot(sname, indirect) = base else {
-        return false;
-    };
-    let holds_addr = *indirect || params.iter().any(|pp| pp.name == *sname && pp.ptr);
-    holds_addr && (*k != 0 || !terms.is_empty())
+    // Every resolved-GEP materialization with an offset or a dynamic
+    // term adds in `W` and so writes `C`, whatever the base kind
+    // (epic-cc#1479 extended the global and local-object bases).
+    *k != 0 || !terms.is_empty()
 }
 
 /// The `icmp` a block's `BrCond` absorbs on PIC18 (epic-cc#862): the block

@@ -15,16 +15,18 @@
 //! (RAM or const-flash), `Base::Slot(name, indirect)`: a byval param copy,
 //! an alloca, or an sret slot holding a target address (indirect). A
 //! constant offset (no terms) reads/writes the plain file register; dynamic
-//! terms set `FSR` to `base + k + Σ s×%r` (single scale-1 term keeps the
-//! `MOVF %r,W; ADDLW base+k; MOVWF FSR` fast path; general sums accumulate
-//! in W as an `ADDWF %r,W` chain); an indirect base takes the target address
+//! terms add into `FSR` one repetition at a time from the folded static
+//! start address, each low-byte carry toggling IRP so the 9-bit sum stays
+//! exact; an indirect base takes the target address
 //! from the slot's contents. Pointers into const (flash) globals load via
 //! `CALL __read_<name>`: a RETLW table emitted after the functions, and a
 //! store through a const base panics (ROM is not writable). `memcpy`
 //! lowers to a byte loop of the same pointer machinery; `alloca` is virtual
 //! like `gep` (the slot is sized by alloc). Static FSR bases reach all four
 //! GPR banks via the IRP bit: every FSR setup emits `BCF/BSF STATUS, 7`
-//! (IRP = base bit 8) first, then loads FSR with `(base + k + off) & 0xFF`.
+//! first (IRP = bit 8 of the wrapped 9-bit address
+//! `(base + k + off) & 0x1FF`), then loads FSR with that low byte.
+//! Dynamic terms then add into FSR, each carry toggling IRP.
 //! The FSR-accessed object fits inside one GPR window
 //! `[0x20,0x80)` `[0xA0,0xF0)` `[0x120,0x170)` `[0x1A0,0x1F0)`: crossing an
 //! SFR hole would silently mis-address, so emission panics when the span
@@ -79,6 +81,42 @@ fn literal_ptr_addr(ptr: &str) -> u16 {
         .unwrap_or_else(|| panic!("isel: malformed literal pointer {ptr:?}"));
     u16::from_str_radix(lit, 16)
         .unwrap_or_else(|_| panic!("isel: malformed literal pointer {ptr:?}"))
+}
+
+/// Returns the physical address of byte `idx` of an object at `base`:
+/// the placement walk in `alloc`, stepping over the gap between GPR
+/// banks, so a straddling object's tail lands in the next bank instead
+/// of the common-RAM alias window the gap contains.
+/// Whether an object at `base_addr` of `span` bytes crosses its bank end.
+fn object_straddles(device: &Device, base_addr: u16, span: u16) -> bool {
+    let (_, end) = device
+        .region_for(base_addr)
+        .expect("isel: global base outside GPR space");
+    base_addr + span - 1 > end
+}
+
+fn physical_byte_addr(device: &Device, base: u16, idx: u16) -> u16 {
+    if let Some((lo, hi)) = device.common_ram {
+        if base >= lo && base <= hi {
+            return base + idx;
+        }
+    }
+    let mut cur = base;
+    let mut remaining = idx;
+    loop {
+        let (start, end) = device
+            .region_for(cur)
+            .expect("isel: global byte outside GPR space");
+        if cur < start {
+            cur = start;
+        }
+        let avail = end - cur + 1;
+        if remaining < avail {
+            return cur + remaining;
+        }
+        remaining -= avail;
+        cur = end + 1;
+    }
 }
 
 /// The GPR windows reachable through FSR+IRP, derived from the device's
@@ -449,7 +487,7 @@ impl<'m> Gen<'m> {
     }
 
     /// Whether `name` is a local object in the current function: an
-    /// `alloca`'s slot IS the object, so a pointer to it is that slot's
+    /// `alloca` or byval param's slot IS the object, so a pointer to it is that slot's
     /// own frame address rather than an address value stored in the slot
     /// (epic-cc#645).
     fn is_local_object(&self, name: &str) -> bool {
@@ -458,11 +496,12 @@ impl<'m> Gen<'m> {
             .iter()
             .find(|f| f.name == self.cur_func)
             .map(|f| {
-                f.blocks.iter().any(|b| {
-                    b.insts
-                        .iter()
-                        .any(|i| matches!(i, ir::Inst::Alloca(a) if a.dst == name))
-                })
+                f.params.iter().any(|p| p.name == name && p.byval.is_some())
+                    || f.blocks.iter().any(|b| {
+                        b.insts
+                            .iter()
+                            .any(|i| matches!(i, ir::Inst::Alloca(a) if a.dst == name))
+                    })
             })
             .unwrap_or(false)
     }
@@ -488,6 +527,20 @@ impl<'m> Gen<'m> {
                 .get(&ssa_key(func, name))
                 .unwrap_or_else(|| panic!("isel: no slot for {func}::{name}")),
         )
+    }
+
+    /// Whether `v` is a resolved GEP value the allocator folded into
+    /// its uses: it has a resolved (base, k, terms) entry but no slot,
+    /// so a reader must materialize it through `emit_load_byte`
+    /// instead of addressing a slot (epic-cc#1472).
+    fn slotless_gep_value(&self, v: &Val) -> bool {
+        match v {
+            Val::Reg(r) => {
+                let key = ssa_key(self.cur_func, r);
+                self.resolved.contains_key(&key) && !self.addrs.contains_key(&key)
+            }
+            _ => false,
+        }
     }
 
     /// The byte width of function `func`'s va region: the maximum over its
@@ -779,6 +832,7 @@ impl<'m> Gen<'m> {
                     Inst::Select(s) if s.dst == name => s.ty.bytes(),
                     Inst::Phi(p) if p.dst == name => p.ty.bytes(),
                     Inst::Freeze(fr) if fr.dst == name => fr.ty.bytes(),
+                    Inst::VaArg(v) if v.dst == name => v.ty.bytes(),
                     Inst::Call(c) if c.dst.as_deref() == Some(name) => {
                         c.ty.map(|t| t.bytes()).unwrap_or(1)
                     }
@@ -795,6 +849,13 @@ impl<'m> Gen<'m> {
             }
         }
         panic!("isel: no definition of %{name} in {}", self.cur_func);
+    }
+
+    /// Whether a pointer term reg has a high byte to add into a 16-bit
+    /// address. A 1-byte term (a folded pointer select's icmp condition)
+    /// zero-extends: the byte past its slot is a neighbour's, not its own.
+    fn term_has_hi(&self, reg: &str) -> bool {
+        self.reg_bytes(reg) > 1
     }
 
     /// The byte span of a resolved FSR base: the whole object a pointer
@@ -864,7 +925,14 @@ impl<'m> Gen<'m> {
                     !self.global_is_const(g),
                     "isel: store to const (flash) global @{g}"
                 );
-                Addr::Direct(self.global_addr(g) + u16::from(byte_off))
+                let base = self.global_addr(g);
+                Addr::Direct(
+                    if object_straddles(self.device, base, self.global_size(g)) {
+                        physical_byte_addr(self.device, base, u16::from(byte_off))
+                    } else {
+                        base + u16::from(byte_off)
+                    },
+                )
             }
             Val::Reg(r) => {
                 let (base, k, terms) = self.resolved_for(r);
@@ -876,11 +944,17 @@ impl<'m> Gen<'m> {
                         );
                         if terms.is_empty() {
                             // Constant offset only: the address is statically
-                            // known, a plain file-register access, no FSR.
+                            // known, a plain file-register access, no FSR. A
+                            // straddling object maps the offset through the
+                            // physical bank walk, skipping the alias gap.
+                            let gbase = self.global_addr(name);
+                            let off = k.wrapping_add(u16::from(byte_off));
                             Addr::Direct(
-                                self.global_addr(name)
-                                    .wrapping_add(k)
-                                    .wrapping_add(u16::from(byte_off)),
+                                if object_straddles(self.device, gbase, self.object_span(&base)) {
+                                    physical_byte_addr(self.device, gbase, off)
+                                } else {
+                                    gbase.wrapping_add(off)
+                                },
                             )
                         } else {
                             let span = self.object_span(&base);
@@ -1173,19 +1247,20 @@ impl<'m> Gen<'m> {
     /// Runtime-length memcpy: `len` is a 16-bit SSA register,
     /// SSA-dead after this copy, so the copy may consume it. The loop
     /// copies one byte per iteration; EVERY byte of the loop state lives
-    /// in fixed common RAM: countdown 0x71/0x72 (the retval bytes, dead
-    /// at a memcpy), byte index 0x7E (the documented free byte), held byte
-    /// 0x7F, so the banking pass can never insert a BANKSEL inside the
-    /// loop and the skip-sensitive test/branch pairs keep their targets:
+    /// in fixed common RAM: countdown in the low retval bytes (dead
+    /// at a memcpy), byte index and held byte in the park pair (the
+    /// high retval bytes, ISR-saved like the countdown), so the
+    /// banking pass can never insert a BANKSEL inside the loop and
+    /// the skip-sensitive test/branch pairs keep their targets:
     ///
-    ///   count = len                          ; 0x71 = lo, 0x72 = hi
-    ///   idx = 0                              ; 0x7E
-    ///   l_loop:  if (0x71 | 0x72) == 0 -> l_done
-    ///            FSR = src_base + k + terms + idx; W = INDF; 0x7F = W
-    ///            FSR = dst_base + k + terms + idx; W = 0x7F; INDF = W
-    ///            idx++                       ; INCF 0x7E
-    ///            countdown-- (16-bit)        ; MOVLW 1 / SUBWF 0x71,F /
-    ///                                         ; BTFSS STATUS,0 / SUBWF 0x72,F
+    ///   count = len                          ; retval lo/hi
+    ///   idx = 0                              ; park pair lo
+    ///   l_loop:  if (count) == 0 -> l_done
+    ///            FSR = src_base + k + terms + idx; W = INDF; hold = W
+    ///            FSR = dst_base + k + terms + idx; W = hold; INDF = W
+    ///            idx++                       ; INCF park pair lo
+    ///            countdown-- (16-bit)        ; MOVLW 1 / SUBWF cnt,F /
+    ///                                         ; BTFSS STATUS,0 / SUBWF cnt+1,F
     ///            GOTO l_loop
     ///   l_done:
     ///
@@ -1203,12 +1278,12 @@ impl<'m> Gen<'m> {
     fn emit_memcpy_dynamic(&mut self, dst: &Val, src: &Val, len: &Val) {
         let l_loop = self.fresh_label();
         let l_done = self.fresh_label();
-        let cnt_lo: u16 = self.retval_lo; // 0x71, dead at a memcpy
-        let cnt_hi: u16 = self.retval_lo + 1; // 0x72
-        let idx: u16 = 0x7E; // documented free common byte
-        let hold: u16 = 0x7F; // documented free common byte
-                              // FSR = base + k + terms + idx for one byte of a pointer; the FSR
-                              // must be re-set per byte (one FSR on classic mid-range).
+        let cnt_lo: u16 = self.retval_lo; // dead at a memcpy
+        let cnt_hi: u16 = self.retval_lo + 1;
+        let idx: u16 = self.park_pair(); // ISR-saved retval bytes
+        let hold: u16 = self.park_pair() + 1;
+        // FSR = base + k + terms + idx for one byte of a pointer; the FSR
+        // must be re-set per byte (one FSR on classic mid-range).
         let emit_byte_fsr = |g: &mut Self, ptr: &Val| {
             let (base, k, terms) = match ptr {
                 Val::Reg(r) => g.resolved_for(r),
@@ -1238,7 +1313,7 @@ impl<'m> Gen<'m> {
                 }
             }
             g.emit(format!("    MOVF 0x{idx:02X}, W"));
-            g.emit("    ADDWF FSR, F".to_string());
+            g.emit_add_w_to_fsr();
         };
         // Length source slot (the SSA reg's own bytes, read once).
         let la = self.val_addr(len).direct();
@@ -1284,13 +1359,12 @@ impl<'m> Gen<'m> {
     /// `span` bytes at `base_addr`. The window check runs first: the whole
     /// object must fit inside its base's GPR window (an unrepresentable
     /// cross-hole address would silently mis-address through INDF, so it
-    /// panics). IRP is then set on EVERY FSR setup: a prior
-    /// bank-2/3 access leaves STATUS bit 7 = 1, so skipping the set on a
-    /// bank-0/1 base would mis-address into bank 2/3. A single scale-1
-    /// term keeps the fast shape (`MOVF %r,W; ADDLW lit; MOVWF FSR`);
-    /// general sums accumulate in W first. The ADDLW
-    /// literal is `(base_addr + k + byte_off) & 0xFF`: FSR holds the low
-    /// byte; IRP carries bit 8.
+    /// panics). The address is 9-bit: FSR holds the low byte and IRP
+    /// carries bit 8, set on EVERY FSR setup because a prior bank-2/3
+    /// access leaves STATUS bit 7 = 1. The static part folds into the
+    /// 9-bit start address at compile time; each term then adds into
+    /// FSR with its carry toggling IRP, so a total past 255 stays exact
+    /// in the 9-bit address space.
     fn emit_fsr_to(
         &mut self,
         base_addr: u16,
@@ -1299,30 +1373,75 @@ impl<'m> Gen<'m> {
         byte_off: u8,
         span: u16,
     ) {
-        let (irp, base_lo) = fsr_window(self.device, base_addr, span);
-        // The sum is modular by design (FSR holds the low byte); irparse
-        // wraps a negative GEP offset into `k`, so a plain `+` can
-        // overflow on loop-reduce's backward walks (epic-cc#645).
-        let lit = u16::from(base_lo)
-            .wrapping_add(k)
-            .wrapping_add(u16::from(byte_off))
-            & 0xFF;
+        fsr_window(self.device, base_addr, span);
+        // Modular by design: irparse wraps a negative GEP offset into
+        // `k`, and the FSR+IRP space is 9 bits (epic-cc#645).
+        let addr = base_addr.wrapping_add(k).wrapping_add(u16::from(byte_off)) & 0x1FF;
+        let irp = addr & 0x100 != 0;
         self.emit(if irp {
             "    BSF STATUS, 7".to_string()
         } else {
             "    BCF STATUS, 7".to_string()
         });
-        match terms {
-            [(1, r)] => {
+        // One 8-bit scale-1 term: the ADDLW carry is exactly the bit-8
+        // toggle, so a conditional IRP set after the FSR store (MOVWF
+        // leaves C alone) keeps this shape two words over the old sum.
+        if let [(1, r)] = terms {
+            if self.reg_bytes(r) == 1 {
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();
+                let lo = (addr & 0xFF) as u8;
                 self.emit(format!("    MOVF 0x{a:02X}, W"));
-                self.emit(format!("    ADDLW 0x{lit:02X}"));
+                if lo != 0 {
+                    self.emit(format!("    ADDLW 0x{lo:02X}"));
+                }
                 self.emit("    MOVWF FSR".to_string());
+                if lo != 0 {
+                    self.emit("    BTFSC STATUS, 0".to_string());
+                    self.emit(if irp {
+                        "    BCF STATUS, 7".to_string()
+                    } else {
+                        "    BSF STATUS, 7".to_string()
+                    });
+                }
+                return;
             }
-            _ => {
-                self.emit_accum_terms(terms);
-                self.emit(format!("    ADDLW 0x{lit:02X}"));
-                self.emit("    MOVWF FSR".to_string());
+        }
+        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+        self.emit("    MOVWF FSR".to_string());
+        self.emit_add_terms_to_fsr(terms);
+    }
+
+    /// Adds the byte in W into the 9-bit FSR+IRP address: the low add
+    /// lands in FSR and a carry out of bit 7 toggles IRP. The `MOVLW`
+    /// between the add and the toggle leaves STATUS alone, and STATUS
+    /// is bank-mirrored, so no BANKSEL can split the skip pair.
+    fn emit_add_w_to_fsr(&mut self) {
+        self.emit("    ADDWF FSR, F".to_string());
+        self.emit("    MOVLW 0x80".to_string());
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit("    XORWF STATUS, F".to_string());
+    }
+
+    /// Adds every scaled term into the 9-bit FSR+IRP address, one
+    /// repetition at a time. A 16-bit term also toggles IRP when its
+    /// high byte is odd: bit 8 of the term is the only high bit the
+    /// 9-bit space keeps. Wider term regs panic.
+    fn emit_add_terms_to_fsr(&mut self, terms: &[(u16, String)]) {
+        for (scale, r) in terms {
+            let a = self.val_addr(&Val::Reg(r.clone())).direct();
+            let bytes = self.reg_bytes(r);
+            assert!(
+                bytes == 1 || bytes == 2,
+                "isel: GEP term %{r} is {bytes} bytes wide, only 1 or 2 supported"
+            );
+            for _ in 0..*scale {
+                self.emit(format!("    MOVF 0x{a:02X}, W"));
+                self.emit_add_w_to_fsr();
+                if bytes == 2 {
+                    self.emit("    MOVLW 0x80".to_string());
+                    self.emit(format!("    BTFSC 0x{:02X}, 0", a + 1));
+                    self.emit("    XORWF STATUS, F".to_string());
+                }
             }
         }
     }
@@ -1335,33 +1454,32 @@ impl<'m> Gen<'m> {
     /// Exactly one of the pair fires: BTFSC skips the BSF when the bit is
     /// 0, BTFSS skips the BCF when it is 1, so IRP always matches the
     /// stored address. IRP is set on EVERY indirect FSR setup (a prior
-    /// bank-2/3 target leaves STATUS bit 7 = 1). The static k + off must
-    /// fit the ADDLW literal.
+    /// bank-2/3 target leaves STATUS bit 7 = 1). The static offset and
+    /// each term then add into the 9-bit address with carry, so a total
+    /// past 255 stays exact in that space.
     fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u16, terms: &[(u16, String)], byte_off: u8) {
-        // `k` can arrive wrapped from a negative GEP, so a plain sum could
-        // overflow past the bound check below; `checked_add` keeps the
-        // rejection honest instead of wrapping into range (epic-cc#645).
+        // `k` can arrive wrapped from a negative GEP, so a plain sum
+        // could overflow u16; `checked_add` keeps that refusal honest
+        // instead of wrapping into range (epic-cc#645).
         let kk = k
             .checked_add(u16::from(byte_off))
-            .filter(|kk| *kk <= 0xFF)
-            .unwrap_or_else(|| {
-                panic!("isel: indirect offset k {k} + off {byte_off} out of byte range")
-            });
+            .unwrap_or_else(|| panic!("isel: indirect offset k {k} + off {byte_off} overflow"));
         let hi = slot_addr + 1;
         self.emit(format!("    BTFSC 0x{hi:02X}, 0"));
         self.emit("    BSF STATUS, 7".to_string());
         self.emit(format!("    BTFSS 0x{hi:02X}, 0"));
         self.emit("    BCF STATUS, 7".to_string());
-        if terms.is_empty() {
-            self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
-            self.emit(format!("    ADDLW 0x{kk:02X}"));
-            self.emit("    MOVWF FSR".to_string());
-        } else {
-            self.emit_accum_terms(terms);
-            self.emit(format!("    ADDWF 0x{slot_addr:02X}, W"));
-            self.emit(format!("    ADDLW 0x{kk:02X}"));
-            self.emit("    MOVWF FSR".to_string());
+        self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
+        self.emit("    MOVWF FSR".to_string());
+        if kk != 0 {
+            self.emit(format!("    MOVLW 0x{:02X}", (kk & 0xFF) as u8));
+            self.emit_add_w_to_fsr();
+            if kk & 0x100 != 0 {
+                self.emit("    MOVLW 0x80".to_string());
+                self.emit("    XORWF STATUS, F".to_string());
+            }
         }
+        self.emit_add_terms_to_fsr(terms);
     }
 
     /// `W = Σ scale×%reg` (mod 256): the first repetition loads
@@ -1388,6 +1506,62 @@ impl<'m> Gen<'m> {
         if first {
             self.emit("    MOVLW 0x00".to_string());
         }
+    }
+
+    /// Adds every term into the 16-bit address already seeded in the
+    /// slot at `pa`, one scaled repetition at a time. Each low-byte
+    /// add carries into the high byte before the high bytes add, so any
+    /// term count and scale stays exact (epic-cc#1449). The slot pair
+    /// and each term pair sit inside one bank, as every multi-byte slot
+    /// here does, so no BANKSEL can land inside the carry skip pair.
+    fn emit_add_terms_to_ptr_slot(&mut self, pa: u16, terms: &[(u16, String)]) {
+        for (scale, reg) in terms {
+            let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
+            for _ in 0..*scale {
+                self.emit(format!("    MOVF 0x{ra:02X}, W"));
+                self.emit(format!("    ADDWF 0x{pa:02X}, F"));
+                self.emit("    BTFSC STATUS, 0".to_string());
+                self.emit(format!("    INCF 0x{:02X}, F", pa + 1));
+                // A 1-byte term has no high byte: the next slot is a
+                // neighbour, not part of the value, so it is never read.
+                if self.term_has_hi(reg) {
+                    self.emit(format!("    MOVF 0x{:02X}, W", ra + 1));
+                    self.emit(format!("    ADDWF 0x{:02X}, F", pa + 1));
+                }
+            }
+        }
+    }
+
+    /// The slot a multi-term pointer argument is summed into: the
+    /// park pair when a term byte or the base byte range overlaps
+    /// the param slot at `pa`, so seeding cannot overwrite a value
+    /// before it is consumed, else `pa` itself. The park pair sits
+    /// in common RAM, or in the banked `isr_home_window` on the
+    /// PIC16F74, which no local or param slot occupies.
+    fn ptr_arg_dest(&self, pa: u16, terms: &[(u16, String)], base: Option<u16>) -> u16 {
+        let overlaps = |lo: u16, hi: u16| lo <= pa + 1 && pa <= hi;
+        let base_danger = base.is_some_and(|sa| overlaps(sa, sa + 1));
+        let term_danger = terms.iter().any(|(_, reg)| {
+            let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
+            overlaps(ra, ra + u16::from(self.reg_bytes(reg).max(1)) - 1)
+        });
+        if base_danger || term_danger {
+            self.park_pair()
+        } else {
+            pa
+        }
+    }
+
+    /// Copies a park-pair sum into the param slot at `pa`. A sum
+    /// built directly in `pa` needs no copy.
+    fn emit_finish_ptr_arg(&mut self, pa: u16, t_lo: u16) {
+        if t_lo == pa {
+            return;
+        }
+        self.emit(format!("    MOVF 0x{t_lo:02X}, W"));
+        self.emit(format!("    MOVWF 0x{pa:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", t_lo + 1));
+        self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
     }
 
     /// `W = k + byte_off + Σ scale×%reg`: the byte index into a const
@@ -1662,6 +1836,72 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// The shared two-byte park pair: the top two retval bytes,
+    /// derived from the device's common-RAM base (`retval_lo` is
+    /// `common_lo + 1`, so the pair is `common_lo + 3/+4`). Both ISR
+    /// prologues already save and restore the whole retval region, so
+    /// a half-built sum or a memcpy index parked here survives an
+    /// interrupt whose handler builds its own sum in the same bytes;
+    /// the old free-tail pair past the ISR save area had no shadow.
+    /// Panics when the device's fixed region cannot supply the pair.
+    fn park_pair(&self) -> u16 {
+        let (lo, hi) = self
+            .device
+            .common_ram
+            .or(self.device.isr_home_window)
+            .expect("isel: park pair needs a common-RAM region or an isr_home_window");
+        let pair = self.retval_lo + 2;
+        assert!(
+            pair + 1 <= hi && pair >= lo,
+            "isel: {} common RAM 0x{lo:02X}-0x{hi:02X} cannot supply a park pair after the fixed scratch/retval/ISR-save layout",
+            self.device.name
+        );
+        pair
+    }
+
+    /// W = byte `idx` of `base + k + terms`, summed in the park pair
+    /// because a per-byte emission cannot recover the low sum's
+    /// carry once a term is scaled or a third addend joins: seeding
+    /// the pair with the full constant part and adding every term
+    /// through the carry-exact slot helper keeps byte 1 exact for
+    /// any scale and term count. No call sits inside the sequence.
+    fn emit_gep_value_byte(
+        &mut self,
+        lit: Option<u16>,
+        sa: u16,
+        k: u16,
+        terms: &[(u16, String)],
+        idx: u8,
+    ) {
+        assert!(idx <= 1, "isel: GEP value byte index {idx} out of range");
+        let t_lo: u16 = self.park_pair();
+        if let Some(addr) = lit {
+            self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+            self.emit(format!("    MOVWF 0x{t_lo:02X}"));
+            self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+            self.emit(format!("    MOVWF 0x{:02X}", t_lo + 1));
+        } else {
+            let k_lo = (k & 0xFF) as u8;
+            let k_hi = (k >> 8) as u8;
+            self.emit(format!("    MOVF 0x{sa:02X}, W"));
+            if k_lo != 0 {
+                self.emit(format!("    ADDLW 0x{k_lo:02X}"));
+            }
+            self.emit(format!("    MOVWF 0x{t_lo:02X}"));
+            self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+            if k_lo != 0 {
+                self.emit("    BTFSC STATUS, 0".to_string());
+                self.emit("    ADDLW 0x01".to_string());
+            }
+            if k_hi != 0 {
+                self.emit(format!("    ADDLW 0x{k_hi:02X}"));
+            }
+            self.emit(format!("    MOVWF 0x{:02X}", t_lo + 1));
+        }
+        self.emit_add_terms_to_ptr_slot(t_lo, terms);
+        self.emit(format!("    MOVF 0x{:02X}, W", t_lo + u16::from(idx)));
+    }
+
     /// W = byte `idx` of `val`.
     fn emit_load_byte(&mut self, val: &Val, idx: u8) {
         match val {
@@ -1742,28 +1982,15 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    MOVLW 0x{hi:02X}"));
                                     self.emit("    BTFSC STATUS, 0".to_string());
                                     self.emit("    ADDLW 0x01".to_string());
-                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                    if self.term_has_hi(reg) {
+                                        self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                    }
                                 }
                             }
-                            _ => {
-                                assert!(
-                                    terms.len() == 2 && terms.iter().all(|(sc, _)| *sc == 1),
-                                    "isel: multi-term GEP load with {terms:?} not supported"
-                                );
-                                let ra1 = self.val_addr(&Val::Reg(terms[0].1.clone())).direct();
-                                let ra2 = self.val_addr(&Val::Reg(terms[1].1.clone())).direct();
-                                if idx == 0 {
-                                    self.emit(format!("    MOVLW 0x{lo:02X}"));
-                                    self.emit(format!("    ADDWF 0x{ra1:02X}, W"));
-                                    self.emit(format!("    ADDWF 0x{ra2:02X}, W"));
-                                } else {
-                                    self.emit(format!("    MOVLW 0x{hi:02X}"));
-                                    self.emit("    BTFSC STATUS, 0".to_string());
-                                    self.emit("    ADDLW 0x01".to_string());
-                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra1 + 1));
-                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra2 + 1));
-                                }
+                            [(1, _), (1, _)] => {
+                                self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx)
                             }
+                            _ => self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx),
                         }
                         return;
                     }
@@ -1795,18 +2022,12 @@ impl<'m> Gen<'m> {
                     // actually adds something: a bare `MOVF` leaves the caller's
                     // carry standing, and propagating that adds a phantom 1.
                     let adds_in_byte0 = k != 0 || !terms.is_empty();
-                    assert!(
-                        k == 0 || terms.is_empty(),
-                        "isel: GEP with both a constant offset and dynamic terms \
-                         loses the term's carry; not supported"
-                    );
                     // An object slot (`alloca`) materializes its frame address
                     // as a LITERAL, exactly like `Base::Global`'s link-time
                     // constant: `sa` is that address, so byte `idx` is a plain
                     // `MOVLW` with `k` folded in. An address-holding slot
                     // (indirect / pointer param) instead reads its two bytes at
-                    // runtime. Terms stay the same shape either way (`k` is zero
-                    // whenever terms are present, per the assert above).
+                    // runtime.
                     let base_lit = (!holds_addr).then(|| sa.wrapping_add(k));
                     match terms.as_slice() {
                         [] => {
@@ -1826,7 +2047,7 @@ impl<'m> Gen<'m> {
                                 }
                             }
                         }
-                        [(1, reg)] => {
+                        [(1, reg)] if k == 0 => {
                             let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                             match (base_lit, idx == 0) {
                                 (Some(addr), true) => {
@@ -1839,7 +2060,9 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    MOVLW 0x{b:02X}"));
                                     self.emit("    BTFSC STATUS, 0".to_string());
                                     self.emit("    ADDLW 0x01".to_string());
-                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                    if self.term_has_hi(reg) {
+                                        self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                    }
                                 }
                                 (None, true) => {
                                     self.emit(format!("    MOVF 0x{sa:02X}, W"));
@@ -1849,43 +2072,20 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
                                     self.emit("    BTFSC STATUS, 0".to_string());
                                     self.emit("    ADDLW 0x01".to_string());
-                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                    if self.term_has_hi(reg) {
+                                        self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                    }
                                 }
                             }
                         }
-                        _ => {
-                            assert!(
-                                terms.len() == 2 && terms.iter().all(|(sc, _)| *sc == 1),
-                                "isel: multi-term GEP load with {terms:?} not supported"
-                            );
-                            let ra1 = self.val_addr(&Val::Reg(terms[0].1.clone())).direct();
-                            let ra2 = self.val_addr(&Val::Reg(terms[1].1.clone())).direct();
-                            if let Some(addr) = base_lit {
-                                let b = ((addr >> (u32::from(idx) * 8)) & 0xFF) as u8;
-                                self.emit(format!("    MOVLW 0x{b:02X}"));
-                            } else if idx == 0 {
-                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
-                            } else {
-                                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
-                            }
-                            // Byte 0's carry into byte 1 must be consumed
-                            // before byte 1's own adds: both the literal base
-                            // and the runtime slot read leave the low byte's
-                            // carry in STATUS.C, and the two ADDWFs below do
-                            // not (the first ADDWF sets C itself, but only
-                            // after the high byte is already in W).
-                            if idx != 0 {
-                                self.emit("    BTFSC STATUS, 0".to_string());
-                                self.emit("    ADDLW 0x01".to_string());
-                            }
-                            if idx == 0 {
-                                self.emit(format!("    ADDWF 0x{ra1:02X}, W"));
-                                self.emit(format!("    ADDWF 0x{ra2:02X}, W"));
-                            } else {
-                                self.emit(format!("    ADDWF 0x{:02X}, W", ra1 + 1));
-                                self.emit(format!("    ADDWF 0x{:02X}, W", ra2 + 1));
-                            }
-                        }
+                        [(1, _), (1, _)] if k == 0 => match base_lit {
+                            Some(addr) => self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx),
+                            None => self.emit_gep_value_byte(None, sa, k, &terms, idx),
+                        },
+                        _ => match base_lit {
+                            Some(addr) => self.emit_gep_value_byte(Some(addr), 0, 0, &terms, idx),
+                            None => self.emit_gep_value_byte(None, sa, k, &terms, idx),
+                        },
                     }
                     return;
                 }
@@ -1977,8 +2177,33 @@ impl<'m> Gen<'m> {
     /// plain load leaves the byte addressable, so its load pops as
     /// dead). Only MOVF/XORWF/XORLW/IORWF/MOVWF run here, so C and DC
     /// survive for the equality-then-carry composites.
-    fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty) {
+    fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty, temp: u16) {
         let n = ty.bytes();
+        if self.slotless_gep_value(b) {
+            // A slotless GEP operand has no byte to XORWF against:
+            // park each `a` byte in `temp` (the result slot, dead
+            // until the caller's materialize writes it, and loaded
+            // before the store when it overlays `a`), materialize
+            // the GEP byte, and XOR against the park. The running
+            // OR accumulates in scratch like the path below.
+            for i in 0..n {
+                self.emit_load_byte(a, i);
+                self.emit(format!("    MOVWF 0x{temp:02X}"));
+                self.emit_load_byte(b, i);
+                self.emit(format!("    XORWF 0x{temp:02X}, W"));
+                if n > 1 {
+                    if i == 0 {
+                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    } else {
+                        self.emit(format!("    IORWF 0x{:02X}, W", self.scratch));
+                        if i + 1 < n {
+                            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let pre_load = self.out.len();
         self.emit_load_byte(a, 0);
         let single0 = self.out.len() == pre_load + 1;
@@ -3417,31 +3642,61 @@ impl<'m> Gen<'m> {
                                         // a legitimate address, so the sum
                                         // is modular (epic-cc#645).
                                         let addr = base_addr.wrapping_add(k);
-                                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                                        self.emit(format!(
+                                            "    MOVLW 0x{:02X}",
+                                            (addr & 0xFF) as u8
+                                        ));
                                         self.emit(format!("    MOVWF 0x{:02X}", pa));
-                                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                                        self.emit(format!(
+                                            "    MOVLW 0x{:02X}",
+                                            ((addr >> 8) & 0xFF) as u8
+                                        ));
                                         self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
                                         continue;
                                     }
                                     [(1, reg)] => {
                                         let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
-                                        self.emit(format!("    MOVLW 0x{:02X}", (base_addr & 0xFF) as u8));
+                                        self.emit(format!(
+                                            "    MOVLW 0x{:02X}",
+                                            (base_addr & 0xFF) as u8
+                                        ));
                                         self.emit(format!("    ADDWF 0x{:02X}, W", ra));
                                         if k_lo != 0 {
                                             self.emit(format!("    ADDLW 0x{k_lo:02X}"));
                                         }
                                         self.emit(format!("    MOVWF 0x{:02X}", pa));
-                                        self.emit(format!("    MOVLW 0x{:02X}", ((base_addr >> 8) & 0xFF) as u8));
+                                        self.emit(format!(
+                                            "    MOVLW 0x{:02X}",
+                                            ((base_addr >> 8) & 0xFF) as u8
+                                        ));
                                         self.emit("    BTFSC STATUS, 0".to_string());
                                         self.emit("    ADDLW 0x01".to_string());
-                                        self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                        if self.term_has_hi(reg) {
+                                            self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                        }
                                         if k_hi != 0 {
                                             self.emit(format!("    ADDLW 0x{k_hi:02X}"));
                                         }
                                         self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
                                         continue;
                                     }
-                                    _ => panic!("isel: plain ptr arg with multiple terms not yet supported: {terms:?}"),
+                                    _ => {
+                                        let addr = base_addr.wrapping_add(k);
+                                        let t_lo = self.ptr_arg_dest(pa, &terms, None);
+                                        self.emit(format!(
+                                            "    MOVLW 0x{:02X}",
+                                            (addr & 0xFF) as u8
+                                        ));
+                                        self.emit(format!("    MOVWF 0x{t_lo:02X}"));
+                                        self.emit(format!(
+                                            "    MOVLW 0x{:02X}",
+                                            ((addr >> 8) & 0xFF) as u8
+                                        ));
+                                        self.emit(format!("    MOVWF 0x{:02X}", t_lo + 1));
+                                        self.emit_add_terms_to_ptr_slot(t_lo, &terms);
+                                        self.emit_finish_ptr_arg(pa, t_lo);
+                                        continue;
+                                    }
                                 }
                             }
                             Base::Slot(sname, false) if self.param_holds_addr(sname) => {
@@ -3452,14 +3707,23 @@ impl<'m> Gen<'m> {
                                 // object, so its address is a compile-time
                                 // constant. Materialize it as two literals
                                 // (epic-cc#125, e.g. `store_handle(&h)`).
-                                let addr = self.slot_addr(self.cur_func, sname).direct();
+                                // The constant folds into the literal at
+                                // compile time, so only the terms need
+                                // runtime adds.
+                                let addr = self
+                                    .slot_addr(self.cur_func, sname)
+                                    .direct()
+                                    .wrapping_add(k);
+                                let t_lo = self.ptr_arg_dest(pa, &terms, None);
                                 self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
-                                self.emit(format!("    MOVWF 0x{:02X}", pa));
+                                self.emit(format!("    MOVWF 0x{t_lo:02X}"));
                                 self.emit(format!(
                                     "    MOVLW 0x{:02X}",
                                     ((addr >> 8) & 0xFF) as u8
                                 ));
-                                self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                                self.emit(format!("    MOVWF 0x{:02X}", t_lo + 1));
+                                self.emit_add_terms_to_ptr_slot(t_lo, &terms);
+                                self.emit_finish_ptr_arg(pa, t_lo);
                                 continue;
                             }
                             // A runtime-address slot (a seeded pointer
@@ -3506,13 +3770,33 @@ impl<'m> Gen<'m> {
                                 self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
                                 self.emit(format!("    BTFSC STATUS, 0"));
                                 self.emit(format!("    ADDLW 0x01"));
-                                self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                if self.term_has_hi(reg) {
+                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                }
                                 if k_hi != 0 {
                                     self.emit(format!("    ADDLW 0x{k_hi:02X}"));
                                 }
                                 self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
                             }
-                            _ => panic!("isel: plain ptr arg with multiple terms not yet supported: {terms:?}"),
+                            _ => {
+                                let t_lo = self.ptr_arg_dest(pa, &terms, Some(sa));
+                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                                if k_lo != 0 {
+                                    self.emit(format!("    ADDLW 0x{k_lo:02X}"));
+                                }
+                                self.emit(format!("    MOVWF 0x{t_lo:02X}"));
+                                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                                if k_lo != 0 {
+                                    self.emit("    BTFSC STATUS, 0".to_string());
+                                    self.emit("    ADDLW 0x01".to_string());
+                                }
+                                if k_hi != 0 {
+                                    self.emit(format!("    ADDLW 0x{k_hi:02X}"));
+                                }
+                                self.emit(format!("    MOVWF 0x{:02X}", t_lo + 1));
+                                self.emit_add_terms_to_ptr_slot(t_lo, &terms);
+                                self.emit_finish_ptr_arg(pa, t_lo);
+                            }
                         }
                     }
                 }
@@ -4306,8 +4590,13 @@ impl<'m> Gen<'m> {
             Inst::Trunc(t) => {
                 // i1 and i8 are both one byte, so the byte widths alone do not
                 // separate `trunc i8 -> i1` (narrowing) from a widening trunc.
+                // A same-width trunc is the `ptrtoint` spelling (epic-cc#1433):
+                // `emit_load_byte` materializes a pointer source's address,
+                // so the copy below moves the address, not pointee bytes.
                 assert!(
-                    t.from.bytes() > t.to.bytes() || (t.to == Ty::I1 && t.from != Ty::I1),
+                    t.from.bytes() > t.to.bytes()
+                        || t.from == t.to
+                        || (t.to == Ty::I1 && t.from != Ty::I1),
                     "isel: trunc must narrow"
                 );
                 let da = self.slot_addr(self.cur_func, &t.dst).direct();
@@ -4329,13 +4618,13 @@ impl<'m> Gen<'m> {
                     "eq" => {
                         // XOR-based compare sets Z = (a == b); materialize
                         // the i1. Kept byte-identical.
-                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         self.emit_materialize("Z", da);
                     }
                     "ne" => {
                         // !Z: the eq compare with the inverted
                         // materialization (BTFSS instead of BTFSC).
-                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         self.emit_materialize("!Z", da);
                     }
                     pred => {
@@ -4354,7 +4643,7 @@ impl<'m> Gen<'m> {
                         // (byte-generic across every width), which
                         // preserves C.
                         if need_z && ic.ty.bytes() > 1 {
-                            self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                            self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         }
                         let mat = match pred {
                             "ult" | "slt" => "!C",
@@ -14167,7 +14456,10 @@ pub fn select_with_opts(
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
-                    init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
+                    init.push(format!(
+                        "    MOVWF 0x{:02X}",
+                        physical_byte_addr(device, base, i as u16)
+                    ));
                 }
             }
         }
@@ -14228,8 +14520,8 @@ pub fn select_with_opts(
     let mut global_addrs: HashSet<u16> = HashSet::new();
     for g in &m.globals {
         if let Some(&a) = addrs.get(&g.name) {
-            for i in 0..g.size as u16 {
-                global_addrs.insert(a + i);
+            for i in 0..g.size {
+                global_addrs.insert(physical_byte_addr(device, a, i));
             }
         }
     }
@@ -14332,7 +14624,10 @@ pub fn select_with_opts(
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
-                    init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
+                    init.push(format!(
+                        "    MOVWF 0x{:02X}",
+                        physical_byte_addr(device, base, i as u16)
+                    ));
                 }
             }
         }
@@ -14367,7 +14662,10 @@ pub fn select_with_opts(
                         } else {
                             init.push(format!("    MOVLW 0x{b:02X}"));
                         }
-                        init.push(format!("    MOVWF 0x{:02X}", base + idx as u16));
+                        init.push(format!(
+                            "    MOVWF 0x{:02X}",
+                            physical_byte_addr(device, base, idx as u16)
+                        ));
                     }
                 }
             }
@@ -14888,7 +15186,7 @@ pub fn select_with_opts(
                                             }
                                             init.push(format!(
                                                 "    MOVWF 0x{:02X}",
-                                                base + i as u16
+                                                physical_byte_addr(device, base, i as u16)
                                             ));
                                         }
                                     }

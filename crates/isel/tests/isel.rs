@@ -1174,13 +1174,13 @@ fn gep_ram_indirect_and_const_retlw() {
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
     // RAM indirect load (%w = load i8 %p): IRP cleared first (bank-0 base
-    // 0x21 — a prior bank-2/3 access would leave IRP=1), then
-    // W = %i; W += 0x21 (base_lo); FSR = W; W = INDF; %w = W.
+    // 0x21, a prior bank-2/3 access would leave IRP=1), then FSR starts
+    // at the base and %i adds into it with carry; W = INDF; %w = W.
     assert!(
         asm.contains(
-            "BCF STATUS, 7\n    MOVF 0x29, W\n    ADDLW 0x21\n    MOVWF FSR\n    MOVF INDF, W"
+            "BCF STATUS, 7\n    MOVF 0x29, W\n    ADDLW 0x21\n    MOVWF FSR\n    BTFSC STATUS, 0\n    BSF STATUS, 7\n    MOVF INDF, W"
         ),
-        "IRP cleared + FSR = base_lo + i for @ram:\n{asm}"
+        "IRP cleared + FSR = base + i for @ram:\n{asm}"
     );
     assert!(asm.contains("MOVWF 0x2B"), "RAM load dst %w:\n{asm}");
     // RAM indirect store (store i8 %v %p): same FSR setup, then W = %v;
@@ -1268,10 +1268,10 @@ fn gep_const_offset_loads_direct_no_fsr() {
 }
 
 #[test]
-fn gep_single_term_uses_fsr_fast_path() {
-    // %p = gep @a +1 +1*%i: one scale-1 term keeps the M5 fast shape —
-    // MOVF %i,W; ADDLW <a_lo + k>; MOVWF FSR — with the constant k folded
-    // into the ADDLW literal. The IRP set (BCF STATUS, 7 for the bank-0
+fn gep_single_term_adds_into_fsr_with_carry() {
+    // %p = gep @a +1 +1*%i: the static part folds into the FSR start
+    // address (MOVLW <a + k>; MOVWF FSR) and the term adds into FSR,
+    // its carry toggling IRP. The IRP set (BCF STATUS, 7 for the bank-0
     // base 0x21) comes first, on every FSR setup.
     let m = parse(
         "global in i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
@@ -1287,17 +1287,17 @@ fn gep_single_term_uses_fsr_fast_path() {
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
-        asm.contains("BCF STATUS, 7\n    MOVF 0x29, W\n    ADDLW 0x22\n    MOVWF FSR\n    MOVF INDF, W\n    MOVWF 0x2A"),
-        "fast path: IRP cleared + FSR = a_lo + k + i (0x21 + 1):\n{asm}"
+        asm.contains("BCF STATUS, 7\n    MOVF 0x29, W\n    ADDLW 0x22\n    MOVWF FSR\n    BTFSC STATUS, 0\n    BSF STATUS, 7\n    MOVF INDF, W\n    MOVWF 0x2A"),
+        "exact path: IRP cleared + FSR = a + k + i (0x21 + 1), carry sets IRP:\n{asm}"
     );
 }
 
 #[test]
 fn gep_scaled_sum_accumulates_in_w() {
-    // %p = gep @a +1 +2*%i: a ×2-scaled term cannot fold into the fast
-    // path's ADDLW: the sum accumulates in W as a MOVF/ADDWF chain on the
-    // term register, then FSR = base + k + W. A two-register sum
-    // (+1*%i +1*%j) uses the same accumulation in term order.
+    // %p = gep @a +1 +2*%i: a scaled term adds into FSR once per
+    // repetition, each add carrying into IRP, after FSR starts at the
+    // folded static address. A two-register sum (+1*%i +1*%j) adds its
+    // terms into FSR in the same order.
     let m = parse(
         "global in i8\nglobal jn i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
            %i = load i8 @in\n    %j = load i8 @jn\n    %p = gep @a +1 +2*%i\n    %v = load i8 %p\n    store i8 %v @out\n    %q = gep @a +1 +1*%i +1*%j\n    %w = load i8 %q\n    store i8 %w @out\n    ret void\n",
@@ -1315,22 +1315,21 @@ fn gep_scaled_sum_accumulates_in_w() {
         ("main::w", 0x2C),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // scale-2 term: W = 2×%i via `MOVF %i,W; ADDWF %i,W` (ADDWF f,W computes
-    // W = f + W, so the register is the operand and W is never reloaded),
-    // then FSR = W + a_lo + k. The IRP set (BCF STATUS, 7) precedes the
-    // whole accumulation, and the scratch byte is never touched.
+    // scale-2 term: FSR starts at a + k, then %i adds into it twice,
+    // each add carrying into IRP. The IRP set (BCF STATUS, 7) precedes
+    // the whole sequence, and the scratch byte is never touched.
     assert!(
         asm.contains(
-            "BCF STATUS, 7\n    MOVF 0x29, W\n    ADDWF 0x29, W\n    ADDLW 0x23\n    MOVWF FSR"
+            "BCF STATUS, 7\n    MOVLW 0x23\n    MOVWF FSR\n    MOVF 0x29, W\n    ADDWF FSR, F\n    MOVLW 0x80\n    BTFSC STATUS, 0\n    XORWF STATUS, F\n    MOVF 0x29, W\n    ADDWF FSR, F"
         ),
-        "scaled term accumulates in W after the IRP clear:\n{asm}"
+        "scaled term adds into FSR after the IRP clear:\n{asm}"
     );
-    // two distinct terms accumulate in order (i then j), same FSR finish.
+    // two distinct terms add in order (i then j), same FSR start.
     assert!(
         asm.contains(
-            "BCF STATUS, 7\n    MOVF 0x29, W\n    ADDWF 0x2A, W\n    ADDLW 0x23\n    MOVWF FSR"
+            "BCF STATUS, 7\n    MOVLW 0x23\n    MOVWF FSR\n    MOVF 0x29, W\n    ADDWF FSR, F\n    MOVLW 0x80\n    BTFSC STATUS, 0\n    XORWF STATUS, F\n    MOVF 0x2A, W\n    ADDWF FSR, F"
         ),
-        "two-term sum accumulates both terms after the IRP clear:\n{asm}"
+        "two-term sum adds both terms after the IRP clear:\n{asm}"
     );
     assert!(
         !asm.contains("0x70"),
@@ -1341,10 +1340,9 @@ fn gep_scaled_sum_accumulates_in_w() {
 #[test]
 fn gep_scaled_multi_term_adds_the_term_once_per_repetition() {
     // %p = gep @a +1 +1*%i +2*%j: a scaled term in non-first position.
-    // ADDWF f,W computes W = f + W, so each repetition of the scale-2 term
-    // is one `ADDWF %j,W` on the running sum in W. Repeating the load
-    // instead would restart the sum, and doubling W would compute
-    // 2*(i + j) + j instead of i + 2*j (silent wrong-address miscompile).
+    // Each repetition of the scale-2 term is one add of %j into FSR.
+    // Repeating a restart or doubling the running address would compute
+    // a different sum (silent wrong-address miscompile).
     let m = parse(
         "global in i8\nglobal jn i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
            %i = load i8 @in\n    %j = load i8 @jn\n    %p = gep @a +1 +1*%i +2*%j\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
@@ -1361,22 +1359,22 @@ fn gep_scaled_multi_term_adds_the_term_once_per_repetition() {
         ("main::v", 0x2B),
     ];
     let asm = select(&PIC16F877A, &m, &addrs(&map));
-    // One ADDWF %j,W per scale-2 repetition: twice in total, no reload.
-    assert_eq!(
-        asm.matches("ADDWF 0x2A, W").count(),
-        2,
-        "scale-2 term adds %j once per repetition:\n{asm}"
-    );
+    // One MOVF %j,W plus FSR add per scale-2 repetition: twice in total.
     assert_eq!(
         asm.matches("MOVF 0x2A, W").count(),
-        0,
-        "%j is never reloaded into W:\n{asm}"
+        2,
+        "scale-2 term loads %j once per repetition:\n{asm}"
     );
-    // Full sequence: IRP cleared (bank-0 base 0x40), then
-    // W = i + 2*j = i + j + j, then FSR = a_lo + 1 + W.
+    assert_eq!(
+        asm.matches("ADDWF FSR, F").count(),
+        3,
+        "FSR receives i plus both %j repetitions:\n{asm}"
+    );
+    // Full sequence: IRP cleared (bank-0 base 0x40), FSR starts at
+    // a + 1, then i and both j repetitions add into it.
     assert!(
-        asm.contains("BCF STATUS, 7\n    MOVF 0x29, W\n    ADDWF 0x2A, W\n    ADDWF 0x2A, W\n    ADDLW 0x41\n    MOVWF FSR"),
-        "scaled multi-term sum accumulates i + 2*j after the IRP clear:\n{asm}"
+        asm.contains("BCF STATUS, 7\n    MOVLW 0x41\n    MOVWF FSR\n    MOVF 0x29, W\n    ADDWF FSR, F\n    MOVLW 0x80\n    BTFSC STATUS, 0\n    XORWF STATUS, F\n    MOVF 0x2A, W\n    ADDWF FSR, F"),
+        "scaled multi-term sum adds i + 2*j after the IRP clear:\n{asm}"
     );
     // End-to-end: i=2, j=2 -> a[1+2+4] = a[7] = 0x17. A doubled running
     // sum computes 2*i + 2*j -> a[9] = 0x19 instead.
@@ -1412,8 +1410,8 @@ fn gep_scaled_multi_term_adds_the_term_once_per_repetition() {
 #[test]
 fn gep_stride_five_ram_index_reads_each_record_in_sim() {
     // The struct-array shape `rec[i].field`: a scale-5 term plus a constant
-    // field offset. The accumulate is `MOVF %i,W` then four `ADDWF %i,W`,
-    // so a lost or extra repetition lands on a neighbouring record.
+    // field offset. The term adds into FSR five times, so a lost or
+    // extra repetition lands on a neighbouring record.
     let ir = "global in i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @a +3 +5*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
     let map = [
         ("in", 0x20u16),
@@ -1424,8 +1422,13 @@ fn gep_stride_five_ram_index_reads_each_record_in_sim() {
     ];
     let asm = select(&PIC16F877A, &parse(ir), &addrs(&map));
     assert!(
-        asm.contains("MOVF 0x29, W\n    ADDWF 0x29, W\n    ADDWF 0x29, W\n    ADDWF 0x29, W\n    ADDWF 0x29, W\n    ADDLW 0x43\n    MOVWF FSR"),
-        "scale-5 term is one load plus four adds in W:\n{asm}"
+        asm.contains("MOVLW 0x43\n    MOVWF FSR\n    MOVF 0x29, W\n    ADDWF FSR, F"),
+        "scale-5 term starts adding into FSR at a + 3:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVF 0x29, W").count(),
+        5,
+        "scale-5 term loads %i once per repetition:\n{asm}"
     );
     for i in 0u8..4 {
         let mut seed: Vec<(u16, u8)> = (0..20u16).map(|n| (0x40 + n, 0x80 + n as u8)).collect();
@@ -1436,6 +1439,47 @@ fn gep_stride_five_ram_index_reads_each_record_in_sim() {
             "a[3 + 5*{i}]"
         );
     }
+}
+
+#[test]
+fn gep_i16_term_high_byte_carries_into_irp_in_sim() {
+    // A 16-bit term of 256 or 257: only its high byte (0x01) sets bit 8
+    // of the 9-bit address, toggling IRP past the low-byte wrap.
+    let ir = "global in i16\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i16 @in\n    %p = gep @a +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
+    let map = [
+        ("in", 0x20u16),
+        ("out", 0x22),
+        ("a", 0x40),
+        ("main::i", 0x29),
+        ("main::v", 0x2B),
+    ];
+    for (i, want) in [(256u16, 0x7Eu8), (257, 0x7F)] {
+        let seed = [
+            (0x20u16, (i & 0xFF) as u8),
+            (0x21, (i >> 8) as u8),
+            (0x40, 0xEE),
+            (0x41, 0xEE),
+            (0x140, 0x7E),
+            (0x141, 0x7F),
+        ];
+        assert_eq!(sim_run(ir, &map, &seed, 0x22), want, "a[{i}] via i16 term");
+    }
+}
+
+#[test]
+fn gep_exact_256_total_carries_into_irp_in_sim() {
+    // Static 56 plus an 8-bit term of 200 totals exactly 256: the low
+    // byte wraps to the base byte and the carry alone sets IRP.
+    let ir = "global in i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @a +56 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
+    let map = [
+        ("in", 0x20u16),
+        ("out", 0x21),
+        ("a", 0x40),
+        ("main::i", 0x29),
+        ("main::v", 0x2A),
+    ];
+    let seed = [(0x20u16, 200u8), (0x60, 0xEE), (0x140, 0x3C)];
+    assert_eq!(sim_run(ir, &map, &seed, 0x21), 0x3C, "a[256] exact total");
 }
 
 #[test]
@@ -1499,9 +1543,10 @@ fn const_table_scaled_two_term_index_reads_each_element_in_sim() {
 
 #[test]
 fn sret_slot_with_scaled_index_stores_at_the_right_byte_in_sim() {
-    // The indirect FSR setup adds the slot's address to a scaled term:
-    // FSR = [r_lo] + 1 + 2*%i. The callee writes through the sret pointer;
-    // the byte at target + 1 + 2*i must change and no other.
+    // The indirect FSR setup adds a scaled term to the slot's address:
+    // FSR = [r_lo] + 1 + 2*%i, each add carrying into IRP. The callee
+    // writes through the sret pointer; the byte at target + 1 + 2*i
+    // must change and no other.
     let ir = "global in i8\nfn make(void) (r=sret)\n  block entry:\n\
            %i = load i8 @in\n\
            %p = gep %r +1 +2*%i\n\
@@ -1520,10 +1565,13 @@ fn sret_slot_with_scaled_index_stores_at_the_right_byte_in_sim() {
     let m = parse(ir);
     let asm = select(&PIC16F877A, &m, &addrs(&map));
     assert!(
-        asm.contains(
-            "MOVF 0x27, W\n    ADDWF 0x27, W\n    ADDWF 0x25, W\n    ADDLW 0x01\n    MOVWF FSR"
-        ),
-        "scaled sum accumulates in W, then adds the slot's low byte:\n{asm}"
+        asm.contains("MOVF 0x25, W\n    MOVWF FSR\n    MOVLW 0x01\n    ADDWF FSR, F"),
+        "FSR starts from the slot's low byte, then the static offset adds in:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVF 0x27, W").count(),
+        2,
+        "scale-2 term loads %i once per repetition:\n{asm}"
     );
     for i in 0u8..3 {
         use pic14_sim::Pic14;
@@ -1555,9 +1603,9 @@ fn sret_param_store_is_indirect_via_slot_contents() {
     assert!(
         asm.contains(
             "BTFSC 0x27, 0\n    BSF STATUS, 7\n    BTFSS 0x27, 0\n    BCF STATUS, 7\n    \
-             MOVF 0x26, W\n    ADDLW 0x00\n    MOVWF FSR\n    MOVF 0x25, W\n    MOVWF INDF"
+             MOVF 0x26, W\n    MOVWF FSR\n    MOVF 0x25, W\n    MOVWF INDF"
         ),
-        "IRP from the stored hi byte, then FSR from the slot contents [r_lo] + k:\n{asm}"
+        "IRP from the stored hi byte, then FSR from the slot contents [r_lo]:\n{asm}"
     );
 }
 
@@ -1641,12 +1689,14 @@ fn fsr_setup_in_each_of_the_four_banks() {
     // M9: FSR reaches all four banks via the IRP bit. A dynamic-index base
     // in bank 0 (0x20) or bank 1 (0xA0) clears IRP (BCF STATUS, 7); bank 2
     // (0x120) or bank 3 (0x1A0) sets it (BSF STATUS, 7). The ADDLW literal
-    // is always (base + k) & 0xFF: 0x120 -> 0x20, 0x1A0 -> 0xA0.
-    for (base, irp_line, lit) in [
-        (0x20u16, "BCF STATUS, 7", "ADDLW 0x20"),
-        (0xA0, "BCF STATUS, 7", "ADDLW 0xA0"),
-        (0x120, "BSF STATUS, 7", "ADDLW 0x20"),
-        (0x1A0, "BSF STATUS, 7", "ADDLW 0xA0"),
+    // is always the low byte of the start address: 0x120 -> 0x20,
+    // 0x1A0 -> 0xA0, with IRP carrying bit 8 and the ADDLW carry
+    // flipping it through the trailing conditional set.
+    for (base, irp_line, lit, flip_line) in [
+        (0x20u16, "BCF STATUS, 7", "ADDLW 0x20", "BSF STATUS, 7"),
+        (0xA0, "BCF STATUS, 7", "ADDLW 0xA0", "BSF STATUS, 7"),
+        (0x120, "BSF STATUS, 7", "ADDLW 0x20", "BCF STATUS, 7"),
+        (0x1A0, "BSF STATUS, 7", "ADDLW 0xA0", "BCF STATUS, 7"),
     ] {
         let m = parse(
             "global in i8\nglobal g i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
@@ -1663,9 +1713,9 @@ fn fsr_setup_in_each_of_the_four_banks() {
         let asm = select(&PIC16F877A, &m, &addrs);
         assert!(
             asm.contains(&format!(
-                "{irp_line}\n    MOVF 0x29, W\n    {lit}\n    MOVWF FSR"
+                "{irp_line}\n    MOVF 0x29, W\n    {lit}\n    MOVWF FSR\n    BTFSC STATUS, 0\n    {flip_line}"
             )),
-            "base 0x{base:03X}: {irp_line} then FSR = (base + i) & 0xFF:\n{asm}"
+            "base 0x{base:03X}: {irp_line} then FSR = base + i, carry flips IRP:\n{asm}"
         );
     }
 }
@@ -1714,8 +1764,8 @@ fn panics_on_fsr_object_crossing_the_0x170_hole() {
 #[test]
 fn byval_param_slot_in_bank_2_sets_irp() {
     // A byval param slot at 0x120 (width 16) dynamically indexed: the FSR
-    // setup must set IRP (BSF STATUS, 7) and use the low byte of the base
-    // (ADDLW 0x20). The span comes from the param's width.
+    // setup must set IRP (BSF STATUS, 7) and add the term to the low byte
+    // of the base (ADDLW 0x20). The span comes from the param's width.
     let m = parse(
         "global in i8\nglobal out i8\nfn f(i8) (0=byval16)\n  block entry:\n\
            %i = load i8 @in\n    %p = gep %0 +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
@@ -1731,8 +1781,10 @@ fn byval_param_slot_in_bank_2_sets_irp() {
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
-        asm.contains("BSF STATUS, 7\n    MOVF 0x25, W\n    ADDLW 0x20\n    MOVWF FSR"),
-        "bank-2 byval slot: IRP set + FSR = (0x120 + i) & 0xFF:\n{asm}"
+        asm.contains(
+            "BSF STATUS, 7\n    MOVF 0x25, W\n    ADDLW 0x20\n    MOVWF FSR\n    BTFSC STATUS, 0\n    BCF STATUS, 7"
+        ),
+        "bank-2 byval slot: IRP set + FSR = 0x120 low byte + i, carry clears IRP:\n{asm}"
     );
 }
 
@@ -1764,13 +1816,13 @@ fn gep_chain_s8_pattern_simulates() {
     ];
     let m = parse(ir);
     let asm = select(&PIC16F877A, &m, &addrs(&map));
-    // The chain folds k = 1 + 1 = 2 into the fast path's ADDLW literal;
-    // the IRP clear (bank-0 base) precedes the FSR setup.
+    // The chain folds k = 1 + 1 = 2 into the FSR start address; the IRP
+    // clear (bank-0 base) precedes the FSR setup.
     assert!(
         asm.contains(
-            "BCF STATUS, 7\n    MOVF 0x29, W\n    ADDLW 0x23\n    MOVWF FSR\n    MOVF INDF, W"
+            "BCF STATUS, 7\n    MOVF 0x29, W\n    ADDLW 0x23\n    MOVWF FSR\n    BTFSC STATUS, 0\n    BSF STATUS, 7\n    MOVF INDF, W"
         ),
-        "chained gep folds to @a + 2 + i (a_lo 0x21 + 2 = 0x23):\n{asm}"
+        "chained gep folds to @a + 2 + i (0x21 + 2 = 0x23), carry sets IRP:\n{asm}"
     );
     // in = 1 -> a[2+1] = a[3] = 0x44; in = 0 -> a[2] = 0x33.
     let seed = [
@@ -3417,8 +3469,8 @@ fn sret_banked_target_emits_low_high_store_and_irp_dance() {
         "callee sets IRP from the stored hi byte (0x01 -> IRP=1):\n{asm}"
     );
     assert!(
-        asm.contains("MOVF 0x2E, W\n    ADDLW 0x00\n    MOVWF FSR"),
-        "FSR = [r] + k unchanged:\n{asm}"
+        asm.contains("MOVF 0x2E, W\n    MOVWF FSR"),
+        "FSR = [r] at k == 0, no static add:\n{asm}"
     );
 }
 
@@ -10205,6 +10257,108 @@ fn isr_scratch_use_does_not_corrupt_preempted_main() {
         0x00,
         "main's i16 eq must still report 0x1212 != 0x1200 (pre-fix the ISR's scratch clobber flips it to 1)"
     );
+}
+
+#[test]
+fn isr_gep_value_does_not_corrupt_preempted_main_gep_value() {
+    // Both contexts materialize a scaled GEP pointer value (k + 12*idx)
+    // into a global. The pair holding the half-built sum must survive an
+    // interrupt taken after its low byte is seeded: the ISR builds its
+    // own sum in the same place, so only an ISR save/restore of the pair
+    // (here: the pair lives in the already-saved retval bytes) keeps
+    // main's read-back exact. Main: 0x120 + 6 + 12*23 = 0x23A.
+    // ISR: 0x40 + 6 + 12*1 = 0x52.
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal in i16\nglobal jn i16\nglobal gp i16\nglobal gp2 i16\n\
+         fn main(void) ()\n  block entry:\n    %i = load i16 @in\n    %p = gep @a +6 +12*%i\n    store i16 %p @gp\n    ret void\n\
+         fn isr(void) [isr] ()\n  block entry:\n    %j = load i16 @jn\n    %q = gep @b +6 +12*%j\n    store i16 %q @gp2\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x120),
+        ("b", 0x40),
+        ("in", 0x20),
+        ("jn", 0x22),
+        ("gp", 0x24),
+        ("gp2", 0x26),
+        ("main::i", 0x30),
+        ("main::p", 0x32),
+        ("isr::j", 0x34),
+        ("isr::q", 0x36),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        asm.contains("MOVWF 0x73"),
+        "GEP pair must live in the ISR-saved retval bytes 0x73/0x74:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVWF 0x7E") && !asm.contains("MOVWF 0x7F"),
+        "GEP pair must not use the unsaved 0x7E/0x7F pair:\n{asm}"
+    );
+    use pic14_sim::Pic14;
+    let mut p = Pic14::new(asm::assemble(&asm));
+    p.ram_mut()[0x20] = 23;
+    p.ram_mut()[0x21] = 0;
+    p.ram_mut()[0x22] = 1;
+    p.ram_mut()[0x23] = 0;
+    // Step until main's low seed (0x120 + 6 = 0x26 low byte) lands in the
+    // pair, then fire mid-sequence.
+    let mut steps = 0usize;
+    while p.ram()[0x73] != 0x26 {
+        p.step();
+        steps += 1;
+        assert!(steps < 500, "never seeded the GEP pair (pc={})", p.pc());
+    }
+    p.fire_interrupt();
+    assert_eq!(p.pc(), 4, "the ISR starts at the vector");
+    p.run(500_000);
+    assert!(p.halted(), "program must SLEEP-halt");
+    assert_eq!(p.ram()[0x26], 0x52, "ISR pointer value low byte");
+    assert_eq!(p.ram()[0x27], 0x00, "ISR pointer value high byte");
+    assert_eq!(
+        p.ram()[0x24],
+        0x3A,
+        "main pointer value low byte survives ISR"
+    );
+    assert_eq!(
+        p.ram()[0x25],
+        0x02,
+        "main pointer value high byte survives ISR"
+    );
+}
+
+#[test]
+fn gep_pair_is_derived_from_the_devices_common_ram() {
+    // p16f84a common RAM is 0x40-0x4F: scratch 0x40, retval 0x41-0x44,
+    // so the ISR-saved pair is 0x43/0x44, never 0x7E/0x7F.
+    let m = parse(
+        "global a i8\nglobal in i16\nglobal gp i16\n\
+         fn main(void) ()\n  block entry:\n    %i = load i16 @in\n    %p = gep @a +6 +12*%i\n    store i16 %p @gp\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x30),
+        ("in", 0x20),
+        ("gp", 0x24),
+        ("main::i", 0x28),
+        ("main::p", 0x2A),
+    ]);
+    let asm = select(&device::PIC16F84, &m, &addrs);
+    assert!(
+        asm.contains("MOVWF 0x43"),
+        "p16f84a GEP pair must be its own 0x43/0x44:\n{asm}"
+    );
+    assert!(
+        !asm.contains("0x7E") && !asm.contains("0x7F"),
+        "p16f84a asm must not touch 0x7E/0x7F:\n{asm}"
+    );
+    // And it runs on the part: in == 3 -> gp == 0x30 + 6 + 12*3 = 0x5A.
+    use pic14_sim::Pic14;
+    let mut p = Pic14::with_device(&device::PIC16F84, asm::assemble(&asm));
+    p.ram_mut()[0x20] = 3;
+    p.ram_mut()[0x21] = 0;
+    p.run(500_000);
+    assert!(p.halted(), "program must SLEEP-halt");
+    assert_eq!(p.ram()[0x24], 0x5A, "p16f84a pointer value low byte");
+    assert_eq!(p.ram()[0x25], 0x00, "p16f84a pointer value high byte");
 }
 
 // ---------------------------------------------------------------------------

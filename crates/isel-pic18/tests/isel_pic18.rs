@@ -5896,6 +5896,87 @@ fn a_width1_const_index_chains_on_tblptr_in_sim() {
 }
 
 #[test]
+fn a_negative_gep_chain_const_read_sign_extends_into_tblptru_in_sim() {
+    // epic-cc#1487 review: the chain +5 then -7 folds to k = 65534
+    // (-2), and idx = 4 brings the read back to tab[2]. Zero-extending
+    // k into the 21-bit TBLPTR reads tab + 65538 instead.
+    let m = with_bytes(
+        parse(
+            "const tab i8\n\
+             global idx i8\n\
+             global out i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i8 @idx\n\
+                 %base = gep @tab +5\n\
+                 %p = gep %base +65529 +1*%i\n\
+                 %v = load i8 %p\n\
+                 store i8 %v @out\n\
+                 ret void\n",
+        ),
+        "tab",
+        &[0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87],
+    );
+    let addrs = addrs(&[
+        ("idx", 0x150),
+        ("out", 0x151),
+        ("main::i", 0x152),
+        ("main::v", 0x153),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x150] = 4;
+    p.run(1000);
+    assert_eq!(p.ram()[0x151], 0x32, "out must be tab[5 - 7 + 4]:\n{asm}");
+}
+
+#[test]
+fn a_negative_static_part_rejoins_the_tblptr_chain_sign_extended_in_sim() {
+    // Same sign extension on the dynamic-chain site: +1 then -3 folds
+    // to static_part = 65534 (-2), and 9*idx with idx = 1 lands on
+    // tab[7]. The chain re-adds the static part after the table base.
+    let mut bytes = vec![0u8; 16];
+    bytes[7] = 0x7E;
+    bytes[9] = 0xE7;
+    let m = with_bytes(
+        parse(
+            "const tab i8\n\
+             global idx i8\n\
+             global out i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i8 @idx\n\
+                 %base = gep @tab +1\n\
+                 %p = gep %base +65533 +9*%i\n\
+                 %v = load i8 %p\n\
+                 store i8 %v @out\n\
+                 ret void\n",
+        ),
+        "tab",
+        &bytes,
+    );
+    let addrs = addrs(&[
+        ("idx", 0x150),
+        ("out", 0x151),
+        ("main::i", 0x152),
+        ("main::v", 0x153),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("CLRF 0xF6,A"),
+        "stride 9 must take the TBLPTR chain:\n{asm}"
+    );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x150] = 1;
+    p.run(1000);
+    assert_eq!(p.ram()[0x151], 0x7E, "out must be tab[1 - 3 + 9]:\n{asm}");
+}
+
+#[test]
 fn a_width2_const_index_reads_the_high_byte_in_sim() {
     // The flash-side miscompile proof: tab is 2323 bytes, idx = 0x0102,
     // scale 9 -> byte offset 0x912 (2322), the table's last byte. A
@@ -10161,6 +10242,230 @@ fn walk_counted_copy_bridges_pointers_and_counts_down() {
 }
 
 #[test]
+fn walk_copy_storing_moved_invariant_gep_keeps_walk_pointers() {
+    // A counted copy walks FSR0/FSR1, but the body also stores a moved
+    // loop-invariant slot-base GEP with k plus a term. Materializing it
+    // in FSR1 would clobber the destination walk pointer, so this loop
+    // must not walk: every copied byte and the stored pointer's target
+    // stay exact.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global ram i8\n\
+         global pv i16\n\
+         global idx i8\n\
+         global out i8\n\
+         fn work(void) (base=ptr, n=i8)\n\
+           block entry:\n\
+             %p = gep %base +257 +1*%n\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %g1 = gep @src +0 +1*%i\n\
+             %v = load i8 %g1\n\
+             %g2 = gep @dst +0 +1*%i\n\
+             store i8 %v %g2\n\
+             store ptr %p @pv\n\
+             %r = add i16 %i, 1\n\
+             %c = icmp eq i16 %r, 11\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             call void @work(@ram, i8 %i)\n\
+             %r = load ptr @pv\n\
+             %v = load i8 %r\n\
+             store i8 %v @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x020),
+        ("dst", 0x030),
+        ("ram", 0x1FE),
+        ("pv", 0x140),
+        ("idx", 0x142),
+        ("out", 0x143),
+        ("work::base", 0x150),
+        ("work::n", 0x152),
+        ("work::i", 0x154),
+        ("work::v", 0x156),
+        ("work::r", 0x157),
+        ("work::c", 0x159),
+        ("main::i", 0x15A),
+        ("main::r", 0x15B),
+        ("main::v", 0x15D),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for k in 0..11u8 {
+        p.ram_mut()[0x20 + usize::from(k)] = 0x50 + k;
+    }
+    p.ram_mut()[0x142] = 3;
+    p.ram_mut()[0x302] = 0xA1;
+    p.run(10000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    for k in 0..11u8 {
+        assert_eq!(p.ram()[0x30 + usize::from(k)], 0x50 + k, "copied byte {k}");
+    }
+    assert_eq!(p.ram()[0x140], 0x02, "stored pointer low byte");
+    assert_eq!(p.ram()[0x141], 0x03, "stored pointer high byte");
+    assert_eq!(p.ram()[0x143], 0xA1, "stored pointer derefs its target");
+}
+
+#[test]
+fn walk_copy_storing_global_gep_value_keeps_walk_pointers() {
+    // A counted copy walks FSR0/FSR1, but the body also stores a moved
+    // global-base GEP with a scaled term. Materializing it seeds FSR0,
+    // which would clobber the source walk pointer, so this loop must
+    // not walk: every copied byte and the stored pointer stay exact.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global ram i8\n\
+         global pv i16\n\
+         global idx i8\n\
+         global out i8\n\
+         fn work(void) (n=i8)\n\
+           block entry:\n\
+             %p = gep @ram +0 +2*%n\n\
+             br loop\n\
+           block loop:\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %g1 = gep @src +0 +1*%i\n\
+             %v = load i8 %g1\n\
+             %g2 = gep @dst +0 +1*%i\n\
+             store i8 %v %g2\n\
+             store ptr %p @pv\n\
+             %r = add i16 %i, 1\n\
+             %c = icmp eq i16 %r, 11\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             call void @work(i8 %i)\n\
+             %r = load ptr @pv\n\
+             %v = load i8 %r\n\
+             store i8 %v @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x020),
+        ("dst", 0x030),
+        ("ram", 0x1FE),
+        ("pv", 0x140),
+        ("idx", 0x142),
+        ("out", 0x143),
+        ("work::n", 0x150),
+        ("work::i", 0x152),
+        ("work::v", 0x154),
+        ("work::r", 0x155),
+        ("work::c", 0x157),
+        ("main::i", 0x158),
+        ("main::r", 0x159),
+        ("main::v", 0x15B),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for k in 0..11u8 {
+        p.ram_mut()[0x20 + usize::from(k)] = 0x50 + k;
+    }
+    p.ram_mut()[0x142] = 3;
+    p.ram_mut()[0x204] = 0xA1;
+    p.run(10000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    for k in 0..11u8 {
+        assert_eq!(p.ram()[0x30 + usize::from(k)], 0x50 + k, "copied byte {k}");
+    }
+    assert_eq!(p.ram()[0x140], 0x04, "stored pointer low byte");
+    assert_eq!(p.ram()[0x141], 0x02, "stored pointer high byte");
+    assert_eq!(p.ram()[0x143], 0xA1, "stored pointer derefs its target");
+}
+
+#[test]
+fn walk_copy_with_gep_backedge_phi_keeps_walk_pointers() {
+    // Same hazard through the latch: a carried pointer phi whose
+    // back-edge incoming is the moved invariant GEP. Its phi copy runs
+    // before the down-counter branches back, so it too must keep this
+    // loop off the walk path.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global ram i8\n\
+         global pv i16\n\
+         global idx i8\n\
+         global out i8\n\
+         fn work(void) (base=ptr, n=i8)\n\
+           block entry:\n\
+             %p = gep %base +257 +1*%n\n\
+             br loop\n\
+           block loop:\n\
+             %q = phi ptr %p loop %p entry\n\
+             %i = phi i16 %r loop 0 entry\n\
+             %g1 = gep @src +0 +1*%i\n\
+             %v = load i8 %g1\n\
+             %g2 = gep @dst +0 +1*%i\n\
+             store i8 %v %g2\n\
+             %r = add i16 %i, 1\n\
+             %c = icmp eq i16 %r, 11\n\
+             br i1 %c, exit, loop\n\
+           block exit:\n\
+             store ptr %q @pv\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             call void @work(@ram, i8 %i)\n\
+             %r = load ptr @pv\n\
+             %v = load i8 %r\n\
+             store i8 %v @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x020),
+        ("dst", 0x030),
+        ("ram", 0x1FE),
+        ("pv", 0x140),
+        ("idx", 0x142),
+        ("out", 0x143),
+        ("work::base", 0x150),
+        ("work::n", 0x152),
+        ("work::q", 0x153),
+        ("work::i", 0x155),
+        ("work::v", 0x157),
+        ("work::r", 0x158),
+        ("work::c", 0x15A),
+        ("main::i", 0x15B),
+        ("main::r", 0x15C),
+        ("main::v", 0x15E),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for k in 0..11u8 {
+        p.ram_mut()[0x20 + usize::from(k)] = 0x50 + k;
+    }
+    p.ram_mut()[0x142] = 3;
+    p.ram_mut()[0x302] = 0xA1;
+    p.run(10000);
+    assert!(p.halted(), "program must halt:\n{asm}");
+    for k in 0..11u8 {
+        assert_eq!(p.ram()[0x30 + usize::from(k)], 0x50 + k, "copied byte {k}");
+    }
+    assert_eq!(p.ram()[0x140], 0x02, "stored pointer low byte");
+    assert_eq!(p.ram()[0x141], 0x03, "stored pointer high byte");
+    assert_eq!(p.ram()[0x143], 0xA1, "stored pointer derefs its target");
+}
+
+#[test]
 fn walk_const_store_writes_literal_per_step() {
     // A counted constant fill keeps the literal in the loop: `MOVLW`
     // plus a `POSTINC` store per step under the down-counter.
@@ -12588,6 +12893,103 @@ fn store_between_zext_and_ret_stays_staged() {
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(asm.contains("0x043"), "zext temp staged:\n{asm}");
     assert!(asm.contains("MOVWF 0x000"), "ret round trip kept:\n{asm}");
+}
+
+#[test]
+fn gep_k_plus_term_moved_from_ram_global_derefs_the_exact_address() {
+    // A moved GEP value over a RAM global: base 0x1FE plus k 0x101 plus
+    // the runtime term must carry out of byte 0 into byte 1, landing at
+    // 0x302 for idx 3. Every nearby wrong sum holds a distinct seed, so
+    // dropping k, the term, or its carry reads a different byte.
+    let ir = "global ram i8\n\
+         global pv i16\n\
+         global idx i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +257 +1*%i\n\
+             store ptr %p @pv\n\
+             %r = load ptr @pv\n\
+             %v = load i8 %r\n\
+             store i8 %v @out\n\
+             ret void\n";
+    let map: Vec<(String, u16)> = [
+        ("ram", 0x1FE),
+        ("pv", 0x140),
+        ("idx", 0x142),
+        ("out", 0x143),
+        ("main::i", 0x144),
+        ("main::r", 0x145),
+        ("main::v", 0x147),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), *v))
+    .collect();
+    let seed: Vec<(u16, u8)> = vec![
+        (0x142, 3),
+        (0x302, 0xA1),
+        (0x2FF, 0xB2),
+        (0x201, 0xC3),
+        (0x202, 0xD4),
+    ];
+    let got = sim_run_bytes(ir, &map, &seed, 0x143, 1);
+    assert_eq!(
+        got,
+        vec![0xA1],
+        "moved GEP must address base+k+term exactly"
+    );
+}
+
+#[test]
+fn gep_k_plus_term_moved_from_pointer_param_derefs_the_exact_address() {
+    // The same moved GEP over a pointer parameter: the slot holds the
+    // runtime base address (0x1FE for @ram), so the materialized value
+    // is that address plus k 0x101 plus the term, carrying into byte 1.
+    let ir = "global ram i8\n\
+         global pv i16\n\
+         global idx i8\n\
+         global out i8\n\
+         fn deref(void) (p=ptr, i=i8)\n\
+           block entry:\n\
+             %q = gep %p +257 +1*%i\n\
+             store ptr %q @pv\n\
+             %r = load ptr @pv\n\
+             %v = load i8 %r\n\
+             store i8 %v @out\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             call void @deref(@ram, i8 %i)\n\
+             ret void\n";
+    let map: Vec<(String, u16)> = [
+        ("ram", 0x1FE),
+        ("pv", 0x140),
+        ("idx", 0x142),
+        ("out", 0x143),
+        ("deref::p", 0x150),
+        ("deref::i", 0x152),
+        ("deref::r", 0x153),
+        ("deref::v", 0x155),
+        ("main::i", 0x156),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), *v))
+    .collect();
+    let seed: Vec<(u16, u8)> = vec![
+        (0x142, 3),
+        (0x302, 0xA1),
+        (0x2FF, 0xB2),
+        (0x201, 0xC3),
+        (0x202, 0xD4),
+    ];
+    let got = sim_run_bytes(ir, &map, &seed, 0x143, 1);
+    assert_eq!(
+        got,
+        vec![0xA1],
+        "moved GEP must address base+k+term exactly"
+    );
 }
 
 #[test]

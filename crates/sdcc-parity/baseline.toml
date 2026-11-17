@@ -35,9 +35,9 @@ sdcc_cycles = 281
 program = "array"
 device = "p16f877a"
 status = "pass"
-epic_flash = 40
+epic_flash = 47
 sdcc_flash = 283
-epic_cycles = 38
+epic_cycles = 41
 sdcc_cycles = 366
 
 [[row]]

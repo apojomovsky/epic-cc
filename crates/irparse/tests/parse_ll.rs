@@ -1048,6 +1048,88 @@ fn parses_volatile_memcpy() {
 // Issue #4: a runtime-length memcpy (`i16 %n`) parses to `MemLen::Reg` — the
 // counted-loop form — instead of panicking on the non-const length.
 #[test]
+fn parses_memmove_as_memmove_call() {
+    let src = r#"
+@b1 = dso_local global [16 x i8] zeroinitializer, align 1
+@b2 = dso_local global [16 x i8] zeroinitializer, align 1
+define dso_local void @main(i16 %n) {
+  call void @llvm.memmove.p0.p0.i16(ptr align 1 @b1, ptr align 1 @b2, i16 %n, i1 false)
+  ret void
+}
+"#;
+    let m = parse_ll(src);
+    let body = &m.funcs[0].blocks[0].insts;
+    assert!(
+        body.iter().any(|i| matches!(i, Inst::Call(c)
+            if c.func == "memmove" && c.dst.is_none() && c.args.len() == 3)),
+        "memmove must become a call to memmove: {body:?}"
+    );
+}
+
+#[test]
+fn parses_memcpy_inline_as_memcpy() {
+    let src = r#"
+@b1 = dso_local global [16 x i8] zeroinitializer, align 1
+@b2 = dso_local global [16 x i8] zeroinitializer, align 1
+define dso_local void @main() {
+  call void @llvm.memcpy.inline.p0.p0.i16(ptr align 1 @b1, ptr align 1 @b2, i16 4, i1 false)
+  ret void
+}
+"#;
+    let m = parse_ll(src);
+    let body = &m.funcs[0].blocks[0].insts;
+    assert!(
+        body.iter()
+            .any(|i| matches!(i, Inst::Memcpy(mm) if mm.len == MemLen::Const(4))),
+        "memcpy.inline must become Memcpy: {body:?}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "irparse: unsupported intrinsic llvm.memset.inline.p0.i16")]
+fn rejects_memset_inline_by_name() {
+    let src = r#"
+@b1 = dso_local global [16 x i8] zeroinitializer, align 1
+define dso_local void @main() {
+  call void @llvm.memset.inline.p0.i16(ptr align 1 @b1, i8 0, i16 4, i1 false)
+  ret void
+}
+"#;
+    let _ = parse_ll(src);
+}
+
+#[test]
+#[should_panic(
+    expected = "irparse: unsupported intrinsic llvm.memset.element.unordered.atomic.p0.i16"
+)]
+fn rejects_atomic_memset_by_name() {
+    let src = r#"
+@b1 = dso_local global [16 x i8] zeroinitializer, align 1
+define dso_local void @main() {
+  call void @llvm.memset.element.unordered.atomic.p0.i16(ptr align 1 @b1, i8 0, i16 4, i32 1)
+  ret void
+}
+"#;
+    let _ = parse_ll(src);
+}
+
+#[test]
+#[should_panic(
+    expected = "irparse: unsupported intrinsic llvm.memcpy.element.unordered.atomic.p0.p0.i16"
+)]
+fn rejects_atomic_memcpy_by_name() {
+    let src = r#"
+@b1 = dso_local global [16 x i8] zeroinitializer, align 1
+@b2 = dso_local global [16 x i8] zeroinitializer, align 1
+define dso_local void @main() {
+  call void @llvm.memcpy.element.unordered.atomic.p0.p0.i16(ptr align 1 @b1, ptr align 1 @b2, i16 4, i32 1)
+  ret void
+}
+"#;
+    let _ = parse_ll(src);
+}
+
+#[test]
 fn parses_runtime_length_memcpy() {
     let src = r#"
 @b1 = dso_local global [16 x i8] zeroinitializer, align 1
@@ -1093,6 +1175,66 @@ define dso_local void @main() {
     assert_eq!(gep.base, GepBase::Global("s".to_string()));
     assert_eq!(gep.k, 2, "field 1 of {{i8,i16}} at offset 2");
     assert!(gep.terms.is_empty());
+}
+
+#[test]
+fn folds_array_of_struct_field_gep_with_element_stride() {
+    let ll = r#"
+%struct.Item = type { i16, i16, i16 }
+%struct.Outer = type { i8, [12 x %struct.Item] }
+@o = dso_local global %struct.Outer zeroinitializer, align 2
+define dso_local void @main(i16 %i) {
+  %p = getelementptr %struct.Outer, ptr @o, i32 0, i32 1, i32 %i, i32 2
+  %q = getelementptr %struct.Outer, ptr @o, i32 0, i32 1, i32 1, i32 2
+  ret void
+}
+"#;
+    let m = parse_ll(ll);
+    let geps: Vec<_> = m.funcs[0].blocks[0]
+        .insts
+        .iter()
+        .filter_map(|i| match i {
+            Inst::Gep(g) => Some(g),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(geps.len(), 2);
+    assert_eq!(geps[0].base, GepBase::Global("o".to_string()));
+    assert_eq!(geps[0].k, 6, "array field at 2 plus field 2 at 4");
+    assert_eq!(
+        geps[0].terms,
+        vec![(6, "i".to_string())],
+        "element stride = sizeof(%struct.Item) = 6, not the whole array"
+    );
+    assert_eq!(geps[1].base, GepBase::Global("o".to_string()));
+    assert_eq!(geps[1].k, 12, "2 + element 1 x 6 + field 2 at 4");
+    assert!(geps[1].terms.is_empty());
+}
+
+#[test]
+fn folds_nested_array_and_struct_field_gep() {
+    let ll = r#"
+%struct.Inner = type { i8, i16 }
+%struct.Outer = type { %struct.Inner, [3 x [4 x i16]] }
+@o = dso_local global %struct.Outer zeroinitializer, align 2
+@a = dso_local global [3 x [4 x i16]] zeroinitializer, align 2
+define dso_local void @main() {
+  %p = getelementptr %struct.Outer, ptr @o, i32 0, i32 0, i32 1
+  %q = getelementptr %struct.Outer, ptr @o, i32 0, i32 1, i32 1, i32 2
+  %r = getelementptr [3 x [4 x i16]], ptr @a, i16 0, i16 1, i16 2
+  ret void
+}
+"#;
+    let m = parse_ll(ll);
+    let ks: Vec<u16> = m.funcs[0].blocks[0]
+        .insts
+        .iter()
+        .filter_map(|i| match i {
+            Inst::Gep(g) => Some(g.k),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ks, vec![2, 16, 12]);
 }
 
 #[test]

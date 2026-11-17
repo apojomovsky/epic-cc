@@ -515,6 +515,141 @@ pub struct DelayUse {
     pub col: u32,
 }
 
+/// One definition of a `static` function named `memset`, with its site.
+///
+/// clang deletes an unused static definition before the driver sees any
+/// IR, so the merged module alone cannot always show that the source
+/// carried one (epic-cc#1453).
+pub struct StaticMemset {
+    /// The input file holding the definition.
+    pub file: String,
+    /// 1-based line and column of the `memset` name.
+    pub line: u32,
+    pub col: u32,
+}
+
+/// The first `static ... memset(...) { ... }` definition across all
+/// sources, if any. Comment-, string- and char-literal-aware like the
+/// other scanners; declarations and calls do not count.
+pub fn find_static_memset(sources: &[(String, String)]) -> Option<StaticMemset> {
+    for (file, text) in sources {
+        if let Some((line, col)) = find_static_memset_in_one_file(text) {
+            return Some(StaticMemset {
+                file: file.clone(),
+                line,
+                col,
+            });
+        }
+    }
+    None
+}
+
+fn find_static_memset_in_one_file(text: &str) -> Option<(u32, u32)> {
+    let b = text.as_bytes();
+    // Blank comments and literals, preserving offsets and newlines, so a
+    // quoted or commented `memset` cannot look like a definition.
+    let mut clean = b.to_vec();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = skip_trivia(b, i) {
+            for byte in clean.iter_mut().take(j).skip(i) {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    let mut i = 0;
+    while i < clean.len() {
+        if !is_ident(clean[i]) || (i > 0 && is_ident(clean[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < clean.len() && is_ident(clean[i]) {
+            i += 1;
+        }
+        if &clean[start..i] != b"memset" {
+            continue;
+        }
+        // The declaration segment runs back to the previous statement or
+        // block boundary: `static` anywhere in it qualifies the name.
+        let seg_start = clean[..start]
+            .iter()
+            .rposition(|c| matches!(c, b';' | b'{' | b'}'))
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let has_static = clean[seg_start..start]
+            .split(|c| !is_ident(*c))
+            .any(|w| w == b"static");
+        if !has_static {
+            continue;
+        }
+        // A definition's parameter list is followed by a body, after any
+        // trailing attribute groups; a declaration ends in `;` instead.
+        let mut j = i;
+        while j < clean.len() && clean[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if clean.get(j) != Some(&b'(') {
+            continue;
+        }
+        let mut depth = 0i32;
+        while j < clean.len() {
+            match clean[j] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let mut j = j + 1;
+        loop {
+            while j < clean.len() && clean[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if clean[j..].starts_with(b"__attribute__") {
+                let mut k = j + "__attribute__".len();
+                while k < clean.len() && clean[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if clean.get(k) != Some(&b'(') {
+                    break;
+                }
+                let mut depth = 0i32;
+                while k < clean.len() {
+                    match clean[k] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                j = k + 1;
+                continue;
+            }
+            break;
+        }
+        if clean.get(j) == Some(&b'{') {
+            return Some(line_col(text, start));
+        }
+    }
+    None
+}
+
 /// The first delay-macro call across all sources, if any.
 pub fn find_delay_use(sources: &[(String, String)]) -> Option<DelayUse> {
     for (file, text) in sources {
@@ -734,4 +869,46 @@ fn find_delay_in_one_file(file: &str, text: &str) -> Option<DelayUse> {
         i += 1;
     }
     None
+}
+
+/// Header paths named by clang `-MD` dependency texts, in first-seen
+/// order. Tokens are whitespace-separated with `\` continuations and a
+/// trailing `:` on targets, so both are trimmed before the extension
+/// test.
+pub fn dep_header_paths(dep_texts: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for text in dep_texts {
+        for tok in text.split_whitespace() {
+            let t = tok.trim_end_matches('\\').trim_end_matches(':');
+            if (t.ends_with(".h") || t.ends_with(".hpp") || t.ends_with(".hh"))
+                && !out.iter().any(|p| p == t)
+            {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dep_header_paths;
+
+    #[test]
+    fn dep_header_paths_extracts_headers_in_order() {
+        let deps = vec![
+            "out.o: src/main.c inc/a.h \\\n  inc/b.hpp /abs/c.hh src/x.c\n".to_string(),
+            "out2.o: inc/a.h inc/d.h\n".to_string(),
+        ];
+        assert_eq!(
+            dep_header_paths(&deps),
+            vec!["inc/a.h", "inc/b.hpp", "/abs/c.hh", "inc/d.h"]
+        );
+    }
+
+    #[test]
+    fn dep_header_paths_ignores_non_headers() {
+        let deps = vec!["out.o: src/main.c src/lib.cpp\n".to_string()];
+        assert!(dep_header_paths(&deps).is_empty());
+    }
 }

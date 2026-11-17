@@ -1824,6 +1824,20 @@ fn unknown_intrinsic_panics() {
     let _ = legalize(m);
 }
 
+/// A void `llvm.mem*` form names itself instead of blaming a missing dst.
+#[test]
+#[should_panic(expected = "legalize: unsupported intrinsic llvm.memset.inline.p0.i16")]
+fn void_mem_intrinsic_panics_by_name() {
+    let m = parse(
+        "global a i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @llvm.memset.inline.p0.i16(@a, 0, 4)\n\
+             ret void\n",
+    );
+    let _ = legalize(m);
+}
+
 /// `llvm.assume` carries no dst and no codegen (epic-cc#1276): both the
 /// register form clang emits for `__builtin_assume(n != 0)` and the const
 /// form lower to nothing while surrounding code is untouched.

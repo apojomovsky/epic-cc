@@ -153,6 +153,24 @@ fn add_c_runs_correctly() {
 }
 
 #[test]
+fn gep_value_icmp_c_runs_correctly() {
+    // in == 6 (fixture comment) -> out == 2, out2 == 1.
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals) = compile("tests/fixtures/gep_value_icmp.c");
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 6;
+    p.ram_mut()[in_addr + 1] = 0;
+    p.run(2_000_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 2, "out == loop trips");
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        1,
+        "out2 == cursor landed on the GEP end"
+    );
+    assert!(p.halted());
+}
+
+#[test]
 fn scalar_c_runs_correctly() {
     let _guard = E2E_LOCK.lock();
     let (mut p, globals) = compile("tests/fixtures/scalar.c");
@@ -242,6 +260,25 @@ fn ptr_probe_c_runs_correctly() {
         "ram[0] must stay untouched"
     );
     assert!(p.halted());
+}
+
+#[test]
+fn ptr_select_c_picks_the_selected_arm() {
+    let _guard = E2E_LOCK.lock();
+    for (input, expected) in [(1u8, 0x22u8), (0u8, 0x11u8)] {
+        let (mut p, globals) = compile("tests/fixtures/ptr_select.c");
+        let buf = globals["buf"] as usize;
+        p.ram_mut()[buf + 1] = 0x11;
+        p.ram_mut()[buf + 2] = 0x22;
+        p.ram_mut()[globals["in"] as usize] = input;
+        p.run(10_000);
+        assert!(p.halted(), "in={input}");
+        assert_eq!(
+            p.ram()[globals["out"] as usize],
+            expected,
+            "in={input} must read through the selected arm"
+        );
+    }
 }
 
 /// P3 array acceptance: a non-const array written and read at a runtime
@@ -1033,4 +1070,70 @@ fn mul_edges_u32_wraps_and_exits_on_zero() {
         ]);
         assert_eq!(got, a.wrapping_mul(b), "u32 {a:#010x} * {b:#010x} mod 2^32");
     }
+}
+
+/// epic-cc#1433: a pointer laundered through `uintptr_t` lowers as a
+/// same-width `trunc i16 -> i16`, and the backend used to refuse it
+/// ("trunc must narrow"), aborting the compile.
+///
+/// The fixture reads the byte back through the laundered address for
+/// both a loaded-global pointer and a local's address, so a wrong
+/// address reads the wrong byte.
+#[test]
+fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
+    let _guard = E2E_LOCK.lock();
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ptrtoint_launder.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(10_000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the laundered address of a global must read back g's byte"
+    );
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        0x33,
+        "the laundered address of a local must read back the local's byte"
+    );
+}
+
+#[test]
+fn byval_gep_launder_reads_back_field_byte() {
+    let _guard = E2E_LOCK.lock();
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/byval_gep_launder.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(10_000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the laundered byval field address must read back s.b"
+    );
+}
+
+#[test]
+fn gep_as_direct_call_arg_reads_back_byte() {
+    let _guard = E2E_LOCK.lock();
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/gep_call_arg.c");
+    let (mut p, globals) = compile(fixture);
+    p.ram_mut()[globals["in"] as usize] = 3;
+    p.run(10_000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the GEP call arg must address buf[3]"
+    );
+    assert_eq!(
+        p.ram()[globals["buf"] as usize],
+        0,
+        "buf[0] must stay untouched"
+    );
 }

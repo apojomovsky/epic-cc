@@ -321,9 +321,26 @@ fn main() {
         .iter()
         .map(|p| std::fs::read_to_string(p).unwrap_or_default())
         .collect();
+    let unit_texts: Vec<String> = units
+        .iter()
+        .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+        .collect();
     let need_string = dep_texts
         .iter()
         .any(|t| driver::header_detect::dep_file_includes(t, "string.h"));
+    // A `llvm.memset` intrinsic (irparse rewrites it to a library call)
+    // needs a memset definition even when no unit included <string.h>;
+    // a unit defining memset itself already provides it (epic-cc#1448).
+    let need_memset = !need_string && {
+        unit_texts.iter().any(|t| t.contains("@llvm.memset."))
+            && !unit_texts.iter().any(|t| {
+                t.lines()
+                    .any(|l| l.starts_with("define") && l.contains("@memset("))
+            })
+    };
+    // Without the header, the full string unit is not linked, so a
+    // bare llvm.memmove needs a memmove-only unit (epic-cc#1451).
+    let need_memmove = !need_string && driver::string_c::needs_provided_memmove(&unit_texts);
     let need_stdio = dep_texts
         .iter()
         .any(|t| driver::header_detect::dep_file_includes(t, "stdio.h"));
@@ -332,8 +349,35 @@ fn main() {
             || driver::header_detect::dep_file_includes(t, "malloc.h")
     });
     if need_string {
+        // Defining a library function beside its header is legal C, so a
+        // user definition wins: drop only the colliding names from the
+        // injected unit and let its survivors reference the user's.
+        let user_defined: std::collections::HashMap<String, usize> = units
+            .iter()
+            .flat_map(|u| {
+                driver::string_c::externally_defined(
+                    &std::fs::read_to_string(u).unwrap_or_default(),
+                )
+            })
+            .collect();
+        // A same-named definition only wins with the library arity: a
+        // mismatched signature is a different function sharing a
+        // reserved name, and binding call sites to it silently would
+        // miscompile where llvm-link used to fail loudly.
+        let arities = driver::string_c::function_arities(driver::string_c::STRING_C);
+        let colliding: std::collections::HashSet<String> =
+            driver::string_c::function_names(driver::string_c::STRING_C)
+                .into_iter()
+                .map(str::to_string)
+                .filter(|n| user_defined.get(n) == arities.get(n))
+                .collect();
+        let string_source = if colliding.is_empty() {
+            driver::string_c::STRING_C.to_string()
+        } else {
+            driver::string_c::without_functions(driver::string_c::STRING_C, &colliding)
+        };
         let string_c_path = tmp.join("__epic_string.c");
-        std::fs::write(&string_c_path, driver::string_c::STRING_C).expect("write string.c");
+        std::fs::write(&string_c_path, string_source).expect("write string.c");
         let ll_path = tmp.join("__epic_string.ll");
         let mut cmd = clang::base_cmd(&clang, &resdir);
         clang::apply_options(&mut cmd, &clang_opts);
@@ -346,6 +390,48 @@ fn main() {
             eprintln!("epic-cc: {cmd:?}");
         }
         let out = cmd.output().expect("run clang for string.c");
+        if !out.status.success() {
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            std::process::exit(1);
+        }
+        units.push(ll_path);
+    }
+    if need_memset {
+        let memset_c_path = tmp.join("__epic_memset.c");
+        std::fs::write(&memset_c_path, driver::string_c::MEMSET_C).expect("write memset.c");
+        let ll_path = tmp.join("__epic_memset.ll");
+        let mut cmd = clang::base_cmd(&clang, &resdir);
+        clang::apply_options(&mut cmd, &clang_opts);
+        cmd.args([
+            "-o",
+            ll_path.to_str().unwrap(),
+            memset_c_path.to_str().unwrap(),
+        ]);
+        if cli.verbose {
+            eprintln!("epic-cc: {cmd:?}");
+        }
+        let out = cmd.output().expect("run clang for memset.c");
+        if !out.status.success() {
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            std::process::exit(1);
+        }
+        units.push(ll_path);
+    }
+    if need_memmove {
+        let memmove_c_path = tmp.join("__epic_memmove.c");
+        std::fs::write(&memmove_c_path, driver::string_c::MEMMOVE_C).expect("write memmove.c");
+        let ll_path = tmp.join("__epic_memmove.ll");
+        let mut cmd = clang::base_cmd(&clang, &resdir);
+        clang::apply_options(&mut cmd, &clang_opts);
+        cmd.args([
+            "-o",
+            ll_path.to_str().unwrap(),
+            memmove_c_path.to_str().unwrap(),
+        ]);
+        if cli.verbose {
+            eprintln!("epic-cc: {cmd:?}");
+        }
+        let out = cmd.output().expect("run clang for memmove.c");
         if !out.status.success() {
             eprint!("{}", String::from_utf8_lossy(&out.stderr));
             std::process::exit(1);
@@ -458,6 +544,37 @@ fn main() {
         Ok(text) => text,
         Err(msg) => diag::error(&format!("whole-program opt: {msg}")),
     };
+
+    // A static `memset` can never serve an `llvm.memset` call: clang
+    // lowers it to an internal function with a rewritten calling
+    // convention, so the intrinsic has no library-ABI body to reach.
+    // Name that here, on the post-opt module, where only a surviving
+    // intrinsic can still reach a later stage (epic-cc#1453).
+    let mut scan_sources = sources.clone();
+    for header in driver::prescan::dep_header_paths(&dep_texts) {
+        if scan_sources.iter().any(|(f, _)| *f == header) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&header) {
+            scan_sources.push((header, text));
+        }
+    }
+    let static_memset = driver::prescan::find_static_memset(&scan_sources);
+    if driver::wholeprog_opt::rejects_static_memset(
+        &merged_ll_text,
+        static_memset.is_some(),
+        need_string,
+    ) {
+        let msg = "static memset cannot serve as the library memset for \
+                   llvm.memset intrinsic calls: a static definition is lowered \
+                   to an internal function with a rewritten calling convention, \
+                   so it has no library memset ABI; declare memset without \
+                   `static`, or rename the static helper";
+        match static_memset {
+            Some(found) => diag::error_at(&found.file, found.line, found.col, msg),
+            None => diag::error(msg),
+        }
+    }
 
     let ll_text = irparse::sanitize_symbols(&merged_ll_text);
     let canonical_spec = ll_text

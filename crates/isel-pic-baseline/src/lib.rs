@@ -247,6 +247,20 @@ impl<'m> Gen<'m> {
         )
     }
 
+    /// Whether `v` is a resolved GEP value the allocator folded into
+    /// its uses: it has a resolved (base, k, terms) entry but no slot,
+    /// so a reader must materialize it through `emit_load_byte`
+    /// instead of addressing a slot (epic-cc#1472).
+    fn slotless_gep_value(&self, v: &Val) -> bool {
+        match v {
+            Val::Reg(r) => {
+                let key = ssa_key(self.cur_func, r);
+                self.resolved.contains_key(&key) && !self.addrs.contains_key(&key)
+            }
+            _ => false,
+        }
+    }
+
     /// Resolve an operand value to its base byte address (lo for multi-byte).
     fn val_addr(&self, v: &Val) -> Slot {
         match v {
@@ -317,7 +331,7 @@ impl<'m> Gen<'m> {
     }
 
     /// Whether `name` is a local object in the current function: an
-    /// `alloca`'s slot IS the object, so a pointer to it is that slot's
+    /// `alloca` or byval param's slot IS the object, so a pointer to it is that slot's
     /// own frame address rather than an address value stored in the slot
     /// (epic-cc#652).
     fn is_local_object(&self, name: &str) -> bool {
@@ -326,11 +340,12 @@ impl<'m> Gen<'m> {
             .iter()
             .find(|f| f.name == self.cur_func)
             .map(|f| {
-                f.blocks.iter().any(|b| {
-                    b.insts
-                        .iter()
-                        .any(|i| matches!(i, ir::Inst::Alloca(a) if a.dst == name))
-                })
+                f.params.iter().any(|p| p.name == name && p.byval.is_some())
+                    || f.blocks.iter().any(|b| {
+                        b.insts
+                            .iter()
+                            .any(|i| matches!(i, ir::Inst::Alloca(a) if a.dst == name))
+                    })
             })
             .unwrap_or(false)
     }
@@ -536,8 +551,30 @@ impl<'m> Gen<'m> {
     }
 
     /// Set the Z flag to (a == b) without disturbing other flags.
-    fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty) {
+    fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty, temp: u16) {
         let n = ty.bytes();
+        if self.slotless_gep_value(b) {
+            // A slotless GEP operand has no byte to XORWF against:
+            // park each `a` byte in `temp` (the result slot, dead
+            // until the caller's materialize writes it, and loaded
+            // before the store when it overlays `a`), materialize
+            // the GEP byte, and XOR against the park. The running
+            // OR accumulates in scratch like the path below.
+            for i in 0..n {
+                self.emit_load_byte(a, i);
+                self.emit(format!("    MOVWF {}", self.fop(temp)));
+                self.emit_load_byte(b, i);
+                self.emit_bank_select(temp);
+                self.emit(format!("    XORWF {}, W", self.fop(temp)));
+                if i == 0 {
+                    self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
+                } else {
+                    self.emit(format!("    IORWF {}, W", self.fop(self.scratch)));
+                    self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
+                }
+            }
+            return;
+        }
         self.emit_load_byte(a, 0);
         self.emit_xor_byte(b, 0);
         self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
@@ -1378,7 +1415,16 @@ impl<'m> Gen<'m> {
         // bases like 0x50 to bank-0 0x10, epic-cc#429).
         let width = 5 + self.device.fsr_bank_bits.max(1);
         let mask = (1u16 << width) - 1;
-        let lit = (u16::from(base_addr) + u16::from(k) + u16::from(byte_off)) & mask;
+        // `k` holds a signed offset as a u16 pattern, so the sum wraps
+        // in 16 bits first (the classic `& 0x1FF` fold): a wrapped
+        // negative offset whose true address lands in range is legal.
+        // Only the wrapped result must fit the FSR width outright.
+        let wrapped = base_addr.wrapping_add(k).wrapping_add(u16::from(byte_off));
+        assert!(
+            wrapped <= mask,
+            "isel: baseline FSR address 0x{wrapped:X} exceeds the {width}-bit FSR range"
+        );
+        let lit = wrapped & mask;
         match terms {
             [(1, r)] => {
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();
@@ -1706,6 +1752,15 @@ impl<'m> Gen<'m> {
                         self.emit_bank_select(pa + 1);
                         self.emit(format!("    CLRF {}", self.fop(pa + 1)));
                     }
+                    Val::Reg(_) if self.slotless_gep_value(&arg.val) => {
+                        // A slotless GEP has no address bytes to copy:
+                        // materialize each byte like a scalar load.
+                        for i in 0..2u8 {
+                            self.emit_load_byte(&arg.val, i);
+                            self.emit_bank_select(pa + u16::from(i));
+                            self.emit(format!("    MOVWF {}", self.fop(pa + u16::from(i))));
+                        }
+                    }
                     Val::Reg(r) => {
                         // A runtime pointer value: copy its two address bytes.
                         let sa = self.slot_addr(self.cur_func, r).direct();
@@ -2013,8 +2068,13 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Trunc(t) => {
+                // A same-width trunc is the `ptrtoint` spelling (epic-cc#1433):
+                // `emit_load_byte` materializes a pointer source's address,
+                // so the copy below moves the address, not pointee bytes.
                 assert!(
-                    t.from.bytes() > t.to.bytes() || (t.to == Ty::I1 && t.from != Ty::I1),
+                    t.from.bytes() > t.to.bytes()
+                        || t.from == t.to
+                        || (t.to == Ty::I1 && t.from != Ty::I1),
                     "isel: trunc must narrow"
                 );
                 let da = self.slot_addr(self.cur_func, &t.dst).direct();
@@ -2032,11 +2092,11 @@ impl<'m> Gen<'m> {
                 let da = self.slot_addr(self.cur_func, &ic.dst).direct();
                 match ic.pred.as_str() {
                     "eq" => {
-                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         self.emit_materialize("Z", da);
                     }
                     "ne" => {
-                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         self.emit_materialize("!Z", da);
                     }
                     pred => {
@@ -2049,7 +2109,7 @@ impl<'m> Gen<'m> {
                         };
                         self.emit_cmp_c(&ic.a, &ic.b, ic.ty, signed);
                         if need_z && ic.ty.bytes() > 1 {
-                            self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                            self.emit_cmp_eq(&ic.a, &ic.b, ic.ty, da);
                         }
                         let mat = match pred {
                             "ult" | "slt" => "!C",

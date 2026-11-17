@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "driver"
-version = "0.5.0"
+version = "0.8.1"
 dependencies = [
  "alloc",
  "asm",
@@ -230,13 +230,16 @@ dependencies = [
  "alloc",
  "asm",
  "banking",
+ "callgraph",
  "device",
  "ir",
+ "irparse",
  "iselcore",
  "legalize",
  "peephole",
  "pic14-sim",
  "schedule",
+ "wholeprog",
 ]
 
 [[package]]
