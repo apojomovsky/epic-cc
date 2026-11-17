@@ -113,6 +113,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "epic-cc-sim"
+version = "0.1.0"
+dependencies = [
+ "device",
+ "pic14-sim",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
