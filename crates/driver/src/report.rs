@@ -81,6 +81,9 @@ pub fn map_text(device: &Device, layout: &AllocLayout) -> String {
             out.push_str(&format!("{kind} 0x{addr:02X}\n"));
         }
     }
+    for (func, size) in &layout.overlay_slack {
+        out.push_str(&format!("overlay-slack {func} {size}\n"));
+    }
     out
 }
 
@@ -896,6 +899,11 @@ pub fn render_size(
         out.push_str(&format!(
             "    ISR region: {} bytes (disjoint, after the main context, included in the bank totals)\n",
             layout.isr_bytes
+        ));
+    }
+    for (func, size) in &layout.overlay_slack {
+        out.push_str(&format!(
+            "    overlay slack: {func} {size} bytes (below the binding top, saves 0B on the total)\n"
         ));
     }
     out
