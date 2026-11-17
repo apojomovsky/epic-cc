@@ -183,6 +183,22 @@ fn parse_val_typed(s: &str, ty: Option<Ty>) -> Val {
         } else {
             Val::Const(v as i64)
         }
+    } else if s.starts_with("ptrtoint") {
+        // `ptrtoint (ptr @g to i16)` / `ptrtoint (ptr %r to i16)`: an
+        // integer copy of a pointer. The operand is the token before
+        // `to`; recursing on it keeps @global/%reg/constant operands.
+        let inner = s
+            .strip_prefix("ptrtoint")
+            .unwrap()
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
+        let operand = inner
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("irparse: malformed ptrtoint {s:?}"));
+        parse_val_typed(operand, None)
     } else if s.starts_with("inttoptr") {
         let inner = s
             .strip_prefix("inttoptr")
@@ -2299,7 +2315,11 @@ fn parse_select_arm(
     loc: Option<&SrcLoc>,
 ) -> Val {
     let part = part.trim();
-    if part.contains("inttoptr") {
+    if part.contains("ptrtoint") {
+        let ty_tok = part.split_whitespace().next().unwrap();
+        let ty = ty_of(ty_tok, loc);
+        parse_value_with_gep(part, ty, types, fresh, out, loc)
+    } else if part.contains("inttoptr") {
         let start = part.find("inttoptr").unwrap();
         let inttoptr_part = &part[start + "inttoptr".len()..];
         let after = inttoptr_part
@@ -2404,7 +2424,21 @@ fn parse_value_with_gep(
         }
         return parse_val_typed(val_str, Some(ty));
     }
-    if s.contains("getelementptr") && s.contains("ptrtoint") {
+    if s.contains("ptrtoint") && !s.contains("getelementptr") {
+        // `ptrtoint (ptr @g to i16)` in value position: the integer copy
+        // of a plain pointer is the pointer value itself.
+        let after = &s[s.find("ptrtoint").unwrap() + "ptrtoint".len()..];
+        let inner = after
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
+        let operand = inner
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("irparse: malformed ptrtoint {s:?}"));
+        parse_val_typed(operand, Some(Ty::I16))
+    } else if s.contains("getelementptr") && s.contains("ptrtoint") {
         let after = &s[s.find("ptrtoint").unwrap() + "ptrtoint".len()..];
         let to_pos = after
             .rfind(" to ")
@@ -2746,7 +2780,23 @@ fn parse_call_arg(
     loc: Option<&SrcLoc>,
 ) -> CallArg {
     let a = a.trim();
-    if a.contains("getelementptr") {
+    if a.contains("ptrtoint") {
+        // `i16 ptrtoint (ptr @g to i16)`: an integer copy of a pointer
+        // passed as an integer argument.
+        let ty_tok = a.split_whitespace().next().unwrap();
+        let ty = if ty_tok == "ptr" {
+            None
+        } else {
+            Some(ty_of(ty_tok, loc))
+        };
+        let val = parse_value_with_gep(a, ty.unwrap_or(Ty::I16), types, fresh, out, loc);
+        CallArg {
+            ty,
+            val,
+            byval: None,
+            sret: false,
+        }
+    } else if a.contains("getelementptr") {
         let ty_tok = a.split_whitespace().next().unwrap();
         let ty = if ty_tok == "ptr" {
             None
@@ -3816,7 +3866,9 @@ fn parse_inst(
             let val_str = a0t[ty_tok.len()..].trim();
             // e.g. a callback table holding `&s.field`) materializes like
             // a call argument; anything else keeps the scalar reading.
-            let val = if val_str.contains("getelementptr") {
+            let val = if val_str.contains("ptrtoint") {
+                parse_value_with_gep(val_str, ty, types, fresh, &mut out, cur.as_ref())
+            } else if val_str.contains("getelementptr") {
                 parse_call_ptr_val(val_str, types, fresh, &mut out, cur.as_ref())
             } else {
                 parse_val_typed(val_str.split_whitespace().next().unwrap(), Some(ty))
@@ -4094,6 +4146,10 @@ fn parse_inst(
             let body = rest["ret".len()..].trim();
             if body == "void" {
                 out.push(Inst::Ret(None, cur.clone()));
+            } else if body.contains("ptrtoint") {
+                let ty = ty_of(body.split_whitespace().next().unwrap(), cur.as_ref());
+                let v = parse_value_with_gep(body, ty, types, fresh, &mut out, cur.as_ref());
+                out.push(Inst::Ret(Some((ty, v)), cur.clone()));
             } else {
                 let mut it = body.split_whitespace();
                 let ty = ty_of(it.next().unwrap(), cur.as_ref());
