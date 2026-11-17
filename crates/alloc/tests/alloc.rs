@@ -4948,3 +4948,56 @@ fn ram_neutral_reshuffle_keeps_lever_off_map() {
         "RAM-neutral reshuffle stays off"
     );
 }
+
+/// epic-cc#1488: a 90-byte global at 0x1A0 on PIC16F1939 occupies
+/// 0x1A0-0x1EF and 0x220-0x229, so a fixed global at 0x225 overlaps
+/// its tail segment even though 0x1A0 + 90 = 0x1FA does not reach it.
+#[test]
+fn straddling_global_tail_does_not_overlap_fixed_global() {
+    let mut m = parse(
+        "global fill0 i8\n\
+         global fill1 i8\n\
+         global fill2 i8\n\
+         global big i8\n\
+         global pinned i32 @0x225\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 80;
+    m.globals[1].size = 80;
+    m.globals[2].size = 80;
+    m.globals[3].size = 90;
+    let out = allocate(&PIC16F1939, &m, "depth 1\n");
+    assert_eq!(out.globals["pinned"], 0x225);
+    assert_eq!(
+        out.globals["big"], 0x22A,
+        "straddling global must bump past the fixed global in its tail"
+    );
+}
+
+/// epic-cc#1488: a fixed address in the gap a straddle skips is not
+/// occupied by the straddling global, so it must not bump it.
+#[test]
+fn straddling_global_ignores_fixed_global_in_skipped_gap() {
+    let mut m = parse(
+        "global fill0 i8\n\
+         global fill1 i8\n\
+         global fill2 i8\n\
+         global big i8\n\
+         global pinned i32 @0x1F0\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 80;
+    m.globals[1].size = 80;
+    m.globals[2].size = 80;
+    m.globals[3].size = 90;
+    let out = allocate(&PIC16F1939, &m, "depth 1\n");
+    assert_eq!(out.globals["pinned"], 0x1F0);
+    assert_eq!(
+        out.globals["big"], 0x1A0,
+        "fixed global in the skipped gap must not bump the straddle"
+    );
+}
