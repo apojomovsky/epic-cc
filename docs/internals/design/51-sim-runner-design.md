@@ -29,14 +29,14 @@ Established by inspection of `origin/master` (7512973, v0.8.1).
 | Fact | Evidence |
 |---|---|
 | The only in-repo simulator is a library, `pic14-sim` (`crates/sim`, `publish = false`). It has no CLI. | `crates/sim/Cargo.toml`, `crates/sim/src/lib.rs` |
-| The sim covers all four cores: `Pic14`, `Pic14e`, `PicBaseline`, `Pic18`, each with `new`/`with_device`, `step`, `run(max_steps)`, `run_until(target, max_steps) -> StopReason`, `cycles()`, `halted()`, `pc()`, `w()`, `ram()`/`ram_mut()`, `read_mem`/`write_mem`. | `crates/sim/src/lib.rs` (types at lines 361, 1077, 1963, 2561) |
+| The sim covers all four cores, but their surfaces differ and the runner must not paper over it: `Pic14` has `new(prog)` (= `with_device(&PIC16F877A, prog)`) and `with_device(&'static Device, prog)`; `Pic14e` has both, but its `with_device(&Device, prog)` checks only the `Core::Pic14e` tag, not per-device fields; `PicBaseline` has only `with_device(&Device, prog)` (no `new`); `Pic18` has only `new(prog)` (no `with_device`, device ignored entirely). All four have `step`, `run(max_steps)`, `run_until(target, max_steps) -> StopReason`, `cycles()`, `halted()`, `pc()` (`u16` except `Pic18: u32`), `w()`, `status()`, `ram()`/`ram_mut()` (256 B baseline, 512 B Pic14, 4096 B Pic14e/Pic18), and `eeprom()` except `PicBaseline`, which has none. `read_mem`/`write_mem` exist on all four but with incompatible address semantics (see D-5). | `crates/sim/src/lib.rs` (types at lines 361, 1077, 1963, 2561) |
 | Stop conditions today are narrow: `StopReason::{Reached, Halted, Capped}`; halt means SLEEP or running off the end of the program. | `crates/sim/src/lib.rs:961` |
 | HEX loading already exists per core: `parse_hex` (PIC14 and baseline), `parse_hex_pic14e`, `parse_hex_pic18`. The parsers panic on malformed input, which is the current error surface. | `crates/sim/src/lib.rs:11,2453,2502` |
 | Device selection already exists: `device::resolve(name)` accepts `p16f877a`, `16F877A`, and `PIC16F877A` spellings, and `Device.core` gives `Core::{Pic14, Pic14e, PicBaseline, Pic18}`. `device::ALL` lists every part. | `crates/device/src/lib.rs:15,142` |
-| The debugger adapter already solved core dispatch from a device name: `core_of` and `load_program` in the gdbserver crate map a device to a core and a core to a HEX parser. It is the nearest sibling to mirror. | `crates/gdbserver/src/lib.rs:131,148` |
+| The debugger adapter already solved part of core dispatch: `core_of` maps a device name to a core and `load_program` maps a core to a HEX parser in the gdbserver crate. Its construction dispatch is narrower than it looks: it calls `Pic14::new`/`Pic14e::new`/`Pic18::new` (default devices, resolved device ignored) and uses the device only for baseline (`PicBaseline::with_device`, defaulting to `p12f509` when none was named). The runner mirrors the parser mapping, not that construction shortcut (D-3). | `crates/gdbserver/src/lib.rs:131,148` |
 | The gdbserver is not a newcomer path: it needs a sidecar ELF argument, a TCP port, and a gdb client. | `crates/gdbserver/src/main.rs`, `USAGE` at `crates/gdbserver/src/lib.rs:49` |
 | CLI precedent is hand-rolled argument parsing, no clap anywhere. Unknown flags get a did-you-mean hint. | `crates/gdbserver/src/lib.rs:88`, `crates/driver/src/cli.rs` |
-| No peripheral output model exists in the sim: no UART, TXREG, or PORT model. Tests observe results by reading RAM (`ram_mut`, `write_mem`) and by `fire_interrupt`/`request_interrupt` hooks. There is one peripheral exception, the PIC18 USB SIE (`crates/sim/src/sie`, driven by `Pic18::usb_*`), which is out of scope here. | `crates/sim/tests/*.rs`, `crates/sim/src/lib.rs` |
+| Peripheral modelling is partial, not absent: Timer0 exists on all cores, Timer2 on Pic18, plus ADC stubs and data-EEPROM models on the cores that have EEPROM; `request_interrupt`/`fire_interrupt` exist on `Pic14`, `Pic14e`, and `Pic18` only — `PicBaseline` has neither (12F509-class parts have no interrupts). There is still no UART/TXREG or pin/PORT output model: SFR cells such as TXREG are plain RAM the trace can observe. The PIC18 USB SIE lives in `crates/sim/src/sie.rs` (driven by `Pic18::usb_*`) and is out of scope here. | `crates/sim/tests/*.rs`, `crates/sim/src/lib.rs`, `crates/sim/src/sie.rs` |
 | The release bundle already ships two binaries, `epic-cc` and `epic-cc-gdbserver`, at the zip root, plus `devices.json`, `include/`, bundled `clang/`, and the LLVM licence. | `docs/internals/design/30-distribution-design.md`, bundle layout section; `Dockerfile` release stage |
 | Linux builds the bundle in the Dockerfile `release` stage (`cargo build --release -p driver -p epic-cc-gdbserver`, then copies). Windows builds natively in `release.yml`. Both already ship the gdbserver, so the earlier note that Windows ships the driver only is stale. | `Dockerfile:247-252`, `.github/workflows/release.yml:73-96` |
 | A bundle gate exists: `scripts/check_release_bundle.py` fails unless each zip carries both binaries. | `scripts/check_release_bundle.py` (`BINARIES`) |
@@ -99,39 +99,53 @@ unchanged (MIT, nothing new to ship or attribute).
 ### D-3: All four cores from day one, one dispatch
 
 The runner resolves `--device` through `device::resolve` and
-dispatches on `Device.core`, mirroring `core_of`/`load_program` in
-`crates/gdbserver/src/lib.rs`: `parse_hex` for PIC14 and baseline,
-`parse_hex_pic14e` for PIC14E, `parse_hex_pic18` for PIC18. The
-runner holds the four sim types behind one internal enum (the same
-pattern as the gdbserver's four target structs) so the run loop,
-stimulus, and output code are written once.
+dispatches on `Device.core`. It mirrors only the HEX-parser mapping
+of `load_program` in `crates/gdbserver/src/lib.rs` (`parse_hex` for
+PIC14 and baseline, `parse_hex_pic14e` for PIC14E,
+`parse_hex_pic18` for PIC18); construction is per core, because the
+constructors genuinely differ and `--device` must not promise what
+a core ignores:
 
-Rationale: the dispatch costs almost nothing (the parsers and cores
-already exist and the gdbserver already wrote this exact match),
-while shipping PIC14-only would force a second design round the
-first time a tutorial targets a PIC14E or PIC18 part. Baseline needs
-a `&'static Device` for `PicBaseline::with_device`; the resolved
-device supplies it, with `p12f509` as the fallback when no device is
-named on a baseline part (the gdbserver does the same).
+| Core | Construction | What `--device` actually selects |
+|---|---|---|
+| `Pic14` | `Pic14::with_device(resolved, prog)` (`&'static Device`, which `device::resolve` returns) | Core, RAM bank map, SFR names |
+| `Pic14e` | `Pic14e::with_device(resolved, prog)` | Core and SFR names; the sim checks only the core tag, so bank/linear maps are per-core constants, not per-device |
+| `PicBaseline` | `PicBaseline::with_device(resolved, prog)` (no `new` exists) | Core, file map, SFR names |
+| `Pic18` | `Pic18::new(prog)` (no `with_device` exists) | Core, HEX parser, and SFR names only; the RAM map is the sim's fixed 4096-byte map regardless of device |
+
+The runner holds the four sim types behind one internal enum (the
+same pattern as the gdbserver's four target structs) so the run
+loop, stimulus, and output code are written once. The enum is not
+free: `pc()` returns `u16`/`u32`, `ram()` returns 256/512/4096-byte
+arrays, and EEPROM and interrupt support differ per core, so each
+enum method is a four-way match (priced in section 7).
+
+Rationale: the parsers and cores already exist, while shipping
+PIC14-only would force a second design round the first time a
+tutorial targets a PIC14E or PIC18 part.
 
 The default device is `p16f877a`, the part the tutorials and the
 repo's own examples target today, so the zero-flag invocation
-`epic-cc-sim blink.hex` does the expected thing.
+`epic-cc-sim blink.hex` does the expected thing. A baseline part is
+therefore only ever selected by an explicit `--device`, and the
+resolved device always supplies the `&'static Device`
+`PicBaseline::with_device` needs; there is no fallback device.
 
 ### D-4: Output is an SFR write trace plus a final state line
 
-This is the load-bearing choice. The sim has no peripherals, so
-"the program printed hello" cannot be observed today. Three models
-were considered:
+This is the load-bearing choice. The sim has no output
+peripheral, so "the program printed hello" cannot be observed
+today. Three models were considered:
 
 - **A. SFR write trace (chosen).** The user names registers with
-  `--trace-sfr PORTB,TXREG`; every write to a traced register prints
-  one line (format in section 3). No firmware cooperation is needed,
+  `--trace-sfr PORTB,TXREG`; every change to a traced register
+  prints one line (format in section 3; change-only in v1, see the
+  implementation note below). No firmware cooperation is needed,
   so LED blink, GPIO, and bit-banged serial tutorials all work with
-  the HEX they already produce. A UART tutorial traces TXREG and
-  reads the byte values from the trace; reconstructing a text
-  stream from those bytes is a reading task for the tutorial, not
-  new sim machinery.
+  the HEX they already produce. A UART tutorial can trace TXREG
+  and read changing byte values from the trace, but v1 does not
+  promise a reconstructable text stream (repeated bytes are lost);
+  that needs the deferred watch hook (T6b) or the putchar trap.
 - **B. Putchar trap (deferred).** A reserved RAM address acts as a
   stdout byte sink, giving precise text. It needs a firmware shim
   (a three-line `putch`), a magic address convention that must never
@@ -146,15 +160,49 @@ were considered:
   questions. It blocks the tutorial on the largest possible scope.
 
 Implementation note for A: the sim has no write callback, and v1
-adds none. The runner steps the program and, after each step,
-compares the traced addresses against their previous values in
-`ram()`. One step is one instruction, so no write is missed, and a
-write of the same value is still caught by comparing before and
-after the step rather than by watching for change across a run.
-This costs one slice comparison per traced address per step, which
-is irrelevant at tutorial scale, and it keeps the change inside the
-new crate. If profiling ever objects, a watch hook in `pic14-sim`
-is a separable follow-up that does not change the CLI.
+adds none. The runner steps the program one instruction at a time
+(D-5) and, after each step, compares each traced register's value
+against its value before the step. **The v1 trace is therefore
+change-only: a write of the same value produces no line, because a
+value comparison cannot detect it.** That is the contract, stated
+plainly rather than implied: LED blink, GPIO, and bit-banged
+tutorials (which toggle values) are unaffected, but a TXREG trace
+loses repeated bytes (`"ll"` in `"hello"` prints once), so v1 does
+not promise a reconstructable UART byte stream. Recovering
+same-value writes requires a sim watch hook; that is deferred
+priced work, not a v1 silent gap: a `pic14-sim` hook fired from
+each core's `write_f` (four call sites, plus a runner callback
+registration) is estimated at S–M (roughly 100–200 lines in
+`crates/sim` plus tests) as its own ticket (T6b in section 7),
+filed only when a tutorial needs the byte stream, and it does not
+change the CLI when it lands.
+
+What a traced register's "value" is, per register kind:
+
+- **RAM-backed registers (the normal case):** the `width` bytes at
+  the register's physical address in `ram()` (see D-5 for the
+  address space), compared as a byte string. `Sfr.width` is 1 for
+  plain SFRs and 2–3 for joined registers (`TMR1` over
+  `TMR1L:TMR1H`, `crates/device/src/lib.rs`); one line is emitted
+  per step in which any of those bytes changed, showing the bytes
+  assembled little-endian (low byte at the lowest address) as
+  `0x` plus exactly `2 × width` lowercase hex digits. A register
+  traced by numeric address always has width 1.
+- **Pseudo-registers not backed by the compared cell** are traced
+  through their accessor instead of `ram()`: `PCL` (physical
+  0x02 on Pic14/Pic14e/PicBaseline; reads as `pc() & 0xFF`, and
+  the `ram[0x02]` cell is not the live value) snapshots
+  `pc() & 0xFF`, and Pic14e `WREG` (file 0x09, backed by the `w`
+  field, not `ram[0x09]`) snapshots `w()`. Pic18 has the same two
+  pseudo-registers at different addresses: `WREG` (0xFE8, backed
+  by `w`, snapshot `w()`) and `PCL` (0xFF9, snapshot
+  `pc() & 0xFF`; the core's execution-time read adds the prefetch
+  offset, but the traced value is defined as the post-step PC low
+  byte so all cores agree). `INDF` (0x00 on Pic14/Pic14e/PicBaseline) is
+  not traceable: its value depends on FSR at access time, so
+  naming or addressing it in `--trace-sfr` is a usage error
+  (exit 2) that says to trace the target register instead; the
+  Pic18 `INDF0`/`INDF1`/`INDF2` family is rejected the same way.
 
 Register names resolve through `Device.sfrs` (name and aliases,
 `crates/device/src/lib.rs`), so `PORTB` and its legacy spellings
@@ -162,16 +210,61 @@ work on devices whose pack data carries SFR names. Where a device
 has no SFR table, or a name is unknown, a numeric address
 (`--trace-sfr 0x06`) always works, and an unknown name is a usage
 error listing the problem rather than a silent no-trace run.
+Name/alias and display rules are in section 3.
 
 ### D-5: Stimulus is pokes, timed by cycle, from flags or a file
 
 Tutorials need to drive inputs (a button on a pin, a sensor byte in
 a register), which today tests do with `ram_mut`/`write_mem` before
-and between steps. The runner exposes exactly that, in two forms:
+and between steps. The runner exposes that in two forms, over one
+explicitly defined address space:
 
-- `--poke ADDR=BYTE` (repeatable): an initial write, applied before
-  the first step, through the core's `write_mem` so bank resolution
-  matches the machine's own operands.
+**Address semantics (decided here; there is no single `ADDR` in
+the sim today).** Every address the CLI takes or prints for data
+memory — `--poke`, stimulus `poke`, `--trace-sfr` numeric
+addresses, and dump offsets — is a **flat physical index into the
+core's `ram()` array**, the same space the trace compares and the
+dump prints. Per core that space is 0x000–0x0FF (PicBaseline,
+256 B), 0x000–0x1FF (Pic14, 512 B), or 0x000–0xFFF (Pic14e and
+Pic18, 4096 B); `Device.sfrs` addresses are already physical in
+this sense (TRISB is 0x86 on the 877A, not 0x06-plus-a-bank). The
+runner deliberately does **not** route pokes through
+`write_mem`: `Pic14::write_mem(addr: u8)` asserts `addr <= 0x7F`
+and resolves through whichever bank is live at that cycle (so
+`--poke 0x86` would panic and a timed poke would land in a
+bank-dependent cell), while the other three cores' `write_mem`
+is already flat physical. One CLI number must mean one cell, at
+any cycle, on every core, so the runner writes the validated
+physical cell directly through `ram_mut()`. Consequence, stated
+for tutorial authors: a poke is a raw cell write — it does not
+fire the EEPROM/ADC/Timer0 side effects that an instruction
+store to the same SFR would, and it does not update the `w`
+field behind a pseudo-register such as Pic14e `WREG`; poking a
+pseudo-register address writes the dead `ram()` cell, so the
+runner rejects pokes to the D-4 pseudo-register and `INDF`
+addresses instead of silently writing a cell nothing reads.
+
+**Validation, so no panic reaches the user.** All addresses and
+bytes are validated before any sim call, and the runner only ever
+indexes `ram()`/`ram_mut()` with a validated address, so the
+sim's internal `assert!`s on `write_mem`/`read_mem` are never
+reached (the runner does not call them at all):
+
+| Check | `--poke` / `--trace-sfr` (flags) | stimulus `poke` |
+|---|---|---|
+| Address parses as a number, byte as 0–0xFF | exit 2 | exit 1, naming file and line |
+| Address inside the core's physical range above | exit 2 | exit 1, naming file and line |
+| Traced range `addr + width` inside the range | exit 2 | n/a |
+| Pseudo-register / `INDF` address | exit 2 | exit 1, naming file and line |
+
+The whole stimulus file is parsed and validated up front (syntax,
+ranges, and the baseline-interrupt rule below) before the first
+step, so a bad line fails fast instead of mid-run.
+
+The two forms:
+
+- `--poke ADDR=BYTE` (repeatable): an initial physical write,
+  applied before the first step.
 - `--stimulus FILE`: a plain text file, one action per line, applied
   when the sim's cycle count reaches the stated cycle:
 
@@ -184,14 +277,34 @@ and between steps. The runner exposes exactly that, in two forms:
   `poke` writes one byte (same addressing as `--poke`); `interrupt`
   calls `request_interrupt` (the gated hook that respects INTCON,
   not the unconditional `fire_interrupt` test hook, so stimulus
-  behaves the way hardware would). Blank lines and `#` comments are
-  ignored. Anything else is a parse error naming the file and line.
+  behaves the way hardware would) **on Pic14, Pic14e, and Pic18
+  only. PicBaseline has no interrupt hook and its parts have no
+  interrupts, so an `interrupt` line for a baseline device is a
+  validation error: exit 2** (the invocation can never do what it
+  asks on that device, the same class as an unknown SFR name),
+  naming the file and line, detected up front. v1 adds no sim API
+  to change this. Blank lines and `#` comments are ignored.
+  Anything else is a parse error naming the file and line.
 
-The run loop therefore steps (or runs in slices bounded by the next
-stimulus cycle, the next breakpoint, or the cycle cap) instead of
-calling `run` once. This is the same loop the gdbserver's resume
-path already implements per core; the runner writes it once over
-its dispatch enum.
+**Run loop (decided here).** The loop always steps one instruction
+at a time; it never calls `run`/`run_until`. Those primitives
+count steps (instructions cost 1–2 cycles), take a single target,
+and cannot express "stop at the earliest of several breakpoints,
+the exact cycle cap, or the next stimulus cycle", so the sliced
+bulk-run loop an earlier draft sketched has no primitive to stand
+on and is removed. Per step, in order: apply stimulus actions
+whose cycle has been reached, check breakpoints against the
+pre-step `pc()`, snapshot traced registers, `step()`, emit trace
+lines for changed registers, then check `halted()` and the cycle
+cap (`cycles() >= cap`; a 2-cycle instruction may overshoot the
+cap by one, which the capped final line reports truthfully).
+Adding a cycle/target-set API to `pic14-sim` to recover bulk
+running was considered and rejected for v1: it is new sim API
+with its own design questions, and per-step stepping is the
+honest price of exact stimulus/breakpoint/cap semantics. The
+performance consequence is accepted and documented in section 8;
+a bulk fast path is separable follow-up work that must not change
+observable output.
 
 **Rejected, a general scripting or interactive mode.** A REPL,
 breakpoint commands, or a stimulus language with expressions would
@@ -251,13 +364,13 @@ epic-cc-sim --version
 | Input | Meaning | Default |
 |---|---|---|
 | `<hex>` | Intel HEX file to run (positional, required). Parsed by the core the device selects. | none |
-| `--device <name>` | Any spelling `device::resolve` accepts (`p16f877a`, `16F877A`, `PIC16F877A`). Selects core, RAM map, and SFR names. | `p16f877a` |
+| `--device <name>` | Any spelling `device::resolve` accepts (`p16f877a`, `16F877A`, `PIC16F877A`). Selects core, HEX parser, and SFR names; it selects the RAM map only where the core takes a device (D-3 table — Pic18 ignores it). | `p16f877a` |
 | `--cycles <n>` | Stop when the sim cycle count reaches `n`. Accepts plain decimal and `0x` hex. | `1000000` |
 | `--break <addr>` | Stop before executing the instruction at this word address (byte address on PIC18, matching `Pic18::pc`). Repeatable. | none |
-| `--poke <addr>=<byte>` | Initial data-memory write before step one. Repeatable. | none |
-| `--stimulus <file>` | Timed pokes and interrupts (D-5). | none |
-| `--trace-sfr <list>` | Comma-separated register names or addresses to trace (D-4). | none |
-| `--dump <what>` | Final dump level: `regs` (registers only), `ram` (registers plus non-zero RAM), `all` (registers plus full RAM and EEPROM). | `regs` |
+| `--poke <addr>=<byte>` | Initial write before step one; `<addr>` is a flat physical `ram()` index (D-5). Repeatable. | none |
+| `--stimulus <file>` | Timed pokes and interrupts (D-5). `interrupt` is rejected with exit 2 on PicBaseline devices. | none |
+| `--trace-sfr <list>` | Comma-separated register names or physical addresses to trace (D-4). Change-only in v1. | none |
+| `--dump <what>` | Dump printed before the final line: `regs` (registers only), `ram` (registers plus non-zero RAM), `all` (registers plus full RAM and, where the core has one, EEPROM). | none (no dump) |
 
 Behaviour:
 
@@ -269,32 +382,59 @@ Behaviour:
   is printed; in particular there is no banner and no progress
   output, however long the run.
 - Trace lines (only for `--trace-sfr` registers, in execution
-  order), one per write:
+  order), one per step in which the register's value changed
+  (D-4; same-value writes emit no line in v1):
 
   ```text
   cycle=1234 pc=0x00ff write PORTB=0x02
   ```
 
-  The name shown is the spelling the user gave, or the canonical
-  SFR name when an address was given and the device knows it.
-- Exactly one final line, always last on stdout:
+  `cycle=` is the sim cycle count after the step, in decimal.
+  `pc=` is the address of the instruction that made the change —
+  the `pc()` captured **before** the step — formatted `0x` plus
+  lowercase hex, zero-padded to 4 digits on Pic14/Pic14e/
+  PicBaseline and 6 digits on Pic18. The value is `0x` plus
+  exactly `2 × width` lowercase hex digits (D-4). The name shown
+  is always the canonical `Sfr.name`: a name or alias the user
+  gave resolves to its canonical entry, an address resolves to
+  the **first** entry in `Device.sfrs` order whose `addr` equals
+  it (deterministic when several SFRs alias one address), and an
+  address with no entry displays as `0x` plus the padded address
+  (2 digits baseline, 3 digits otherwise — e.g. `write 0x06=0x02`
+  is not produced; the form is `write 0x006=0x02` on Pic14).
+  Tracing the same `(address, width)` twice (by name, alias, and
+  address in any mix) emits one line, not duplicates.
+- Dump (only with `--dump`), printed after the last trace line
+  and **before** the final line, byte-stable in this order:
+  first the register block, one line each, always in this order —
+  `w=0xNN`, `status=0xNN`, `pc=` with the per-core padding
+  above; then, for `ram`, one row per 16-byte-aligned block that
+  contains a non-zero byte, and for `all`, every block of the
+  core's RAM, as `ram 0x0020: 01 02 …` (address `0x` plus 4
+  lowercase hex digits, colon, then 16 two-digit lowercase hex
+  bytes separated by single spaces; a trailing partial block
+  cannot occur since all RAM sizes are multiples of 16); then,
+  for `all` only and only on Pic14/Pic14e/Pic18, the EEPROM the
+  same way as `eeprom 0x0000: …` over all 256 bytes.
+  `PicBaseline` has no `eeprom()`, so `--dump all` on a baseline
+  device prints the full RAM and no EEPROM rows — no placeholder.
+- Exactly one final line, **always last on stdout** (the dump
+  precedes it, never follows it):
 
   ```text
   halted after 1234 cycles pc=0x0100 w=0x02 status=0x18
   ```
 
   The first word is the stop reason: `halted`, `breakpoint`, or
-  `capped`. With `--dump ram|all`, the dump follows the final line
-  (registers as `name=0xNN` lines, RAM as `ram 0x20: 01 02 ...` rows
-  of 16 bytes, EEPROM likewise under `eeprom`), so a diffing
-  tutorial can match the final line as a prefix.
+  `capped`. `pc=` uses the per-core padding above; `w=` and
+  `status=` are two lowercase hex digits from `w()`/`status()`.
 - Exit codes, also part of the contract:
 
   | Code | Meaning |
   |---|---|
   | 0 | The program halted (`halted` final line). |
-  | 1 | Runtime error: HEX unreadable or malformed, stimulus file unreadable or malformed. The diagnostic is on stderr. |
-  | 2 | Usage error: unknown flag, bad value, unknown device, unknown SFR name, missing `<hex>`. Usage text follows the diagnostic on stderr. This matches the gdbserver's usage exit. |
+  | 1 | Runtime error: HEX unreadable or malformed, stimulus file unreadable or malformed (including out-of-range or pseudo-register stimulus pokes, D-5). The diagnostic is on stderr. |
+  | 2 | Usage error: unknown flag, bad value, unknown device, unknown SFR name, out-of-range or pseudo-register `--poke`/`--trace-sfr` address, an `interrupt` stimulus line on a PicBaseline device, missing `<hex>`. Usage text follows the diagnostic on stderr. This matches the gdbserver's usage exit. |
   | 3 | The cycle cap was reached (`capped` final line). Distinct from 0 so a tutorial script can tell "ran to completion" from "stopped early". |
   | 4 | A breakpoint was hit (`breakpoint` final line). |
 
@@ -305,26 +445,47 @@ Behaviour:
   branch on them.
 - `--help` prints usage to stdout and exits 0; `--version` prints
   `epic-cc-sim <EPIC_CC_STAMP>` and exits 0, the gdbserver shape.
-- Malformed HEX: the sim parsers panic today. The runner catches
-  that at its boundary (read the file itself, validate record shape
-  before handing text to the parser) and reports it as exit 1 with
-  the offending line, rather than leaking a panic and backtrace
-  hint at a newcomer. This follows the repo's stated direction that
-  a panic reaching a user is a defect (design 46, section 1), scoped
-  to the new binary only; hardening the parsers themselves is a
-  separable sim follow-up.
+- Malformed HEX: the sim parsers panic today (indexing
+  `bytes[3]`, `chunk[1]`, bad nibbles, unsupported record types).
+  The guarantee that no panic reaches the user rests on one
+  mechanism, not on validator completeness: the runner calls the
+  parser inside `std::panic::catch_unwind` (with the panic hook
+  silenced for that call, restored after) and maps any caught
+  panic to exit 1 with `malformed HEX in <file>` on stderr. As
+  defence in depth, and to name the offending line in the common
+  cases, the runner first validates each record itself: leading
+  `:`, even number of hex digits after it, at least 5 bytes
+  (count, address, type, checksum), declared byte count equals
+  the actual data length, checksum sums to zero mod 256, record
+  type is one of 0x00/0x01/0x04, and data length is even for
+  data records; the first failing line is reported as
+  `malformed HEX in <file>:<line>` with exit 1 without calling
+  the parser. A malformed shape that slips past the checklist
+  is still caught by the `catch_unwind` boundary (without a line
+  number), so the exit-1 promise does not depend on the
+  checklist being exhaustive. This follows the repo's stated
+  direction that a panic reaching a user is a defect (design 46,
+  section 1), scoped to the new binary only; hardening the
+  parsers themselves is a separable sim follow-up. The same
+  no-panic rule covers stimulus and pokes by construction (D-5
+  validation; the runner never calls the asserting
+  `read_mem`/`write_mem`).
 
 ## 4. How it relates to the existing code
 
 - **`crates/sim` (`pic14-sim`) is the engine, unchanged in v1.** The
   runner consumes the public surface listed in section 1. No new
-  sim API is required: stimulus uses `write_mem` and
-  `request_interrupt`, tracing uses `ram()` reads around `step()`,
-  breakpoints use the loop condition (or `run_until` where a slice
-  has a single target), and the final line uses `cycles()`, `pc()`,
-  `w()`, and the core's status accessor. If a core lacks a uniform
-  accessor the runner reads the status register from RAM at the
-  core's known address, as the sim's own tests do.
+  sim API is required — the blockers were closed by carving out or
+  narrowing the CLI, not by pricing new sim surface into v1:
+  stimulus pokes use validated `ram_mut()` writes (not the
+  banked/asserting `write_mem`, D-5), `interrupt` stimulus is
+  rejected on PicBaseline (which has no hook), tracing is
+  change-only comparison of `ram()`/accessor snapshots around
+  `step()` (D-4), and the run loop steps per instruction instead
+  of needing a cycle/target-set bulk API (D-5). The final line
+  and dump use `cycles()`, `pc()`, `w()`, `status()`, `ram()`,
+  and `eeprom()` where present — all four cores expose those
+  accessors (EEPROM excepted on baseline, handled in section 3).
 - **`crates/gdbserver` is the sibling to mirror, not a dependency.**
   The runner copies its shapes (hand-rolled `parse_args` returning
   `Result<_, String>`, a public `USAGE` constant, `core_of`-style
@@ -387,8 +548,11 @@ the acceptance test the epic-docs getting-started page will encode.
   diff-stable precisely so scripts can consume it. A `--format
   json` flag is a compatible addition if a consumer appears; it is
   not designed here.
-- **No new sim watch or callback API in v1** (D-4 note), and no
-  change to `pic14-sim` behaviour, the parsers' panic surface
+- **No new sim watch or callback API in v1** (D-4), and no cycle/
+  target-set bulk-run API (D-5). The watch hook is deferred priced
+  work (T6b, S–M, roughly 100–200 lines in `crates/sim`) for when
+  a tutorial needs same-value writes such as a TXREG byte stream.
+  No change to `pic14-sim` behaviour, the parsers' panic surface
   outside the runner's own boundary, or any existing binary's CLI.
 - **No PlatformIO change in this repo's follow-ups.** The PIO
   toolchain package consumes the same zip (design 30, D-8); picking
@@ -403,30 +567,34 @@ ticket, T6 is conditional.
 
 | Ticket | Scope | Size | Depends on |
 |---|---|---|---|
-| T1: `crates/sim-runner` skeleton | New crate, `build.rs` stamp, hand-rolled `parse_args` with `USAGE`, `--help`/`--version`, device resolution, per-core HEX load, run to halt or cap, final line, exit codes 0/1/2/3. Unit tests for argument parsing; an integration test running a fixture HEX to `halted`. | M (about 300 lines plus tests) | none |
-| T2: Breakpoints, pokes, and stimulus | `--break`, `--poke`, `--stimulus` file parser, the sliced run loop, `request_interrupt` stimulus, exit code 4. Tests: timed poke observed by the program, interrupt stimulus taken, malformed stimulus line exits 1 naming file and line. | M | T1 |
-| T3: SFR trace and dumps | `--trace-sfr` name/address resolution over `Device.sfrs`, step-and-compare tracing, `--dump regs|ram|all`. Tests: PORTB trace lines in order on a blink fixture, unknown SFR name exits 2, dump formats pinned by golden files. | M | T1 |
-| T4: Bundle packaging | Dockerfile `release` stage and `release.yml` Windows job build and copy the binary; `check_release_bundle.py` requires it; per-platform smoke runs the shipped runner on the smoke HEX and asserts the final line and exit 0. Record measured binary and zip sizes in the PR. | S | T1 (T2/T3 not required: smoke needs only halt) |
+| T1: `crates/sim-runner` skeleton | New crate plus root workspace registration: add `crates/sim-runner` to `members` in the root `Cargo.toml` (without it `cargo build -p epic-cc-sim` errors), `build.rs` stamp, hand-rolled `parse_args` with `USAGE`, `--help`/`--version`, device resolution, the four-way dispatch enum (differing `pc`/`write_mem` types, 256–4096 B RAM, EEPROM/interrupt presence), HEX pre-validation plus the `catch_unwind` parser boundary (section 3), the always-stepping run loop to halt or cap, final line, exit codes 0/1/2/3. Unit tests for argument parsing; an integration test running a fixture HEX to `halted`; a malformed-HEX test asserting exit 1 and no panic output. | L (roughly 350–450 lines plus tests) | none |
+| T2: Breakpoints, pokes, and stimulus | `--break`, `--poke`, `--stimulus` file parser with up-front validation (D-5 address table), the per-step stimulus/breakpoint checks in the run loop, `request_interrupt` stimulus, exit code 4. Tests: timed poke observed by the program, interrupt stimulus taken on a core that has the hook, `interrupt` on a baseline device exits 2, out-of-range flag poke exits 2 and stimulus poke exits 1, malformed stimulus line exits 1 naming file and line. | M (roughly 250–350 lines plus tests) | T1 |
+| T3: SFR trace and dumps | `--trace-sfr` name/alias/address resolution over `Device.sfrs` (canonical display, first-match-by-address, deduplication, pseudo-register and multi-byte rules in D-4/section 3), step-and-compare change-only tracing, `--dump regs|ram|all` in the section 3 byte-stable order with the final line last. Tests: PORTB trace lines in order on a blink fixture, same-value write emits no line, unknown SFR name exits 2, `INDF` trace exits 2, dump formats pinned by golden files. | M (roughly 250–350 lines plus tests) | T1 |
+| T4: Bundle packaging | Confirm the root `Cargo.toml` member added in T1 builds in the release context; Dockerfile `release` stage and `release.yml` Windows job build and copy the binary; `check_release_bundle.py` requires it; per-platform smoke runs the shipped runner on the smoke HEX and asserts the final line and exit 0. Record measured binary and zip sizes in the PR. | S | T1 (T2/T3 not required: smoke needs only halt) |
 | T5: Tutorial readiness | README quickstart gains the compile-then-simulate flow (user-visible surface, so the README rule applies); a short user doc under `docs/user/` for the runner's flags, output, and exit codes, generated from the same `USAGE` where the docs generator allows. Verify the section 5 walkthrough from a clean directory with only the zip. | S | T4 |
 | T6 (conditional): Putchar trap | Only if a tutorial needs text output. Small design note for the magic address, sim or runner support, tutorial shim. Not filed until the need is concrete. | S to M | T3, a requesting tutorial |
+| T6b (conditional): Sim watch hook | Only if a tutorial needs same-value writes (e.g. a TXREG byte stream). A write hook in `pic14-sim` fired from each core's `write_f`, runner registration, CLI unchanged. | S to M (roughly 100–200 lines in `crates/sim` plus tests) | T3, a requesting tutorial |
 
-Total for T1 to T5: roughly 600 to 900 lines including tests,
-spread over three M and two S tickets, plus the packaging lines.
-No ticket touches `crates/driver`, `crates/sim` internals, or any
-existing CLI. The review gate and takeoff ritual apply per PR as
-usual, and each PR that changes user-visible surface carries its
-README note.
+Total for T1 to T5: roughly 900 to 1300 lines including tests,
+spread over one L, two M, and two S tickets, plus the packaging
+lines. No ticket in T1–T5 touches `crates/driver`, `crates/sim`
+internals, or any existing CLI (T6b is the conditional exception,
+filed only on need). The review gate and takeoff ritual apply per
+PR as usual, and each PR that changes user-visible surface carries
+its README note.
 
 ## 8. Risks and open questions for the approver
 
-- **Trace cost on long runs.** Step-and-compare is one instruction
-  at a time; a tutorial running tens of millions of cycles with no
-  trace flags should use the bulk `run` path when no breakpoint or
-  stimulus is pending. The run loop in T2 must slice on the next
-  event (stimulus cycle, breakpoint, cap) and bulk-run between
-  events, or `--cycles 100000000` becomes a slow way to learn
-  nothing. This is a design requirement on T1/T2, recorded here so
-  review can check it.
+- **Run cost on long runs (accepted, not a requirement to slice).**
+  The loop always steps per instruction (D-5), so a run costs one
+  dispatch-enum step plus traced-register snapshots per
+  instruction, traced or not. At the default 1,000,000-cycle cap
+  that is tutorial-scale and fine; `--cycles 100000000` will be
+  proportionally slower than a bulk `run` would be, and the docs
+  should say so rather than promise speed v1 does not have. A
+  bulk fast path (or a cycle/target-set sim API) is follow-up
+  work only if profiling demands it, and it must reproduce the
+  per-step output exactly.
 - **Devices without SFR tables** get numeric tracing only. If the
   beta board set (design 46, D-2) is the tutorial target list, T3
   should confirm those parts carry `sfrs` data and file a device
