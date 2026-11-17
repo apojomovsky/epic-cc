@@ -1368,3 +1368,67 @@ fn byval_gep_launder_reads_back_field_byte() {
         "the laundered byval field address must read back s.b"
     );
 }
+
+#[test]
+fn byval_scaled_gep_launder_reads_back_element_byte() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/byval_scaled_gep_launder.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the laundered scaled byval element address must read back s.arr[2]"
+    );
+}
+
+#[test]
+fn scaled_gep_global_launder_reads_back_element_byte() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/scaled_gep_global_launder.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the laundered scaled global element address must read back arr[2]"
+    );
+}
+
+#[test]
+fn byval_whole_gep_launder_reads_back_first_byte() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/byval_whole_gep_launder.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the laundered whole-object byval address must read back s.a"
+    );
+}
+
+#[test]
+fn byval_scaled_gep_as_direct_call_arg_reads_back_byte() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/byval_scaled_gep_call_arg.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "the scaled byval GEP call arg must address s.arr[2]"
+    );
+}
