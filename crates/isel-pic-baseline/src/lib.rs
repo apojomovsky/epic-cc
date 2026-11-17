@@ -441,6 +441,9 @@ impl<'m> Gen<'m> {
                         self.emit_accum_terms(&terms);
                         self.emit_bank_select(sa);
                         self.emit(format!("    ADDWF {}, W", self.fop(sa)));
+                        if k != 0 {
+                            self.emit_add_w_const((k & 0xFF) as u8);
+                        }
                     }
                     return;
                 }
