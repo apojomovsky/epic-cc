@@ -132,9 +132,10 @@ definite pass serves is a shape the definite pass has proved: the
 definite pass refuses and the taint serves is refused, never served
 as flash.
 
-The two passes do not share their substrate: each has its own object
-set, location resolver, memory-byte model, and binop algebra. The
-algebras differ in one place: the taint treats a subtraction
+The two passes share one substrate in `iselcore` (epic-cc#1428): the
+object set, the location resolvers, the memory-byte addressing, and
+the binop algebra are one owner, with the polarity as a parameter.
+The algebras differ in one place: the taint treats a subtraction
 symmetrically, while the definite pass requires the address to be
 the minuend, because `n - address` is not an address. The definite
 pass's rule is the one the backend applies.

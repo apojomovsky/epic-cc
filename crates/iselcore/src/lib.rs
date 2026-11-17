@@ -2122,6 +2122,212 @@ enum SlotWriter {
     Bad,
 }
 
+/// Polarity of an integer-domain flash query (epic-cc#1428): `May` asks
+/// whether some path can carry a flash address, `Definite` whether every
+/// path does. The two passes share the substrate below and differ only
+/// in polarity, the way the slot-domain pair shares its writers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlashPolarity {
+    May,
+    Definite,
+}
+
+/// Whether a binop over flash-carrying operands still carries one, per
+/// polarity. The one genuine divergence: `May` treats `Sub` symmetrically
+/// (either operand taints, both cancel), while `Definite` requires the
+/// address as minuend with a constant subtrahend, because `n - address`
+/// is not an address. ADR-054 makes the definite rule authoritative
+/// where the backend serves both answers.
+fn bin_carries_flash(pol: FlashPolarity, x: &ir::Bin, a_flash: bool, b_flash: bool) -> bool {
+    let is_const = |v: &ir::Val| matches!(v, ir::Val::Const(_));
+    match pol {
+        FlashPolarity::May => {
+            if !(a_flash || b_flash) {
+                return false;
+            }
+            let small = |v: &ir::Val| matches!(v, ir::Val::Const(c) if (0..=0xFF).contains(c));
+            match x.op {
+                ir::BinOp::Sub => !(a_flash && b_flash),
+                ir::BinOp::And => !(small(&x.a) || small(&x.b)),
+                ir::BinOp::LShr | ir::BinOp::AShr => !matches!(&x.b, ir::Val::Const(c) if *c >= 8),
+                _ => true,
+            }
+        }
+        FlashPolarity::Definite => match x.op {
+            ir::BinOp::Add => (a_flash && is_const(&x.b)) || (b_flash && is_const(&x.a)),
+            ir::BinOp::Sub => a_flash && is_const(&x.b),
+            _ => false,
+        },
+    }
+}
+
+/// Slots whose bytes are an object, never an address: allocas and byval
+/// params. Every other slot with address bytes may point anywhere.
+fn object_slots(m: &Module) -> HashSet<String> {
+    let mut objects: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Alloca(a) = i {
+                    objects.insert(ssa_key(&f.name, &a.dst));
+                }
+            }
+        }
+        for p in &f.params {
+            if p.byval.is_some() {
+                objects.insert(ssa_key(&f.name, &p.name));
+            }
+        }
+    }
+    objects
+}
+
+/// Gcd of the term scales of a resolved pointer: 0 for a fixed offset,
+/// otherwise runtime indices step in multiples of it.
+fn term_stride(terms: &[(u16, String)]) -> u32 {
+    fn gcd(a: u32, b: u32) -> u32 {
+        if b == 0 {
+            a
+        } else {
+            gcd(b, a % b)
+        }
+    }
+    terms
+        .iter()
+        .fold(0u32, |g, (sc, _)| gcd(g, u32::from(*sc)))
+        .max(u32::from(!terms.is_empty()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocKind {
+    Global,
+    ObjectSlot,
+    PlainSlot,
+    Unresolved,
+}
+
+/// One resolved pointer location, shared by both integer-domain passes:
+/// the slot key, the constant byte offset, and the runtime stride. Each
+/// polarity projects it: `May` keeps dynamic and plain-slot locations
+/// (an unknown pointee may alias anything), `Definite` fixes only a
+/// global or object slot at a constant offset.
+#[derive(Clone)]
+struct PtrLoc {
+    slot: String,
+    off: u32,
+    stride: u32,
+    has_terms: bool,
+    kind: LocKind,
+}
+
+impl PtrLoc {
+    /// Maybe view: (slot, (offset, stride), names-an-unknown-pointee).
+    fn may_view(&self) -> (String, (u32, u32), bool) {
+        (
+            self.slot.clone(),
+            (self.off, self.stride),
+            matches!(self.kind, LocKind::PlainSlot | LocKind::Unresolved),
+        )
+    }
+    /// Definite view: a fixed (slot, offset), or nothing provable.
+    fn fixed(&self) -> Option<(String, u32)> {
+        if self.has_terms {
+            return None;
+        }
+        match self.kind {
+            LocKind::Global | LocKind::ObjectSlot => Some((self.slot.clone(), self.off)),
+            LocKind::PlainSlot | LocKind::Unresolved => None,
+        }
+    }
+    /// The slot this pointer operand names, if it resolves at all.
+    fn slot_key(&self) -> Option<String> {
+        match self.kind {
+            LocKind::Unresolved => None,
+            _ => Some(self.slot.clone()),
+        }
+    }
+}
+
+fn ptr_loc(
+    objects: &HashSet<String>,
+    resolved: &PtrResolution,
+    func: &str,
+    ptr: &str,
+) -> Option<PtrLoc> {
+    if let Some(g) = ptr.strip_prefix('@') {
+        return Some(PtrLoc {
+            slot: format!("@{g}"),
+            off: 0,
+            stride: 0,
+            has_terms: false,
+            kind: LocKind::Global,
+        });
+    }
+    let r = ptr.strip_prefix('%')?;
+    match resolved.get(&ssa_key(func, r)) {
+        Some((Base::Global(g), k, terms)) => Some(PtrLoc {
+            slot: format!("@{g}"),
+            off: u32::from(*k),
+            stride: term_stride(terms),
+            has_terms: !terms.is_empty(),
+            kind: LocKind::Global,
+        }),
+        Some((Base::Slot(sname, _), k, terms)) => {
+            let key = ssa_key(func, sname);
+            let kind = if objects.contains(&key) {
+                LocKind::ObjectSlot
+            } else {
+                LocKind::PlainSlot
+            };
+            Some(PtrLoc {
+                slot: key,
+                off: u32::from(*k),
+                stride: term_stride(terms),
+                has_terms: !terms.is_empty(),
+                kind,
+            })
+        }
+        None => Some(PtrLoc {
+            slot: ssa_key(func, r),
+            off: 0,
+            stride: 0,
+            has_terms: false,
+            kind: LocKind::Unresolved,
+        }),
+    }
+}
+
+fn val_ptr_loc(
+    objects: &HashSet<String>,
+    resolved: &PtrResolution,
+    func: &str,
+    v: &ir::Val,
+) -> Option<PtrLoc> {
+    match v {
+        ir::Val::Global(g) => Some(PtrLoc {
+            slot: format!("@{g}"),
+            off: 0,
+            stride: 0,
+            has_terms: false,
+            kind: LocKind::Global,
+        }),
+        ir::Val::Reg(r) => ptr_loc(objects, resolved, func, &format!("%{r}")),
+        ir::Val::Const(_) => None,
+    }
+}
+
+/// The two bytes each global initializer ref occupies: (slot, offset,
+/// target), the shared seed of both memory-byte models.
+fn global_ref_bytes(m: &Module) -> Vec<(String, u32, String)> {
+    let mut out = Vec::new();
+    for g in &m.globals {
+        for (pos, target, _) in &g.refs {
+            out.push((format!("@{}", g.name), *pos as u32, target.clone()));
+        }
+    }
+    out
+}
+
 /// Static address space of every pointer slot (epic-cc#1119): params and
 /// phi/select/gep/load-ptr dsts keyed `{func}::{slot}`, globals as
 /// `@{global}`. A slot is flash-kind when every address it can hold is a
@@ -2270,23 +2476,8 @@ pub fn flash_slot_spaces_ex(
     }
     // Slots whose bytes ARE an object, never an address: stores through
     // pointers derived from them stay object-local and never touch a
-    // global slot. Allocas and byval params qualify; every other slot
-    // with address bytes may point anywhere.
-    let mut objects: HashSet<String> = HashSet::new();
-    for f in &m.funcs {
-        for b in &f.blocks {
-            for i in &b.insts {
-                if let Inst::Alloca(a) = i {
-                    objects.insert(ssa_key(&f.name, &a.dst));
-                }
-            }
-        }
-        for p in &f.params {
-            if p.byval.is_some() {
-                objects.insert(ssa_key(&f.name, &p.name));
-            }
-        }
-    }
+    // global slot.
+    let objects = object_slots(m);
     // Globals whose address is taken as a value anywhere (stored,
     // passed, returned, or selected): only these can be overwritten
     // through an unknown pointer, so only these demote on one.
@@ -2398,19 +2589,17 @@ pub fn flash_slot_spaces_ex(
         if ptr.starts_with("0x") {
             return DstSpace::Object;
         }
-        let Some(r) = ptr.strip_prefix('%') else {
-            return DstSpace::Unknown;
-        };
-        match resolved.get(&ssa_key(func, r)) {
-            Some((Base::Global(g), _, _)) => DstSpace::Global(g.clone()),
-            Some((Base::Slot(sname, _), _, _)) => {
-                if objects.contains(&ssa_key(func, sname)) {
-                    DstSpace::Object
-                } else {
-                    DstSpace::Unknown
-                }
-            }
-            None => DstSpace::Unknown,
+        match ptr_loc(&objects, resolved, func, ptr) {
+            Some(PtrLoc {
+                kind: LocKind::Global,
+                slot,
+                ..
+            }) => DstSpace::Global(slot[1..].to_string()),
+            Some(PtrLoc {
+                kind: LocKind::ObjectSlot,
+                ..
+            }) => DstSpace::Object,
+            _ => DstSpace::Unknown,
         }
     };
     for f in &m.funcs {
@@ -2817,7 +3006,8 @@ pub fn flash_slot_spaces_ex(
 /// (they carry flash or RAM per path, epic-cc#1284), propagate through
 /// pointer derivations, and compute the integer-domain flash taint. Call
 /// after `flash_slot_spaces_ex`; `slot_flash` and `slot_mixed` are its
-/// two sets.
+/// two sets. This is the `May` polarity of the shared integer-domain
+/// substrate above `flash_slot_spaces` (epic-cc#1428).
 pub fn add_flash_laundering(
     prov: &mut FlashProvenance,
     m: &Module,
@@ -2826,17 +3016,10 @@ pub fn add_flash_laundering(
     slot_mixed: &HashSet<String>,
     is_flash_const: impl Fn(&str) -> bool,
 ) {
+    let objects = object_slots(m);
     // Slot key a load/store pointer operand names, if any.
     let slot_of = |func: &str, ptr: &str| -> Option<String> {
-        if let Some(g) = ptr.strip_prefix('@') {
-            return Some(format!("@{g}"));
-        }
-        let r = ptr.strip_prefix('%')?;
-        match resolved.get(&ssa_key(func, r)) {
-            Some((Base::Global(g), _, _)) => Some(format!("@{g}")),
-            Some((Base::Slot(sname, _), _, _)) => Some(ssa_key(func, sname)),
-            None => None,
-        }
+        ptr_loc(&objects, resolved, func, ptr).and_then(|l| l.slot_key())
     };
     // Pointer loads from a maybe-flash slot, then derivations of them.
     for f in &m.funcs {
@@ -2937,63 +3120,14 @@ pub fn add_flash_laundering(
         }
     }
     // Memory location a pointer operand names: slot key plus constant byte
-    // offset (`None` when a runtime term makes it dynamic).
-    // Slots whose bytes are an object (alloca, byval param); every other
-    // slot with address bytes may point anywhere.
-    let mut objects: HashSet<String> = HashSet::new();
-    for f in &m.funcs {
-        for b in &f.blocks {
-            for i in &b.insts {
-                if let Inst::Alloca(a) = i {
-                    objects.insert(ssa_key(&f.name, &a.dst));
-                }
-            }
-        }
-        for p in &f.params {
-            if p.byval.is_some() {
-                objects.insert(ssa_key(&f.name, &p.name));
-            }
-        }
-    }
-    let stride = |terms: &[(u16, String)]| -> u32 {
-        fn gcd(a: u32, b: u32) -> u32 {
-            if b == 0 {
-                a
-            } else {
-                gcd(b, a % b)
-            }
-        }
-        terms
-            .iter()
-            .fold(0u32, |g, (sc, _)| gcd(g, u32::from(*sc)))
-            .max(u32::from(!terms.is_empty()))
-    };
-    // The bool is true when the pointer did not resolve to a known slot.
+    // offset (`None` when a runtime term makes it dynamic). The bool is
+    // true when the pointer did not resolve to a known slot: a slot
+    // holding a pointer value (param, loaded pointer) may alias any slot.
     let loc = |func: &str, ptr: &str| -> Option<(String, Off, bool)> {
-        if let Some(g) = ptr.strip_prefix('@') {
-            return Some((format!("@{g}"), (0, 0), false));
-        }
-        let r = ptr.strip_prefix('%')?;
-        match resolved.get(&ssa_key(func, r)) {
-            Some((Base::Global(g), k, terms)) => {
-                Some((format!("@{g}"), (u32::from(*k), stride(terms)), false))
-            }
-            // A slot holding a pointer value (param, loaded pointer): the
-            // pointee may alias any slot, so it is an unknown location.
-            Some((Base::Slot(sname, _), k, terms)) => {
-                let key = ssa_key(func, sname);
-                let unknown = !objects.contains(&key);
-                Some((key, (u32::from(*k), stride(terms)), unknown))
-            }
-            None => Some((ssa_key(func, r), (0, 0), true)),
-        }
+        ptr_loc(&objects, resolved, func, ptr).map(|l| l.may_view())
     };
     let val_loc = |func: &str, v: &ir::Val| -> Option<(String, Off, bool)> {
-        match v {
-            ir::Val::Global(g) => Some((format!("@{g}"), (0, 0), false)),
-            ir::Val::Reg(r) => loc(func, &format!("%{r}")),
-            ir::Val::Const(_) => None,
-        }
+        val_ptr_loc(&objects, resolved, func, v).map(|l| l.may_view())
     };
     // Integer-domain taint as caller-independent taint plus the callee
     // params the value may depend on. `indep` covers flash constants,
@@ -3035,11 +3169,9 @@ pub fn add_flash_laundering(
     }
     let mut mt = MemTaint::default();
     // Flash references in a global's initializer are flash addresses.
-    for g in &m.globals {
-        for (pos, target, _) in &g.refs {
-            if is_flash_const(target) {
-                mt.mark(&format!("@{}", g.name), (*pos as u32, 0), 2);
-            }
+    for (slot, pos, target) in global_ref_bytes(m) {
+        if is_flash_const(&target) {
+            mt.mark(&slot, (pos, 0), 2);
         }
     }
     let tp = |t: &HashMap<String, TState>,
@@ -3107,21 +3239,10 @@ pub fn add_flash_laundering(
               v: &ir::Val|
      -> bool { ts_bool(&fp(frag, param_keys, func, v)) };
     // Whether a binary op over a tainted operand can still be an address.
+    // Masking to a byte or shifting right by a byte leaves a fragment, not
+    // an address; the Bin arm tracks it so reassembly re-taints.
     let bin_taints = |x: &ir::Bin, ta: bool, tb: bool| -> bool {
-        if !(ta || tb) {
-            return false;
-        }
-        let small = |v: &ir::Val| matches!(v, ir::Val::Const(c) if (0..=0xFF).contains(c));
-        match x.op {
-            // A difference of two addresses is a length.
-            ir::BinOp::Sub => !(ta && tb),
-            // Masking to a byte leaves a fragment, not an address; the Bin
-            // arm tracks it so a later `or`/`add` reassembly re-taints.
-            ir::BinOp::And => !(small(&x.a) || small(&x.b)),
-            // Shifting right by a byte or more drops the address the same way.
-            ir::BinOp::LShr | ir::BinOp::AShr => !matches!(&x.b, ir::Val::Const(c) if *c >= 8),
-            _ => true,
-        }
+        bin_carries_flash(FlashPolarity::May, x, ta, tb)
     };
     // Sizes of every growing set: `indep` flags, param deps, merged call
     // taints, and tainted memory bytes. All grow monotonically, so equal
@@ -3466,7 +3587,9 @@ pub fn add_flash_laundering(
 
 /// Prove the integer-domain values that certainly carry a flash table
 /// address, so an `inttoptr` of one lowers through `TBLPTR` instead of
-/// being refused (epic-cc#1346).
+/// being refused (epic-cc#1346). This is the `Definite` polarity of the
+/// shared integer-domain substrate above `flash_slot_spaces`
+/// (epic-cc#1428).
 ///
 /// The maybe-taint in `add_flash_laundering` says a value *may* carry a
 /// flash address; this says it *does*. The difference is the space
@@ -3513,21 +3636,7 @@ pub fn add_int_flash_definite(
 ) {
     // Object slots: an alloca or a byval param. Their bytes are the
     // object itself, so a load through them reads a known location.
-    let mut objects: HashSet<String> = HashSet::new();
-    for f in &m.funcs {
-        for b in &f.blocks {
-            for i in &b.insts {
-                if let Inst::Alloca(a) = i {
-                    objects.insert(ssa_key(&f.name, &a.dst));
-                }
-            }
-        }
-        for p in &f.params {
-            if p.byval.is_some() {
-                objects.insert(ssa_key(&f.name, &p.name));
-            }
-        }
-    }
+    let objects = object_slots(m);
     // Functions reachable through an indirect call: their params take
     // an unknown value on that path, so no proof survives it.
     let mut indirect: HashSet<String> = HashSet::new();
@@ -3549,28 +3658,8 @@ pub fn add_int_flash_definite(
         Unknown,
     }
     let loc = |func: &str, ptr: &str| -> Loc {
-        if let Some(g) = ptr.strip_prefix('@') {
-            return Loc::Fixed(format!("@{g}"), 0);
-        }
-        let Some(r) = ptr.strip_prefix('%') else {
-            return Loc::Unknown;
-        };
-        match resolved.get(&ssa_key(func, r)) {
-            Some((Base::Global(g), k, terms)) => {
-                if terms.is_empty() {
-                    Loc::Fixed(format!("@{g}"), u32::from(*k))
-                } else {
-                    Loc::Unknown
-                }
-            }
-            Some((Base::Slot(sname, _), k, terms)) => {
-                let key = ssa_key(func, sname);
-                if terms.is_empty() && objects.contains(&key) {
-                    Loc::Fixed(key, u32::from(*k))
-                } else {
-                    Loc::Unknown
-                }
-            }
+        match ptr_loc(&objects, resolved, func, ptr).and_then(|l| l.fixed()) {
+            Some((slot, off)) => Loc::Fixed(slot, off),
             None => Loc::Unknown,
         }
     };
@@ -3622,10 +3711,10 @@ pub fn add_int_flash_definite(
     let val_slot = |func: &str, v: &ir::Val| -> Option<(String, u32)> {
         match v {
             ir::Val::Global(g) => Some((format!("@{g}"), 0)),
-            ir::Val::Reg(r) => match resolved.get(&ssa_key(func, r)) {
-                Some((Base::Global(g), k, terms)) if terms.is_empty() => {
-                    Some((format!("@{g}"), u32::from(*k)))
-                }
+            // A pointer value names the pointee, which only a global
+            // resolution bounds; a slot resolution names its own bytes.
+            ir::Val::Reg(_) => match val_ptr_loc(&objects, resolved, func, v) {
+                Some(l) if l.kind == LocKind::Global => l.fixed(),
                 _ => None,
             },
             ir::Val::Const(_) => None,
@@ -3857,19 +3946,14 @@ pub fn add_int_flash_definite(
     }
     // A global's initializer names the consts it holds: the two bytes
     // of a ref hold that const's address.
-    for g in &m.globals {
-        let key = format!("@{}", g.name);
-        for (pos, target, _) in &g.refs {
-            let idx = writes.len();
-            writes.push(Write::Init {
-                target: target.clone(),
-            });
-            for k in 0..2u32 {
-                writes_by
-                    .entry((key.clone(), *pos as u32 + k))
-                    .or_default()
-                    .push(idx);
-            }
+    for (key, pos, target) in global_ref_bytes(m) {
+        let idx = writes.len();
+        writes.push(Write::Init { target });
+        for k in 0..2u32 {
+            writes_by
+                .entry((key.clone(), pos + k))
+                .or_default()
+                .push(idx);
         }
     }
     // A param's def is the entry block, before every instruction: the
@@ -4122,17 +4206,12 @@ pub fn add_int_flash_definite(
                 // A constant offset keeps the address; a difference of two
                 // addresses is a length, and a mask or a shift leaves a
                 // fragment.
-                Inst::Bin(x) => {
-                    let a_def = is_def(flash_val, func, &x.a);
-                    let b_def = is_def(flash_val, func, &x.b);
-                    let a_const = matches!(x.a, ir::Val::Const(_));
-                    let b_const = matches!(x.b, ir::Val::Const(_));
-                    match x.op {
-                        ir::BinOp::Add => (a_def && b_const) || (b_def && a_const),
-                        ir::BinOp::Sub => a_def && b_const,
-                        _ => false,
-                    }
-                }
+                Inst::Bin(x) => bin_carries_flash(
+                    FlashPolarity::Definite,
+                    x,
+                    is_def(flash_val, func, &x.a),
+                    is_def(flash_val, func, &x.b),
+                ),
                 // A join is definite when every arm is.
                 Inst::Select(s) => is_def(flash_val, func, &s.a) && is_def(flash_val, func, &s.b),
                 Inst::Phi(p) => {
@@ -4588,7 +4667,7 @@ pub fn global_fan_in(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_directive, resolve_pointers, Base};
+    use super::{bin_carries_flash, is_directive, resolve_pointers, Base, FlashPolarity};
 
     /// Two pointer phis that read each other, one through a gep
     /// (epic-cc#1127): the optimistic round seeds both, and the gep over
@@ -4638,6 +4717,52 @@ mod tests {
              br 1\n",
         );
         let _ = resolve_pointers(&m);
+    }
+
+    /// The shared binop algebra keeps the one polarity divergence:
+    /// `May` taints `n - address`, `Definite` does not (ADR-054).
+    #[test]
+    fn binop_sub_polarity_divergence_is_explicit() {
+        let bin = |op, a, b| ir::Bin {
+            dst: "0".into(),
+            op,
+            ty: ir::Ty::I16,
+            a,
+            b,
+            loc: None,
+        };
+        let addr_minus_const = bin(ir::BinOp::Sub, ir::Val::Reg("1".into()), ir::Val::Const(4));
+        assert!(bin_carries_flash(
+            FlashPolarity::May,
+            &addr_minus_const,
+            true,
+            false
+        ));
+        assert!(bin_carries_flash(
+            FlashPolarity::Definite,
+            &addr_minus_const,
+            true,
+            false
+        ));
+        let const_minus_addr = bin(ir::BinOp::Sub, ir::Val::Const(4), ir::Val::Reg("1".into()));
+        assert!(bin_carries_flash(
+            FlashPolarity::May,
+            &const_minus_addr,
+            false,
+            true
+        ));
+        assert!(!bin_carries_flash(
+            FlashPolarity::Definite,
+            &const_minus_addr,
+            false,
+            true
+        ));
+        assert!(!bin_carries_flash(
+            FlashPolarity::May,
+            &addr_minus_const,
+            true,
+            true
+        ));
     }
 
     #[test]
