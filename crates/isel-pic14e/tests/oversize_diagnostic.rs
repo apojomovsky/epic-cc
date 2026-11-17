@@ -61,6 +61,49 @@ fn numbers_after(msg: &str, marker: &str) -> usize {
         .unwrap_or_else(|_| panic!("{marker:?} must be followed by a number:\n{msg}"))
 }
 
+fn oversize_message(m: &ir::Module) -> String {
+    let layout = alloc::allocate(&PIC16F1937, m, "depth 1\n");
+    let mut addrs: HashMap<String, u16> = HashMap::new();
+    addrs.extend(layout.globals.clone());
+    addrs.extend(layout.locals.clone());
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        isel_pic14e::select_with_locs(&PIC16F1937, m, &addrs, &HashSet::new())
+    }));
+    let err = result.expect_err("oversize program must not compile");
+    err.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+#[test]
+fn oversize_with_multi_chunk_const_reports_total_including_chunk_readers() {
+    // A 300-byte const is two chunks; its second chunk reader sits
+    // after the table data, so the true total ends past the data tail.
+    let mut m = build(400, 8);
+    m.globals.push(ir::Global {
+        name: "zzbig".into(),
+        ty: ir::Ty::I8,
+        is_const: true,
+        size: 300,
+        bytes: (0..300).map(|i| (i % 251) as u8).collect(),
+        refs: Vec::new(),
+        addr: None,
+        internal: false,
+    });
+    let msg = oversize_message(&m);
+    let total = numbers_after(&msg, "program needs ");
+    assert_eq!(
+        total, 13870,
+        "exact total must include chunk readers:\n{msg}"
+    );
+    assert_eq!(
+        numbers_after(&msg, "words in total ("),
+        total - 8192,
+        "overage must be total minus limit:\n{msg}"
+    );
+}
+
 #[test]
 fn oversize_program_reports_total_against_device_limit() {
     // PIC16F1937 flash is 8192 words; this program is sized past it.

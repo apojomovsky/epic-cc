@@ -7511,6 +7511,25 @@ fn place_consts(
     out
 }
 
+/// True end of a placed const section: the furthest reader or table
+/// word. Multi-chunk tables place chunk readers after the data, so
+/// the data tail alone undercounts the section.
+fn const_section_end(consts: &[&ir::Global], places: &[ConstPlace]) -> usize {
+    let mut end = 0;
+    for (g, p) in consts.iter().zip(places.iter()) {
+        for (c, ch) in p.chunks.iter().enumerate() {
+            end = end.max(ch.reader_at + reader_len(ch.short));
+            let data = if g.bytes.len() >= 256 {
+                g.bytes.len().saturating_sub(256 * c).min(256)
+            } else {
+                g.bytes.len()
+            };
+            end = end.max(ch.base_at + data);
+        }
+    }
+    end
+}
+
 /// Modeled page of every const-table chunk base, in emission order: the
 /// `(base label, base page)` pairs the driver re-checks after its own
 /// passes (epic-cc#1137). Built from the emission `places`, so it matches
@@ -8452,20 +8471,56 @@ pub fn select_with_locs(
             }
         }
         let func_end = sim_next.last().copied().unwrap_or(0);
+        // Measured staged lengths at the simulated section start, so the
+        // oversize total uses the same sizes as final placement.
+        let staged_len: HashMap<String, usize> = if consts.iter().any(|g| staged.contains(&g.name))
+        {
+            let nominal = place_consts(&consts, staged, &HashMap::new(), func_end);
+            let (sec_text, _) = emit_const_section(&consts, staged, addrs, scratch, &nominal);
+            let mut m2 = measure.clone();
+            m2.push(sec_text.join("\n"));
+            let banked = banking::assign_banks(device, &m2.join("\n"));
+            let peeped = peephole::optimize(&banked);
+            let (stage_actual, reader_actual) = measure_section_units(&peeped);
+            let want: HashMap<String, usize> = nominal
+                .iter()
+                .flat_map(|p| {
+                    p.chunks
+                        .iter()
+                        .enumerate()
+                        .map(|(c, ch)| (chunk_entry(&p.name, c), reader_len(ch.short)))
+                })
+                .collect();
+            for (entry, words) in &reader_actual {
+                let want = want.get(entry).copied().unwrap_or(6);
+                assert!(
+                    *words == want,
+                    "isel: const reader {entry} is {words} words post-banking, not {want}"
+                );
+            }
+            let mut lens = HashMap::new();
+            for g in &consts {
+                if staged.contains(&g.name) {
+                    lens.insert(
+                        g.name.clone(),
+                        stage_actual.get(&g.name).copied().unwrap_or_else(|| {
+                            panic!(
+                                "isel: staged routine __stage_{} missing from the banked text",
+                                g.name
+                            )
+                        }),
+                    );
+                }
+            }
+            lens
+        } else {
+            HashMap::new()
+        };
         let total_words = if consts.is_empty() {
             func_end
         } else {
-            let places = place_consts(&consts, staged, &HashMap::new(), func_end);
-            places
-                .iter()
-                .zip(consts.iter())
-                .filter_map(|(p, g)| {
-                    p.chunks
-                        .last()
-                        .map(|c| c.base_at + (g.bytes.len() - 256 * (p.chunks.len() - 1)))
-                })
-                .max()
-                .unwrap_or(func_end)
+            let places = place_consts(&consts, staged, &staged_len, func_end);
+            const_section_end(&consts, &places).max(func_end)
         };
         let mut unplaced_words = placeable_words + (total_words - func_end);
         for (name, _) in &bodies {
@@ -8537,57 +8592,7 @@ pub fn select_with_locs(
             .last()
             .copied()
             .unwrap_or(if has_isr { 4 } else { 5 });
-        // Staged routines change size under banking (MOVLBs in, redundant
-        // PCLATH sets out), and the section model must carry the post-banking
-        // lengths before pass B: its same-page elision consults the reader page
-        // map below, which is wrong when the model misses hundreds of routine
-        // words (epic-cc#933). Banking and peephole see instruction sequences,
-        // never addresses, and every routine opens with a label reset, so one
-        // banking of the pass-A text plus the nominal section measures the exact
-        // growths the final text will show.
-        let staged_len: HashMap<String, usize> = if consts.iter().any(|g| staged.contains(&g.name))
-        {
-            let nominal = place_consts(&consts, staged, &HashMap::new(), table_start);
-            let (sec_text, _) = emit_const_section(&consts, staged, addrs, scratch, &nominal);
-            let mut m2 = measure.clone();
-            m2.push(sec_text.join("\n"));
-            let banked = banking::assign_banks(device, &m2.join("\n"));
-            let peeped = peephole::optimize(&banked);
-            let (stage_actual, reader_actual) = measure_section_units(&peeped);
-            let want: HashMap<String, usize> = nominal
-                .iter()
-                .flat_map(|p| {
-                    p.chunks
-                        .iter()
-                        .enumerate()
-                        .map(|(c, ch)| (chunk_entry(&p.name, c), reader_len(ch.short)))
-                })
-                .collect();
-            for (entry, words) in &reader_actual {
-                let want = want.get(entry).copied().unwrap_or(6);
-                assert!(
-                    *words == want,
-                    "isel: const reader {entry} is {words} words post-banking, not {want}"
-                );
-            }
-            let mut lens = HashMap::new();
-            for g in &consts {
-                if staged.contains(&g.name) {
-                    lens.insert(
-                        g.name.clone(),
-                        stage_actual.get(&g.name).copied().unwrap_or_else(|| {
-                            panic!(
-                                "isel: staged routine __stage_{} missing from the banked text",
-                                g.name
-                            )
-                        }),
-                    );
-                }
-            }
-            lens
-        } else {
-            HashMap::new()
-        };
+        // staged_len was measured above at the simulated section start.
         for (entry, page) in reader_pages(&consts, staged, &staged_len, table_start) {
             pages.insert(entry, page);
         }
