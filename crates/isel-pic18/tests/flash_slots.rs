@@ -1775,29 +1775,52 @@ fn dynamic_walk_over_mixed_base_keeps_base_tag() {
 }
 
 #[test]
-#[should_panic(expected = "load through maybe-flash address")]
-fn int_laundered_flash_joined_with_ram_arm_is_refused() {
-    // epic-cc#1346: a select joining a laundered flash address with a
-    // RAM address is maybe-flash, so no tag survives and the refusal
-    // stands. The flash arm alone must not carry the join.
-    let _ = laundering_asm(
-        "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal out i8\n\
-         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %f = load i8 @flag\n    %m = select i1 %f, ptr @buf, ptr %p\n    %v = load i8 %m\n    store i8 %v @out\n    ret void\n",
-        |_| {},
-    );
+fn int_laundered_flash_joined_with_ram_select_reads_both_spaces() {
+    // epic-cc#1419: a select joining a laundered flash address with a
+    // RAM address is maybe-flash: the select writes the picked arm's
+    // tag, and the load dispatches on it.
+    let ir = "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %f = load i8 @flag\n    %m = select i1 %f, ptr @buf, ptr %p\n    %v = load i8 %m\n    store i8 %v @out\n    ret void\n";
+    let (asm, map) = laundering_select(ir, |_| {});
+    assert!(asm.contains("TBLRD*"), "flash arm must read flash:\n{asm}");
+    for (f, want) in [(0u8, b'P'), (1u8, b'B')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[map["flag"] as usize] = f;
+        p.ram_mut()[map["buf"] as usize] = b'B';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(
+            p.ram()[map["out"] as usize],
+            want,
+            "arm f={f} must read its space"
+        );
+    }
 }
 
 #[test]
-#[should_panic(expected = "load through maybe-flash address")]
-fn int_laundered_flash_gep_joined_with_ram_arm_is_refused() {
+fn int_laundered_flash_gep_joined_with_ram_select_reads_both_spaces() {
     // The same join, with a GEP between the laundered address and the
-    // join. The GEP derives from the flash pointer, so the join is
-    // maybe-flash through the derivation too.
-    let _ = laundering_asm(
-        "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal out i8\n\
-         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %q = gep %p +0\n    %f = load i8 @flag\n    %m = select i1 %f, ptr @buf, ptr %q\n    %v = load i8 %m\n    store i8 %v @out\n    ret void\n",
-        |_| {},
-    );
+    // join. The GEP derives from the flash pointer, so its tag is flash.
+    let ir = "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %q = gep %p +0\n    %f = load i8 @flag\n    %m = select i1 %f, ptr @buf, ptr %q\n    %v = load i8 %m\n    store i8 %v @out\n    ret void\n";
+    let (asm, map) = laundering_select(ir, |_| {});
+    assert!(asm.contains("TBLRD*"), "flash arm must read flash:\n{asm}");
+    for (f, want) in [(0u8, b'P'), (1u8, b'B')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[map["flag"] as usize] = f;
+        p.ram_mut()[map["buf"] as usize] = b'B';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(
+            p.ram()[map["out"] as usize],
+            want,
+            "arm f={f} must read its space"
+        );
+    }
 }
 
 #[test]
