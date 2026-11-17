@@ -108,7 +108,10 @@ FIELD_ALIAS = {
 # former aliases to the shipped `osc` name.
 PART_FIELD_ALIASES = {
     "p16f877a": {"BOREN": "bor", "BODEN": "bor"},
+    # The PIC18Fxx5x family's cfgdata spells it BOR, the shipped name is boren.
+    "p18f2455": {"BOR": "boren"},
     "p18f2550": {"BOR": "boren"},
+    "p18f4455": {"BOR": "boren"},
     "p16f13145": {"FEXTOSC": "osc"},
 }
 
@@ -422,6 +425,9 @@ SAFE_DEFAULTS = {
 }
 
 PART_DEFAULTS = {
+    "p18f2550": {
+        "cp3": "off",
+    },
     "p16f877a": {
         "osc": None,
         "wdt": "off",
