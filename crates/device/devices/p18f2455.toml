@@ -73,12 +73,11 @@ shift = 0
 values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
 
 [[config.fields]]
-name = "bor"
+name = "boren"
 byte_offset = 2
 mask = 0x06
 shift = 1
-default = "on"
-values = [{ name = "off", bits = 0 }, { name = "soft", bits = 1 }, { name = "on_active", bits = 2 }, { name = "on", bits = 3 }]
+values = [{ name = "off", bits = 0 }, { name = "sw", bits = 1 }, { name = "hw_off_in_sleep", bits = 2 }, { name = "hw_always", bits = 3 }]
 
 [[config.fields]]
 name = "borv"

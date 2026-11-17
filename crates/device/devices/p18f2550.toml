@@ -197,6 +197,7 @@ name = "cp3"
 byte_offset = 8
 mask = 0x08
 shift = 3
+default = "off"
 values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
 
 [[config.fields]]

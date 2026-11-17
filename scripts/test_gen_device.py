@@ -484,6 +484,17 @@ class GenDeviceTest(unittest.TestCase):
         self.assertEqual(text, "", "nothing may be written when a field is missing")
 
 
+class Pic18Fxx5xFamilyTest(unittest.TestCase):
+    def test_bor_aliases_to_boren_for_the_whole_family(self):
+        # The family's cfgdata spells the brown-out field BOR, while the
+        # config TU epic-hal emits names it boren (epic-cc#1441).
+        for stem in ("p18f2455", "p18f2550", "p18f4455"):
+            self.assertEqual(gen_device.alias_field("BOR", stem), "boren")
+
+    def test_p18f2550_cp3_defaults_off(self):
+        self.assertEqual(gen_device.PART_DEFAULTS["p18f2550"]["cp3"], "off")
+
+
 class GenDevicePic18Test(unittest.TestCase):
     """PIC18's EDC shape (byte-addressed DCRDef config bytes, an access
     bank split from banked GPR, an Extended Instruction Set mirror this
