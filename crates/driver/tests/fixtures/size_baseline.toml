@@ -280,7 +280,7 @@ ram_bytes = 95
 name = "bench-struct-scan-16f877a@O0"
 device = "16F877A"
 profile = "O0"
-flash_words = 1392
+flash_words = 963
 ram_bytes = 104
 
 [[entry]]

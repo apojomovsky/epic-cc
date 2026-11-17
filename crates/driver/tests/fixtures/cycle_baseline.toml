@@ -975,8 +975,8 @@ ram_bytes = 47
 name = "speed-struct-scan-16f877a"
 device = "16F877A"
 profile = "O0"
-cycles = 1262
-flash_words = 180
+cycles = 1046
+flash_words = 153
 ram_bytes = 47
 
 [[entry]]
