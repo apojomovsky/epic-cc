@@ -304,6 +304,8 @@ fn overlapping_fixed_end(
         cur = end + 1;
     }
     None
+}
+
 /// Raise each bank's high-water mark in `bank_hi` by the physical bytes
 /// of a `width`-byte global at `start`, walking regions like
 /// `physical_end`: a bank-straddling global charges each bank only the
