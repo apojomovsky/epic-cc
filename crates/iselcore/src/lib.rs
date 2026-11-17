@@ -2354,6 +2354,19 @@ pub fn flash_slot_spaces_ex(
             ir::Val::Const(_) => SlotWriter::Bad,
         }
     };
+    // A value crossing a call boundary: a definite inttoptr pointer
+    // (epic-cc#1346) is a flash writer of the param or call-dst slot it
+    // lands in, exactly like a proven flash pointer. Inside a function
+    // the same value only grounds its own slot, so a join with a RAM
+    // arm stays maybe-flash there and keeps its refusal.
+    let arg_writer = |v: &ir::Val, func: &str| -> SlotWriter {
+        if let ir::Val::Reg(r) = v {
+            if prov.int_flash_ptr.contains(&ssa_key(func, r)) {
+                return SlotWriter::Src;
+            }
+        }
+        val_writer(v, func)
+    };
     // Indirect-call targets gain an unknown caller: their params can
     // receive any address, so they prune to RAM.
     let mut indirect_targets: HashSet<String> = HashSet::new();
@@ -2562,7 +2575,7 @@ pub fn flash_slot_spaces_ex(
                                     } else {
                                         push(
                                             ssa_key(&c.func, &p.name),
-                                            val_writer(&arg.val, &f.name),
+                                            arg_writer(&arg.val, &f.name),
                                         );
                                     }
                                 }
@@ -2586,7 +2599,7 @@ pub fn flash_slot_spaces_ex(
                                         for b in &callee.blocks {
                                             for i in &b.insts {
                                                 if let Inst::Ret(Some((_, v)), _) = i {
-                                                    push(key.clone(), val_writer(v, &callee.name));
+                                                    push(key.clone(), arg_writer(v, &callee.name));
                                                 }
                                             }
                                         }
@@ -2608,7 +2621,7 @@ pub fn flash_slot_spaces_ex(
                                         for b in &callee.blocks {
                                             for i in &b.insts {
                                                 if let Inst::Ret(Some((_, v)), _) = i {
-                                                    push(key.clone(), val_writer(v, &callee.name));
+                                                    push(key.clone(), arg_writer(v, &callee.name));
                                                 }
                                             }
                                         }

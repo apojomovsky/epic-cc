@@ -511,6 +511,105 @@ fn int_laundered_flash_address_reads_flash() {
 }
 
 #[test]
+fn int_laundered_flash_address_passed_to_a_param_reads_flash() {
+    // epic-cc#1346 review round 2: a definite inttoptr pointer is a
+    // flash writer of the callee's param slot, so the callee's
+    // dereference reads flash like any other flash-kind param.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal out i8\n\
+             fn use(void) (p=ptr)\n  block entry:\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    call void @use(ptr %p)\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("main::x", 0x13),
+            ("main::p", 0x15),
+            ("use::p", 0x17),
+            ("use::v", 0x19),
+        ]),
+        None,
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[0x12],
+        b'P',
+        "the callee must read the table through its param"
+    );
+}
+
+#[test]
+#[should_panic(expected = "cannot pass flash address %p to a RAM pointer param")]
+fn int_laundered_flash_address_passed_beside_a_ram_arg_is_refused() {
+    // The same param also takes a RAM address at another call site, so
+    // no single space applies to it: a definite flash value bound for
+    // it is refused like any other definite flash argument.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i8\nglobal out i8\n\
+             fn use(void) (p=ptr)\n  block entry:\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    call void @use(ptr %p)\n    call void @use(ptr @buf)\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("buf", 0x13),
+            ("main::x", 0x14),
+            ("main::p", 0x16),
+            ("use::p", 0x18),
+            ("use::v", 0x1B),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "cannot return flash address")]
+fn int_laundered_flash_address_return_is_refused() {
+    // A definite flash return is refused like any flash return: the
+    // caller's slot would read it back as RAM (epic-cc#1119).
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal out i8\n\
+             fn get(ptr) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    ret ptr %p\n\
+             fn main(void) ()\n  block entry:\n    %r = call ptr @get()\n    %v = load i8 %r\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("get::x", 0x13),
+            ("get::p", 0x15),
+            ("main::r", 0x17),
+            ("main::v", 0x19),
+        ]),
+        None,
+    );
+}
+
+#[test]
 fn int_laundered_through_second_global_reads_flash() {
     // The integer copy travels through another global and a trunc/zext.
     let m = with_bytes(

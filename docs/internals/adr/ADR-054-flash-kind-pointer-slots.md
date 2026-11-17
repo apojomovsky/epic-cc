@@ -173,11 +173,18 @@ maybe-flash slot is sized by `alloc` from its own slot proof, so
 marking the `inttoptr` dst a flash writer there would widen the slot
 on the backend side only.
 
-The proof leaves the `inttoptr` dsts out of the slot proof's writer
-set, so the set is extended in the backend alone. The extension
-reaches the deref path, and the store path with it: a store through
-a definite flash address is a ROM write, which the backend refuses,
-as it does for any other flash pointer.
+Inside a function the `inttoptr` dsts stay out of the slot proof's
+writer set, so a join with a RAM arm stays maybe-flash and keeps its
+refusal. At a call boundary a definite `inttoptr` value is a flash
+writer of the param or call-dst slot it lands in, exactly like a
+proven flash pointer, so the callee's dereference through that param
+reads flash. `alloc` runs the same definite proof before its slot
+proof, so both sides agree on that slot's space and size. The
+backend still extends its deref set with the dsts, and the store
+path with it: a store through a definite flash address is a ROM
+write, which the backend refuses, as it does for any other flash
+pointer. A definite flash return is refused the same way, so a
+laundered address can be passed in but not returned.
 
 Eight shapes stay refused. A `ptrtoint` of a GEP reads the GEP's own
 slot, which `resolve_pointers` folds away and never writes, so the
