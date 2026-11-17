@@ -54,8 +54,8 @@ use std::collections::{HashMap, HashSet};
 
 mod chunk;
 use chunk::{
-    block_asm_labels, chunk_slice, insert_goto_sets, place_unit, plan_chunks, post_extents,
-    rewrite_restores, slice_banked_lines, CHUNK_LINK_WORDS,
+    block_asm_labels, chunk_slice, insert_goto_sets, place_unit, place_unit_unbounded, plan_chunks,
+    post_extents, rewrite_restores, slice_banked_lines, CHUNK_LINK_WORDS,
 };
 
 /// Returns the recipe for a runtime routine name, or `None` for other names.
@@ -7524,6 +7524,25 @@ fn place_consts(
     out
 }
 
+/// True end of a placed const section: the furthest reader or table
+/// word. Multi-chunk tables place chunk readers after the data, so
+/// the data tail alone undercounts the section.
+fn const_section_end(consts: &[&ir::Global], places: &[ConstPlace]) -> usize {
+    let mut end = 0;
+    for (g, p) in consts.iter().zip(places.iter()) {
+        for (c, ch) in p.chunks.iter().enumerate() {
+            end = end.max(ch.reader_at + reader_len(ch.short));
+            let data = if g.bytes.len() >= 256 {
+                g.bytes.len().saturating_sub(256 * c).min(256)
+            } else {
+                g.bytes.len()
+            };
+            end = end.max(ch.base_at + data);
+        }
+    }
+    end
+}
+
 /// Modeled page of every const-table chunk base, in emission order: the
 /// `(base label, base page)` pairs the driver re-checks after its own
 /// passes (epic-cc#1137). Built from the emission `places`, so it matches
@@ -8433,76 +8452,43 @@ pub fn select_with_locs(
         } else {
             5 + word_size(&modasm_lines) + init_words
         }];
-        for (name, _) in &bodies {
-            let size = post[name];
-            if has_isr && name == isr_names[0] {
-                assert!(
-                4 + size + 4 + init_words <= 0x800,
-                "isel: isr @{name} of {size} words does not fit page 0 (0x004-0x7FF) with room for the reset __start"
-            );
-                pages.insert(name.clone(), 0);
-                pads.insert((name.clone(), 0), 4);
-                // Counts the ISR body plus the following `__start` and init in
-                // the page-0 budget (epic-cc#207).
-                page_next[0] = 4 + size + 4 + init_words;
-                placed.push((name.clone(), 0, 0));
-            } else if let Some(plan) = split_plans.get(name) {
-                let last = plan.len() - 1;
-                for (k, (_, words)) in plan.iter().enumerate() {
-                    // Non-final chunks carry their link words.
-                    let unit = if k < last {
-                        *words + CHUNK_LINK_WORDS
-                    } else {
-                        *words
-                    };
-                    let (page, start) = place_unit(device, name, unit, &mut page_next);
-                    // Anchors page-aligned chunk starts with `.org`, as for
-                    // whole functions below.
-                    if start & 0x7FF == 0 {
-                        pads.insert((name.clone(), k), start);
-                    }
-                    placed.push((name.clone(), k, page));
-                }
-            } else {
-                if size > 0x800 {
-                    panic!(
-                        "isel: function @{name} of {size} words exceeds a 2048-word page (0x800)"
-                    );
-                }
-                let (page, start) = place_unit(device, name, size, &mut page_next);
-                pages.insert(name.clone(), page);
-                // Anchors page-aligned starts with `.org`: without it, pass-B
-                // shrinkage slides the function below the boundary and its label
-                // and tail disagree on the page.
-                if start & 0x7FF == 0 {
-                    pads.insert((name.clone(), 0), start);
-                }
-                placed.push((name.clone(), 0, page));
-            }
-        }
-        // Maps const readers to post-call pages. Pins the section start, so the
-        // map holds in the final text.
+        // Oversize totals (epic-cc#1484): replay placement unbounded and
+        // lay the const section at that end, so a failure names the whole
+        // program instead of only the first unplaced function.
         let mut consts: Vec<&ir::Global> = m
             .globals
             .iter()
             .filter(|g| g.is_const && !addrs.contains_key(&g.name))
             .collect();
         consts.sort_by_key(|g| g.name.clone());
-        let table_start = page_next
-            .last()
-            .copied()
-            .unwrap_or(if has_isr { 4 } else { 5 });
-        // Staged routines change size under banking (MOVLBs in, redundant
-        // PCLATH sets out), and the section model must carry the post-banking
-        // lengths before pass B: its same-page elision consults the reader page
-        // map below, which is wrong when the model misses hundreds of routine
-        // words (epic-cc#933). Banking and peephole see instruction sequences,
-        // never addresses, and every routine opens with a label reset, so one
-        // banking of the pass-A text plus the nominal section measures the exact
-        // growths the final text will show.
+        let mut sim_next = page_next.clone();
+        let mut placeable_words = 0usize;
+        for (name, _) in &bodies {
+            let size = post[name];
+            if has_isr && name == &isr_names[0] {
+                sim_next[0] = 4 + size + 4 + init_words;
+            } else if let Some(plan) = split_plans.get(name) {
+                let last = plan.len() - 1;
+                for (k, (_, words)) in plan.iter().enumerate() {
+                    let unit = if k < last {
+                        *words + CHUNK_LINK_WORDS
+                    } else {
+                        *words
+                    };
+                    placeable_words += unit;
+                    place_unit_unbounded(unit, &mut sim_next);
+                }
+            } else {
+                placeable_words += size;
+                place_unit_unbounded(size, &mut sim_next);
+            }
+        }
+        let func_end = sim_next.last().copied().unwrap_or(0);
+        // Measured staged lengths at the simulated section start, so the
+        // oversize total uses the same sizes as final placement.
         let staged_len: HashMap<String, usize> = if consts.iter().any(|g| staged.contains(&g.name))
         {
-            let nominal = place_consts(&consts, staged, &HashMap::new(), table_start);
+            let nominal = place_consts(&consts, staged, &HashMap::new(), func_end);
             let (sec_text, _) = emit_const_section(&consts, staged, addrs, scratch, &nominal);
             let mut m2 = measure.clone();
             m2.push(sec_text.join("\n"));
@@ -8543,6 +8529,83 @@ pub fn select_with_locs(
         } else {
             HashMap::new()
         };
+        let total_words = if consts.is_empty() {
+            func_end
+        } else {
+            let places = place_consts(&consts, staged, &staged_len, func_end);
+            const_section_end(&consts, &places).max(func_end)
+        };
+        let mut unplaced_words = placeable_words + (total_words - func_end);
+        for (name, _) in &bodies {
+            let size = post[name];
+            if has_isr && name == isr_names[0] {
+                assert!(
+                4 + size + 4 + init_words <= 0x800,
+                "isel: isr @{name} of {size} words does not fit page 0 (0x004-0x7FF) with room for the reset __start"
+            );
+                pages.insert(name.clone(), 0);
+                pads.insert((name.clone(), 0), 4);
+                // Counts the ISR body plus the following `__start` and init in
+                // the page-0 budget (epic-cc#207).
+                page_next[0] = 4 + size + 4 + init_words;
+                placed.push((name.clone(), 0, 0));
+            } else if let Some(plan) = split_plans.get(name) {
+                let last = plan.len() - 1;
+                for (k, (_, words)) in plan.iter().enumerate() {
+                    // Non-final chunks carry their link words.
+                    let unit = if k < last {
+                        *words + CHUNK_LINK_WORDS
+                    } else {
+                        *words
+                    };
+                    let (page, start) = place_unit(
+                        device,
+                        name,
+                        unit,
+                        &mut page_next,
+                        total_words,
+                        unplaced_words,
+                    );
+                    unplaced_words -= unit;
+                    // Anchors page-aligned chunk starts with `.org`, as for
+                    // whole functions below.
+                    if start & 0x7FF == 0 {
+                        pads.insert((name.clone(), k), start);
+                    }
+                    placed.push((name.clone(), k, page));
+                }
+            } else {
+                if size > 0x800 {
+                    panic!(
+                        "isel: function @{name} of {size} words exceeds a 2048-word page (0x800)"
+                    );
+                }
+                let (page, start) = place_unit(
+                    device,
+                    name,
+                    size,
+                    &mut page_next,
+                    total_words,
+                    unplaced_words,
+                );
+                unplaced_words -= size;
+                pages.insert(name.clone(), page);
+                // Anchors page-aligned starts with `.org`: without it, pass-B
+                // shrinkage slides the function below the boundary and its label
+                // and tail disagree on the page.
+                if start & 0x7FF == 0 {
+                    pads.insert((name.clone(), 0), start);
+                }
+                placed.push((name.clone(), 0, page));
+            }
+        }
+        // Maps const readers to post-call pages. Pins the section start, so the
+        // map holds in the final text.
+        let table_start = page_next
+            .last()
+            .copied()
+            .unwrap_or(if has_isr { 4 } else { 5 });
+        // staged_len was measured above at the simulated section start.
         for (entry, page) in reader_pages(&consts, staged, &staged_len, table_start) {
             pages.insert(entry, page);
         }
