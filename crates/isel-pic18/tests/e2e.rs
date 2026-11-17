@@ -1426,3 +1426,18 @@ fn gep_trunc_materializes_the_runtime_indexed_address() {
         "the laundered address of a plain pointer must read back g's byte"
     );
 }
+
+#[test]
+fn cond_term_ptr_arg_c_runs_correctly() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/cond_term_ptr_arg.c"
+    ));
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x5A,
+        "out == byte written through the selected pointer"
+    );
+    assert!(p.halted());
+}

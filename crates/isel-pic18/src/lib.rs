@@ -7689,6 +7689,12 @@ impl<'m> Gen<'m> {
             .unwrap_or_else(|| panic!("isel-pic18: no function {}", self.cur_func));
         !Self::is_wide_zext(f, reg)
     }
+    /// Whether a pointer term reg has a high byte to add into a 16-bit
+    /// address. A 1-byte term (a folded pointer select's icmp condition)
+    /// zero-extends: the byte past its slot is a neighbour's, not its own.
+    fn term_has_hi(&self, reg: &str) -> bool {
+        self.term_wide(reg)
+    }
     /// The byte width of a value-defining register in the current function
     /// (its slot is `bytes` wide), for folding a 16-bit index register's
     /// high byte into scaled GEP terms (RAM and const-table paths).
@@ -8209,9 +8215,11 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    ADDLW 0x{hi:02X}"));
                                 }
                             }
-                            let (ra_a, ra_f) = self.operand(ra + u16::from(i));
-                            let ra_bank = if ra_a == 0 { "A" } else { "B" };
-                            self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                            if i == 0 || self.term_has_hi(reg) {
+                                let (ra_a, ra_f) = self.operand(ra + u16::from(i));
+                                let ra_bank = if ra_a == 0 { "A" } else { "B" };
+                                self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                            }
                             let (a, f) = self.operand(dst + u16::from(i));
                             let bank = if a == 0 { "A" } else { "B" };
                             self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
@@ -8242,7 +8250,9 @@ impl<'m> Gen<'m> {
                                 } else {
                                     self.emit("    BTFSC 0xFD8,0,A".to_string());
                                     self.emit("    ADDLW 0x01".to_string());
-                                    self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                                    if self.term_has_hi(reg) {
+                                        self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                                    }
                                 }
                             }
                             _ => {
@@ -8415,8 +8425,10 @@ impl<'m> Gen<'m> {
                                 self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
                                 self.emit("    BTFSC 0xFD8,0,A".to_string());
                                 self.emit("    ADDLW 0x01".to_string());
-                                for _ in 0..*s {
-                                    self.emit(format!("    ADDWF 0x{ra1_f:03X},W,{ra1_bank}"));
+                                if self.term_has_hi(reg) {
+                                    for _ in 0..*s {
+                                        self.emit(format!("    ADDWF 0x{ra1_f:03X},W,{ra1_bank}"));
+                                    }
                                 }
                             }
                             let (a, f) = self.operand(dst + u16::from(i));
@@ -13669,7 +13681,9 @@ impl<'m> Gen<'m> {
                     self.emit("    BTFSC 0xFD8,0,A".to_string());
                     self.emit("    ADDLW 0x01".to_string());
                 }
-                self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                if offset == 0 || self.term_has_hi(reg) {
+                    self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                }
             }
             _ => {
                 self.emit_fsr0_dynamic(addr, k, terms, 0);
@@ -13710,7 +13724,9 @@ impl<'m> Gen<'m> {
                     self.emit("    BTFSC 0xFD8,0,A".to_string());
                     self.emit("    ADDLW 0x01".to_string());
                 }
-                self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                if offset == 0 || self.term_has_hi(reg) {
+                    self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                }
                 let kb = ((kk >> (u32::from(offset) * 8)) & 0xFF) as u8;
                 if kb != 0 {
                     self.emit(format!("    ADDLW 0x{kb:02X}"));
@@ -13853,7 +13869,9 @@ impl<'m> Gen<'m> {
                                 self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
                                 self.emit("    BTFSC 0xFD8,0,A".to_string());
                                 self.emit("    ADDLW 0x01".to_string());
-                                self.emit(format!("    ADDWF 0x{ra1_f:03X},W,{ra1_bank}"));
+                                if self.term_has_hi(reg) {
+                                    self.emit(format!("    ADDWF 0x{ra1_f:03X},W,{ra1_bank}"));
+                                }
                             }
                             return;
                         }
