@@ -104,6 +104,26 @@ an issue under epic-cc#1306: int-laundered addresses (no tag survives
 `ptrtoint`), PIC14 (no `TBLRD` path there), and memcpy into a
 maybe-flash destination (a raw byte copy has no tag source).
 
+## PIC14 family alternative (epic-cc#1347)
+
+The PIC14 family has no `TBLRD` path, so it takes no tagged slots:
+every pointer slot stays 2 bytes in `alloc` and in all three backends,
+and the tag dispatch is never emitted. A maybe-flash join instead
+reads the flash arm's staged RAM copy, the same lowering the walk
+shapes already used: select, phi, global-store, call-argument, return,
+indexed, wide, memcpy-source, store-through, and int-laundered joins
+all compile and run on `isel`, `isel-pic14e`, and `isel-pic-baseline`
+(`tests/maybe_flash_joins.rs` in each backend crate).
+
+One shape had no staging site: a RAM global initialized with a flash
+address (`const char *g = "lit";`) materialized the flash label as a
+RAM address at startup and read the wrong bytes. `alloc` now forces a
+RAM copy for initializer refs into RAM-kind globals on the PIC14
+family too, and marks the const as escaped so staging and the pool
+gate cannot take the copy away. An initializer naming a const over
+255 bytes has no copy and no flash slot to fall back on, so `alloc`
+refuses it instead of emitting the label.
+
 ## Integer-domain space proof (epic-cc#1346)
 
 An address that passes through the integer domain keeps its space when
