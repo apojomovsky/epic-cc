@@ -928,28 +928,27 @@ fn banked2_c_selects_upper_banks_and_runs_correctly() {
 /// global's ADDRESS (the register-map shape). The table's refs name a
 /// RAM global, which has no assembler label: the bytes must be the
 /// alloc-time address, not LOW()/HIGH() label literals (the assembler
-/// panics on those). Mirrors the pic18 #443 test, including its
-/// restraint: the sim runs to halt, but the runtime value is unclaimed,
-/// const-table reads ride on the separately-filed #454 hole.
+/// panics on those). The pointer to the table lives in a RAM global, so
+/// on this core the table keeps a RAM copy (epic-cc#1347) and the
+/// runtime value is claimed: regs[1] (0) plus count (4).
 #[test]
 fn const_ramref_struct_materializes_the_alloc_address() {
     let _guard = E2E_LOCK.lock();
-    let (mut p, _globals, asm) = compile_asm("tests/fixtures/const_ramref_struct.c");
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/const_ramref_struct.c");
     assert!(
         !asm.contains("LOW(holding_regs)") && !asm.contains("HIGH(holding_regs)"),
         "a RAM global has no label to resolve:\n{asm}"
     );
-    let table = asm.split("\nmap:\n").nth(1).expect("map table label");
-    let table = table.split("\n    end").next().expect("table before end");
     assert!(
-        !table.contains("LOW(") && !table.contains("HIGH("),
-        "table bytes must be numeric:\n{asm}"
-    );
-    assert!(
-        table.matches("RETLW 0x").count() >= 3,
-        "two address bytes plus the count byte:\n{asm}"
+        globals.contains_key("map"),
+        "the table must keep a RAM copy for the RAM pointer global:\n{asm}"
     );
     p.run(10_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        4,
+        "out = regs[1] (0) + count (4) through the RAM copy"
+    );
     assert!(p.halted());
 }
 

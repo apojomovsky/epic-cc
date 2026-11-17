@@ -3496,9 +3496,10 @@ fn allocate_inner(
     // Maybe-flash slots (epic-cc#1306, PIC18 only): pointer slots that can
     // hold a flash address on some path and RAM on another widen to 3
     // bytes (tag plus address) in both frame layouts and the global
-    // placement below. Other cores keep every pointer slot 2 bytes: their
-    // backends still refuse these shapes. Hoisted ahead of the frame
-    // layouts, which size every slot they place.
+    // placement below. Other cores keep every pointer slot 2 bytes and
+    // read the flash arm's RAM copy instead (epic-cc#1347, ADR-054).
+    // Hoisted ahead of the frame layouts, which size every slot they
+    // place.
     let (flash_resident_early, flash_spaces_early, mixed_spaces): (
         HashSet<String>,
         HashSet<String>,
@@ -4409,10 +4410,14 @@ fn allocate_inner(
             }
         }
     }
-    // Initializer refs into a RAM-kind global read back through RAM on
-    // PIC18: their consts keep the copies the fixpoint forced
-    // (epic-cc#1119 review). Flash-kind globals keep none.
-    if device.core == Core::Pic18 {
+    // Initializer refs into a RAM-kind global read back through RAM:
+    // their consts keep the copies the fixpoint forced (epic-cc#1119
+    // review). Flash-kind globals keep none. On the PIC14 family the
+    // copy is the only lowering (no tagged slot, epic-cc#1347), so the
+    // const also joins the phi escapes: staging and the pool gate must
+    // not take the copy away, as the address escapes at startup.
+    let pic14_family = matches!(device.core, Core::Pic14 | Core::Pic14e | Core::PicBaseline);
+    if device.core == Core::Pic18 || pic14_family {
         for g in &m.globals {
             if g.is_const || flash_spaces.contains(&format!("@{}", g.name)) {
                 continue;
@@ -4424,6 +4429,17 @@ fn allocate_inner(
                 if let Some(gl) = m.globals.iter().find(|x| x.name == *t && x.is_const) {
                     if gl.size <= 255 {
                         const_to_ram.insert(t.clone());
+                        if pic14_family {
+                            const_phi.insert(t.clone());
+                        }
+                    } else if pic14_family {
+                        // No flash slot to fall back on and no RAM copy
+                        // this size: refuse, never emit the flash label
+                        // as a RAM address (epic-cc#1347).
+                        panic!(
+                            "alloc: global @{} is initialized with the address of const @{} ({} bytes), which has no RAM copy on this core (epic-cc#1347)",
+                            g.name, t, gl.size
+                        );
                     }
                 }
             }
