@@ -473,10 +473,10 @@ fn mixed_select_returned_reads_both_spaces() {
 }
 
 #[test]
-#[should_panic(expected = "flash address that passed through integers")]
-fn int_laundered_flash_address_is_refused() {
-    // epic-cc#1284: a flash-kind slot read as `i16` and `inttoptr`ed back
-    // would be dereferenced as RAM at the table address. Refuse.
+fn int_laundered_flash_address_reads_flash() {
+    // epic-cc#1346: a flash-kind slot read as `i16` and `inttoptr`ed
+    // back carries the table address through the integer domain. The
+    // space proof settles the space, so the dereference reads flash.
     let m = with_bytes(
         parse(
             "const c i8\nglobal g i16\nglobal out i8\n\
@@ -485,7 +485,7 @@ fn int_laundered_flash_address_is_refused() {
         "c",
         b"P",
     );
-    let _ = select(
+    let asm = select(
         &PIC18F4550,
         &m,
         &addrs(&[
@@ -497,11 +497,120 @@ fn int_laundered_flash_address_is_refused() {
         ]),
         None,
     );
+    assert!(asm.contains("TBLRD*"), "must read flash:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[0x12],
+        b'P',
+        "the laundered address must read the table"
+    );
 }
 
 #[test]
-#[should_panic(expected = "flash address that passed through integers")]
-fn int_laundered_through_second_global_is_refused() {
+fn int_laundered_flash_address_passed_to_a_param_reads_flash() {
+    // epic-cc#1346 review round 2: a definite inttoptr pointer is a
+    // flash writer of the callee's param slot, so the callee's
+    // dereference reads flash like any other flash-kind param.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal out i8\n\
+             fn use(void) (p=ptr)\n  block entry:\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    call void @use(ptr %p)\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("main::x", 0x13),
+            ("main::p", 0x15),
+            ("use::p", 0x17),
+            ("use::v", 0x19),
+        ]),
+        None,
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[0x12],
+        b'P',
+        "the callee must read the table through its param"
+    );
+}
+
+#[test]
+#[should_panic(expected = "cannot pass flash address %p to a RAM pointer param")]
+fn int_laundered_flash_address_passed_beside_a_ram_arg_is_refused() {
+    // The same param also takes a RAM address at another call site, so
+    // no single space applies to it: a definite flash value bound for
+    // it is refused like any other definite flash argument.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i8\nglobal out i8\n\
+             fn use(void) (p=ptr)\n  block entry:\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    call void @use(ptr %p)\n    call void @use(ptr @buf)\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("buf", 0x13),
+            ("main::x", 0x14),
+            ("main::p", 0x16),
+            ("use::p", 0x18),
+            ("use::v", 0x1B),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "cannot return flash address")]
+fn int_laundered_flash_address_return_is_refused() {
+    // A definite flash return is refused like any flash return: the
+    // caller's slot would read it back as RAM (epic-cc#1119).
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal out i8\n\
+             fn get(ptr) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    ret ptr %p\n\
+             fn main(void) ()\n  block entry:\n    %r = call ptr @get()\n    %v = load i8 %r\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("get::x", 0x13),
+            ("get::p", 0x15),
+            ("main::r", 0x17),
+            ("main::v", 0x19),
+        ]),
+        None,
+    );
+}
+
+#[test]
+fn int_laundered_through_second_global_reads_flash() {
     // The integer copy travels through another global and a trunc/zext.
     let m = with_bytes(
         parse(
@@ -511,7 +620,7 @@ fn int_laundered_through_second_global_is_refused() {
         "c",
         b"P",
     );
-    let _ = select(
+    let asm = select(
         &PIC18F4550,
         &m,
         &addrs(&[
@@ -524,6 +633,17 @@ fn int_laundered_through_second_global_is_refused() {
             ("main::v", 0x1b),
         ]),
         None,
+    );
+    assert!(asm.contains("TBLRD*"), "must read flash:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[0x14],
+        b'P',
+        "the laundered address must read the table"
     );
 }
 
@@ -576,8 +696,7 @@ fn mixed_global_pointer_load_reads_both_spaces() {
 }
 
 #[test]
-#[should_panic(expected = "flash address that passed through integers")]
-fn int_laundered_through_local_slot_is_refused() {
+fn int_laundered_through_local_slot_reads_flash() {
     // epic-cc#1284 review: the integer copy parks in an alloca.
     let m = with_bytes(
         parse(
@@ -587,7 +706,7 @@ fn int_laundered_through_local_slot_is_refused() {
         "c",
         b"P",
     );
-    let _ = select(
+    let asm = select(
         &PIC18F4550,
         &m,
         &addrs(&[
@@ -601,11 +720,30 @@ fn int_laundered_through_local_slot_is_refused() {
         ]),
         None,
     );
+    assert!(asm.contains("TBLRD*"), "must read flash:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[0x12],
+        b'P',
+        "the laundered address must read the table"
+    );
 }
 
 /// Parse `ir`, give the const `c` the bytes `P` and assign addresses to
 /// every non-const global and every `%reg =` / `%reg` def of `main`.
 fn laundering_asm(ir: &str, mutate: impl FnOnce(&mut ir::Module)) -> String {
+    laundering_select(ir, mutate).0
+}
+
+/// The assembly and the address map for a laundering program.
+fn laundering_select(
+    ir: &str,
+    mutate: impl FnOnce(&mut ir::Module),
+) -> (String, HashMap<String, u16>) {
     let mut m = with_bytes(parse(ir), "c", b"P");
     mutate(&mut m);
     let mut pairs: Vec<(String, u16)> = Vec::new();
@@ -639,7 +777,22 @@ fn laundering_asm(ir: &str, mutate: impl FnOnce(&mut ir::Module)) -> String {
         }
     }
     let map: HashMap<String, u16> = pairs.into_iter().collect();
-    select(&PIC18F4550, &m, &map, None)
+    (select(&PIC18F4550, &m, &map, None), map)
+}
+
+/// Run a laundering program in the simulator and return the byte it
+/// stored in the `out` global. The laundered address must read the
+/// table, so the byte is the table's first byte.
+fn laundering_out(ir: &str, mutate: impl FnOnce(&mut ir::Module)) -> u8 {
+    let (asm, map) = laundering_select(ir, mutate);
+    assert!(asm.contains("TBLRD*"), "must read flash:\n{asm}");
+    let out = map["out"];
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    p.ram()[out as usize]
 }
 
 #[test]
@@ -666,9 +819,10 @@ fn struct_table_integer_field_next_to_flash_pointer_compiles() {
 }
 
 #[test]
-#[should_panic(expected = "flash address that passed through integers")]
-fn struct_table_pointer_field_read_as_integer_is_refused() {
-    let _ = laundering_asm(
+fn struct_table_pointer_field_read_as_integer_reads_flash() {
+    // The struct's pointer field holds a flash address, so the integer
+    // copy of it carries the address through the integer domain.
+    let got = laundering_out(
         "const c i8\nglobal tab i8\nglobal out i8\n\
          fn main(void) ()\n  block entry:\n    %a = gep @tab +0\n    %x = load i16 %a\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
         |m| {
@@ -681,6 +835,7 @@ fn struct_table_pointer_field_read_as_integer_is_refused() {
             }
         },
     );
+    assert_eq!(got, b'P', "the laundered address must read the table");
 }
 
 #[test]
@@ -701,7 +856,9 @@ fn trunc_spelled_ptrtoint_of_flash_gep_is_refused() {
 #[should_panic(expected = "flash address that passed through integers")]
 fn ptrtoint_of_flash_gep_is_refused() {
     // The IR a `(uintptr_t)"lit"` cast produces: a gep, an integer cast,
-    // then inttoptr.
+    // then inttoptr. The gep is folded away by `resolve_pointers`, so
+    // its slot holds no address: the cast copies an unwritten slot, and
+    // the value is not a table address (epic-cc#1346).
     let _ = laundering_asm(
         "const c i8\nglobal out i8\n\
          fn main(void) ()\n  block entry:\n    %q = gep @c +0\n    %x = zext i16 %q to i16\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
@@ -1191,13 +1348,15 @@ fn sext_of_a_gep_materializes_the_address() {
 }
 
 #[test]
-#[should_panic(expected = "flash address that passed through integers")]
-fn memcpy_of_tainted_slot_is_propagated() {
-    let _ = laundering_asm(
+fn memcpy_of_tainted_slot_reads_flash() {
+    // The copy moves the flash address's bytes, so the laundered value
+    // is still the table address.
+    let got = laundering_out(
         "const c i8\nglobal g i16\nglobal h i16\nglobal out i8\n\
          fn main(void) ()\n  block entry:\n    store ptr @c @g\n    memcpy @h @g 2\n    %y = load i16 @h\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
         |_| {},
     );
+    assert_eq!(got, b'P', "the laundered address must read the table");
 }
 
 #[test]
@@ -1220,12 +1379,23 @@ fn memcpy_of_untainted_offset_compiles() {
 }
 
 #[test]
-#[should_panic(expected = "flash address that passed through integers")]
-fn address_arithmetic_keeps_the_taint() {
-    let _ = laundering_asm(
+fn address_arithmetic_reads_flash() {
+    // A constant offset keeps the address in the flash space: the
+    // dereference reads the table one byte further on.
+    let got = laundering_out(
         "const c i8\nglobal g i16\nglobal out i8\n\
          fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %y = add i16 %x, 1\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
-        |_| {},
+        |m| {
+            m.globals
+                .iter_mut()
+                .find(|g| g.name == "c")
+                .expect("const c")
+                .bytes = vec![b'P', b'Q'];
+        },
+    );
+    assert_eq!(
+        got, b'Q',
+        "the offset address must read the next table byte"
     );
 }
 
@@ -1271,13 +1441,15 @@ fn indexed_table_name_field_read_as_integer_is_refused() {
 }
 
 #[test]
-#[should_panic(expected = "flash address that passed through integers")]
-fn const_table_name_field_read_as_integer_is_refused() {
-    let _ = laundering_asm(
+fn const_table_name_field_read_as_integer_reads_flash() {
+    // The const table's first two bytes are the address of `c`, so the
+    // integer read carries that address through the integer domain.
+    let got = laundering_out(
         "const c i8\nconst tab i8\nglobal out i8\n\
          fn main(void) ()\n  block entry:\n    %x = load i16 @tab\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
         |m| tab_mut(m, true),
     );
+    assert_eq!(got, b'P', "the laundered address must read the table");
 }
 
 #[test]
@@ -1306,16 +1478,16 @@ fn untainted_caller_of_int_passthrough_callee_compiles() {
 }
 
 #[test]
-#[should_panic(expected = "flash address that passed through integers")]
-fn tainted_result_through_int_passthrough_callee_is_refused() {
+fn tainted_result_through_int_passthrough_callee_reads_flash() {
     // The tainted site's own result still carries the address: the
     // per-site result taint must survive the epic-cc#1324 tightening.
-    let _ = laundering_asm(
+    let got = laundering_out(
         "const c i8\nglobal g i16\nglobal out i8\n\
          fn id(i16) (x=i16)\n  block entry:\n    ret i16 %x\n\
          fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %t = load i16 @g\n    %r1 = call i16 @id(i16 %t)\n    %p = inttoptr i16 %r1 to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
         |_| {},
     );
+    assert_eq!(got, b'P', "the laundered address must read the table");
 }
 
 #[test]
@@ -1600,4 +1772,728 @@ fn dynamic_walk_over_mixed_base_keeps_base_tag() {
         assert!(p.halted(), "program must halt");
         assert_eq!(p.ram()[0x17], want, "arm f={f} i={i} must read its space");
     }
+}
+
+#[test]
+#[should_panic(expected = "load through maybe-flash address")]
+fn int_laundered_flash_joined_with_ram_arm_is_refused() {
+    // epic-cc#1346: a select joining a laundered flash address with a
+    // RAM address is maybe-flash, so no tag survives and the refusal
+    // stands. The flash arm alone must not carry the join.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %f = load i8 @flag\n    %m = select i1 %f, ptr @buf, ptr %p\n    %v = load i8 %m\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "load through maybe-flash address")]
+fn int_laundered_flash_gep_joined_with_ram_arm_is_refused() {
+    // The same join, with a GEP between the laundered address and the
+    // join. The GEP derives from the flash pointer, so the join is
+    // maybe-flash through the derivation too.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %q = gep %p +0\n    %f = load i8 @flag\n    %m = select i1 %f, ptr @buf, ptr %q\n    %v = load i8 %m\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn memcpy_of_dynamic_term_source_is_refused() {
+    // epic-cc#1346 review: a memcpy source with a runtime term names no
+    // fixed bytes, so the copy's destination is not proven to hold the
+    // table address, and the laundered value is not a flash address.
+    let _ = laundering_asm(
+        "const c i8\nglobal tab i8\nglobal idx i8\nglobal h i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %i = load i8 @idx\n    %s = gep @tab +2 +4*%i\n    memcpy @h %s 2\n    %y = load i16 @h\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |m| tab_mut(m, false),
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn memcpy_of_dynamic_term_destination_is_refused() {
+    // The same, with the runtime term on the destination side: the copy
+    // lands in bytes the proof does not name.
+    let _ = laundering_asm(
+        "const c i8\nglobal tab i8\nglobal idx i8\nglobal h i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %i = load i8 @idx\n    %d = gep @h +0 +4*%i\n    memcpy %d @tab 2\n    %y = load i16 @h\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |m| tab_mut(m, false),
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn call_result_over_a_clobbered_param_is_refused() {
+    // epic-cc#1346 review: the callee overwrites its parameter's name,
+    // so the returned value is not the incoming address.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal ram i16\nglobal out i8\n\
+         fn clobber(i16) (x=i16)\n  block entry:\n    %x = load i16 @ram\n    ret i16 %x\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %t = load i16 @g\n    %r = call i16 @clobber(i16 %t)\n    %p = inttoptr i16 %r to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+fn int_laundered_flash_deref_beside_a_ram_join_reads_flash() {
+    // epic-cc#1346 review: a maybe-flash join withdraws the join's
+    // result, not the flash arm it joined. A direct dereference
+    // through the arm still reads the table byte.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i16\nglobal flag i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    %f = load i8 @flag\n    %m = select i1 %f, ptr @buf, ptr %p\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("buf", 0x13),
+            ("flag", 0x16),
+            ("out", 0x17),
+            ("main::x", 0x18),
+            ("main::p", 0x1A),
+            ("main::v", 0x1C),
+            ("main::f", 0x1D),
+            ("main::m", 0x1E),
+        ]),
+        None,
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    // The table byte lives only in program memory, so a RAM read
+    // would return something else.
+    assert_eq!(p.ram()[0x17], b'P', "the arm must read the table");
+}
+
+#[test]
+fn int_laundered_flash_joined_with_a_ram_reg_arm_keeps_ram_read() {
+    // epic-cc#1346 review: the RAM arm of the join is a register, not
+    // a global. The join is maybe-flash, so the arm keeps its own
+    // space: a load through it reads RAM, never program memory.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal ram i16\nglobal data i8\nglobal flag i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %r = load ptr @ram\n    %f = load i8 @flag\n    %m = select i1 %f, ptr %r, ptr %p\n    %v = load i8 %r\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("ram", 0x13),
+            ("data", 0x16),
+            ("flag", 0x17),
+            ("out", 0x18),
+            ("main::x", 0x19),
+            ("main::p", 0x1B),
+            ("main::r", 0x1D),
+            ("main::f", 0x1F),
+            ("main::m", 0x20),
+            ("main::v", 0x22),
+        ]),
+        None,
+    );
+    // The RAM arm is read through FSR, never through TBLRD.
+    assert!(
+        !asm.contains("TBLRD*"),
+        "a RAM arm must not read flash:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    // The RAM pointer holds the address of the data byte.
+    p.ram_mut()[0x13] = 0x16;
+    p.ram_mut()[0x14] = 0x00;
+    p.ram_mut()[0x16] = b'R';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x18], b'R', "the RAM arm must read RAM");
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn call_result_over_a_va_arg_clobbered_param_is_refused() {
+    // epic-cc#1346 review: the callee overwrites its parameter's name
+    // with a `va_arg` result, so the returned value is not the incoming
+    // address.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn clobber(i16) (x=i16)\n  block entry:\n    %ap = alloca 4\n    %x = va_arg ptr %ap i16\n    ret i16 %x\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %t = load i16 @g\n    %r = call i16 @clobber(i16 %t)\n    %p = inttoptr i16 %r to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+fn int_laundered_global_with_a_plain_initializer_reads_ram() {
+    // epic-cc#1346 review: the global's own initializer holds a plain
+    // value, so its bytes are not an address. The laundered value is
+    // the initialized one, and the dereference reads RAM, not flash.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" {
+            g.bytes = vec![0x40, 0x00];
+        }
+    }
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("main::x", 0x13),
+            ("main::p", 0x15),
+            ("main::v", 0x17),
+        ]),
+        None,
+    );
+    assert!(!asm.contains("TBLRD*"), "must not read flash:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x40] = b'R';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x12], b'R', "the laundered value must read RAM");
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_address_minus_from_a_constant_is_refused() {
+    // epic-cc#1346 review: `n - address` is not an address, so the
+    // subtraction does not keep the space.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %y = sub i16 4, %x\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_global_read_before_its_store_is_refused() {
+    // epic-cc#1346 review: the global is read before the only store
+    // into it, so the read sees the initializer, not the store. The
+    // proof cannot say which write a read observes, so the slot is not
+    // definite.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal h i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %t = load i16 @g\n    %y = load i16 @h\n    store i16 %t @h\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_global_read_on_another_switch_arm_is_refused() {
+    // epic-cc#1346 review: the flash write is on one switch arm and
+    // the read on another, so the read observes the global's reset
+    // value, not the write. The switch's edges are part of the block
+    // graph the order check reads.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal v i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %v = load i16 @v\n    \
+             switch i16 %v, default %def, cases 0 %c0, 1 %c1\n\
+             block c0:\n    store ptr @c @g\n    br join\n\
+             block c1:\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    %c = load i8 %p\n    store i8 %c @out\n    br join\n\
+             block def:\n    store ptr @c @g\n    br join\n\
+             block join:\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("v", 0x12),
+            ("out", 0x14),
+            ("main::v", 0x15),
+            ("main::x", 0x17),
+            ("main::p", 0x19),
+            ("main::c", 0x1B),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_pointer_load_before_its_store_is_refused() {
+    // epic-cc#1346 review: the pointer load reads the global's bytes
+    // before the only store into it, so it observes the global's reset
+    // value, not the store. A pointer load counts as a read of the same
+    // bytes a value load does.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %p = load ptr @g\n    store ptr @c @g\n    store ptr %p @h\n    %y = load i16 @h\n    %q = inttoptr i16 %y to ptr\n    %v = load i8 %q\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x12),
+            ("out", 0x14),
+            ("main::p", 0x15),
+            ("main::y", 0x17),
+            ("main::q", 0x19),
+            ("main::v", 0x1b),
+        ]),
+        None,
+    );
+}
+
+#[test]
+fn int_laundered_call_result_looks_up_its_actual_in_the_caller_reads_ram() {
+    // epic-cc#1346 review: the callee's own register holds a flash
+    // address while the caller's register of the same name holds a RAM
+    // address. The actual lives in the caller's scope, so the result
+    // is the caller's value, and the dereference reads RAM.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i16\nglobal h i16\nglobal h2 i16\nglobal out i8\n\
+             fn f(i16) (x=i16)\n  block entry:\n    store ptr @c @g\n    %1 = load i16 @g\n    ret i16 %x\n\
+             fn main(void) ()\n  block entry:\n    %a = gep @buf +512\n    store ptr %a @h\n    %1 = load i16 @h\n    %r = call i16 @f(i16 %1)\n    %q = gep %r +0\n    memcpy @h2 %q 2\n    %y = load i16 @h2\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("buf", 0x13),
+            ("h", 0x16),
+            ("h2", 0x19),
+            ("out", 0x1C),
+            ("f::1", 0x1D),
+            ("f::x", 0x1F),
+            ("main::1", 0x21),
+            ("main::r", 0x23),
+            ("main::q", 0x25),
+            ("main::y", 0x27),
+            ("main::p", 0x29),
+            ("main::v", 0x2B),
+        ]),
+        None,
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    // The caller's pointer holds a data address the start-up clear
+    // never reaches. That address holds another data address, which
+    // the copy carries over and the dereference reads.
+    p.ram_mut()[0x213] = 0x40;
+    p.ram_mut()[0x214] = 0x00;
+    p.ram_mut()[0x40] = b'R';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    // The table byte lives only in program memory, so a flash read
+    // would return something else.
+    assert_eq!(p.ram()[0x1C], b'R', "the caller's address must read RAM");
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_memcpy_before_its_source_store_is_refused() {
+    // epic-cc#1346 review: the copy reads the source before the only
+    // write into it, so the copy holds the source's reset value, not
+    // the flash address. A copy reads the source's bytes, so the
+    // source's write must have happened by it.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    memcpy @h @g 2\n    store ptr @c @g\n    %y = load i16 @h\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x12),
+            ("out", 0x14),
+            ("main::y", 0x15),
+            ("main::p", 0x17),
+            ("main::v", 0x19),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_value_of_a_redefined_name_is_refused() {
+    // epic-cc#1346 review: the function defines the name twice, so a
+    // use cannot be attributed to one definition. The first load holds
+    // the RAM value the program means; the later one reads a const
+    // table's address, which would be the flash value.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nconst tab i8\nglobal ram i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %x = load i16 @ram\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    br next\n\
+             block next:\n    %x = load i16 @tab\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    for g in &mut m.globals {
+        if g.name == "tab" {
+            g.bytes = vec![1, 0, 0x81, 0x0F];
+            g.size = 4;
+            g.refs = vec![(0, "c".to_string(), 0)];
+            g.is_const = true;
+        }
+    }
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("ram", 0x10),
+            ("out", 0x13),
+            ("main::x", 0x14),
+            ("main::p", 0x16),
+            ("main::v", 0x18),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_param_overwritten_later_in_the_body_is_refused() {
+    // epic-cc#1346 review: the body overwrites the parameter's name
+    // after the use, so the use observes the incoming value, not the
+    // overwrite. A param's name the body writes is a redefinition.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nconst tab i8\nglobal out i8\n\
+             fn f(i16) (x=i16)\n  block entry:\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    %x = load i16 @tab\n    ret void\n\
+             fn main(void) ()\n  block entry:\n    call void @f(i16 16)\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    for g in &mut m.globals {
+        if g.name == "tab" {
+            g.bytes = vec![1, 0, 0x81, 0x0F];
+            g.size = 4;
+            g.refs = vec![(0, "c".to_string(), 0)];
+            g.is_const = true;
+        }
+    }
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("out", 0x10),
+            ("f::x", 0x11),
+            ("f::p", 0x13),
+            ("f::v", 0x15),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_value_used_before_its_def_is_refused() {
+    // epic-cc#1346 review: the use precedes the definition, so the
+    // value the use observes is the slot's, not the definition's.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nconst tab i8\nglobal ram i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %p = inttoptr i16 %y to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    br next\n\
+             block next:\n    %y = load i16 @tab\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    for g in &mut m.globals {
+        if g.name == "tab" {
+            g.bytes = vec![1, 0, 0x81, 0x0F];
+            g.size = 4;
+            g.refs = vec![(0, "c".to_string(), 0)];
+            g.is_const = true;
+        }
+    }
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("ram", 0x10),
+            ("out", 0x13),
+            ("main::y", 0x14),
+            ("main::p", 0x16),
+            ("main::v", 0x18),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_value_redefined_by_an_icmp_is_refused() {
+    // epic-cc#1346 review: the name is redefined by a compare, so the
+    // use observes the compare's result, not the load's value.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %i = load i8 @c\n    %x = icmp eq i8 %i, %i\n    %p = inttoptr i16 %x to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("main::x", 0x13),
+            ("main::i", 0x15),
+            ("main::p", 0x17),
+            ("main::v", 0x19),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_high_half_of_a_wide_store_is_refused() {
+    // epic-cc#1346 review: a wide store spreads the value over bytes
+    // that hold something else, so the high half is not the address.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i32\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %w = zext i16 %x to i32\n    %y = add i32 %w, 4194304\n    store i32 %y @h\n    %z = load i16 @h +2\n    %p = inttoptr i16 %z to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x13),
+            ("out", 0x18),
+            ("main::x", 0x19),
+            ("main::w", 0x1B),
+            ("main::y", 0x1F),
+            ("main::z", 0x23),
+            ("main::p", 0x25),
+            ("main::v", 0x27),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_pair_of_byte_stores_is_refused() {
+    // epic-cc#1346 review: two one-byte stores compose a pair whose
+    // halves are each definite but whose value is not an address.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal g2 i16\nglobal h i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    store ptr @c @g2\n    %x = load i16 @g\n    %y = load i16 @g2\n    %a = trunc i16 %x to i8\n    %b = trunc i16 %y to i8\n    store i8 %a @h\n    %h1 = gep @h +1\n    store i8 %b %h1\n    %z = load i16 @h\n    %p = inttoptr i16 %z to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("g2", 0x13),
+            ("h", 0x16),
+            ("out", 0x19),
+            ("main::x", 0x1A),
+            ("main::y", 0x1C),
+            ("main::a", 0x1E),
+            ("main::b", 0x1F),
+            ("main::h1", 0x20),
+            ("main::z", 0x22),
+            ("main::p", 0x24),
+            ("main::v", 0x26),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_pair_of_overlapping_stores_is_refused() {
+    // epic-cc#1346 review: two two-byte stores overlap, so the pair
+    // holds one store's low byte and the other's high byte, which is
+    // not an address.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal g2 i16\nglobal h i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    store ptr @c @g2\n    %x = load i16 @g\n    %y = load i16 @g2\n    store i16 %x @h\n    %h1 = gep @h +1\n    store i16 %y %h1\n    %z = load i16 @h\n    %p = inttoptr i16 %z to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("g2", 0x13),
+            ("h", 0x16),
+            ("out", 0x19),
+            ("main::x", 0x1A),
+            ("main::y", 0x1C),
+            ("main::h1", 0x1E),
+            ("main::z", 0x20),
+            ("main::p", 0x22),
+            ("main::v", 0x24),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_pair_with_a_byte_write_over_it_is_refused() {
+    // The same, with a one-byte write over the high half of a
+    // two-byte store.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal g2 i16\nglobal h i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    store ptr @c @g2\n    %x = load i16 @g\n    %y = load i16 @g2\n    %b = trunc i16 %y to i8\n    store i16 %x @h\n    %h1 = gep @h +1\n    store i8 %b %h1\n    %z = load i16 @h\n    %p = inttoptr i16 %z to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("g2", 0x13),
+            ("h", 0x16),
+            ("out", 0x19),
+            ("main::x", 0x1A),
+            ("main::y", 0x1C),
+            ("main::b", 0x1E),
+            ("main::h1", 0x20),
+            ("main::z", 0x22),
+            ("main::p", 0x24),
+            ("main::v", 0x26),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn int_laundered_pair_copied_from_a_chimera_is_refused() {
+    // epic-cc#1346 review: the copy takes the source's bytes, so a
+    // source whose two bytes come from two writes must not become a
+    // slot that looks whole.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal g2 i16\nglobal h i16\nglobal s i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    store ptr @c @g2\n    %x = load i16 @g\n    %y = load i16 @g2\n    store i16 %x @h\n    %h1 = gep @h +1\n    store i16 %y %h1\n    memcpy @s @h 2\n    %z = load i16 @s\n    %p = inttoptr i16 %z to ptr\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("g2", 0x13),
+            ("h", 0x16),
+            ("s", 0x19),
+            ("out", 0x1C),
+            ("main::x", 0x1D),
+            ("main::y", 0x1F),
+            ("main::h1", 0x21),
+            ("main::z", 0x23),
+            ("main::p", 0x25),
+            ("main::v", 0x27),
+        ]),
+        None,
+    );
+}
+
+#[test]
+fn int_laundered_memcpy_from_a_pointer_value_reads_ram() {
+    // epic-cc#1346 review: a memcpy whose source is a pointer value
+    // copies the pointee's content, which the proof cannot bound, so
+    // the copy names no bytes and the laundered value is not an
+    // address. The dereference reads RAM.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i16\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %p = load ptr @g\n    memcpy @buf %p 2\n    %y = load i16 @buf\n    %q = inttoptr i16 %y to ptr\n    %v = load i8 %q\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("buf", 0x13),
+            ("out", 0x16),
+            ("main::p", 0x17),
+            ("main::y", 0x19),
+            ("main::q", 0x1B),
+            ("main::v", 0x1D),
+        ]),
+        None,
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    // The copy moved the table's first two bytes into `buf`, so the
+    // laundered value is that content, and the dereference reads RAM
+    // at the address the content holds.
+    p.ram_mut()[0x50] = b'R';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    // The table byte lives only in program memory, so a flash read
+    // would return something else.
+    assert_eq!(p.ram()[0x16], b'R', "the copied content must read RAM");
 }

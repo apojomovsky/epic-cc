@@ -5,8 +5,72 @@ pub mod chunk;
 pub mod delay;
 pub mod walk;
 
-use ir::{GepBase, Inst, Module};
+use ir::{Func, GepBase, Inst, Module};
 use std::collections::{HashMap, HashSet};
+
+/// The blocks each block of `f` dominates, keyed by the block's label.
+/// The entry block dominates itself; every other block dominates the
+/// blocks every predecessor path reaches.
+pub fn func_dominators(f: &Func) -> HashMap<String, HashSet<String>> {
+    let Some(entry) = f.blocks.first().map(|b| b.label.clone()) else {
+        return HashMap::new();
+    };
+    let all: HashSet<String> = f.blocks.iter().map(|b| b.label.clone()).collect();
+    // Predecessor lists from the terminators' targets (the terminator is
+    // the last inst of every block).
+    let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+    for b in &f.blocks {
+        let mut targets: Vec<&str> = Vec::new();
+        match b.insts.last() {
+            Some(Inst::Br(br)) => targets.push(br.target.as_str()),
+            Some(Inst::BrCond(bc)) => {
+                targets.push(bc.t.as_str());
+                targets.push(bc.f.as_str());
+            }
+            // A switch dispatches to every case and to the default.
+            Some(Inst::Switch(sw)) => {
+                for (_, l) in &sw.cases {
+                    targets.push(l);
+                }
+                targets.push(&sw.default);
+            }
+            _ => {}
+        }
+        for t in targets {
+            preds.entry(t).or_default().push(b.label.as_str());
+        }
+    }
+    let mut dom: HashMap<String, HashSet<String>> = HashMap::new();
+    dom.insert(entry.clone(), HashSet::from([entry.clone()]));
+    for b in &f.blocks {
+        if b.label != entry {
+            dom.insert(b.label.clone(), all.clone());
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in &f.blocks {
+            if b.label == entry {
+                continue;
+            }
+            let mut new: HashSet<String> = match preds.get(b.label.as_str()) {
+                Some(ps) => ps
+                    .iter()
+                    .map(|p| dom[*p].clone())
+                    .reduce(|a, c| a.intersection(&c).cloned().collect())
+                    .unwrap_or_else(|| all.clone()),
+                None => all.clone(),
+            };
+            new.insert(b.label.clone());
+            if new != dom[&b.label] {
+                dom.insert(b.label.clone(), new);
+                changed = true;
+            }
+        }
+    }
+    dom
+}
 
 /// Map key for a local value: `{func}::{name}` (IR value names without `%`).
 /// Matches the keys `alloc` emits in its overlay layout, so a callee's param
@@ -1633,6 +1697,11 @@ pub struct FlashProvenance {
     /// domain (epic-cc#1284). An `inttoptr` of one would dereference the
     /// table address as RAM, so the backend refuses it.
     pub int_flash: HashSet<String>,
+    /// Pointer slots (`{func}::{slot}`) an `inttoptr` produced from a
+    /// definitely-flash integer (epic-cc#1346). Each holds a flash
+    /// address, so a dereference through it seeds `TBLPTR` from the slot
+    /// bytes exactly like a flash-kind pointer slot.
+    pub int_flash_ptr: HashSet<String>,
 }
 
 /// One ultimate address base behind a pointer value: a global plus a
@@ -2285,6 +2354,19 @@ pub fn flash_slot_spaces_ex(
             ir::Val::Const(_) => SlotWriter::Bad,
         }
     };
+    // A value crossing a call boundary: a definite inttoptr pointer
+    // (epic-cc#1346) is a flash writer of the param or call-dst slot it
+    // lands in, exactly like a proven flash pointer. Inside a function
+    // the same value only grounds its own slot, so a join with a RAM
+    // arm stays maybe-flash there and keeps its refusal.
+    let arg_writer = |v: &ir::Val, func: &str| -> SlotWriter {
+        if let ir::Val::Reg(r) = v {
+            if prov.int_flash_ptr.contains(&ssa_key(func, r)) {
+                return SlotWriter::Src;
+            }
+        }
+        val_writer(v, func)
+    };
     // Indirect-call targets gain an unknown caller: their params can
     // receive any address, so they prune to RAM.
     let mut indirect_targets: HashSet<String> = HashSet::new();
@@ -2493,7 +2575,7 @@ pub fn flash_slot_spaces_ex(
                                     } else {
                                         push(
                                             ssa_key(&c.func, &p.name),
-                                            val_writer(&arg.val, &f.name),
+                                            arg_writer(&arg.val, &f.name),
                                         );
                                     }
                                 }
@@ -2517,7 +2599,7 @@ pub fn flash_slot_spaces_ex(
                                         for b in &callee.blocks {
                                             for i in &b.insts {
                                                 if let Inst::Ret(Some((_, v)), _) = i {
-                                                    push(key.clone(), val_writer(v, &callee.name));
+                                                    push(key.clone(), arg_writer(v, &callee.name));
                                                 }
                                             }
                                         }
@@ -2539,7 +2621,7 @@ pub fn flash_slot_spaces_ex(
                                         for b in &callee.blocks {
                                             for i in &b.insts {
                                                 if let Inst::Ret(Some((_, v)), _) = i {
-                                                    push(key.clone(), val_writer(v, &callee.name));
+                                                    push(key.clone(), arg_writer(v, &callee.name));
                                                 }
                                             }
                                         }
@@ -3380,6 +3462,1031 @@ pub fn add_flash_laundering(
         .filter(|(_, s)| s.indep || s.deps.iter().any(|d| ptaint.contains(d)))
         .map(|(k, _)| k.clone())
         .collect();
+}
+
+/// Prove the integer-domain values that certainly carry a flash table
+/// address, so an `inttoptr` of one lowers through `TBLPTR` instead of
+/// being refused (epic-cc#1346).
+///
+/// The maybe-taint in `add_flash_laundering` says a value *may* carry a
+/// flash address; this says it *does*. The difference is the space
+/// proof: a value is definite only when every path that produces it
+/// yields a flash address, so the dereference dispatches statically
+/// rather than on a runtime tag. A value that may be flash or RAM stays
+/// in the refusal.
+///
+/// The proof is a greatest fixpoint by removal: every value starts
+/// assumed definite, and a value is dropped as soon as its derivation
+/// fails under the current state. That is the sound direction (a value
+/// is claimed only when every path agrees), and the state only shrinks,
+/// so the iteration terminates.
+///
+/// A value is definite when:
+///
+/// - it is a flash const global, or a pointer derived from one;
+/// - it is a two-byte load from a location whose two bytes are
+///   definite;
+/// - it is a copy (zext, sext, trunc, freeze) of a definite value;
+/// - it is an add or a subtract of a definite value and a constant,
+///   which keeps the address (a difference of two addresses is a
+///   length, and a mask or a shift leaves a fragment, so neither is
+///   definite);
+/// - it is a select, a phi, or a call result whose every arm is
+///   definite.
+///
+/// Memory bytes are definite when every write to them writes a
+/// definite value, so a slot that also takes RAM loses the proof for
+/// exactly those bytes. A location a pointer operand names is direct
+/// only for a global or an object slot (alloca, byval param); every
+/// other pointer names an unknown location, whose load is never
+/// definite and whose store voids the whole memory proof.
+///
+/// `prov.int_flash_ptr` holds the pointer regs that hold a flash
+/// address: an `inttoptr` of a definite value, and every pointer
+/// derived from it (a GEP over it, a select or a phi arm). A
+/// dereference through one seeds `TBLPTR` from the slot bytes.
+pub fn add_int_flash_definite(
+    prov: &mut FlashProvenance,
+    m: &Module,
+    resolved: &PtrResolution,
+    is_flash_const: impl Fn(&str) -> bool,
+) {
+    // Object slots: an alloca or a byval param. Their bytes are the
+    // object itself, so a load through them reads a known location.
+    let mut objects: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Alloca(a) = i {
+                    objects.insert(ssa_key(&f.name, &a.dst));
+                }
+            }
+        }
+        for p in &f.params {
+            if p.byval.is_some() {
+                objects.insert(ssa_key(&f.name, &p.name));
+            }
+        }
+    }
+    // Functions reachable through an indirect call: their params take
+    // an unknown value on that path, so no proof survives it.
+    let mut indirect: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Call(c) = i {
+                    indirect.extend(c.callees.iter().cloned());
+                }
+            }
+        }
+    }
+
+    // Where a pointer operand points. `Fixed` is a known location at a
+    // constant byte offset; every other shape names a location no
+    // proof can bound, so a load through it is never definite.
+    enum Loc {
+        Fixed(String, u32),
+        Unknown,
+    }
+    let loc = |func: &str, ptr: &str| -> Loc {
+        if let Some(g) = ptr.strip_prefix('@') {
+            return Loc::Fixed(format!("@{g}"), 0);
+        }
+        let Some(r) = ptr.strip_prefix('%') else {
+            return Loc::Unknown;
+        };
+        match resolved.get(&ssa_key(func, r)) {
+            Some((Base::Global(g), k, terms)) => {
+                if terms.is_empty() {
+                    Loc::Fixed(format!("@{g}"), u32::from(*k))
+                } else {
+                    Loc::Unknown
+                }
+            }
+            Some((Base::Slot(sname, _), k, terms)) => {
+                let key = ssa_key(func, sname);
+                if terms.is_empty() && objects.contains(&key) {
+                    Loc::Fixed(key, u32::from(*k))
+                } else {
+                    Loc::Unknown
+                }
+            }
+            None => Loc::Unknown,
+        }
+    };
+
+    // A write to a location. `Val` writes a value, `Copy` moves bytes
+    // from one location to another, and `Init` names the const a
+    // global's initializer holds.
+    enum Write {
+        Val {
+            func: String,
+            val: ir::Val,
+            block: String,
+            index: usize,
+            /// The bytes the write covers, as a start offset and a
+            /// length. A definite pair comes from one two-byte write,
+            /// so the byte rule needs the range.
+            off: u32,
+            len: u32,
+        },
+        Copy {
+            func: String,
+            sslot: String,
+            soff: u32,
+            doff: u32,
+            block: String,
+            index: usize,
+        },
+        Init {
+            target: String,
+        },
+    }
+    let mut writes: Vec<Write> = Vec::new();
+    // The writes covering each byte, as indices into `writes`.
+    let mut writes_by: HashMap<(String, u32), Vec<usize>> = HashMap::new();
+    // The bytes each write covers, as its start offset and its length.
+    let mut write_span: HashMap<usize, (u32, u32)> = HashMap::new();
+    // The reads of each byte, with the place of the read, so a write is
+    // known to have happened by every read of the byte.
+    let mut reads_by: HashMap<(String, u32), Vec<(String, String, usize)>> = HashMap::new();
+    // A write through a pointer no proof can resolve: every byte of
+    // memory may hold it, so no byte is definite.
+    let mut void_all = false;
+
+    // The location a memcpy side names. A global names its own bytes; a
+    // pointer value names the memory it points at, which the proof
+    // cannot bound, so a copy from or to one names no known bytes and
+    // the caller voids the whole memory proof. A dynamic term makes the
+    // location runtime-dependent, the same way.
+    let val_slot = |func: &str, v: &ir::Val| -> Option<(String, u32)> {
+        match v {
+            ir::Val::Global(g) => Some((format!("@{g}"), 0)),
+            ir::Val::Reg(r) => match resolved.get(&ssa_key(func, r)) {
+                Some((Base::Global(g), k, terms)) if terms.is_empty() => {
+                    Some((format!("@{g}"), u32::from(*k)))
+                }
+                _ => None,
+            },
+            ir::Val::Const(_) => None,
+        }
+    };
+
+    // How a pointer slot receives its value.
+    enum SlotRule {
+        /// An `inttoptr` copies a definite integer into the slot.
+        IntToPtr { func: String, val: ir::Val },
+        /// A pointer join takes the value of every arm.
+        Join { func: String, arms: Vec<ir::Val> },
+        /// A pointer load copies the source's two bytes.
+        LoadPtr { func: String, ptr: String },
+        /// A pointer param receives the actual of every call site.
+        Param { calls: Vec<(String, ir::Val)> },
+        /// A pointer call result holds what the callee returns.
+        CallPtr { callee: String },
+    }
+    let mut slot_rule: HashMap<String, SlotRule> = HashMap::new();
+    // The instruction defining each value, keyed `{func}::{name}`, with
+    // the place of the definition. A param has no instruction: its
+    // definition is the call site's actual.
+    let mut defs: HashMap<String, (String, Option<&Inst>, String, usize)> = HashMap::new();
+    // The names a function defines more than once.
+    let mut redefined: HashSet<String> = HashSet::new();
+    // The uses of every name, with the place of the use, so a def
+    // can be checked against them.
+    let mut uses: HashMap<String, Vec<(String, String, usize)>> = HashMap::new();
+
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for (inst_index, i) in b.insts.iter().enumerate() {
+                let func = f.name.clone();
+                match i {
+                    Inst::Store(s) => match loc(&func, &s.ptr) {
+                        Loc::Fixed(slot, off) => {
+                            let idx = writes.len();
+                            writes.push(Write::Val {
+                                func: func.clone(),
+                                val: s.val.clone(),
+                                block: b.label.clone(),
+                                index: inst_index,
+                                off,
+                                len: u32::from(s.ty.bytes()),
+                            });
+                            write_span.insert(idx, (off, u32::from(s.ty.bytes())));
+                            for k in 0..u32::from(s.ty.bytes()) {
+                                writes_by
+                                    .entry((slot.clone(), off + k))
+                                    .or_default()
+                                    .push(idx);
+                            }
+                        }
+                        Loc::Unknown => void_all = true,
+                    },
+                    Inst::Memcpy(mc) => {
+                        let src = val_slot(&func, &mc.src);
+                        let dst = val_slot(&func, &mc.dst);
+                        let (Some((ss, so)), Some((ds, doff))) = (src, dst) else {
+                            void_all = true;
+                            continue;
+                        };
+                        let ir::MemLen::Const(n) = mc.len else {
+                            void_all = true;
+                            continue;
+                        };
+                        let idx = writes.len();
+                        writes.push(Write::Copy {
+                            func: func.clone(),
+                            sslot: ss.clone(),
+                            soff: so,
+                            doff,
+                            block: b.label.clone(),
+                            index: inst_index,
+                        });
+                        write_span.insert(idx, (doff, u32::from(n)));
+                        for k in 0..u32::from(n) {
+                            writes_by
+                                .entry((ds.clone(), doff + k))
+                                .or_default()
+                                .push(idx);
+                            // The copy reads the source bytes, so a
+                            // write to them must have happened by it.
+                            reads_by.entry((ss.clone(), so + k)).or_default().push((
+                                func.clone(),
+                                b.label.clone(),
+                                inst_index,
+                            ));
+                        }
+                    }
+                    Inst::Asm(a) => {
+                        // An asm output writes bytes no proof can name.
+                        if a.clobbers_memory {
+                            void_all = true;
+                        }
+                        for op in &a.operands {
+                            if op.constraint.starts_with('=') || op.constraint.starts_with('+') {
+                                match loc(&func, &op.ptr) {
+                                    Loc::Fixed(slot, off) => {
+                                        let idx = writes.len();
+                                        writes.push(Write::Val {
+                                            func: func.clone(),
+                                            val: ir::Val::Const(-1),
+                                            block: b.label.clone(),
+                                            index: inst_index,
+                                            off,
+                                            len: 1,
+                                        });
+                                        write_span.insert(idx, (off, 1));
+                                        writes_by.entry((slot, off)).or_default().push(idx);
+                                    }
+                                    Loc::Unknown => void_all = true,
+                                }
+                            }
+                        }
+                    }
+                    Inst::Load(l) => {
+                        // A read observes the slot's bytes at this
+                        // place, so a write must have happened by it.
+                        // A pointer load reads the same two bytes a
+                        // value load does, so it counts too.
+                        if let Loc::Fixed(slot, off) = loc(&func, &l.ptr) {
+                            for k in 0..u32::from(l.ty.bytes()) {
+                                reads_by.entry((slot.clone(), off + k)).or_default().push((
+                                    func.clone(),
+                                    b.label.clone(),
+                                    inst_index,
+                                ));
+                            }
+                        }
+                        if l.ptr_ty {
+                            slot_rule.insert(
+                                ssa_key(&func, &l.dst),
+                                SlotRule::LoadPtr {
+                                    func: func.clone(),
+                                    ptr: l.ptr.clone(),
+                                },
+                            );
+                        }
+                    }
+                    Inst::IntToPtr(p) => {
+                        slot_rule.insert(
+                            ssa_key(&func, &p.dst),
+                            SlotRule::IntToPtr {
+                                func: func.clone(),
+                                val: p.val.clone(),
+                            },
+                        );
+                    }
+                    Inst::Select(s) if s.ptr => {
+                        slot_rule.insert(
+                            ssa_key(&func, &s.dst),
+                            SlotRule::Join {
+                                func: func.clone(),
+                                arms: vec![s.a.clone(), s.b.clone()],
+                            },
+                        );
+                    }
+                    Inst::Phi(p) if p.ptr => {
+                        slot_rule.insert(
+                            ssa_key(&func, &p.dst),
+                            SlotRule::Join {
+                                func: func.clone(),
+                                arms: p.incoming.iter().map(|(v, _)| v.clone()).collect(),
+                            },
+                        );
+                    }
+                    Inst::Call(c) => {
+                        // A call result used in pointer position is a
+                        // pointer value: its slot holds the returned
+                        // address.
+                        if let Some(d) = &c.dst {
+                            let key = ssa_key(&func, d);
+                            if resolved.contains_key(&key) {
+                                slot_rule.insert(
+                                    key,
+                                    SlotRule::CallPtr {
+                                        callee: c.func.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // Record the uses of every value this instruction
+                // reads.
+                for r in ir::read_vals(i) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    uses.entry(ssa_key(&func, &r)).or_default().push((
+                        func.clone(),
+                        b.label.clone(),
+                        inst_index,
+                    ));
+                }
+                // Record the defining instruction of every value.
+                let dst: Option<&String> = match i {
+                    Inst::Zext(z) => Some(&z.dst),
+                    Inst::Sext(z) => Some(&z.dst),
+                    Inst::Trunc(z) => Some(&z.dst),
+                    Inst::Freeze(z) => Some(&z.dst),
+                    Inst::Bin(x) => Some(&x.dst),
+                    Inst::Select(s) => Some(&s.dst),
+                    Inst::Phi(p) => Some(&p.dst),
+                    Inst::Call(c) => c.dst.as_ref(),
+                    Inst::Load(l) => Some(&l.dst),
+                    Inst::IntToPtr(p) => Some(&p.dst),
+                    Inst::Gep(g) => Some(&g.dst),
+                    Inst::Icmp(c) => Some(&c.dst),
+                    Inst::Alloca(a) => Some(&a.dst),
+                    Inst::VaArg(v) => Some(&v.dst),
+                    _ => None,
+                };
+                if let Some(d) = dst {
+                    let key = ssa_key(&func, d);
+                    // A name defined more than once in a function is
+                    // not definite: the IR is a slot IR, so a use
+                    // cannot be attributed to one definition.
+                    if defs.contains_key(&key) {
+                        redefined.insert(key.clone());
+                    }
+                    defs.insert(key, (func.clone(), Some(i), b.label.clone(), inst_index));
+                }
+            }
+        }
+    }
+    // A global's initializer names the consts it holds: the two bytes
+    // of a ref hold that const's address.
+    for g in &m.globals {
+        let key = format!("@{}", g.name);
+        for (pos, target, _) in &g.refs {
+            let idx = writes.len();
+            writes.push(Write::Init {
+                target: target.clone(),
+            });
+            for k in 0..2u32 {
+                writes_by
+                    .entry((key.clone(), *pos as u32 + k))
+                    .or_default()
+                    .push(idx);
+            }
+        }
+    }
+    // A param's def is the entry block, before every instruction: the
+    // body's own write of the name is a redefinition.
+    for f in &m.funcs {
+        let Some(entry) = f.blocks.first().map(|b| b.label.clone()) else {
+            continue;
+        };
+        for p in &f.params {
+            let key = ssa_key(&f.name, &p.name);
+            if defs.contains_key(&key) {
+                redefined.insert(key.clone());
+            } else {
+                defs.insert(key, (f.name.clone(), None, entry.clone(), 0));
+            }
+        }
+    }
+    // A pointer param receives the actual of every call site.
+    for f in &m.funcs {
+        for (idx, p) in f.params.iter().enumerate() {
+            if !p.ptr || p.byval.is_some() || p.sret {
+                continue;
+            }
+            let mut calls: Vec<(String, ir::Val)> = Vec::new();
+            if !indirect.contains(&f.name) {
+                for g in &m.funcs {
+                    for b in &g.blocks {
+                        for i in &b.insts {
+                            if let Inst::Call(c) = i {
+                                if c.func == f.name {
+                                    if let Some(arg) = c.args.get(idx) {
+                                        calls.push((g.name.clone(), arg.val.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            slot_rule.insert(ssa_key(&f.name, &p.name), SlotRule::Param { calls });
+        }
+    }
+
+    // The state: the values and the memory bytes proven definite.
+    let mut flash_val: HashSet<String> = defs.keys().cloned().collect();
+    let mut flash_bytes: HashSet<(String, u32)> = if void_all {
+        HashSet::new()
+    } else {
+        writes_by.keys().cloned().collect()
+    };
+    if !void_all {
+        for key in slot_rule.keys() {
+            for k in 0..2u32 {
+                flash_bytes.insert((key.clone(), k));
+            }
+        }
+    }
+
+    // Whether a value is definitely a flash address.
+    let is_def = |flash_val: &HashSet<String>, func: &str, v: &ir::Val| -> bool {
+        match v {
+            ir::Val::Global(n) => is_flash_const(n),
+            ir::Val::Reg(r) => flash_val.contains(&ssa_key(func, r)),
+            ir::Val::Const(_) => false,
+        }
+    };
+    // Whether the two bytes a location holds are definite.
+    let two_def = |flash_bytes: &HashSet<(String, u32)>, slot: &str, off: u32| -> bool {
+        if !flash_bytes.contains(&(slot.to_string(), off))
+            || !flash_bytes.contains(&(slot.to_string(), off + 1))
+        {
+            return false;
+        }
+        // One write produced both bytes, and nothing else touched
+        // either of them: a second write to either half would leave
+        // the pair holding one value's low byte and another's high
+        // byte, which is not an address.
+        let (Some(lo), Some(hi)) = (
+            writes_by.get(&(slot.to_string(), off)),
+            writes_by.get(&(slot.to_string(), off + 1)),
+        ) else {
+            return false;
+        };
+        if lo.len() != 1 || hi.len() != 1 || lo[0] != hi[0] {
+            return false;
+        }
+        // The write must cover both bytes of the pair. An initializer
+        // covers the two bytes of the const address it names.
+        match write_span.get(&lo[0]) {
+            Some((woff, len)) => *len == 2 && *woff <= off && off + 1 <= *woff + *len,
+            None => matches!(writes[lo[0]], Write::Init { .. }),
+        }
+    };
+
+    // Whether a call's returned value is definite at this site, with the
+    // callee's integer params substituted by the actuals.
+    let call_returns_def = |flash_val: &HashSet<String>, func: &str, c: &ir::Call| -> bool {
+        if !c.callees.is_empty() {
+            // An indirect call returns an unknown value.
+            return false;
+        }
+        let Some(callee) = m.funcs.iter().find(|x| x.name == c.func) else {
+            return false;
+        };
+        let mut returns: Vec<&ir::Val> = Vec::new();
+        for bb in &callee.blocks {
+            for ri in &bb.insts {
+                if let Inst::Ret(Some((_, v)), _) = ri {
+                    returns.push(v);
+                }
+            }
+        }
+        // The names the callee defines, so a returned register that the
+        // body overwrites is not the parameter's incoming value. The IR
+        // is a slot IR, so a name may be reused.
+        let mut defined: HashSet<String> = HashSet::new();
+        for bb in &callee.blocks {
+            for ri in &bb.insts {
+                let dst: Option<&String> = match ri {
+                    Inst::Load(l) => Some(&l.dst),
+                    Inst::Bin(x) => Some(&x.dst),
+                    Inst::Zext(z) => Some(&z.dst),
+                    Inst::Sext(s) => Some(&s.dst),
+                    Inst::Trunc(t) => Some(&t.dst),
+                    Inst::Freeze(z) => Some(&z.dst),
+                    Inst::IntToPtr(p) => Some(&p.dst),
+                    Inst::Icmp(i) => Some(&i.dst),
+                    Inst::Select(s) => Some(&s.dst),
+                    Inst::Phi(p) => Some(&p.dst),
+                    Inst::Call(cc) => cc.dst.as_ref(),
+                    Inst::Gep(g) => Some(&g.dst),
+                    Inst::Alloca(a) => Some(&a.dst),
+                    Inst::VaArg(v) => Some(&v.dst),
+                    _ => None,
+                };
+                if let Some(d) = dst {
+                    defined.insert(d.clone());
+                }
+            }
+        }
+        !returns.is_empty()
+            && returns.iter().all(|v| match v {
+                ir::Val::Global(n) => is_flash_const(n),
+                ir::Val::Reg(r) => {
+                    let Some(idx) = callee.params.iter().position(|p| &p.name == r) else {
+                        return false;
+                    };
+                    // Only an integer param carries an address through
+                    // the call: a pointer param has its own slot rules.
+                    if callee.params[idx].ptr {
+                        return false;
+                    }
+                    // The body must not have overwritten the name: the
+                    // returned value is the parameter's incoming value
+                    // only when nothing else wrote it.
+                    if defined.contains(r) {
+                        return false;
+                    }
+                    let Some(arg) = c.args.get(idx) else {
+                        return false;
+                    };
+                    is_def(flash_val, func, &arg.val)
+                }
+                ir::Val::Const(_) => false,
+            })
+    };
+
+    // The blocks each block dominates, so a write in one block is known
+    // to have happened when a later block reads.
+    let dominators: HashMap<String, HashMap<String, HashSet<String>>> = m
+        .funcs
+        .iter()
+        .map(|f| (f.name.clone(), func_dominators(f)))
+        .collect();
+    // Whether a write has happened by a read: the same block counts
+    // when the write comes first, and another block counts when it
+    // dominates the read's block.
+    let write_precedes = |write_func: &str,
+                          write_block: &str,
+                          write_index: usize,
+                          read_func: &str,
+                          read_block: &str,
+                          read_index: usize|
+     -> bool {
+        if write_func != read_func {
+            // A write in another function happens at a call site the
+            // proof does not track, so it never precedes a read here.
+            return false;
+        }
+        if write_block == read_block {
+            write_index < read_index
+        } else {
+            dominators
+                .get(read_func)
+                .and_then(|d| d.get(read_block))
+                .is_some_and(|set| set.contains(write_block))
+        }
+    };
+
+    // The derivation of one value, under the current state.
+    let derive =
+        |flash_val: &HashSet<String>, flash_bytes: &HashSet<(String, u32)>, key: &str| -> bool {
+            let Some((func, inst, def_block, def_index)) = defs.get(key) else {
+                return false;
+            };
+            let Some(inst) = inst else {
+                // A param's value is the call site's actual, which the
+                // slot rules settle.
+                return false;
+            };
+            // The def must have happened by every use: the same block
+            // counts when the def comes first, and another block counts
+            // when it dominates the use's.
+            if let Some(us) = uses.get(key) {
+                if !us
+                    .iter()
+                    .all(|(uf, ub, ui)| write_precedes(func, def_block, *def_index, uf, ub, *ui))
+                {
+                    return false;
+                }
+            }
+            // A name the function defines more than once is not
+            // definite: the IR is a slot IR, so a use cannot be
+            // attributed to one definition.
+            if redefined.contains(key) {
+                return false;
+            }
+            // The def must have happened by every use: the same block
+            // counts when the def comes first, and another block counts
+            // when it dominates the use's.
+
+            match inst {
+                // A load reads the bytes the location holds: the value is a
+                // flash address when both address bytes are definite. A
+                // narrower or wider load reads no address.
+                Inst::Load(l) => {
+                    if l.ty.bytes() != 2 {
+                        return false;
+                    }
+                    match loc(func, &l.ptr) {
+                        Loc::Fixed(slot, off) => two_def(flash_bytes, &slot, off),
+                        Loc::Unknown => false,
+                    }
+                }
+                // A copy of a definite value keeps the address.
+                Inst::Zext(z) => z.from.bytes() == 2 && is_def(flash_val, func, &z.val),
+                Inst::Sext(z) => z.from.bytes() == 2 && is_def(flash_val, func, &z.val),
+                Inst::Trunc(z) => z.to.bytes() == 2 && is_def(flash_val, func, &z.val),
+                Inst::Freeze(z) => is_def(flash_val, func, &z.val),
+                // A constant offset keeps the address; a difference of two
+                // addresses is a length, and a mask or a shift leaves a
+                // fragment.
+                Inst::Bin(x) => {
+                    let a_def = is_def(flash_val, func, &x.a);
+                    let b_def = is_def(flash_val, func, &x.b);
+                    let a_const = matches!(x.a, ir::Val::Const(_));
+                    let b_const = matches!(x.b, ir::Val::Const(_));
+                    match x.op {
+                        ir::BinOp::Add => (a_def && b_const) || (b_def && a_const),
+                        ir::BinOp::Sub => a_def && b_const,
+                        _ => false,
+                    }
+                }
+                // A join is definite when every arm is.
+                Inst::Select(s) => is_def(flash_val, func, &s.a) && is_def(flash_val, func, &s.b),
+                Inst::Phi(p) => {
+                    !p.incoming.is_empty()
+                        && p.incoming.iter().all(|(v, _)| is_def(flash_val, func, v))
+                }
+                // A call result is definite when every returned value is,
+                // with the callee's integer params substituted by the
+                // actuals of this site.
+                Inst::Call(c) => call_returns_def(flash_val, func, c),
+                // A pointer value: definite when the integer it copies is.
+                // A GEP is not one: `resolve_pointers` folds it away, so its
+                // own slot never holds the address (the address materializes
+                // at each use), and a read of that slot is not an address.
+                Inst::IntToPtr(p) => is_def(flash_val, func, &p.val),
+                _ => false,
+            }
+        };
+
+    // The derivation of one memory byte, under the current state.
+    let derive_byte = |flash_val: &HashSet<String>,
+                       flash_bytes: &HashSet<(String, u32)>,
+                       slot: &str,
+                       off: u32|
+     -> bool {
+        // A slot whose value comes from a rule (an `inttoptr`, a join, a
+        // pointer load, a param, a call result) is definite when the
+        // rule holds; the memory writes do not apply to it.
+        if let Some(rule) = slot_rule.get(slot) {
+            let r = match rule {
+                SlotRule::IntToPtr { func, val } => is_def(flash_val, func, val),
+                SlotRule::Join { func, arms } => {
+                    !arms.is_empty() && arms.iter().all(|v| is_def(flash_val, func, v))
+                }
+                SlotRule::LoadPtr { func, ptr } => match loc(func, ptr) {
+                    Loc::Fixed(s, o) => two_def(flash_bytes, &s, o),
+                    Loc::Unknown => false,
+                },
+                SlotRule::Param { calls } => {
+                    !calls.is_empty() && calls.iter().all(|(f, v)| is_def(flash_val, f, v))
+                }
+                SlotRule::CallPtr { callee } => {
+                    // The slot holds what the callee returns. Every
+                    // call site of that callee must agree, and each
+                    // site's own arguments decide the callee's
+                    // integer params. The actual lives in the caller's
+                    // scope, so the caller's name is the one to look it
+                    // up in.
+                    let mut sites: Vec<(&String, &ir::Call)> = Vec::new();
+                    for g in &m.funcs {
+                        for b in &g.blocks {
+                            for i in &b.insts {
+                                if let Inst::Call(cc) = i {
+                                    if cc.func == *callee {
+                                        sites.push((&g.name, cc));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    !sites.is_empty()
+                        && sites
+                            .iter()
+                            .all(|(caller, cc)| call_returns_def(flash_val, caller, cc))
+                }
+            };
+            return r;
+        }
+        // Every write to the byte must write a definite value, and
+        // every read of the byte must observe one of those writes: a
+        // read before a later write sees the earlier value, so the
+        // byte is not definite.
+        let Some(list) = writes_by.get(&(slot.to_string(), off)) else {
+            return false;
+        };
+        if list.is_empty() {
+            return false;
+        }
+        let reads = reads_by.get(&(slot.to_string(), off));
+        list.iter().all(|idx| match &writes[*idx] {
+            Write::Val {
+                func,
+                val,
+                block,
+                index,
+                off: woff,
+                len,
+            } => {
+                if !is_def(flash_val, func, val) {
+                    return false;
+                }
+                // A definite pair comes from one two-byte write of a
+                // definite value. A wider write spreads the value over
+                // bytes that hold something else, and a narrower one
+                // leaves the pair to two writes whose halves are not one
+                // address. The write must cover this byte and the one
+                // beside it, so the pair is one value.
+                if *len != 2 || (*woff != off && *woff + 1 != off) {
+                    return false;
+                }
+                // The write must have happened by every read of the
+                // byte.
+                match reads {
+                    Some(rs) => rs
+                        .iter()
+                        .all(|(rf, rb, ri)| write_precedes(func, block, *index, rf, rb, *ri)),
+                    None => true,
+                }
+            }
+            Write::Copy {
+                func,
+                sslot,
+                soff,
+                doff,
+                block,
+                index,
+            } => {
+                if !flash_bytes.contains(&(sslot.clone(), soff + (off - doff))) {
+                    return false;
+                }
+                // The copy takes the source's bytes, so the source's
+                // own pair must be one write: a source whose two bytes
+                // come from two writes holds a chimera, and the copy
+                // would launder it into a slot that looks whole.
+                if !two_def(flash_bytes, sslot, *soff) {
+                    return false;
+                }
+                match reads {
+                    Some(rs) => rs
+                        .iter()
+                        .all(|(rf, rb, ri)| write_precedes(func, block, *index, rf, rb, *ri)),
+                    None => true,
+                }
+            }
+            Write::Init { target } => is_flash_const(target),
+        })
+    };
+
+    // The greatest fixpoint by removal: a value or byte that no longer
+    // derives is dropped, and the state only shrinks.
+    loop {
+        let mut changed = false;
+        for key in flash_val.clone() {
+            if !derive(&flash_val, &flash_bytes, &key) {
+                flash_val.remove(&key);
+                changed = true;
+            }
+        }
+        for (slot, off) in flash_bytes.clone() {
+            if !derive_byte(&flash_val, &flash_bytes, &slot, off) {
+                flash_bytes.remove(&(slot, off));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // The pointer regs that hold a flash address: the `inttoptr` dsts
+    // whose source integer is definite, and the pointers derived from
+    // them. The walk starts at the `inttoptr` dsts alone: a slot that
+    // merely holds a definite integer is data, not an address.
+    //
+    // Within the candidates, the set is a fixpoint by removal, like the
+    // value proof. Removal keeps the derivations consistent, so a
+    // pointer derived from a dropped one is dropped too.
+    let mut ptr: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::IntToPtr(p) = i {
+                    let key = ssa_key(&f.name, &p.dst);
+                    if flash_val.contains(&key) {
+                        ptr.insert(key);
+                    }
+                }
+            }
+        }
+    }
+    // The candidates: the pointers derived from an `inttoptr` dst (a
+    // GEP base, a select arm, a phi arm, a freeze operand).
+    let mut cands: HashSet<String> = ptr.clone();
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for f in &m.funcs {
+            for b in &f.blocks {
+                for i in &b.insts {
+                    let dst: Option<&String> = match i {
+                        Inst::Gep(g) => Some(&g.dst),
+                        Inst::Select(s) if s.ptr => Some(&s.dst),
+                        Inst::Phi(p) if p.ptr => Some(&p.dst),
+                        Inst::Freeze(fr) => Some(&fr.dst),
+                        _ => None,
+                    };
+                    let Some(dst) = dst else { continue };
+                    let srcs: Vec<String> = match i {
+                        Inst::Gep(g) => match &g.base {
+                            GepBase::Reg(r) => vec![r.clone()],
+                            GepBase::Global(_) => continue,
+                        },
+                        Inst::Select(s) if s.ptr => [&s.a, &s.b]
+                            .iter()
+                            .filter_map(|v| match v {
+                                ir::Val::Reg(r) => Some(r.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        Inst::Phi(p) if p.ptr => p
+                            .incoming
+                            .iter()
+                            .filter_map(|(v, _)| match v {
+                                ir::Val::Reg(r) => Some(r.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        Inst::Freeze(fr) => match &fr.val {
+                            ir::Val::Reg(r) => vec![r.clone()],
+                            _ => continue,
+                        },
+                        _ => continue,
+                    };
+                    if srcs.is_empty() {
+                        continue;
+                    }
+                    let key = ssa_key(&f.name, dst);
+                    if srcs.iter().any(|r| cands.contains(&ssa_key(&f.name, r)))
+                        && cands.insert(key)
+                    {
+                        grew = true;
+                    }
+                }
+            }
+        }
+    }
+    ptr = cands.clone();
+    // The derivation of one pointer, under the current state: a GEP
+    // over a flash pointer, a join whose every arm is a flash pointer
+    // (a flash const global arm counts), and a freeze of one.
+    //
+    // A join that mixes a flash pointer with a non-flash value does not
+    // derive, so its result is withdrawn.
+    let derives = |ptr: &HashSet<String>, func: &str, inst: &Inst| -> bool {
+        match inst {
+            Inst::IntToPtr(p) => flash_val.contains(&ssa_key(func, &p.dst)),
+            Inst::Gep(g) => match &g.base {
+                GepBase::Reg(r) => ptr.contains(&ssa_key(func, r)),
+                GepBase::Global(n) => is_flash_const(n),
+            },
+            Inst::Select(s) if s.ptr => [&s.a, &s.b].iter().all(|v| match v {
+                ir::Val::Reg(r) => ptr.contains(&ssa_key(func, r)),
+                ir::Val::Global(n) => is_flash_const(n),
+                ir::Val::Const(_) => false,
+            }),
+            Inst::Phi(p) if p.ptr => {
+                !p.incoming.is_empty()
+                    && p.incoming.iter().all(|(v, _)| match v {
+                        ir::Val::Reg(r) => ptr.contains(&ssa_key(func, r)),
+                        ir::Val::Global(n) => is_flash_const(n),
+                        ir::Val::Const(_) => false,
+                    })
+            }
+            Inst::Freeze(fr) => match &fr.val {
+                ir::Val::Reg(r) => ptr.contains(&ssa_key(func, r)),
+                ir::Val::Global(n) => is_flash_const(n),
+                ir::Val::Const(_) => false,
+            },
+            _ => false,
+        }
+    };
+    // The greatest fixpoint by removal: a pointer that no longer
+    // derives is dropped, and the state only shrinks.
+    loop {
+        let mut changed = false;
+        for f in &m.funcs {
+            for b in &f.blocks {
+                for i in &b.insts {
+                    let dst: Option<&String> = match i {
+                        Inst::IntToPtr(p) => Some(&p.dst),
+                        Inst::Gep(g) => Some(&g.dst),
+                        Inst::Select(s) if s.ptr => Some(&s.dst),
+                        Inst::Phi(p) if p.ptr => Some(&p.dst),
+                        Inst::Freeze(fr) => Some(&fr.dst),
+                        _ => None,
+                    };
+                    let Some(dst) = dst else { continue };
+                    let key = ssa_key(&f.name, dst);
+                    if !ptr.contains(&key) {
+                        continue;
+                    }
+                    if derives(&ptr, &f.name, i) {
+                        continue;
+                    }
+                    ptr.remove(&key);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // The maybe-flash joins, classified over the final set: a join
+    // whose arms mix a flash pointer with a value that is not one
+    // carries flash on one path and RAM on another, so its result is
+    // marked mixed and the backend's maybe-flash refusal fires on a
+    // dereference through it. The classification runs after the
+    // removal fixpoint, so it does not depend on the order the joins
+    // were examined in. Only the joins over a candidate are classified.
+    let mut mixed_joins: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                let (dst, arms): (&String, Vec<&ir::Val>) = match i {
+                    Inst::Select(s) if s.ptr => (&s.dst, vec![&s.a, &s.b]),
+                    Inst::Phi(p) if p.ptr => (&p.dst, p.incoming.iter().map(|(v, _)| v).collect()),
+                    _ => continue,
+                };
+                if arms.is_empty() {
+                    continue;
+                }
+                let key = ssa_key(&f.name, dst);
+                if !cands.contains(&key) {
+                    continue;
+                }
+                // The flash arms of the join, read off the final set.
+                let flash_arms = arms.iter().any(|v| match v {
+                    ir::Val::Reg(r) => ptr.contains(&ssa_key(&f.name, r)),
+                    ir::Val::Global(n) => is_flash_const(n),
+                    ir::Val::Const(_) => false,
+                });
+                if !flash_arms {
+                    continue;
+                }
+                // Every arm must be a flash arm for the join to be
+                // flash; one that is not makes it maybe-flash.
+                let all_flash = arms.iter().all(|v| match v {
+                    ir::Val::Reg(r) => ptr.contains(&ssa_key(&f.name, r)),
+                    ir::Val::Global(n) => is_flash_const(n),
+                    ir::Val::Const(_) => false,
+                });
+                if !all_flash {
+                    mixed_joins.insert(key);
+                }
+            }
+        }
+    }
+    // The maybe-flash joins are mixed pointers: the backend refuses a
+    // dereference through one, because no tag survives the join.
+    for key in &mixed_joins {
+        prov.mixed.insert(key.clone());
+    }
+    prov.int_flash_ptr = ptr;
 }
 
 /// Global names an address value may carry, following pointer

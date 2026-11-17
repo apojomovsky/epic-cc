@@ -32,8 +32,8 @@ use std::collections::{HashMap, HashSet};
 use device::{Core, Device};
 use ir::{Inst, Module};
 use iselcore::{
-    add_flash_walks, const_fan_in, find_value_folds, flash_provenance, flash_slot_spaces_ex,
-    resolve_pointers, ssa_key, Base, PtrResolution, ValueFolds,
+    add_flash_walks, add_int_flash_definite, const_fan_in, find_value_folds, flash_provenance,
+    flash_slot_spaces_ex, resolve_pointers, ssa_key, Base, PtrResolution, ValueFolds,
 };
 use retain::Retention;
 
@@ -3066,6 +3066,9 @@ fn flash_resident_consts(
     loop {
         let mut prov = flash_provenance(m);
         add_flash_walks(&mut prov, m, |n| live.contains(n));
+        // Same definite proof the backend runs, so both agree on the
+        // space of a param or call-dst slot an inttoptr value lands in.
+        add_int_flash_definite(&mut prov, m, resolved, |n| live.contains(n));
         let ex = flash_slot_spaces_ex(m, resolved, &prov, |n| live.contains(n));
         spaces = ex.0;
         mixed_spaces = ex.1;

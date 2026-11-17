@@ -1,8 +1,10 @@
 # ADR-054 -- PIC18 pointer slots carry a static flash or RAM address space
 
 **Status:** Accepted 2026-10-14 (oracle decision on `epic-cc#1119`;
-amended 2026-10-17 by `epic-cc#1306`)<br>
-**Decides:** `epic-cc#1119`, `epic-cc#1092`, `epic-cc#1306`<br>
+amended 2026-10-17 by `epic-cc#1306`; amended 2026-10-21 by
+`epic-cc#1346`)<br>
+**Decides:** `epic-cc#1119`, `epic-cc#1092`, `epic-cc#1306`,
+`epic-cc#1346`<br>
 **Evidence:** `crates/isel-pic18/tests/flash_slots.rs`,
 `crates/iselcore/tests/slot_spaces.rs`,
 `crates/driver/tests/flash_walk_e2e.rs`
@@ -101,3 +103,105 @@ and benches carry no mixed pointer to widen. Deferred, each filed as
 an issue under epic-cc#1306: int-laundered addresses (no tag survives
 `ptrtoint`), PIC14 (no `TBLRD` path there), and memcpy into a
 maybe-flash destination (a raw byte copy has no tag source).
+
+## Integer-domain space proof (epic-cc#1346)
+
+An address that passes through the integer domain keeps its space when
+the space is settled statically, so no runtime tag is needed.
+
+The key fact is what an integer read of a pointer slot holds: the
+slot's own bytes, which are the address, not the table content. A
+flash-kind slot read as `i16` yields the table's byte address, and
+the `inttoptr` of that integer is the same address a direct pointer
+would carry. The read of a *const table* yields the table's content,
+whose first two bytes are the address of the const it names.
+
+`iselcore::add_int_flash_definite` proves the space with a greatest
+fixpoint by removal, the mirror image of the maybe-taint: a value is
+definite only when every path that produces it yields a flash address,
+and the state only shrinks, so the iteration terminates.
+
+The two integer-domain passes answer different questions, and where
+they overlap the definite one is authoritative: a value the definite
+proof settles is served, and a value it does not falls back to the
+maybe-taint's refusal. The definite pass is the stricter of the two
+on the shapes they share, because it requires every path to agree
+while the taint requires only one. A shape the taint refuses and the
+definite pass serves is a shape the definite pass has proved: the
+`inttoptr` of a value whose space is settled statically. A shape the
+definite pass refuses and the taint serves is refused, never served
+as flash.
+
+The two passes do not share their substrate: each has its own object
+set, location resolver, memory-byte model, and binop algebra. The
+algebras differ in one place: the taint treats a subtraction
+symmetrically, while the definite pass requires the address to be
+the minuend, because `n - address` is not an address. The definite
+pass's rule is the one the backend applies.
+
+A value is definite when it is a flash const global, a two-byte load
+from a location whose two bytes are definite, a copy of a definite
+value, an add of a definite value and a constant (a subtraction keeps
+the space only when the address is the minuend, and a difference of
+two addresses is a length, a mask or a shift leaves a fragment), or a
+select, phi, or call result whose every arm is definite.
+
+Memory bytes are definite when every write to them writes a definite
+value, so a slot that also takes RAM loses the proof for exactly those
+bytes. A write must also have happened by every read of the byte: a
+read before a later write observes the earlier value, so the proof
+tracks the block and the position of each write and each read, and a
+write in another block counts only when that block dominates the
+read's. Without that order, a global read before its only store would
+observe the store's value.
+
+A value is definite the same way: its definition must have happened
+by every use of it, and a name the function defines more than once is
+never definite, because the IR is a slot IR and a use cannot be
+attributed to one definition. A parameter's name the body writes is
+such a redefinition, so a use before that write keeps the incoming
+value.
+
+A pointer that joins a definite flash pointer with a value that is
+not a flash address is maybe-flash, and no tag survives the join, so
+the proof withdraws the flash claim from the join's result and marks
+it mixed. The join's own dereference then keeps the maybe-flash
+refusal; the flash arm it joined keeps its claim, so a direct
+dereference through the arm still reads flash. The withdrawal is what
+keeps the maybe case safe without the 3-byte tagged form: a
+maybe-flash slot is sized by `alloc` from its own slot proof, so
+marking the `inttoptr` dst a flash writer there would widen the slot
+on the backend side only.
+
+Inside a function the `inttoptr` dsts stay out of the slot proof's
+writer set, so a join with a RAM arm stays maybe-flash and keeps its
+refusal. At a call boundary a definite `inttoptr` value is a flash
+writer of the param or call-dst slot it lands in, exactly like a
+proven flash pointer, so the callee's dereference through that param
+reads flash. `alloc` runs the same definite proof before its slot
+proof, so both sides agree on that slot's space and size. The
+backend still extends its deref set with the dsts, and the store
+path with it: a store through a definite flash address is a ROM
+write, which the backend refuses, as it does for any other flash
+pointer. A definite flash return is refused the same way, so a
+laundered address can be passed in but not returned.
+
+Eight shapes stay refused. A `ptrtoint` of a GEP reads the GEP's own
+slot, which `resolve_pointers` folds away and never writes, so the
+value is not an address. A store of a flash address through a pointer
+the proof cannot resolve names no location, so no byte is definite. A
+`memcpy` side with a runtime term names no fixed bytes, so the copy's
+other side is not proven to hold the address. A call result is
+definite only when the callee returned a parameter it never
+overwrote, since the IR is a slot IR and a name may be reused. A
+global whose initializer holds a plain value holds no address, so its
+bytes are not definite. A subtraction with a constant minuend is not
+an address, so it does not keep the space. A pair of bytes counts as
+an address only when one write produced both of them, so a wide store
+and two byte stores that overlap do not make one. A `memcpy` whose
+side names a pointer value copies the pointee's content, which the
+proof cannot bound, so it names no bytes.
+
+The proof cannot see an `asm` that writes a hardcoded address, since
+the proof only knows the slots an `asm` names as operands. The
+pre-existing slot proof has the same blind spot.
