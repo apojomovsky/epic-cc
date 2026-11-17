@@ -843,6 +843,37 @@ fn zext_of_a_flash_gep_materializes_the_label() {
 }
 
 #[test]
+fn widening_zext_of_a_gep_zero_fills_the_high_bytes() {
+    // A widening zext of a GEP must CLRF the bytes past the 16-bit
+    // address: poison the dst slot first, so a missing fill leaves
+    // the poison in the stored i32 instead of the expected zeros.
+    let ir = "global tab i8\nglobal out i32\n\
+              fn main(void) ()\n  block entry:\n    %q = gep @tab +1\n    %x = zext i16 %q to i32\n    store i32 %x @out\n    ret void\n";
+    let (asm, map) = laundry_sim(ir, &[], &[]);
+    let tab = map["tab"];
+    let out = map["out"];
+    let x = map["main::x"];
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[x as usize + 2] = 0xAA;
+    p.ram_mut()[x as usize + 3] = 0xBB;
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    let base = tab + 1;
+    assert_eq!(
+        [
+            p.ram()[out as usize],
+            p.ram()[out as usize + 1],
+            p.ram()[out as usize + 2],
+            p.ram()[out as usize + 3],
+        ],
+        [base as u8, (base >> 8) as u8, 0, 0],
+        "the widening zext must zero-fill the high bytes:\n{asm}"
+    );
+}
+
+#[test]
 fn scevgep_icmp_loop_sums_through_deref() {
     // epic-cc#1479: an LSR walk compares its step GEP against the end
     // GEP to leave the loop. Both GEP dsts are virtual (no slot), so
@@ -1137,7 +1168,10 @@ fn sext_of_a_gep_materializes_the_address() {
     );
     // The sign fill comes from bit 7 of the materialized high byte, so
     // an address with that bit set fills the upper bytes with 0xFF.
-    let (asm, map) = laundry_sim(ir, &[], &[("tab", 0x807F)]);
+    // Placing tab at 0x807E makes the address 0x807F, whose low byte
+    // has bit 7 clear: reading the low byte as the sign source would
+    // fill 0x00 instead, so this pins which byte the fill reads.
+    let (asm, map) = laundry_sim(ir, &[], &[("tab", 0x807E)]);
     let out = map["out"];
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
@@ -1151,7 +1185,7 @@ fn sext_of_a_gep_materializes_the_address() {
             p.ram()[out as usize + 2],
             p.ram()[out as usize + 3],
         ],
-        [0x80, 0x80, 0xFF, 0xFF],
+        [0x7F, 0x80, 0xFF, 0xFF],
         "a high address must sign-fill the upper bytes:\n{asm}"
     );
 }
