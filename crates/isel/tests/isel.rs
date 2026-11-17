@@ -1315,21 +1315,20 @@ fn gep_scaled_sum_accumulates_in_w() {
         ("main::w", 0x2C),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // scale-2 term: FSR starts at a + k, then %i adds into it twice,
-    // each add carrying into IRP. The IRP set (BCF STATUS, 7) precedes
-    // the whole sequence, and the scratch byte is never touched.
+    // scale-2 term: W accumulates a + k + 2*i, FSR counts carries,
+    // then IRP flips once for odd parity (epic-cc#1505).
     assert!(
         asm.contains(
-            "BCF STATUS, 7\n    MOVLW 0x23\n    MOVWF FSR\n    MOVF 0x29, W\n    ADDWF FSR, F\n    MOVLW 0x80\n    BTFSC STATUS, 0\n    XORWF STATUS, F\n    MOVF 0x29, W\n    ADDWF FSR, F"
+            "BCF STATUS, 7\n    MOVLW 0x23\n    CLRF FSR\n    ADDWF 0x29, W\n    BTFSC STATUS, 0\n    INCF FSR, F\n    ADDWF 0x29, W\n    BTFSC STATUS, 0\n    INCF FSR, F\n    BTFSC FSR, 0\n    BSF STATUS, 7\n    MOVWF FSR"
         ),
-        "scaled term adds into FSR after the IRP clear:\n{asm}"
+        "scaled term accumulates in W with FSR parity:\n{asm}"
     );
-    // two distinct terms add in order (i then j), same FSR start.
+    // two distinct terms accumulate in order (i then j).
     assert!(
         asm.contains(
-            "BCF STATUS, 7\n    MOVLW 0x23\n    MOVWF FSR\n    MOVF 0x29, W\n    ADDWF FSR, F\n    MOVLW 0x80\n    BTFSC STATUS, 0\n    XORWF STATUS, F\n    MOVF 0x2A, W\n    ADDWF FSR, F"
+            "BCF STATUS, 7\n    MOVLW 0x23\n    CLRF FSR\n    ADDWF 0x29, W\n    BTFSC STATUS, 0\n    INCF FSR, F\n    ADDWF 0x2A, W\n    BTFSC STATUS, 0\n    INCF FSR, F\n    BTFSC FSR, 0\n    BSF STATUS, 7\n    MOVWF FSR"
         ),
-        "two-term sum adds both terms after the IRP clear:\n{asm}"
+        "two-term sum accumulates in W with FSR parity:\n{asm}"
     );
     assert!(
         !asm.contains("0x70"),
@@ -1359,22 +1358,20 @@ fn gep_scaled_multi_term_adds_the_term_once_per_repetition() {
         ("main::v", 0x2B),
     ];
     let asm = select(&PIC16F877A, &m, &addrs(&map));
-    // One MOVF %j,W plus FSR add per scale-2 repetition: twice in total.
+    // One W accumulate per repetition: %j twice, three in total.
     assert_eq!(
-        asm.matches("MOVF 0x2A, W").count(),
+        asm.matches("ADDWF 0x2A, W").count(),
         2,
-        "scale-2 term loads %j once per repetition:\n{asm}"
+        "scale-2 term accumulates %j once per repetition:\n{asm}"
     );
     assert_eq!(
-        asm.matches("ADDWF FSR, F").count(),
+        asm.matches("INCF FSR, F").count(),
         3,
-        "FSR receives i plus both %j repetitions:\n{asm}"
+        "FSR counts a carry for i plus both %j repetitions:\n{asm}"
     );
-    // Full sequence: IRP cleared (bank-0 base 0x40), FSR starts at
-    // a + 1, then i and both j repetitions add into it.
     assert!(
-        asm.contains("BCF STATUS, 7\n    MOVLW 0x41\n    MOVWF FSR\n    MOVF 0x29, W\n    ADDWF FSR, F\n    MOVLW 0x80\n    BTFSC STATUS, 0\n    XORWF STATUS, F\n    MOVF 0x2A, W\n    ADDWF FSR, F"),
-        "scaled multi-term sum adds i + 2*j after the IRP clear:\n{asm}"
+        asm.contains("BCF STATUS, 7\n    MOVLW 0x41\n    CLRF FSR\n    ADDWF 0x29, W\n    BTFSC STATUS, 0\n    INCF FSR, F\n    ADDWF 0x2A, W"),
+        "scaled multi-term sum accumulates i + 2*j in W:\n{asm}"
     );
     // End-to-end: i=2, j=2 -> a[1+2+4] = a[7] = 0x17. A doubled running
     // sum computes 2*i + 2*j -> a[9] = 0x19 instead.
@@ -1422,13 +1419,13 @@ fn gep_stride_five_ram_index_reads_each_record_in_sim() {
     ];
     let asm = select(&PIC16F877A, &parse(ir), &addrs(&map));
     assert!(
-        asm.contains("MOVLW 0x43\n    MOVWF FSR\n    MOVF 0x29, W\n    ADDWF FSR, F"),
-        "scale-5 term starts adding into FSR at a + 3:\n{asm}"
+        asm.contains("MOVLW 0x43\n    CLRF FSR\n    ADDWF 0x29, W"),
+        "scale-5 term starts accumulating in W at a + 3:\n{asm}"
     );
     assert_eq!(
-        asm.matches("MOVF 0x29, W").count(),
+        asm.matches("ADDWF 0x29, W").count(),
         5,
-        "scale-5 term loads %i once per repetition:\n{asm}"
+        "scale-5 term accumulates %i once per repetition:\n{asm}"
     );
     for i in 0u8..4 {
         let mut seed: Vec<(u16, u8)> = (0..20u16).map(|n| (0x40 + n, 0x80 + n as u8)).collect();
@@ -1439,6 +1436,48 @@ fn gep_stride_five_ram_index_reads_each_record_in_sim() {
             "a[3 + 5*{i}]"
         );
     }
+}
+
+#[test]
+fn gep_parity_shape_crossing_past_255_is_exact_in_sim() {
+    // New W+parity shape (epic-cc#1505) vs the #1466 guard: totals
+    // past 255 stay exact, including an even-parity double cross
+    // and a 2-byte term whose high byte is odd per repetition.
+    let ir8 = "global in i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @a +100 +2*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
+    let map8 = [
+        ("in", 0x20u16),
+        ("out", 0x21),
+        ("a", 0x40),
+        ("main::i", 0x29),
+        ("main::v", 0x2A),
+    ];
+    let asm = select(&PIC16F877A, &parse(ir8), &addrs(&map8));
+    assert!(
+        asm.contains("CLRF FSR") && asm.contains("BTFSC FSR, 0"),
+        "parity shape emitted for scale-2 term:\n{asm}"
+    );
+    // i=100: total 0x40+100+200=364 (odd parity); i=200: 564 mod
+    // 512 = 52 (even parity, crossed twice).
+    for (i, phys, wrapped) in [(100u8, 364u16, 108u16), (200, 52, 308)] {
+        let seed = [(0x20u16, i), (phys, 0x5A), (wrapped, 0xEE)];
+        assert_eq!(sim_run(ir8, &map8, &seed, 0x21), 0x5A, "a[100+2*{i}]");
+    }
+    let ir16 = "global in i16\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i16 @in\n    %p = gep @a +10 +3*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
+    let map16 = [
+        ("in", 0x20u16),
+        ("out", 0x22),
+        ("a", 0x40),
+        ("main::i", 0x29),
+        ("main::v", 0x2B),
+    ];
+    let asm = select(&PIC16F877A, &parse(ir16), &addrs(&map16));
+    assert!(
+        asm.contains("BTFSC 0x2A, 0\n    INCF FSR, F"),
+        "2-byte term counts high byte bit 0 into parity:\n{asm}"
+    );
+    // i=300 (high byte odd): total 0x40+10+900=974 mod 512 = 462.
+    let seed = [(0x20u16, 44u8), (0x21, 1), (462, 0x5C), (206, 0xEE)];
+    assert_eq!(sim_run(ir16, &map16, &seed, 0x22), 0x5C, "a[10+3*300]");
 }
 
 #[test]
