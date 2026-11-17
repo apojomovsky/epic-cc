@@ -100,15 +100,21 @@ fn help_and_version_exit_zero_on_stdout() {
 fn usage_errors_exit_two_with_usage_on_stderr() {
     let out = binary().output().expect("run binary");
     assert_eq!(out.status.code(), Some(2), "exit: {}", out.status);
-    assert!(String::from_utf8_lossy(&out.stderr).contains(epic_cc_sim::USAGE));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("missing <hex>"), "stderr: {err}");
+    assert!(err.contains(epic_cc_sim::USAGE), "stderr: {err}");
 
     let out = binary()
         .args([fixture("halt.hex"), "--devce".into(), "x".into()])
         .output()
         .expect("run binary");
     assert_eq!(out.status.code(), Some(2), "exit: {}", out.status);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--device"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unknown option --devce"), "stderr: {err}");
+    assert!(err.contains("--device"), "stderr: {err}");
+    assert!(err.contains(epic_cc_sim::USAGE), "stderr: {err}");
 
+    // Design 51 section 3: usage text follows the diagnostic on stderr.
     let out = binary()
         .args([
             fixture("halt.hex"),
@@ -118,5 +124,9 @@ fn usage_errors_exit_two_with_usage_on_stderr() {
         .output()
         .expect("run binary");
     assert_eq!(out.status.code(), Some(2), "exit: {}", out.status);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown device"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    let diag = err.find("unknown device no-such-part").expect("diagnostic");
+    let usage = err.find(epic_cc_sim::USAGE).expect("usage text");
+    assert!(diag < usage, "stderr: {err}");
+    assert!(out.stdout.is_empty(), "stdout: {:?}", out.stdout);
 }

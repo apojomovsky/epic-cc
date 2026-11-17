@@ -121,6 +121,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
 }
 
 /// Resolve the `--device` spelling (or the default) to its registry entry.
+/// An unknown name is a usage error, so the error carries the usage text.
 pub fn resolve_device(name: Option<&str>) -> Result<&'static device::Device, String> {
     let name = name.unwrap_or(DEFAULT_DEVICE);
     device::resolve(name).ok_or_else(|| {
@@ -129,7 +130,9 @@ pub fn resolve_device(name: Option<&str>) -> Result<&'static device::Device, Str
             .map(|d| d.name)
             .collect::<Vec<_>>()
             .join(", ");
-        format!("epic-cc-sim: unknown device {name} (available: {available})")
+        usage_err(format!(
+            "epic-cc-sim: unknown device {name} (available: {available})"
+        ))
     })
 }
 
@@ -434,14 +437,20 @@ mod tests {
 
     #[test]
     fn bad_cycles_and_missing_values_are_usage_errors() {
-        assert!(parse_args(&argv(&["a.hex", "--cycles", "soon"])).is_err());
-        assert!(parse_args(&argv(&["a.hex", "--cycles"])).is_err());
-        assert!(parse_args(&argv(&["a.hex", "--device"])).is_err());
+        for parts in [
+            &["a.hex", "--cycles", "soon"][..],
+            &["a.hex", "--cycles"][..],
+            &["a.hex", "--device"][..],
+        ] {
+            let e = parse_args(&argv(parts)).unwrap_err();
+            assert!(e.contains(USAGE), "{e}");
+        }
     }
 
     #[test]
     fn extra_positional_is_a_usage_error() {
-        assert!(parse_args(&argv(&["a.hex", "b.hex"])).is_err());
+        let e = parse_args(&argv(&["a.hex", "b.hex"])).unwrap_err();
+        assert!(e.contains(USAGE), "{e}");
     }
 
     #[test]
@@ -459,7 +468,9 @@ mod tests {
             resolve_device(Some("PIC16F877A")).unwrap().name,
             resolve_device(None).unwrap().name
         );
-        assert!(resolve_device(Some("no-such-part")).is_err());
+        let e = resolve_device(Some("no-such-part")).unwrap_err();
+        assert!(e.contains("unknown device no-such-part"), "{e}");
+        assert!(e.contains(USAGE), "{e}");
     }
 
     #[test]
