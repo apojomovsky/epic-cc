@@ -266,6 +266,45 @@ fn physical_end(device: &Device, start: u16, width: u16) -> u16 {
     }
     cur
 }
+
+/// The end of the first fixed region a `width`-byte global at `start`
+/// physically overlaps, or `None`. Walks regions like `physical_end`:
+/// only occupied segments count, so a fixed address in a skipped gap
+/// does not overlap and a tail segment past the gap does.
+fn overlapping_fixed_end(
+    device: &Device,
+    fixed: &[(String, u16, u16)],
+    start: u16,
+    width: u16,
+) -> Option<u16> {
+    let mut cur = start;
+    let mut remaining = width;
+    while remaining > 0 {
+        let (region_start, end) = device.region_for(cur)?;
+        if cur < region_start {
+            cur = region_start;
+        }
+        let avail = end - cur + 1;
+        let seg_end = if remaining <= avail {
+            cur + remaining
+        } else {
+            end + 1
+        };
+        for (_, fa, fs) in fixed {
+            let fend = *fa + *fs;
+            if cur < fend && seg_end > *fa {
+                return Some(fend);
+            }
+        }
+        if remaining <= avail {
+            return None;
+        }
+        remaining -= avail;
+        cur = end + 1;
+    }
+    None
+}
+
 /// The RAM bytes a global occupies: a maybe-flash pointer slot (epic-cc#1306)
 /// widens from 2 to 3 (tag plus address) on PIC18, where the backend
 /// lowers it as a fat value. Anything else keeps its declared size, so
@@ -4833,50 +4872,15 @@ fn allocate_inner(
                 // If the next placement would overlap a fixed region, bump
                 // past it before asking try_place_at.
                 let mut candidate = addr;
-                loop {
-                    let mut bumped = false;
-                    for (_, fa, fs) in &fixed {
-                        if candidate < *fa + *fs
-                            && candidate + u16::from(width) > *fa
-                            && candidate >= *fa
-                            && candidate < *fa + *fs
-                        {
-                            candidate = *fa + *fs;
-                            bumped = true;
-                            break;
-                        }
-                        // Also catch the case where the placed range would
-                        // straddle into a fixed region that starts inside it.
-                        if candidate < *fa && candidate + u16::from(width) > *fa {
-                            // Overlaps the start of a fixed region; bump if
-                            // there is overlap, but respect alignment: just
-                            // move candidate past the fixed region and retry.
-                            candidate = *fa + *fs;
-                            bumped = true;
-                            break;
-                        }
-                    }
-                    if !bumped {
-                        break;
-                    }
+                while let Some(next) = overlapping_fixed_end(device, &fixed, candidate, width) {
+                    candidate = next;
                 }
                 let start = try_place_at(device, candidate, width)?;
                 // Final overlap check: the aligned placement from
                 // try_place_at may have landed inside a fixed region.
                 let mut start = start;
-                loop {
-                    let mut overlap = None;
-                    for (_, fa, fs) in &fixed {
-                        if start < *fa + *fs && start + u16::from(width) > *fa {
-                            overlap = Some(*fa + *fs);
-                            break;
-                        }
-                    }
-                    if let Some(next) = overlap {
-                        start = try_place_at(device, next, width)?;
-                    } else {
-                        break;
-                    }
+                while let Some(next) = overlapping_fixed_end(device, &fixed, start, width) {
+                    start = try_place_at(device, next, width)?;
                 }
                 out.insert(g.name.clone(), start);
                 addr = physical_end(device, start, u16::from(width));
