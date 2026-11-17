@@ -194,7 +194,8 @@ pub struct AllocLayout {
     /// 0. The allocator places sequentially from each bank start, so this
     /// is the occupied bytes; the only holes are the 1-byte region-tail
     /// gaps an i16 leaves when it moves wholesale to the next bank, which
-    /// the high-water mark conservatively includes.
+    /// the high-water mark conservatively includes. A bank-straddling
+    /// global charges each bank only its segment physically in that bank.
     pub bank_used: Vec<u16>,
     /// The disjoint ISR region's span in bytes (0 without an ISR): the
     /// distance from the ISR root's base to the highest ISR-context frame
@@ -303,6 +304,41 @@ fn overlapping_fixed_end(
         cur = end + 1;
     }
     None
+/// Raise each bank's high-water mark in `bank_hi` by the physical bytes
+/// of a `width`-byte global at `start`, walking regions like
+/// `physical_end`: a bank-straddling global charges each bank only the
+/// segment physically in it, never the gap addresses its span skips.
+fn charge_global(device: &Device, bank_hi: &mut [Option<u16>], start: u16, width: u16) {
+    // A global pinned outside every GPR bank (common RAM, say) charges
+    // no bank, as before; only a bank start walks the straddle.
+    if !device
+        .ram_banks
+        .iter()
+        .any(|&(s, e)| start >= s && start <= e)
+    {
+        return;
+    }
+    let mut cur = start;
+    let mut remaining = width;
+    while remaining > 0 {
+        let (region_start, end) = device
+            .region_for(cur)
+            .expect("alloc: global placement past the last GPR bank");
+        if cur < region_start {
+            cur = region_start;
+        }
+        let take = remaining.min(end - cur + 1);
+        let seg_end = cur + take;
+        if let Some(i) = device
+            .ram_banks
+            .iter()
+            .position(|&(s, e)| cur >= s && cur <= e)
+        {
+            bank_hi[i] = Some(bank_hi[i].map_or(seg_end, |h| h.max(seg_end)));
+        }
+        remaining -= take;
+        cur = end + 1;
+    }
 }
 
 /// The RAM bytes a global occupies: a maybe-flash pointer slot (epic-cc#1306)
@@ -5196,24 +5232,17 @@ fn allocate_inner(
             .unwrap_or(isr_lo);
         isr_bytes = isr_hi - isr_lo;
     }
-    for (i, &(start, end)) in device.ram_banks.iter().enumerate() {
-        let mut hi: Option<u16> = None;
-        // The synthetic staging buffer lives outside `m.globals`: chain
-        // it in exactly like `end_of_globals` does, or the report
-        // undercounts RAM by the buffer.
-        for g in m.globals.iter().chain(stage_holder.iter()) {
-            if let Some(&a) = globals.get(&g.name) {
-                // A bank-straddling global's physical end skips common RAM
-                // (docs/internals/design/33 §D-2), so the per-bank high-water must use
-                // physical_end, not a + size (which would overcount the
-                // first bank into the common-RAM hole and miss the later
-                // banks entirely).
-                let e = physical_end(device, a, gsize(&mixed_spaces, g));
-                if a >= start && a <= end {
-                    hi = Some(hi.map_or(e, |h| h.max(e)));
-                }
-            }
+    let mut bank_hi: Vec<Option<u16>> = device.ram_banks.iter().map(|_| None).collect();
+    // The synthetic staging buffer lives outside `m.globals`: chain
+    // it in exactly like `end_of_globals` does, or the report
+    // undercounts RAM by the buffer.
+    for g in m.globals.iter().chain(stage_holder.iter()) {
+        if let Some(&a) = globals.get(&g.name) {
+            charge_global(device, &mut bank_hi, a, gsize(&mixed_spaces, g));
         }
+    }
+    for (i, &(start, end)) in device.ram_banks.iter().enumerate() {
+        let mut hi = bank_hi[i];
         for (key, &a) in &locals {
             let e = a + u16::from(local_width[key]);
             if a >= start && a <= end {
