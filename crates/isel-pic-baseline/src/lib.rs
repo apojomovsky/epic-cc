@@ -357,6 +357,19 @@ impl<'m> Gen<'m> {
         s
     }
 
+    /// W = `lit` + the scaled term sum, for byte 0 of a GEP value.
+    /// Any scale and term count rides `emit_accum_terms`, which adds
+    /// each register `scale` times, so a scaled single term such as
+    /// (2, idx) over an `unsigned int` array lowers like the FSR path.
+    fn emit_w_lit_plus_terms(&mut self, lit: u8, terms: &[(u16, String)]) {
+        if terms.is_empty() {
+            self.emit(format!("    MOVLW 0x{lit:02X}"));
+        } else {
+            self.emit_accum_terms(terms);
+            self.emit_add_w_const(lit);
+        }
+    }
+
     /// W = byte `idx` of `val`.
     fn emit_load_byte(&mut self, val: &Val, idx: u8) {
         match val {
@@ -375,37 +388,10 @@ impl<'m> Gen<'m> {
                     if let Base::Global(name) = &base {
                         let addr = self.global_addr(name).wrapping_add(k as u16);
                         let lo = (addr & 0xFF) as u8;
-                        match terms.as_slice() {
-                            [] => {
-                                self.emit(format!(
-                                    "    MOVLW 0x{:02X}",
-                                    if idx == 0 { lo } else { 0 }
-                                ));
-                            }
-                            [(1, reg)] => {
-                                let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
-                                if idx == 0 {
-                                    self.emit(format!("    MOVLW 0x{lo:02X}"));
-                                    self.emit(format!("    ADDWF {}, W", self.fop(ra)));
-                                } else {
-                                    self.emit("    MOVLW 0x00".to_string());
-                                }
-                            }
-                            _ => {
-                                assert!(
-                                    terms.len() == 2 && terms.iter().all(|(sc, _)| *sc == 1),
-                                    "isel: multi-term GEP load with {terms:?} not supported"
-                                );
-                                let ra1 = self.val_addr(&Val::Reg(terms[0].1.clone())).direct();
-                                let ra2 = self.val_addr(&Val::Reg(terms[1].1.clone())).direct();
-                                if idx == 0 {
-                                    self.emit(format!("    MOVLW 0x{lo:02X}"));
-                                    self.emit(format!("    ADDWF {}, W", self.fop(ra1)));
-                                    self.emit(format!("    ADDWF {}, W", self.fop(ra2)));
-                                } else {
-                                    self.emit("    MOVLW 0x00".to_string());
-                                }
-                            }
+                        if idx == 0 {
+                            self.emit_w_lit_plus_terms(lo, &terms);
+                        } else {
+                            self.emit("    MOVLW 0x00".to_string());
                         }
                         return;
                     }
@@ -440,62 +426,23 @@ impl<'m> Gen<'m> {
                         assert!(k <= 0xFF, "isel: slot offset {k} exceeds 255");
                         Some((sa.wrapping_add(k) & 0xFF) as u8)
                     };
-                    match terms.as_slice() {
-                        [] => {
-                            if idx == 0 {
-                                if let Some(lo) = base_lit {
-                                    self.emit(format!("    MOVLW 0x{lo:02X}"));
-                                } else {
-                                    self.emit(format!("    MOVF {}, W", self.fop(sa)));
-                                    if k != 0 {
-                                        let k8 = u8::try_from(k).unwrap_or_else(|_| {
-                                            panic!("isel: slot offset {k} exceeds 255")
-                                        });
-                                        self.emit_add_w_const(k8);
-                                    }
-                                }
-                            } else {
-                                self.emit("    MOVLW 0x00".to_string());
-                            }
+                    if idx != 0 {
+                        self.emit("    MOVLW 0x00".to_string());
+                    } else if let Some(lo) = base_lit {
+                        self.emit_w_lit_plus_terms(lo, &terms);
+                    } else if terms.is_empty() {
+                        self.emit(format!("    MOVF {}, W", self.fop(sa)));
+                        if k != 0 {
+                            let k8 = u8::try_from(k)
+                                .unwrap_or_else(|_| panic!("isel: slot offset {k} exceeds 255"));
+                            self.emit_add_w_const(k8);
                         }
-                        [(1, reg)] => {
-                            let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
-                            if idx == 0 {
-                                match base_lit {
-                                    Some(lo) => {
-                                        self.emit(format!("    MOVLW 0x{lo:02X}"));
-                                        self.emit(format!("    ADDWF {}, W", self.fop(ra)));
-                                    }
-                                    None => {
-                                        self.emit(format!("    MOVF {}, W", self.fop(sa)));
-                                        self.emit(format!("    ADDWF {}, W", self.fop(ra)));
-                                    }
-                                }
-                            } else {
-                                self.emit("    MOVLW 0x00".to_string());
-                            }
-                        }
-                        _ => {
-                            assert!(
-                                terms.len() == 2 && terms.iter().all(|(sc, _)| *sc == 1),
-                                "isel: multi-term GEP load with {terms:?} not supported"
-                            );
-                            let ra1 = self.val_addr(&Val::Reg(terms[0].1.clone())).direct();
-                            let ra2 = self.val_addr(&Val::Reg(terms[1].1.clone())).direct();
-                            if idx == 0 {
-                                match base_lit {
-                                    Some(lo) => {
-                                        self.emit(format!("    MOVLW 0x{lo:02X}"));
-                                    }
-                                    None => {
-                                        self.emit(format!("    MOVF {}, W", self.fop(sa)));
-                                    }
-                                }
-                                self.emit(format!("    ADDWF {}, W", self.fop(ra1)));
-                                self.emit(format!("    ADDWF {}, W", self.fop(ra2)));
-                            } else {
-                                self.emit("    MOVLW 0x00".to_string());
-                            }
+                    } else {
+                        self.emit_accum_terms(&terms);
+                        self.emit_bank_select(sa);
+                        self.emit(format!("    ADDWF {}, W", self.fop(sa)));
+                        if k != 0 {
+                            self.emit_add_w_const((k & 0xFF) as u8);
                         }
                     }
                     return;
