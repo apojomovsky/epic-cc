@@ -1606,6 +1606,27 @@ fn bank_used_counts_a_multi_byte_value_in_full() {
 }
 
 #[test]
+fn bank_used_charges_a_straddling_global_per_bank() {
+    // A 90-byte global pinned at 0x1A0 (bank 3, 0x1A0..0x1EF) straddles
+    // into bank 4 (0x220..): 80 bytes sit in bank 3 and 10 in bank 4. The
+    // physical end is 0x22A, so charging physical_end - base to bank 3
+    // would report 138 bytes against an 80-byte bank.
+    let mut m = parse(
+        "global big i8 @0x1A0\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 90; // big: [90 x i8]
+    let out = allocate(&PIC16F1939, &m, "depth 1\n");
+    assert_eq!(out.globals["big"], 0x1A0);
+    let mut expected = vec![0u16; out.bank_used.len()];
+    expected[3] = 80;
+    expected[4] = 10;
+    assert_eq!(out.bank_used, expected);
+}
+
+#[test]
 fn isr_bytes_reports_the_disjoint_region_span() {
     // main's context occupies 0x21..0x24 (sink at 0x20); the ISR root's
     // base is 0x24 and its chain (isr -> m1_isr -> m2_isr, one i8 local
