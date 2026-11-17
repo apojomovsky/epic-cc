@@ -8371,65 +8371,6 @@ impl<'m> Gen<'m> {
     }
 }
 
-/// The classic iterative dominator sets for a function's CFG: `doms[b]` is
-/// the set of blocks that dominate block `b`. Used to classify the phi-copy
-/// edges: `pred -> merge` is a BACK edge iff `merge` dominates `pred`: the
-/// pred is inside the merge's loop, so on that edge the merge's phi slots
-/// hold the CURRENT iteration's values. This covers self-loops
-/// (pred == merge) AND separate-latch back edges (pred is a latch block).
-fn block_dominators(f: &ir::Func) -> HashMap<String, HashSet<String>> {
-    let entry = &f.blocks[0].label;
-    let all: HashSet<String> = f.blocks.iter().map(|b| b.label.clone()).collect();
-    // Predecessor lists from the terminators' targets (the terminator is
-    // the last inst of every block).
-    let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
-    for b in &f.blocks {
-        let targets: Vec<&str> = match b.insts.last() {
-            Some(Inst::Br(br)) => vec![br.target.as_str()],
-            Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
-            Some(Inst::Switch(sw)) => {
-                let mut v: Vec<&str> = sw.cases.iter().map(|(_, l)| l.as_str()).collect();
-                v.push(sw.default.as_str());
-                v
-            }
-            _ => vec![],
-        };
-        for t in targets {
-            preds.entry(t).or_default().push(b.label.as_str());
-        }
-    }
-    let mut dom: HashMap<String, HashSet<String>> = HashMap::new();
-    dom.insert(entry.clone(), HashSet::from([entry.clone()]));
-    for b in &f.blocks {
-        if b.label != *entry {
-            dom.insert(b.label.clone(), all.clone());
-        }
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in &f.blocks {
-            if b.label == *entry {
-                continue;
-            }
-            let mut new: HashSet<String> = match preds.get(b.label.as_str()) {
-                Some(ps) => ps
-                    .iter()
-                    .map(|p| dom[*p].clone())
-                    .reduce(|a, c| a.intersection(&c).cloned().collect())
-                    .unwrap_or_else(|| all.clone()),
-                None => all.clone(),
-            };
-            new.insert(b.label.clone());
-            if new != dom[&b.label] {
-                dom.insert(b.label.clone(), new);
-                changed = true;
-            }
-        }
-    }
-    dom
-}
-
 /// The ISR context-save prologue, right after the vector entry (word 4):
 /// `w_save` (nibble-swapped in place) first, `SWAPF STATUS, W` captures the
 /// interrupted bank+flags without touching them, then PCLATH/FSR and the
@@ -11908,7 +11849,7 @@ fn emit_func_body(g: &mut Gen<'_>, f: &ir::Func) {
     // Back-edge classifier for the phi-copy ordering: `merge` dominates the
     // pred (self-loop OR separate-latch back edge) => the merge's phi slots
     // hold the current iteration's values and readers run first.
-    let doms = block_dominators(f);
+    let doms = iselcore::func_dominators(f);
     // Counted byte loops as down-counter walks (epic-cc#897): planned up
     // front from the same folds the normal arms read, emitted whole at
     // each header below. Latch-out loops (epic-cc#1169) own a region of
@@ -12453,7 +12394,7 @@ fn prev_instruction(out: &[String], k: usize) -> Option<&str> {
 /// copy never overwrites a slot a later copy still needs to read.
 ///
 /// The ordering depends on whether the edge is a BACK edge into the merge
-/// (`back_edge`, computed by `block_dominators`, the merge block dominates
+/// (`back_edge`, computed by `iselcore::func_dominators`, the merge block dominates
 /// the pred, so the pred is inside the merge's loop):
 /// - Back edge (a self-loop OR a separate-latch back edge): the merge's phi
 ///   slots hold the CURRENT iteration's values, so a copy reading a slot
@@ -15930,7 +15871,7 @@ mod fit_repair_tests {
 /// copy order on it flips.
 #[cfg(test)]
 mod switch_dominator_tests {
-    use super::block_dominators;
+    use iselcore::func_dominators;
 
     /// A dispatch block whose switch feeds two case blocks, plus a second
     /// branch the dispatch cannot reach. The case block's dominator set
@@ -15952,7 +15893,7 @@ mod switch_dominator_tests {
     #[test]
     fn switch_target_does_not_dominate_an_unrelated_block() {
         let f = switch_cfg();
-        let doms = block_dominators(&f);
+        let doms = func_dominators(&f);
         let c0 = &doms["c0"];
         assert!(
             !c0.contains("other"),
@@ -15968,7 +15909,7 @@ mod switch_dominator_tests {
     #[test]
     fn switch_default_target_does_not_dominate_an_unrelated_block() {
         let f = switch_cfg();
-        let doms = block_dominators(&f);
+        let doms = func_dominators(&f);
         let def = &doms["def"];
         assert!(
             !def.contains("other"),
@@ -15986,7 +15927,7 @@ mod switch_dominator_tests {
         // not contain a case target, or the dispatch would look like it
         // sits inside a case block's loop.
         let f = switch_cfg();
-        let doms = block_dominators(&f);
+        let doms = func_dominators(&f);
         let dispatch = &doms["dispatch"];
         assert!(
             !dispatch.contains("c0") && !dispatch.contains("c1"),
