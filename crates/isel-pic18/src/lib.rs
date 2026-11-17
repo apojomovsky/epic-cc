@@ -19542,7 +19542,22 @@ pub fn select_with_opts(
                     // leave a stale tag behind (epic-cc#1306).
                     // (alloc copies returned consts to RAM, epic-cc#1119).
                     // A null constant is space-neutral and stays allowed.
-                    if !matches!(v, Val::Const(_)) && g.flash_val(&f.name, v) {
+                    // A definite inttoptr return is the exception
+                    // (epic-cc#1442): every direct caller's dst is
+                    // flash-kind at the same 2-byte width alloc gives
+                    // it, but only when every return here is definite
+                    // or null and no indirect site joins it mixed.
+                    let definite = |rv: &Val| -> bool {
+                        matches!(rv, Val::Reg(r) if g.prov.int_flash_ptr.contains(&ssa_key(&f.name, r)))
+                            || matches!(rv, Val::Const(0))
+                    };
+                    let definite_return = definite(v)
+                        && f.blocks.iter().flat_map(|b| &b.insts).all(|i| {
+                            !matches!(i, Inst::Ret(Some((_, rv)), _) if !definite(rv))
+                        })
+                        && !g.m.funcs.iter().flat_map(|h| &h.blocks).flat_map(|b| &b.insts)
+                            .any(|i| matches!(i, Inst::Call(c) if c.callees.iter().any(|t| t == &f.name)));
+                    if !definite_return && !matches!(v, Val::Const(_)) && g.flash_val(&f.name, v) {
                         panic!(
                             "isel-pic18: cannot return flash address {v:?} to a RAM caller (epic-cc#1119)"
                         );
