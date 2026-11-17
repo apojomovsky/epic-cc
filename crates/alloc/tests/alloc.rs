@@ -512,6 +512,53 @@ fn pure_flash_select_arms_stay_in_flash_on_pic18() {
 }
 
 #[test]
+fn int_laundered_flash_select_slot_is_tagged_and_const_stays_flash_on_pic18() {
+    // epic-cc#1419: alloc's own slot proof must agree with the backend
+    // that the join is maybe-flash, so its slot carries the tag byte
+    // and no neighbour local or global lands on it. The laundered
+    // const stays flash-resident: no RAM copy for the backend to read.
+    let m = parse(
+        "const c i8\n\
+         global g i16\n\
+         global buf i16\n\
+         global flag i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store ptr @c @g\n\
+             %x = load i16 @g\n\
+             %p = inttoptr i16 %x to ptr\n\
+             %f = load i8 @flag\n\
+             %m = select i1 %f, ptr @buf, ptr %p\n\
+             %v = load i8 %m\n\
+             store i8 %v @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    assert!(
+        out.const_globals.contains("c") && !out.globals.contains_key("c"),
+        "laundered const @c must stay flash-resident: globals={:?} consts={:?}",
+        out.globals,
+        out.const_globals
+    );
+    let m_addr = out.locals["main::m"];
+    let taken: Vec<u16> = out
+        .locals
+        .iter()
+        .filter(|(k, _)| *k != "main::m")
+        .map(|(_, a)| *a)
+        .chain(out.globals.values().copied())
+        .collect();
+    assert!(
+        !taken.iter().any(|a| (m_addr + 1..=m_addr + 2).contains(a)),
+        "maybe-flash slot at {m_addr} must own its tag byte at {}: locals={:?} globals={:?}",
+        m_addr + 2,
+        out.locals,
+        out.globals
+    );
+}
+
+#[test]
 fn a_single_const_select_arm_is_copied_to_ram() {
     // A select with one const arm and one RAM global arm does not fold
     // (iselcore seeds it as an indirect slot): the const arm's bytes are
