@@ -8912,6 +8912,18 @@ impl<'m> Gen<'m> {
                     "isel-pic18: memcpy into a maybe-flash destination %{r} is not supported (epic-cc#1306)"
                 );
             }
+            // A GEP register names its base slot, not itself: resolve
+            // it, or a maybe-flash global escapes this refusal.
+            let base_is_mixed = match self.resolved.get(&key) {
+                Some((Base::Global(g), _, _)) => self.global_slot_is_mixed(g),
+                Some((Base::Slot(sname, _), _, _)) => self.slot_is_mixed(self.cur_func, sname),
+                _ => false,
+            };
+            if base_is_mixed {
+                panic!(
+                    "isel-pic18: memcpy into a maybe-flash destination %{r} is not supported (epic-cc#1306)"
+                );
+            }
             if let Some(sname) = self.maybe_flash_slot_under_index(&key) {
                 panic!(
                     "isel-pic18: ROM is not writable: memcpy into runtime-indexed walk over flash or maybe-flash pointer %{sname} (epic-cc#1100, epic-cc#1099)"
@@ -8937,11 +8949,28 @@ impl<'m> Gen<'m> {
         let may_be_flash = |v: &Val| match v {
             Val::Reg(r) => {
                 let key = ssa_key(self.cur_func, r);
+                // A GEP register is keyed by itself above but names its
+                // resolved base: a GEP onto a global or slot must check
+                // that base, or the call falls through to the trap loop.
+                let base_may_be_flash = match self.resolved.get(&key) {
+                    Some((Base::Global(g), _, _)) => {
+                        self.global_slot_is_mixed(g) || self.global_is_const(g)
+                    }
+                    Some((Base::Slot(sname, _), _, _)) => {
+                        let sk = ssa_key(self.cur_func, sname);
+                        self.prov.flash.contains(&sk)
+                            || self.prov.mixed.contains(&sk)
+                            || self.slot_flash.contains(&sk)
+                            || self.slot_mixed.contains(&sk)
+                    }
+                    _ => false,
+                };
                 self.prov.flash.contains(&key)
                     || self.prov.mixed.contains(&key)
                     || self.slot_flash.contains(&key)
                     || self.slot_mixed.contains(&key)
                     || self.maybe_flash_slot_under_index(&key).is_some()
+                    || base_may_be_flash
             }
             Val::Global(g) => self.global_slot_is_mixed(g),
             _ => false,
