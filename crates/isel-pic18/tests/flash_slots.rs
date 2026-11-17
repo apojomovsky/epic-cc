@@ -689,6 +689,38 @@ fn int_laundered_flash_address_returned_beside_ram_return_is_refused() {
 }
 
 #[test]
+#[should_panic(expected = "cannot return flash address")]
+fn int_laundered_flash_return_into_mixed_call_dst_is_refused() {
+    // The caller's dst slot is shared with a RAM call result, so alloc
+    // widens it to the 3-byte fat form while this callee writes only
+    // the 2-byte address: the return stays refused.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i8\nglobal out i8\n\
+             fn getr(ptr) ()\n  block entry:\n    ret ptr @buf\n\
+             fn get(ptr) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    ret ptr %p\n\
+             fn main(void) ()\n  block entry:\n    %r = call ptr @getr()\n    %r = call ptr @get()\n    %v = load i8 %r\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("buf", 0x13),
+            ("get::x", 0x14),
+            ("get::p", 0x16),
+            ("main::r", 0x18),
+            ("main::v", 0x1B),
+        ]),
+        None,
+    );
+}
+
+#[test]
 fn int_laundered_through_second_global_reads_flash() {
     // The integer copy travels through another global and a trunc/zext.
     let m = with_bytes(

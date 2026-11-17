@@ -187,9 +187,10 @@ pointer. A definite flash return crosses the boundary the same
 way (epic-cc#1442): every direct caller's call-dst slot is a flash
 writer's slot at the same 2-byte width, so the caller reads the
 returned address back through TBLRD. The backend allows it only
-when every return of the function is definite or null and no
-indirect call site can join the return into a mixed dst slot; a
-RAM return beside a definite one stays refused.
+when every return of the function is definite or null, no
+indirect call site can join the return into a mixed dst slot, and
+no direct caller's dst is itself mixed; a RAM return beside a
+definite one stays refused.
 
 Eight shapes stay refused. A `ptrtoint` of a GEP reads the GEP's own
 slot, which `resolve_pointers` folds away and never writes, so the

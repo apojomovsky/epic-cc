@@ -19546,12 +19546,25 @@ pub fn select_with_opts(
                     // (epic-cc#1442): every direct caller's dst is
                     // flash-kind at the same 2-byte width alloc gives
                     // it, but only when every return here is definite
-                    // or null and no indirect site joins it mixed.
+                    // or null, no indirect site joins it mixed, and no
+                    // direct caller's dst is itself mixed. A mixed dst
+                    // is 3 bytes wide, while this callee writes only
+                    // the 2-byte address, leaving a stale tag behind.
                     let definite = |rv: &Val| -> bool {
                         matches!(rv, Val::Reg(r) if g.prov.int_flash_ptr.contains(&ssa_key(&f.name, r)))
                             || matches!(rv, Val::Const(0))
                     };
+                    let mixed_direct_dst = g.m.funcs.iter().any(|h| {
+                        h.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                            matches!(i, Inst::Call(c) if c.callees.is_empty()
+                            && c.func == f.name
+                            && c.dst.as_ref().is_some_and(|d| {
+                                g.slot_mixed.contains(&ssa_key(&h.name, d))
+                            }))
+                        })
+                    });
                     let definite_return = definite(v)
+                        && !mixed_direct_dst
                         && f.blocks.iter().flat_map(|b| &b.insts).all(|i| {
                             !matches!(i, Inst::Ret(Some((_, rv)), _) if !definite(rv))
                         })
