@@ -34,6 +34,25 @@ fn overlay_module() -> ir::Module {
 }
 
 #[test]
+fn whole_pointer_memcpy_destination_widens_for_its_tag() {
+    // The destination of a whole-pointer memcpy from a maybe-flash
+    // slot is maybe-flash itself (epic-cc#1348): alloc must reserve
+    // the tag byte or the tag write lands on the next global.
+    let m = parse(
+        "const c i8\nglobal s i16\nglobal g i16\nglobal h i16\nglobal buf i8\nglobal flag i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @s\n    %p = load ptr @s\n    store ptr %p @g\n    %f = load i8 @flag\n    br i1 %f ram join\n  block ram:\n    %b = gep @buf +0\n    store ptr %b @g\n    br join\n  block join:\n    memcpy @h @g 2\n    ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
+    let h = out.globals["h"];
+    for (name, addr) in &out.globals {
+        assert!(
+            name == "h" || !(h..h + 3).contains(addr),
+            "{name} at {addr:#x} overlaps the widened slot h at {h:#x}"
+        );
+    }
+}
+
+#[test]
 fn globals_get_bank0_addresses() {
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    ret void\n");
     let out = allocate(&PIC16F877A, &m, "depth 1\n");
