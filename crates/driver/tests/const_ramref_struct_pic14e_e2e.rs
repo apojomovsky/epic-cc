@@ -46,32 +46,16 @@ fn const_ramref_struct_table_materializes_numeric_bytes_pic14e() {
     let _ = std::fs::remove_file(&asm_path);
 
     // holding_regs is a RAM global: it has no assembler label at all,
-    // so its name must appear nowhere in the emitted text. `map` is a
-    // flash const table and DOES get a label (the init and the table
-    // reader resolve LOW(map)/HIGH(map) against it); that is fine.
+    // so its name must appear nowhere in the emitted text. The pointer
+    // to `map` lives in a RAM global, so on this core `map` keeps a RAM
+    // copy instead of a flash table (epic-cc#1347): no table label, and
+    // the copy's ref bytes materialize as numeric init bytes.
     assert!(
         !asm.contains("holding_regs"),
         "a RAM global must never be materialized as a label literal:\n{asm}"
     );
-    // The map table carries the pointer's two address bytes plus the
-    // count byte (clang pads the struct to 4 bytes here): every table
-    // byte must be a numeric RETLW, none a label.
-    let table = asm.split("\nmap:").nth(1).expect("map table label");
-    let table = table.split("\nend").next().expect("table before end");
-    let byte_lines: Vec<&str> = table
-        .lines()
-        .filter(|l| l.trim_start().starts_with("RETLW"))
-        .collect();
     assert!(
-        byte_lines.len() >= 3,
-        "two address bytes plus the count byte:\n{asm}"
-    );
-    assert!(
-        byte_lines.iter().all(|l| {
-            l.trim_start()
-                .strip_prefix("RETLW ")
-                .is_some_and(|v| v.starts_with("0x"))
-        }),
-        "every table byte must be numeric:\n{asm}"
+        !asm.contains("\nmap:"),
+        "the table must not be emitted as a flash table:\n{asm}"
     );
 }

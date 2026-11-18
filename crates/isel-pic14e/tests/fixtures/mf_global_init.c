@@ -1,0 +1,6 @@
+
+volatile unsigned char flag;
+volatile unsigned char out;
+char buf[4] = "abcd";
+const char *g = "PQRS";
+int main(void){ if (flag) g = buf; out = (unsigned char)g[1]; return 0; }
