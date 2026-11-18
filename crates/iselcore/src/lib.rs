@@ -3055,13 +3055,35 @@ pub fn flash_slot_spaces_ex(
             ir::Val::Const(_) => false,
         }
     };
+    // A return is definite when every value it can hold is a flash
+    // address or null: it needs no tag to tell the spaces apart, so a
+    // function returning only definite values stays 2-byte
+    // (epic-cc#1442). A may-flash return beside a non-definite one
+    // still fattens, per the seed comment above.
+    let val_definite = |v: &ir::Val, func: &str| -> bool {
+        match v {
+            ir::Val::Global(n) => !is_func(n) && is_flash_const(n),
+            ir::Val::Reg(r) => {
+                let key = ssa_key(func, r);
+                flash.contains(&key) || prov.flash.contains(&key)
+            }
+            ir::Val::Const(0) => true,
+            ir::Val::Const(_) => false,
+        }
+    };
     let mut ret_fat: HashSet<String> = HashSet::new();
     for f in &m.funcs {
-        let fat = f
+        let rets: Vec<&ir::Val> = f
             .blocks
             .iter()
             .flat_map(|b| &b.insts)
-            .any(|i| matches!(i, Inst::Ret(Some((_, v)), _) if val_may_flash(v, &f.name)));
+            .filter_map(|i| match i {
+                Inst::Ret(Some((_, v)), _) => Some(v),
+                _ => None,
+            })
+            .collect();
+        let fat = rets.iter().any(|v| val_may_flash(v, &f.name))
+            && rets.iter().any(|v| !val_definite(v, &f.name));
         if fat {
             ret_fat.insert(f.name.clone());
         }
