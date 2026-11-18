@@ -2,9 +2,9 @@
 
 **Status:** Accepted 2026-10-14 (oracle decision on `epic-cc#1119`;
 amended 2026-10-17 by `epic-cc#1306`; amended 2026-10-21 by
-`epic-cc#1346`)<br>
+`epic-cc#1346`; amended by `epic-cc#1429`)<br>
 **Decides:** `epic-cc#1119`, `epic-cc#1092`, `epic-cc#1306`,
-`epic-cc#1346`<br>
+`epic-cc#1346`, `epic-cc#1429`<br>
 **Evidence:** `crates/isel-pic18/tests/flash_slots.rs`,
 `crates/iselcore/tests/slot_spaces.rs`,
 `crates/driver/tests/flash_walk_e2e.rs`
@@ -227,6 +227,16 @@ and two byte stores that overlap do not make one. A `memcpy` whose
 side names a pointer value copies the pointee's content, which the
 proof cannot bound, so it names no bytes.
 
-The proof cannot see an `asm` that writes a hardcoded address, since
-the proof only knows the slots an `asm` names as operands. The
-pre-existing slot proof has the same blind spot.
+The proof cannot see which address an `asm` writes, since it only
+knows the slots an `asm` names as operands: an `asm` without a memory
+clobber that writes a hardcoded RAM address names none of them. Since
+`epic-cc#1429` both proofs close that blind spot conservatively
+instead of trusting the clobber list: any `asm`, clobbering or not,
+is an unknown write in the slot proof (demoting taken globals, and
+sparing globals never taken as values) and voids the definite proof
+outright, exactly as a memory-clobbering `asm` already did. The cost
+is contained to programs that contain `asm` at all: a flash proof
+beside an `asm` falls back to the RAM or refusal path, so some such
+programs are refused rather than miscompiled. Naming the written
+address (an output operand) stays the precise path, and the C
+dialect needs no new restriction.

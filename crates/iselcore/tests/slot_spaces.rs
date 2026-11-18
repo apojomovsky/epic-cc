@@ -352,6 +352,63 @@ fn asm_output_to_global_prunes_flash_slot() {
     assert!(!s.contains("@g"), "asm output must prune: {s:?}");
 }
 
+// epic-cc#1429: an asm without a memory clobber may still write a
+// hardcoded address, so it demotes taken globals like an unknown
+// store, and spares untaken ones.
+#[test]
+fn bare_asm_demotes_only_taken_globals() {
+    let m = parse(
+        "const c i8\n\
+         const c2 i8\n\
+         global g i16\n\
+         global t i16\n\
+         global sink i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store ptr @c @g\n\
+             store ptr @c2 @t\n\
+             store ptr @t @sink\n\
+             asm \"movwf 0x20\"\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let prov = iselcore::flash_provenance(&m);
+    let is_flash = |n: &str| n == "c" || n == "c2";
+    let s = iselcore::flash_slot_spaces(&m, &r, &prov, is_flash);
+    assert!(s.contains("@g"), "untaken global must stay flash: {s:?}");
+    assert!(!s.contains("@t"), "taken global must demote: {s:?}");
+}
+
+// epic-cc#1429: a bare asm voids the definite integer-domain proof,
+// so an int-laundered return beside it is no longer flash.
+#[test]
+fn bare_asm_voids_definite_int_flash() {
+    let m = parse(
+        "const c i8\n\
+         global g i16\n\
+         fn get(ptr) ()\n\
+           block entry:\n\
+             store ptr @c @g\n\
+             %x = load i16 @g\n\
+             asm \"movwf 0x20\"\n\
+             %p = inttoptr i16 %x to ptr\n\
+             ret ptr %p\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %r = call ptr @get()\n\
+             %v = load i8 %r\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let mut prov = iselcore::flash_provenance(&m);
+    iselcore::add_int_flash_definite(&mut prov, &m, &r, |n| n == "c");
+    let (flash, ..) = iselcore::flash_slot_spaces_ex(&m, &r, &prov, |n| n == "c");
+    assert!(
+        !flash.contains("main::r"),
+        "bare asm must void the definite proof: {flash:?}"
+    );
+}
+
 #[test]
 fn init_ref_to_flash_const_grounds_global() {
     let mut m = parse(
