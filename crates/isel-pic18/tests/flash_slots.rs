@@ -840,6 +840,30 @@ fn struct_table_pointer_field_read_as_integer_reads_flash() {
 
 #[test]
 #[should_panic(expected = "flash address that passed through integers")]
+fn launder_store_load_ptr_without_gep_is_refused() {
+    // epic-cc#1430: an integer copy of a flash address parked in a plain
+    // RAM slot and loaded back as a pointer must not dereference as RAM.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal h i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    store i16 %x @h\n    %p = load ptr @h\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
+fn launder_store_load_ptr_of_zext_gep_is_refused() {
+    // epic-cc#1430: the zext-of-GEP shape from epic-cc#1418 reaches the
+    // same store/load-ptr laundering path.
+    let _ = laundering_asm(
+        "const c i8\nglobal g i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %q = gep @c +0\n    %x = zext i16 %q to i16\n    store i16 %x @g\n    %p = load ptr @g\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        |_| {},
+    );
+}
+
+#[test]
+#[should_panic(expected = "flash address that passed through integers")]
 fn trunc_spelled_ptrtoint_of_flash_gep_is_refused() {
     // irparse spells `ptrtoint` as a same-width `trunc`, the shape the
     // backend now lowers as a copy (epic-cc#1421). Laundering a flash

@@ -1702,6 +1702,11 @@ pub struct FlashProvenance {
     /// address, so a dereference through it seeds `TBLPTR` from the slot
     /// bytes exactly like a flash-kind pointer slot.
     pub int_flash_ptr: HashSet<String>,
+    /// Pointer regs (`{func}::{reg}`) a `load ptr` produced from memory
+    /// whose integer bytes may carry a flash address (epic-cc#1430), plus
+    /// pointers derived from them. A dereference through one would read
+    /// the flash address as RAM, so the backend refuses it.
+    pub int_flash_load_ptr: HashSet<String>,
 }
 
 /// One ultimate address base behind a pointer value: a global plus a
@@ -3583,6 +3588,129 @@ pub fn add_flash_laundering(
         .filter(|(_, s)| s.indep || s.deps.iter().any(|d| ptaint.contains(d)))
         .map(|(k, _)| k.clone())
         .collect();
+    // A `load ptr` from tainted integer bytes re-enters the pointer
+    // domain without an `inttoptr`, so no existing guard sees it
+    // (epic-cc#1430). Mark those pointer regs, and every pointer derived
+    // from them, through a pointer slot, or into a callee's pointer
+    // param, so a dereference can refuse them.
+    let mut laundered: HashSet<String> = HashSet::new();
+    let mut ptr_mem: HashSet<(String, u32)> = HashSet::new();
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for f in &m.funcs {
+            for b in &f.blocks {
+                for i in &b.insts {
+                    match i {
+                        Inst::Load(l) if l.ptr_ty => {
+                            // A flash-kind or maybe-flash slot is not
+                            // laundered: its loads dispatch on the space
+                            // (TBLRD, or the tag for a mixed slot).
+                            let hit = loc(&f.name, &l.ptr).is_some_and(|(slot, off, _)| {
+                                !slot_flash.contains(&slot)
+                                    && !slot_mixed.contains(&slot)
+                                    && (mt.query(&slot, off, 2)
+                                        || (off.1 == 0 && ptr_mem.contains(&(slot, off.0))))
+                            });
+                            if hit && laundered.insert(ssa_key(&f.name, &l.dst)) {
+                                grew = true;
+                            }
+                        }
+                        Inst::Gep(g) => {
+                            if let GepBase::Reg(r) = &g.base {
+                                if laundered.contains(&ssa_key(&f.name, r))
+                                    && laundered.insert(ssa_key(&f.name, &g.dst))
+                                {
+                                    grew = true;
+                                }
+                            }
+                        }
+                        Inst::Phi(p) if p.ptr => {
+                            let hit = p.incoming.iter().any(|(v, _)| match v {
+                                ir::Val::Reg(r) => laundered.contains(&ssa_key(&f.name, r)),
+                                _ => false,
+                            });
+                            if hit && laundered.insert(ssa_key(&f.name, &p.dst)) {
+                                grew = true;
+                            }
+                        }
+                        Inst::Select(s) if s.ptr => {
+                            let hit = [&s.a, &s.b].iter().any(|v| match v {
+                                ir::Val::Reg(r) => laundered.contains(&ssa_key(&f.name, r)),
+                                _ => false,
+                            });
+                            if hit && laundered.insert(ssa_key(&f.name, &s.dst)) {
+                                grew = true;
+                            }
+                        }
+                        Inst::Freeze(fr) => {
+                            if let ir::Val::Reg(r) = &fr.val {
+                                if laundered.contains(&ssa_key(&f.name, r))
+                                    && laundered.insert(ssa_key(&f.name, &fr.dst))
+                                {
+                                    grew = true;
+                                }
+                            }
+                        }
+                        Inst::Store(s) => {
+                            if let ir::Val::Reg(r) = &s.val {
+                                if laundered.contains(&ssa_key(&f.name, r)) {
+                                    if let Some((slot, off, _)) = loc(&f.name, &s.ptr) {
+                                        if off.1 == 0 && ptr_mem.insert((slot, off.0)) {
+                                            grew = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Inst::Call(c) => {
+                            let targets: Vec<&String> = if c.callees.is_empty() {
+                                vec![&c.func]
+                            } else {
+                                c.callees.iter().collect()
+                            };
+                            for name in targets {
+                                let Some(callee) = m.funcs.iter().find(|x| &x.name == name) else {
+                                    continue;
+                                };
+                                for (p, a) in callee.params.iter().zip(c.args.iter()) {
+                                    if !p.ptr {
+                                        continue;
+                                    }
+                                    if let ir::Val::Reg(r) = &a.val {
+                                        if laundered.contains(&ssa_key(&f.name, r))
+                                            && laundered.insert(ssa_key(name, &p.name))
+                                        {
+                                            grew = true;
+                                        }
+                                    }
+                                }
+                                if let Some(d) = &c.dst {
+                                    let hit =
+                                        callee.blocks.iter().flat_map(|bb| &bb.insts).any(|ri| {
+                                            match ri {
+                                                Inst::Ret(Some((_, v)), _) => match v {
+                                                    ir::Val::Reg(r) => {
+                                                        laundered.contains(&ssa_key(name, r))
+                                                    }
+                                                    _ => false,
+                                                },
+                                                _ => false,
+                                            }
+                                        });
+                                    if hit && laundered.insert(ssa_key(&f.name, d)) {
+                                        grew = true;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    prov.int_flash_load_ptr = laundered;
 }
 
 /// Prove the integer-domain values that certainly carry a flash table

@@ -7586,6 +7586,16 @@ impl<'m> Gen<'m> {
         }
     }
 
+    // Refuse a dereference through a pointer a `load ptr` produced
+    // from integer bytes that may carry a flash address (epic-cc#1430).
+    fn refuse_laundered_ptr(&self, func: &str, r: &str) {
+        if self.prov.int_flash_load_ptr.contains(&ssa_key(func, r)) {
+            panic!(
+                "isel-pic18: dereference through %{r} is derived from a flash address that passed through integers (ptrtoint or an integer copy of a pointer); a dereference would read RAM, not program memory (epic-cc#1430, epic-cc#1284, epic-cc#1119)"
+            );
+        }
+    }
+
     /// Whether `v` evaluates to a flash address or null in `func`: a flash
     /// const global, a proven flash or flash-kind reg, a GEP over a flash
     /// const, or a null constant. RAM addresses, functions, and unproven
@@ -10783,6 +10793,9 @@ impl<'m> Gen<'m> {
         self.cur_loc = i.loc().cloned();
         match i {
             Inst::Load(l) => {
+                if let Some(r) = l.ptr.strip_prefix('%') {
+                    self.refuse_laundered_ptr(self.cur_func, r);
+                }
                 // A packed flag materializes its bit as a 0/1 byte. The
                 // fused branch skips these loads at the block loop, so a
                 // load reaching here has another consumer. The sequence is
@@ -10964,6 +10977,9 @@ impl<'m> Gen<'m> {
                 self.emit_ram_load_tail(&ptr_val, dst, n);
             }
             Inst::Store(s) => {
+                if let Some(r) = s.ptr.strip_prefix('%') {
+                    self.refuse_laundered_ptr(self.cur_func, r);
+                }
                 // The destination slot when it is maybe-flash: a direct
                 // global slot, or a register operand folding to one with
                 // no offset (epic-cc#1306). Either takes the value whole
@@ -12302,6 +12318,11 @@ impl<'m> Gen<'m> {
             Inst::Memcpy(mc) => match &mc.len {
                 ir::MemLen::Const(n) => {
                     let n = *n;
+                    for v in [&mc.src, &mc.dst] {
+                        if let Val::Reg(r) = v {
+                            self.refuse_laundered_ptr(self.cur_func, r);
+                        }
+                    }
                     // A staged run draining mid-copy would invalidate the
                     // setup decisions byte 0 makes; drain first (the
                     // epic-cc#486 review's drain-before-decision rule).
