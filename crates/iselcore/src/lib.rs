@@ -2785,11 +2785,11 @@ pub fn flash_slot_spaces_ex(
                     }
                     Inst::Asm(a) => {
                         // Only outputs (constraints starting with `=` or
-                        // `+`) write; reads never touch a slot. Blanket
-                        // clobbers demote taken globals.
-                        if a.clobbers_memory {
-                            unknown_write = true;
-                        }
+                        // `+`) write; reads never touch a slot. Any asm
+                        // may also write a hardcoded address no operand
+                        // names, so every asm is an unknown write
+                        // (epic-cc#1429).
+                        unknown_write = true;
                         for op in &a.operands {
                             if !(op.constraint.starts_with('=') || op.constraint.starts_with('+')) {
                                 continue;
@@ -4080,10 +4080,11 @@ pub fn add_int_flash_definite(
                         }
                     }
                     Inst::Asm(a) => {
-                        // An asm output writes bytes no proof can name.
-                        if a.clobbers_memory {
-                            void_all = true;
-                        }
+                        // An asm output writes bytes no proof can name,
+                        // and any asm may write a hardcoded address no
+                        // operand names, so every asm voids the proof
+                        // (epic-cc#1429).
+                        void_all = true;
                         for op in &a.operands {
                             if op.constraint.starts_with('=') || op.constraint.starts_with('+') {
                                 match loc(&func, &op.ptr) {
