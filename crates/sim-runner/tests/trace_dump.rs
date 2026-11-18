@@ -96,6 +96,38 @@ fn indf_trace_exits_two_by_name_and_address() {
 }
 
 #[test]
+fn indf_trace_exits_two_by_address_on_pic14e_pic18_and_baseline() {
+    for (device, target) in [
+        ("p16f1937", "INDF0"),
+        ("p16f1937", "INDF1"),
+        ("p16f1937", "0x00"),
+        ("p16f1937", "0x01"),
+        ("p18f4550", "INDF2"),
+        ("p18f4550", "0xFEF"),
+        ("p18f4550", "0xFE7"),
+        ("p18f4550", "0xFDF"),
+        ("p12f509", "0x00"),
+    ] {
+        let out = run(&[
+            fixture("halt.hex"),
+            "--device".into(),
+            device.into(),
+            "--trace-sfr".into(),
+            target.into(),
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{device} {target} exit: {}",
+            out.status
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("INDF"), "{device} {target} stderr: {err}");
+        assert!(out.stdout.is_empty(), "stdout: {:?}", out.stdout);
+    }
+}
+
+#[test]
 fn duplicate_trace_specs_emit_one_line_per_change() {
     let out = run(&[
         fixture("samevalue.hex"),

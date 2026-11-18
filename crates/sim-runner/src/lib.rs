@@ -595,18 +595,43 @@ impl Traced {
     }
 }
 
-fn indf_addrs(core: Core) -> &'static [u16] {
-    match core {
-        Core::Pic18 => &[0xFEF, 0xFE7, 0xFDF],
-        _ => &[0x00],
-    }
+// The SFR table names each core's indirect registers (Pic14e has both
+// INDF0 and INDF1, Pic18 has three), so derive the set from it and add
+// the core's architectural addresses for devices with no SFR table.
+fn indf_addrs(device: &device::Device) -> Vec<u16> {
+    let mut addrs: Vec<u16> = device
+        .sfrs
+        .iter()
+        .filter(|s| is_indf_name(s.name) || s.aliases.iter().any(|a| is_indf_name(a)))
+        .map(|s| s.addr)
+        .collect();
+    addrs.extend(match device.core {
+        Core::Pic18 => &[0xFEF, 0xFE7, 0xFDF][..],
+        Core::Pic14e => &[0x00, 0x01][..],
+        _ => &[0x00][..],
+    });
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
 }
 
-fn pseudo_kind(core: Core, addr: u16) -> TraceKind {
-    match core {
+fn pseudo_kind(device: &device::Device, addr: u16) -> TraceKind {
+    for sfr in device.sfrs.iter().filter(|s| s.addr == addr) {
+        let named = |want: &str| {
+            sfr.name.eq_ignore_ascii_case(want)
+                || sfr.aliases.iter().any(|a| a.eq_ignore_ascii_case(want))
+        };
+        if named("PCL") {
+            return TraceKind::Pcl;
+        }
+        if named("WREG") {
+            return TraceKind::Wreg;
+        }
+    }
+    match device.core {
         Core::Pic14e if addr == 0x09 => TraceKind::Wreg,
         Core::Pic18 if addr == 0xFE8 => TraceKind::Wreg,
-        _ if addr == 0x02 && core != Core::Pic18 => TraceKind::Pcl,
+        _ if addr == 0x02 && device.core != Core::Pic18 => TraceKind::Pcl,
         Core::Pic18 if addr == 0xFF9 => TraceKind::Pcl,
         _ => TraceKind::Ram,
     }
@@ -639,6 +664,7 @@ pub fn resolve_traces(
     items: &[String],
 ) -> Result<Vec<Traced>, String> {
     let core = device.core;
+    let indf = indf_addrs(device);
     let mut traced: Vec<Traced> = Vec::new();
     let push = |t: Traced, traced: &mut Vec<Traced>| {
         if !traced
@@ -656,7 +682,7 @@ pub fn resolve_traces(
                 )));
             }
             let addr = addr as u16;
-            if indf_addrs(core).contains(&addr) {
+            if indf.contains(&addr) {
                 return Err(usage_err(
                     "epic-cc-sim: INDF is not traceable; trace the target register instead"
                         .to_string(),
@@ -678,7 +704,7 @@ pub fn resolve_traces(
                 display,
                 addr,
                 width: 1,
-                kind: pseudo_kind(core, addr),
+                kind: pseudo_kind(device, addr),
             }
         } else {
             let Some(sfr) = device.sfrs.iter().find(|s| {
@@ -689,7 +715,7 @@ pub fn resolve_traces(
                     "epic-cc-sim: unknown SFR name {item} in --trace-sfr"
                 )));
             };
-            if is_indf_name(sfr.name) || indf_addrs(core).contains(&sfr.addr) {
+            if is_indf_name(sfr.name) || indf.contains(&sfr.addr) {
                 return Err(usage_err(
                     "epic-cc-sim: INDF is not traceable; trace the target register instead"
                         .to_string(),
@@ -705,7 +731,7 @@ pub fn resolve_traces(
                 display: sfr.name.to_string(),
                 addr: sfr.addr,
                 width: sfr.width,
-                kind: pseudo_kind(core, sfr.addr),
+                kind: pseudo_kind(device, sfr.addr),
             }
         };
         push(resolved, &mut traced);
@@ -1061,6 +1087,87 @@ mod tests {
         // PCL is a pseudo-register traced through pc(), not ram().
         let traced = resolve_traces(dev, 512, &["PCL".into()]).unwrap();
         assert_eq!(traced[0].kind, TraceKind::Pcl);
+    }
+
+    #[test]
+    fn indf_rejected_by_name_and_address_on_every_core() {
+        // (device, ram length, INDF names in its table, INDF addresses)
+        let cases: &[(&str, usize, &[&str], &[&str])] = &[
+            ("p16f877a", 512, &["INDF"], &["0x00"]),
+            ("p16f84a", 512, &[], &["0x00"]),
+            ("p16f1937", 4096, &["INDF0", "INDF1"], &["0x00", "0x01"]),
+            ("p16f1933", 4096, &[], &["0x00", "0x01"]),
+            (
+                "p18f4550",
+                4096,
+                &["INDF0", "INDF1", "INDF2"],
+                &["0xFEF", "0xFE7", "0xFDF"],
+            ),
+            ("p18f4520", 4096, &[], &["0xFEF", "0xFE7", "0xFDF"]),
+            ("p12f509", 256, &[], &["0x00"]),
+        ];
+        for &(name, ram_len, names, addrs) in cases {
+            let dev = resolve_device(Some(name)).unwrap();
+            for item in names.iter().chain(addrs) {
+                let e = resolve_traces(dev, ram_len, &[item.to_string()]).unwrap_err();
+                assert!(e.contains("INDF is not traceable"), "{name} {item}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn pseudo_registers_resolve_on_every_core() {
+        let dev = resolve_device(None).unwrap();
+        let traced = resolve_traces(dev, 512, &["0x02".into()]).unwrap();
+        assert_eq!(traced[0].kind, TraceKind::Pcl);
+
+        let dev = resolve_device(Some("p16f1937")).unwrap();
+        for (item, kind) in [
+            ("PCL", TraceKind::Pcl),
+            ("WREG", TraceKind::Wreg),
+            ("0x02", TraceKind::Pcl),
+            ("0x09", TraceKind::Wreg),
+        ] {
+            let traced = resolve_traces(dev, 4096, &[item.into()]).unwrap();
+            assert_eq!(traced[0].kind, kind, "p16f1937 {item}");
+        }
+
+        let dev = resolve_device(Some("p18f4550")).unwrap();
+        for (item, kind) in [
+            ("PCL", TraceKind::Pcl),
+            ("WREG", TraceKind::Wreg),
+            ("0xFF9", TraceKind::Pcl),
+            ("0xFE8", TraceKind::Wreg),
+        ] {
+            let traced = resolve_traces(dev, 4096, &[item.into()]).unwrap();
+            assert_eq!(traced[0].kind, kind, "p18f4550 {item}");
+        }
+
+        // Baseline has no SFR table: PCL still resolves by address, and
+        // an unnamed address displays with two digits, not three.
+        let dev = resolve_device(Some("p12f509")).unwrap();
+        let traced = resolve_traces(dev, 256, &["0x02".into()]).unwrap();
+        assert_eq!(traced[0].kind, TraceKind::Pcl);
+        let traced = resolve_traces(dev, 256, &["0x20".into()]).unwrap();
+        assert_eq!(traced[0].display, "0x20");
+    }
+
+    #[test]
+    fn wreg_and_pcl_traces_snapshot_the_accessors() {
+        let dev = resolve_device(Some("p16f1937")).unwrap();
+        // movlw 0x05; sleep
+        let mut sim = Sim::new(dev, vec![0x3005, 0x0063]);
+        let traced = resolve_traces(dev, sim.ram().len(), &["WREG".into(), "PCL".into()]).unwrap();
+        let (outcome, lines) = run_traced(&mut sim, 100, &traced);
+        assert_eq!(outcome.stop, Stop::Halted, "lines: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains(" write WREG=0x05")),
+            "lines: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains(" write PCL=")),
+            "lines: {lines:?}"
+        );
     }
 
     #[test]
