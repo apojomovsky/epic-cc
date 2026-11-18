@@ -3092,7 +3092,12 @@ enum Dip {
 fn flash_resident_consts(
     m: &Module,
     resolved: &PtrResolution,
-) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+) -> (
+    HashSet<String>,
+    HashSet<String>,
+    HashSet<String>,
+    HashSet<String>,
+) {
     let mut live: HashSet<String> = m
         .globals
         .iter()
@@ -3101,6 +3106,7 @@ fn flash_resident_consts(
         .collect();
     let mut spaces: HashSet<String>;
     let mut mixed_spaces: HashSet<String>;
+    let mut ret_spaces: HashSet<String>;
     loop {
         let mut prov = flash_provenance(m);
         add_flash_walks(&mut prov, m, |n| live.contains(n));
@@ -3110,6 +3116,7 @@ fn flash_resident_consts(
         let ex = flash_slot_spaces_ex(m, resolved, &prov, |n| live.contains(n));
         spaces = ex.0;
         mixed_spaces = ex.1;
+        ret_spaces = ex.2;
         let mut bad: HashSet<String> = HashSet::new();
         // Every const an offending value may carry leaves. Values are
         // followed through GEP chains and select/phi arms, so a pure
@@ -3151,7 +3158,9 @@ fn flash_resident_consts(
                                             && p.byval.is_none()
                                             && !p.sret
                                             && p.width == 2
-                                            && spaces.contains(&ssa_key(&c.func, &p.name))
+                                            && (spaces.contains(&ssa_key(&c.func, &p.name))
+                                                || mixed_spaces
+                                                    .contains(&ssa_key(&c.func, &p.name)))
                                     });
                                 if !ok {
                                     force_val(&f.name, &arg.val);
@@ -3171,7 +3180,10 @@ fn flash_resident_consts(
                                 Some(g) => {
                                     let dst_const =
                                         m.globals.iter().any(|x| x.name == g && x.is_const);
-                                    if !dst_const && !spaces.contains(&format!("@{g}")) {
+                                    if !dst_const
+                                        && !spaces.contains(&format!("@{g}"))
+                                        && !mixed_spaces.contains(&format!("@{g}"))
+                                    {
                                         force_val(&f.name, &s.val);
                                     }
                                 }
@@ -3192,7 +3204,9 @@ fn flash_resident_consts(
                             }
                         }
                         ir::Inst::Ret(Some((_, v)), _) => {
-                            force_val(&f.name, v);
+                            if !ret_spaces.contains(&f.name) {
+                                force_val(&f.name, v);
+                            }
                         }
                         ir::Inst::Select(s) if s.ptr => {
                             if spaces.contains(&ssa_key(&f.name, &s.dst)) {
@@ -3246,7 +3260,7 @@ fn flash_resident_consts(
             live.remove(&g);
         }
     }
-    (live, spaces, mixed_spaces)
+    (live, spaces, mixed_spaces, ret_spaces)
 }
 
 /// Address allocation with a value-fold gate (epic-cc#863). `None`
@@ -3500,14 +3514,20 @@ fn allocate_inner(
     // read the flash arm's RAM copy instead (epic-cc#1347, ADR-054).
     // Hoisted ahead of the frame layouts, which size every slot they
     // place.
-    let (flash_resident_early, flash_spaces_early, mixed_spaces): (
+    let (flash_resident_early, flash_spaces_early, mixed_spaces, _ret_spaces_early): (
+        HashSet<String>,
         HashSet<String>,
         HashSet<String>,
         HashSet<String>,
     ) = if device.core == Core::Pic18 {
         flash_resident_consts(m, &resolved)
     } else {
-        (HashSet::new(), HashSet::new(), HashSet::new())
+        (
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+        )
     };
     for f in &m.funcs {
         let fl = frame_layout(
