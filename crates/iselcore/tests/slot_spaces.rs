@@ -412,6 +412,42 @@ fn call_result_of_mixed_return_is_maybe_flash() {
     assert!(!fat.contains("main"), "void main returns nothing fat");
 }
 
+// epic-cc#1442: a definite inttoptr return is a flash writer of the
+// caller's call-dst slot. Both consumers run this same proof after the
+// same definite proof, so the slot stays 2 bytes in alloc and the
+// backend alike: flash-kind, never maybe-flash, never fat.
+#[test]
+fn int_laundered_return_makes_call_result_flash_not_mixed() {
+    let m = parse(
+        "const c i8\n\
+         global g i16\n\
+         fn get(ptr) ()\n\
+           block entry:\n\
+             store ptr @c @g\n\
+             %x = load i16 @g\n\
+             %p = inttoptr i16 %x to ptr\n\
+             ret ptr %p\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %r = call ptr @get()\n\
+             %v = load i8 %r\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let mut prov = iselcore::flash_provenance(&m);
+    iselcore::add_int_flash_definite(&mut prov, &m, &r, |n| n == "c");
+    let (flash, mixed, fat) = iselcore::flash_slot_spaces_ex(&m, &r, &prov, |n| n == "c");
+    assert!(
+        flash.contains("main::r"),
+        "returned inttoptr slot must be flash: {flash:?}"
+    );
+    assert!(
+        !mixed.contains("main::r"),
+        "definite return must not widen the slot: {mixed:?}"
+    );
+    assert!(!fat.contains("get"), "definite return needs no fat form");
+}
+
 // An integer call result never becomes a candidate: no tag, no width.
 #[test]
 fn integer_call_result_stays_out_of_maybe_flash() {

@@ -581,15 +581,92 @@ fn int_laundered_flash_address_passed_beside_a_ram_arg_is_refused() {
 }
 
 #[test]
-#[should_panic(expected = "cannot return flash address")]
-fn int_laundered_flash_address_return_is_refused() {
-    // A definite flash return is refused like any flash return: the
-    // caller's slot would read it back as RAM (epic-cc#1119).
+fn int_laundered_flash_address_returned_reads_flash() {
+    // epic-cc#1442: a definite inttoptr pointer is a flash writer of
+    // the caller's call-dst slot, so the caller reads the returned
+    // address back through TBLRD like any flash-kind slot.
     let m = with_bytes(
         parse(
             "const c i8\nglobal g i16\nglobal out i8\n\
              fn get(ptr) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    ret ptr %p\n\
              fn main(void) ()\n  block entry:\n    %r = call ptr @get()\n    %v = load i8 %r\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("get::x", 0x13),
+            ("get::p", 0x15),
+            ("main::r", 0x17),
+            ("main::v", 0x19),
+        ]),
+        None,
+    );
+    assert!(asm.contains("TBLRD*"), "must read flash:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[0x12],
+        b'P',
+        "the caller must read the table through the returned address"
+    );
+}
+
+#[test]
+fn int_laundered_flash_address_returned_through_alloc_reads_flash() {
+    // epic-cc#1442: with alloc's own layout the caller's slot keeps the
+    // 2-byte width the backend copies, and the table stays flash-only.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal out i8\n\
+             fn get(ptr) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    ret ptr %p\n\
+             fn main(void) ()\n  block entry:\n    %r = call ptr @get()\n    %v = load i8 %r\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let layout = alloc::allocate(&PIC18F4550, &m, "edge main get\n");
+    assert!(
+        !layout.globals.contains_key("c"),
+        "the table must stay flash-resident: {:?}",
+        layout.globals
+    );
+    let mut full: HashMap<String, u16> = HashMap::new();
+    full.extend(layout.globals.clone());
+    full.extend(layout.locals.clone());
+    let asm = select(&PIC18F4550, &m, &full, layout.isr_low_save);
+    assert!(asm.contains("TBLRD*"), "must read flash:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[layout.globals["out"] as usize],
+        b'P',
+        "the caller must read the table through the returned address"
+    );
+}
+
+#[test]
+#[should_panic(expected = "cannot return flash address")]
+fn int_laundered_flash_address_returned_beside_ram_return_is_refused() {
+    // One RAM return path joins the definite flash one in the caller's
+    // slot, so no single space applies there and the fat form does not
+    // carry a definite inttoptr value: the return stays refused.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i8\nglobal out i8\n\
+             fn get(ptr) (c=i1)\n  block entry:\n    br i1 %c, label %f, label %r\n  block f:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    ret ptr %p\n  block r:\n    ret ptr @buf\n\
+             fn main(void) ()\n  block entry:\n    %r = call ptr @get(i1 1)\n    %v = load i8 %r\n    store i8 %v @out\n    ret void\n",
         ),
         "c",
         b"P",
@@ -600,10 +677,44 @@ fn int_laundered_flash_address_return_is_refused() {
         &addrs(&[
             ("g", 0x10),
             ("out", 0x12),
-            ("get::x", 0x13),
-            ("get::p", 0x15),
-            ("main::r", 0x17),
-            ("main::v", 0x19),
+            ("buf", 0x13),
+            ("get::c", 0x14),
+            ("get::x", 0x15),
+            ("get::p", 0x17),
+            ("main::r", 0x19),
+            ("main::v", 0x1B),
+        ]),
+        None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "cannot return flash address")]
+fn int_laundered_flash_return_into_mixed_call_dst_is_refused() {
+    // The caller's dst slot is shared with a RAM call result, so alloc
+    // widens it to the 3-byte fat form while this callee writes only
+    // the 2-byte address: the return stays refused.
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i8\nglobal out i8\n\
+             fn getr(ptr) ()\n  block entry:\n    ret ptr @buf\n\
+             fn get(ptr) ()\n  block entry:\n    store ptr @c @g\n    %x = load i16 @g\n    %p = inttoptr i16 %x to ptr\n    ret ptr %p\n\
+             fn main(void) ()\n  block entry:\n    %r = call ptr @getr()\n    %r = call ptr @get()\n    %v = load i8 %r\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("out", 0x12),
+            ("buf", 0x13),
+            ("get::x", 0x14),
+            ("get::p", 0x16),
+            ("main::r", 0x18),
+            ("main::v", 0x1B),
         ]),
         None,
     );
