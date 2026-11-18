@@ -60,7 +60,7 @@ unzip epic-cc-*-x86_64-linux.zip
 cd epic-cc-*-x86_64-linux/
 ```
 
-The folder you end up in holds the `epic-cc` program, its clang, and the definitions of the supported parts.
+The folder you end up in holds the `epic-cc` program, its clang, and the definitions of the supported parts. It also holds `epic-cc-sim`, which runs a compiled `.hex` file in the simulator: `./epic-cc-sim add.hex`.
 
 Check that it runs:
 

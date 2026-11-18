@@ -32,6 +32,7 @@ class CheckReleaseBundleTest(unittest.TestCase):
             [
                 "epic-cc-1.0.0-x86_64-linux/epic-cc",
                 "epic-cc-1.0.0-x86_64-linux/epic-cc-gdbserver",
+                "epic-cc-1.0.0-x86_64-linux/epic-cc-sim",
             ],
         )
         self.assertEqual(crb.missing_members(z), [])
@@ -44,7 +45,10 @@ class CheckReleaseBundleTest(unittest.TestCase):
         )
         self.assertEqual(
             crb.missing_members(z),
-            ["epic-cc-1.0.0-x86_64-windows/epic-cc-gdbserver.exe"],
+            [
+                "epic-cc-1.0.0-x86_64-windows/epic-cc-gdbserver.exe",
+                "epic-cc-1.0.0-x86_64-windows/epic-cc-sim.exe",
+            ],
         )
         self.assertEqual(crb.main([z]), 1)
 
@@ -55,9 +59,10 @@ class CheckReleaseBundleTest(unittest.TestCase):
             [
                 "epic-cc-1.0.0-x86_64-windows/epic-cc",
                 "epic-cc-1.0.0-x86_64-windows/epic-cc-gdbserver",
+                "epic-cc-1.0.0-x86_64-windows/epic-cc-sim",
             ],
         )
-        self.assertEqual(len(crb.missing_members(z)), 2)
+        self.assertEqual(len(crb.missing_members(z)), 3)
 
     def test_backslash_separators_accepted(self):
         z = make_zip(
@@ -66,9 +71,25 @@ class CheckReleaseBundleTest(unittest.TestCase):
             [
                 "epic-cc-1.0.0-x86_64-windows\\epic-cc.exe",
                 "epic-cc-1.0.0-x86_64-windows\\epic-cc-gdbserver.exe",
+                "epic-cc-1.0.0-x86_64-windows\\epic-cc-sim.exe",
             ],
         )
         self.assertEqual(crb.missing_members(z), [])
+
+    def test_linux_bundle_without_sim_runner_fails(self):
+        z = make_zip(
+            self.dir,
+            "epic-cc-1.0.0-x86_64-linux.zip",
+            [
+                "epic-cc-1.0.0-x86_64-linux/epic-cc",
+                "epic-cc-1.0.0-x86_64-linux/epic-cc-gdbserver",
+            ],
+        )
+        self.assertEqual(
+            crb.missing_members(z),
+            ["epic-cc-1.0.0-x86_64-linux/epic-cc-sim"],
+        )
+        self.assertEqual(crb.main([z]), 1)
 
     def test_any_failing_zip_fails_the_run(self):
         good = make_zip(
@@ -77,6 +98,7 @@ class CheckReleaseBundleTest(unittest.TestCase):
             [
                 "epic-cc-1.0.0-x86_64-linux/epic-cc",
                 "epic-cc-1.0.0-x86_64-linux/epic-cc-gdbserver",
+                "epic-cc-1.0.0-x86_64-linux/epic-cc-sim",
             ],
         )
         bad = make_zip(self.dir, "epic-cc-1.0.0-x86_64-windows.zip", [])
