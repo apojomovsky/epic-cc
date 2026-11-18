@@ -1,0 +1,17 @@
+[package]
+name = "epic-cc-sim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "epic-cc-sim"
+path = "src/main.rs"
+
+[lib]
+name = "epic_cc_sim"
+path = "src/lib.rs"
+
+[dependencies]
+device = { path = "../device" }
+pic14-sim = { path = "../sim" }
