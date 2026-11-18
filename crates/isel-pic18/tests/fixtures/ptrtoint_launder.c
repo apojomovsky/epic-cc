@@ -18,8 +18,8 @@
 // cast compiled.
 //
 // The address of a GLOBAL in value position (`(uintptr_t)&g`) is a
-// constant-expression `ptrtoint`, which the frontend does not parse yet
-// (epic-cc#1422); that shape is out of scope here.
+// constant-expression `ptrtoint` (epic-cc#1422); that shape is covered
+// by `ptrtoint_flash_launder.c`, out of scope here.
 //
 // Expected: out == 0x5A, the byte `g` holds, read back through the
 // laundered address of `g`; and out2 == 0x33, the byte at the laundered

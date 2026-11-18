@@ -1389,6 +1389,33 @@ fn ptrtoint_laundered_pointer_reads_back_through_its_address() {
     );
 }
 
+/// epic-cc#1422: a flash table address laundered through `uintptr_t`
+/// in value position (`(uintptr_t)tab`, a `ptrtoint` constant
+/// expression) and through a call result reads the table byte. The
+/// frontend must parse the `ptrtoint` value and lower it as an integer
+/// copy of the pointer so the space proof dispatches the read to
+/// flash.
+#[test]
+fn ptrtoint_flash_laundered_address_reads_the_table_byte() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ptrtoint_flash_launder.c"
+    );
+    let (mut p, globals) = compile(fixture);
+    p.run(5000);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x33,
+        "the laundered flash address plus two must read tab[2]"
+    );
+    assert_eq!(
+        p.ram()[globals["out2"] as usize],
+        0x11,
+        "the flash address through the call result must read tab[0]"
+    );
+}
+
 /// epic-cc#1426: a runtime-indexed address cast to an integer lowers as a
 /// same-width `trunc i16 -> i16` over a GEP, and the backend used to
 /// refuse it ("trunc must narrow"), aborting the compile.
