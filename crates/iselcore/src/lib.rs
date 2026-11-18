@@ -2608,6 +2608,39 @@ pub fn flash_slot_spaces_ex(
             _ => DstSpace::Unknown,
         }
     };
+    // A memcpy side as a slot: the destination space it writes, and the
+    // 2-byte RAM pointer slot a whole-pointer copy reads (epic-cc#1348).
+    let memcpy_dst = |func: &str, v: &ir::Val| -> DstSpace {
+        match v {
+            ir::Val::Global(g) => DstSpace::Global(g.clone()),
+            ir::Val::Reg(r) => dst_space(func, &format!("%{r}")),
+            ir::Val::Const(_) => DstSpace::Unknown,
+        }
+    };
+    let memcpy_at_base = |func: &str, v: &ir::Val| -> bool {
+        match v {
+            ir::Val::Global(_) => true,
+            ir::Val::Reg(r) => matches!(
+                resolved.get(&ssa_key(func, r)),
+                Some((Base::Global(_), 0, terms)) if terms.is_empty()
+            ),
+            ir::Val::Const(_) => false,
+        }
+    };
+    let memcpy_src_slot = |func: &str, v: &ir::Val| -> Option<String> {
+        let g = match v {
+            ir::Val::Global(g) => Some(g.clone()),
+            ir::Val::Reg(r) => match resolved.get(&ssa_key(func, r)) {
+                Some((Base::Global(g), 0, terms)) if terms.is_empty() => Some(g.clone()),
+                _ => None,
+            },
+            ir::Val::Const(_) => None,
+        }?;
+        m.globals
+            .iter()
+            .any(|x| x.name == g && !x.is_const && x.size == 2)
+            .then(|| format!("@{g}"))
+    };
     for f in &m.funcs {
         for b in &f.blocks {
             for i in &b.insts {
@@ -2727,16 +2760,21 @@ pub fn flash_slot_spaces_ex(
                     Inst::Memcpy(mc) => {
                         // A copy into a slot overwrites its bytes with
                         // unknown ones: precise globals go Bad, unknown
-                        // targets demote taken globals.
-                        let dst = |v: &ir::Val| match v {
-                            ir::Val::Global(g) => DstSpace::Global(g.clone()),
-                            ir::Val::Reg(r) => dst_space(&f.name, &format!("%{r}")),
-                            ir::Val::Const(_) => DstSpace::Unknown,
-                        };
-                        match dst(&mc.dst) {
+                        // targets demote taken globals. A 2-byte copy
+                        // from a pointer slot at offset 0 carries a
+                        // whole pointer instead, so it delegates to the
+                        // source slot (epic-cc#1348).
+                        match memcpy_dst(&f.name, &mc.dst) {
                             DstSpace::Global(g) => {
                                 if m.globals.iter().any(|x| x.name == g && !x.is_const) {
-                                    push(format!("@{g}"), SlotWriter::Bad);
+                                    let whole = matches!(mc.len, ir::MemLen::Const(2))
+                                        && memcpy_at_base(&f.name, &mc.dst)
+                                        && m.globals.iter().any(|x| x.name == g && x.size == 2);
+                                    match whole.then(|| memcpy_src_slot(&f.name, &mc.src)).flatten()
+                                    {
+                                        Some(s) => push(format!("@{g}"), SlotWriter::Node(s)),
+                                        None => push(format!("@{g}"), SlotWriter::Bad),
+                                    }
                                 }
                             }
                             DstSpace::Object => {}
@@ -2770,22 +2808,31 @@ pub fn flash_slot_spaces_ex(
                         }
                     }
                     Inst::Call(c) => {
-                        // A direct `memcpy` call copies bytes like the
-                        // `Memcpy` instruction (the PIC18 backend lowers
-                        // a flash one the same way), so its destination
-                        // is overwritten with content, not an address
-                        // (epic-cc#1435).
+                        // A `memcpy` call writes its destination like the
+                        // `Memcpy` instruction (epic-cc#1348).
                         if c.func == "memcpy" && c.callees.is_empty() {
-                            if let Some(dst) = c.args.first() {
-                                let space = match &dst.val {
-                                    ir::Val::Global(g) => DstSpace::Global(g.clone()),
-                                    ir::Val::Reg(r) => dst_space(&f.name, &format!("%{r}")),
-                                    ir::Val::Const(_) => DstSpace::Unknown,
-                                };
-                                match space {
+                            if let (Some(d), Some(s)) = (c.args.first(), c.args.get(1)) {
+                                let whole = matches!(
+                                    c.args.get(2).map(|a| &a.val),
+                                    Some(ir::Val::Const(2))
+                                );
+                                match memcpy_dst(&f.name, &d.val) {
                                     DstSpace::Global(g) => {
                                         if m.globals.iter().any(|x| x.name == g && !x.is_const) {
-                                            push(format!("@{g}"), SlotWriter::Bad);
+                                            let whole = whole
+                                                && memcpy_at_base(&f.name, &d.val)
+                                                && m.globals
+                                                    .iter()
+                                                    .any(|x| x.name == g && x.size == 2);
+                                            match whole
+                                                .then(|| memcpy_src_slot(&f.name, &s.val))
+                                                .flatten()
+                                            {
+                                                Some(s) => {
+                                                    push(format!("@{g}"), SlotWriter::Node(s))
+                                                }
+                                                None => push(format!("@{g}"), SlotWriter::Bad),
+                                            }
                                         }
                                     }
                                     DstSpace::Object => {}
@@ -3008,13 +3055,35 @@ pub fn flash_slot_spaces_ex(
             ir::Val::Const(_) => false,
         }
     };
+    // A return is definite when every value it can hold is a flash
+    // address or null: it needs no tag to tell the spaces apart, so a
+    // function returning only definite values stays 2-byte
+    // (epic-cc#1442). A may-flash return beside a non-definite one
+    // still fattens, per the seed comment above.
+    let val_definite = |v: &ir::Val, func: &str| -> bool {
+        match v {
+            ir::Val::Global(n) => !is_func(n) && is_flash_const(n),
+            ir::Val::Reg(r) => {
+                let key = ssa_key(func, r);
+                flash.contains(&key) || prov.flash.contains(&key)
+            }
+            ir::Val::Const(0) => true,
+            ir::Val::Const(_) => false,
+        }
+    };
     let mut ret_fat: HashSet<String> = HashSet::new();
     for f in &m.funcs {
-        let fat = f
+        let rets: Vec<&ir::Val> = f
             .blocks
             .iter()
             .flat_map(|b| &b.insts)
-            .any(|i| matches!(i, Inst::Ret(Some((_, v)), _) if val_may_flash(v, &f.name)));
+            .filter_map(|i| match i {
+                Inst::Ret(Some((_, v)), _) => Some(v),
+                _ => None,
+            })
+            .collect();
+        let fat = rets.iter().any(|v| val_may_flash(v, &f.name))
+            && rets.iter().any(|v| !val_definite(v, &f.name));
         if fat {
             ret_fat.insert(f.name.clone());
         }

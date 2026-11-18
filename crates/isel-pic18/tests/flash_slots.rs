@@ -1758,6 +1758,227 @@ fn flash_memcpy_call_into_a_flash_slot_is_refused() {
 }
 
 #[test]
+fn memcpy_whole_pointer_into_mixed_global_carries_tag() {
+    // A 2-byte copy from one pointer slot into a maybe-flash slot
+    // carries a whole pointer, so the destination tag follows the
+    // source slot: flash arm reads the table, RAM arm reads RAM.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i16\nglobal buf i8\nglobal flag i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %f = load i8 @flag\n    br i1 %f ram join\n  block ram:\n    %b = gep @buf +0\n    store ptr %b @g\n    br join\n  block join:\n    memcpy @h @g 2\n    %q = load ptr @h\n    %v = load i8 %q\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"PQ",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" || g.name == "h" {
+            g.bytes = vec![1, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x13),
+            ("buf", 0x16),
+            ("flag", 0x17),
+            ("out", 0x18),
+            ("main::f", 0x19),
+            ("main::b", 0x1A),
+            ("main::q", 0x1C),
+            ("main::v", 0x1F),
+        ]),
+        None,
+    );
+    assert!(asm.contains("TBLRD*"), "flash arm must read flash:\n{asm}");
+    for (f, want) in [(0u8, b'P'), (1u8, b'R')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x17] = f;
+        p.ram_mut()[0x16] = b'R';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x18], want, "arm f={f} must read its space");
+    }
+}
+
+#[test]
+fn plain_memcpy_call_whole_pointer_into_mixed_global_carries_tag() {
+    // The call form lowers to the same copy, so it threads the tag too.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i16\nglobal buf i8\nglobal flag i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %f = load i8 @flag\n    br i1 %f ram join\n  block ram:\n    %b = gep @buf +0\n    store ptr %b @g\n    br join\n  block join:\n    call void @memcpy(@h, @g, 2)\n    %q = load ptr @h\n    %v = load i8 %q\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"PQ",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" || g.name == "h" {
+            g.bytes = vec![1, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x13),
+            ("buf", 0x16),
+            ("flag", 0x17),
+            ("out", 0x18),
+            ("main::f", 0x19),
+            ("main::b", 0x1A),
+            ("main::q", 0x1C),
+            ("main::v", 0x1F),
+        ]),
+        None,
+    );
+    for (f, want) in [(0u8, b'P'), (1u8, b'R')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x17] = f;
+        p.ram_mut()[0x16] = b'R';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x18], want, "arm f={f} must read its space");
+    }
+}
+
+#[test]
+fn plain_memcpy_call_with_gep_destination_carries_tag() {
+    // The destination names the mixed global through a GEP register.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i16\nglobal buf i8\nglobal flag i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %f = load i8 @flag\n    br i1 %f ram join\n  block ram:\n    %b = gep @buf +0\n    store ptr %b @g\n    br join\n  block join:\n    %d = gep @h +0\n    call void @memcpy(%d, @g, 2)\n    %q = load ptr @h\n    %v = load i8 %q\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"PQ",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" || g.name == "h" {
+            g.bytes = vec![1, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x13),
+            ("buf", 0x16),
+            ("flag", 0x17),
+            ("out", 0x18),
+            ("main::f", 0x19),
+            ("main::b", 0x1A),
+            ("main::q", 0x1C),
+            ("main::v", 0x1F),
+            ("main::d", 0x20),
+        ]),
+        None,
+    );
+    for (f, want) in [(0u8, b'P'), (1u8, b'R')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x17] = f;
+        p.ram_mut()[0x16] = b'R';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x18], want, "arm f={f} must read its space");
+    }
+}
+
+#[test]
+fn plain_memcpy_call_with_gep_source_and_destination_carries_tag() {
+    // Both operands name their globals through GEP registers: the call
+    // must still route to the tag-threading copy, not the trap loop.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i16\nglobal buf i8\nglobal flag i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %f = load i8 @flag\n    br i1 %f ram join\n  block ram:\n    %b = gep @buf +0\n    store ptr %b @g\n    br join\n  block join:\n    %d = gep @h +0\n    %s = gep @g +0\n    call void @memcpy(%d, %s, 2)\n    %q = load ptr @h\n    %v = load i8 %q\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"PQ",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" || g.name == "h" {
+            g.bytes = vec![1, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x13),
+            ("buf", 0x16),
+            ("flag", 0x17),
+            ("out", 0x18),
+            ("main::f", 0x19),
+            ("main::b", 0x1A),
+            ("main::q", 0x1C),
+            ("main::v", 0x1F),
+            ("main::d", 0x20),
+            ("main::s", 0x22),
+        ]),
+        None,
+    );
+    assert!(!asm.contains("BRA $"), "call must not trap:\n{asm}");
+    for (f, want) in [(0u8, b'P'), (1u8, b'R')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x17] = f;
+        p.ram_mut()[0x16] = b'R';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x18], want, "arm f={f} must read its space");
+    }
+}
+
+#[test]
+#[should_panic(expected = "maybe-flash destination")]
+fn plain_memcpy_call_with_gep_destination_and_short_length_is_refused() {
+    // A GEP register naming a mixed global is still a maybe-flash
+    // destination: a 1-byte call copy cannot thread its tag.
+    let mut m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal h i16\nglobal buf i8\n\
+             fn main(void) ()\n  block entry:\n    %b = gep @buf +0\n    store ptr %b @g\n    store ptr %b @h\n    %d = gep @h +0\n    call void @memcpy(%d, @g, 1)\n    ret void\n",
+        ),
+        "c",
+        b"P",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" || g.name == "h" {
+            g.bytes = vec![1, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let _ = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("h", 0x13),
+            ("buf", 0x16),
+            ("main::b", 0x17),
+            ("main::d", 0x19),
+        ]),
+        None,
+    );
+}
+
+#[test]
 fn memcpy_from_runtime_indexed_flash_walk_copies_table_element() {
     // A 14-byte element copied from the middle of a flash table: the
     // source pointer lives in a flash slot and gains a runtime term,

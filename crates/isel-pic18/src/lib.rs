@@ -7239,6 +7239,19 @@ impl<'m> Gen<'m> {
         self.slot_mixed.contains(&format!("@{name}"))
     }
 
+    /// Whether global `name` is a maybe-flash pointer slot whose tag a
+    /// memcpy would have to thread: only a 2-byte slot holds a pointer
+    /// value at all, so a wider global in the mixed set is a content
+    /// buffer, not a tagged slot (epic-cc#1435).
+    fn global_slot_is_mixed_ptr(&self, name: &str) -> bool {
+        self.global_slot_is_mixed(name)
+            && self
+                .m
+                .globals
+                .iter()
+                .any(|x| x.name == name && !x.is_const && x.size == 2)
+    }
+
     /// Whether slot `slot` of `func` is maybe-flash.
     fn slot_is_mixed(&self, func: &str, slot: &str) -> bool {
         self.slot_mixed.contains(&ssa_key(func, slot))
@@ -8778,7 +8791,7 @@ impl<'m> Gen<'m> {
     /// reporting the resolved kinds. Bodies live in `emit_memcpy_body`
     /// so one seed can serve a whole walk. (epic-cc#492)
     fn emit_memcpy_setups(&mut self, mc: &ir::Memcpy, byte_off: u8) -> (McSrc, Addr) {
-        self.check_memcpy_flash_dst(&mc.dst);
+        self.check_memcpy_flash_dst_mc(&mc.dst, Some(mc));
         // Sets the source on FSR1 so the destination FSR0 setup cannot clobber
         // an indirect source (epic-cc#143); a flash source has no RAM
         // address and seeds `TBLPTR` instead.
@@ -8831,9 +8844,65 @@ impl<'m> Gen<'m> {
         (src_direct.map_or(McSrc::Indirect, McSrc::Direct), dst)
     }
 
+    /// The global a memcpy side names at offset 0: the global itself, or
+    /// a GEP folded onto it with no offset and no dynamic terms.
+    fn memcpy_slot_global(&self, v: &Val) -> Option<String> {
+        match v {
+            Val::Global(g) => Some(g.clone()),
+            Val::Reg(r) => match self.resolved.get(&ssa_key(self.cur_func, r)) {
+                Some((Base::Global(g), 0, terms)) if terms.is_empty() => Some(g.clone()),
+                _ => None,
+            },
+            Val::Const(_) => None,
+        }
+    }
+
+    /// A whole-pointer copy into a maybe-flash slot: 2 bytes from a
+    /// 2-byte RAM pointer slot at offset 0 into a maybe-flash global
+    /// slot at offset 0 (epic-cc#1348). Returns the destination tag
+    /// address and the source tag to write there, or `None` for every
+    /// other shape, which keeps the refusal below. The slot proof in
+    /// iselcore delegates the destination to the same source slot, so
+    /// alloc widens both slots and the tag byte exists.
+    fn memcpy_tag_thread(&self, mc: &ir::Memcpy) -> Option<(u16, TagSrc)> {
+        if !matches!(mc.len, ir::MemLen::Const(2)) {
+            return None;
+        }
+        let dst = self.memcpy_slot_global(&mc.dst)?;
+        let src = self.memcpy_slot_global(&mc.src)?;
+        let size2 = |g: &str| {
+            self.m
+                .globals
+                .iter()
+                .any(|x| x.name == g && !x.is_const && x.size == 2)
+        };
+        if !size2(&dst) || !size2(&src) || !self.global_slot_is_mixed(&dst) {
+            return None;
+        }
+        let tag = if self.global_slot_is_mixed(&src) {
+            TagSrc::Slot(self.global_addr(&src) + 2)
+        } else if self.global_slot_is_flash(&src) {
+            TagSrc::Flash
+        } else {
+            TagSrc::Ram
+        };
+        Some((self.global_addr(&dst) + 2, tag))
+    }
+
     /// Panics when a memcpy would write into ROM, whatever its source. The
     /// Store arm panics on the same shapes (epic-cc#832, epic-cc#1099).
     fn check_memcpy_flash_dst(&self, dst: &Val) {
+        self.check_memcpy_flash_dst_mc(dst, None);
+    }
+
+    fn check_memcpy_flash_dst_mc(&self, dst: &Val, mc: Option<&ir::Memcpy>) {
+        // A whole-pointer copy into a maybe-flash slot carries its tag
+        // with the address bytes, so it is not a ROM write (epic-cc#1348).
+        if let Some(m) = mc {
+            if self.memcpy_tag_thread(m).is_some() {
+                return;
+            }
+        }
         if self.const_base_of(dst).is_some() {
             panic!(
                 "isel-pic18: ROM is not writable: memcpy into const global {dst:?} (epic-cc#1100)"
@@ -8849,10 +8918,21 @@ impl<'m> Gen<'m> {
                     "isel-pic18: ROM is not writable: memcpy into flash-derived address %{r} (epic-cc#1100)"
                 );
             }
-            // A memcpy into a maybe-flash destination stays refused: the
-            // tag the slot needs has no source in a raw byte copy
-            // (epic-cc#1306 defers it).
+            // A memcpy into a maybe-flash destination stays refused
+            // unless it threads a whole-pointer tag (epic-cc#1348).
             if self.slot_mixed.contains(&key) {
+                panic!(
+                    "isel-pic18: memcpy into a maybe-flash destination %{r} is not supported (epic-cc#1306)"
+                );
+            }
+            // A GEP register names its base slot, not itself: resolve
+            // it, or a maybe-flash global escapes this refusal.
+            let base_is_mixed = match self.resolved.get(&key) {
+                Some((Base::Global(g), _, _)) => self.global_slot_is_mixed_ptr(g),
+                Some((Base::Slot(sname, _), _, _)) => self.slot_is_mixed(self.cur_func, sname),
+                _ => false,
+            };
+            if base_is_mixed {
                 panic!(
                     "isel-pic18: memcpy into a maybe-flash destination %{r} is not supported (epic-cc#1306)"
                 );
@@ -8864,7 +8944,7 @@ impl<'m> Gen<'m> {
             }
         }
         if let Val::Global(g) = dst {
-            if self.global_slot_is_mixed(g) {
+            if self.global_slot_is_mixed_ptr(g) {
                 panic!(
                     "isel-pic18: memcpy into a maybe-flash destination @{g} is not supported (epic-cc#1306)"
                 );
@@ -8882,12 +8962,30 @@ impl<'m> Gen<'m> {
         let may_be_flash = |v: &Val| match v {
             Val::Reg(r) => {
                 let key = ssa_key(self.cur_func, r);
+                // A GEP register is keyed by itself above but names its
+                // resolved base: a GEP onto a global or slot must check
+                // that base, or the call falls through to the trap loop.
+                let base_may_be_flash = match self.resolved.get(&key) {
+                    Some((Base::Global(g), _, _)) => {
+                        self.global_slot_is_mixed_ptr(g) || self.global_is_const(g)
+                    }
+                    Some((Base::Slot(sname, _), _, _)) => {
+                        let sk = ssa_key(self.cur_func, sname);
+                        self.prov.flash.contains(&sk)
+                            || self.prov.mixed.contains(&sk)
+                            || self.slot_flash.contains(&sk)
+                            || self.slot_mixed.contains(&sk)
+                    }
+                    _ => false,
+                };
                 self.prov.flash.contains(&key)
                     || self.prov.mixed.contains(&key)
                     || self.slot_flash.contains(&key)
                     || self.slot_mixed.contains(&key)
                     || self.maybe_flash_slot_under_index(&key).is_some()
+                    || base_may_be_flash
             }
+            Val::Global(g) => self.global_slot_is_mixed_ptr(g),
             _ => false,
         };
         self.const_base_of(&dst.val).is_some() || may_be_flash(&dst.val) || may_be_flash(&src.val)
@@ -8903,7 +9001,18 @@ impl<'m> Gen<'m> {
                 c.args.len()
             );
         };
-        self.check_memcpy_flash_dst(&dst.val);
+        // A runtime length cannot thread a tag, so only a constant
+        // 2-byte copy gets the threaded check (epic-cc#1348).
+        let probe = match len.val {
+            Val::Const(n) => u8::try_from(n).ok().map(|n| ir::Memcpy {
+                dst: dst.val.clone(),
+                src: src.val.clone(),
+                len: ir::MemLen::Const(n),
+                loc: None,
+            }),
+            _ => None,
+        };
+        self.check_memcpy_flash_dst_mc(&dst.val, probe.as_ref());
         let Val::Const(n) = len.val else {
             panic!(
                 "isel-pic18: memcpy from a flash pointer with a runtime length is not supported (epic-cc#1100)"
@@ -9031,9 +9140,8 @@ impl<'m> Gen<'m> {
         terms: &[(u16, String)],
     ) {
         // The driver intercept bypasses `emit_memcpy_setups`, so run
-        // its destination check here: a copy into a maybe-flash slot
-        // has no tag source and stays refused (epic-cc#1306 defers it).
-        self.check_memcpy_flash_dst(&mc.dst);
+        // its destination check here (epic-cc#1348).
+        self.check_memcpy_flash_dst_mc(&mc.dst, Some(mc));
         let l_ram = self.fresh_label();
         let l_end = self.fresh_label();
         let (ta, tf) = self.operand(tag);
@@ -12395,6 +12503,12 @@ impl<'m> Gen<'m> {
                         }
                         if walk && matches!(dst0, Addr::Indirect) {
                             self.bump_fsr0_tracked_offset(n);
+                        }
+                        // A whole-pointer copy into a maybe-flash slot
+                        // writes the source slot tag after its bytes
+                        // (epic-cc#1348).
+                        if let Some((dst_tag, tag)) = self.memcpy_tag_thread(mc) {
+                            self.emit_tag_store(tag, dst_tag);
                         }
                     }
                 }

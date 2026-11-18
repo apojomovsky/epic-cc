@@ -470,6 +470,59 @@ fn integer_call_result_stays_out_of_maybe_flash() {
     assert!(!fat.contains("id"), "integer return must not be fat");
 }
 
+#[test]
+fn whole_pointer_memcpy_into_global_carries_source_space() {
+    // A 2-byte slot-to-slot copy carries a whole pointer: the
+    // destination joins the source slot space even though its own
+    // initializer is null, so alloc widens it with the source.
+    let m = parse(
+        "const c i8\nglobal g i16\nglobal h i16\nglobal buf i8\nglobal flag i8\n\
+         fn main(void) ()\n  block entry:\n    %f = load i8 @flag\n    br i1 %f ram join\n  block ram:\n    %b = gep @buf +0\n    store ptr %b @g\n    br join\n  block join:\n    memcpy @h @g 2\n    ret void\n",
+    );
+    let mut m = m;
+    for g in &mut m.globals {
+        if g.name == "g" {
+            g.bytes = vec![1, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let r = resolve_pointers(&m);
+    let prov = iselcore::flash_provenance(&m);
+    let (flash, mixed, _) = iselcore::flash_slot_spaces_ex(&m, &r, &prov, |n| n == "c");
+    assert!(
+        mixed.contains("@g"),
+        "source slot must be maybe-flash: {mixed:?}"
+    );
+    assert!(
+        mixed.contains("@h"),
+        "whole-pointer copy must make the destination maybe-flash: flash={flash:?} mixed={mixed:?}"
+    );
+}
+
+#[test]
+fn partial_memcpy_into_global_does_not_carry_source_space() {
+    // A 1-byte copy carries no whole pointer, so it stays an unknown
+    // byte write and the destination gains no space from the source.
+    let m = parse(
+        "const c i8\nglobal g i16\nglobal h i16\nglobal buf i8\nglobal flag i8\n\
+         fn main(void) ()\n  block entry:\n    %f = load i8 @flag\n    br i1 %f ram join\n  block ram:\n    %b = gep @buf +0\n    store ptr %b @g\n    br join\n  block join:\n    memcpy @h @g 1\n    ret void\n",
+    );
+    let mut m = m;
+    for g in &mut m.globals {
+        if g.name == "g" {
+            g.bytes = vec![1, 0];
+            g.refs = vec![(0, "c".to_string(), 0)];
+        }
+    }
+    let r = resolve_pointers(&m);
+    let prov = iselcore::flash_provenance(&m);
+    let (flash, mixed, _) = iselcore::flash_slot_spaces_ex(&m, &r, &prov, |n| n == "c");
+    assert!(
+        !flash.contains("@h") && !mixed.contains("@h"),
+        "partial copy must not carry a space: flash={flash:?} mixed={mixed:?}"
+    );
+}
+
 // A freeze copies its operand whole, tag included.
 #[test]
 fn freeze_of_mixed_select_is_maybe_flash() {
