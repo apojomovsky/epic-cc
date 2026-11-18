@@ -7257,6 +7257,17 @@ impl<'m> Gen<'m> {
         self.slot_mixed.contains(&ssa_key(func, slot))
     }
 
+    /// The slot of a maybe-flash walk base: a slotless base has no tag
+    /// byte to ride, so every dispatch over it refuses the same way
+    /// (epic-cc#1306, epic-cc#1352).
+    fn mixed_base_addr(&self, func: &str, sname: &str) -> u16 {
+        self.addrs.get(&ssa_key(func, sname)).copied().unwrap_or_else(|| {
+            panic!(
+                "isel-pic18: join of a walk over a slotless maybe-flash base %{sname} is not supported (epic-cc#1306)"
+            )
+        })
+    }
+
     /// Where a pointer value's space tag comes from (epic-cc#1306): every
     /// join into a maybe-flash slot writes the tag alongside the address
     /// bytes, so a later deref can dispatch on it.
@@ -7295,12 +7306,7 @@ impl<'m> Gen<'m> {
                 match self.resolved.get(&key) {
                     Some((Base::Slot(sname, _), _, _)) => {
                         if self.slot_is_mixed(func, sname) {
-                            match self.addrs.get(&ssa_key(func, sname)).copied() {
-                                Some(sa) => TagSrc::Slot(sa + 2),
-                                None => panic!(
-                                    "isel-pic18: join of a walk over a slotless maybe-flash base %{sname} is not supported (epic-cc#1306)"
-                                ),
-                            }
+                            TagSrc::Slot(self.mixed_base_addr(func, sname) + 2)
                         } else {
                             TagSrc::Ram
                         }
@@ -7348,7 +7354,7 @@ impl<'m> Gen<'m> {
         match self.resolved.get(&key) {
             Some((Base::Slot(sname, _), k, terms)) => {
                 if self.slot_is_mixed(func, sname) {
-                    let slot = self.slot_addr(func, sname).direct();
+                    let slot = self.mixed_base_addr(func, sname);
                     Some((slot + 2, slot, *k, terms.clone()))
                 } else {
                     None
@@ -20463,6 +20469,32 @@ mod p3_gen_tests {
             trunc_fwd: HashMap::new(),
             zext_ret: HashSet::new(),
         }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "isel-pic18: join of a walk over a slotless maybe-flash base %base is not supported (epic-cc#1306)"
+    )]
+    fn mixed_tag_slotless_maybe_flash_base_panics_with_1306_message() {
+        // A walk over a maybe-flash base that has no slot must report
+        // the same #1306 refusal as `tag_src`, not the generic
+        // slot-lookup panic (epic-cc#1352).
+        let m = Module {
+            globals: Vec::new(),
+            funcs: Vec::new(),
+            module_asm: Vec::new(),
+        };
+        let addrs = HashMap::new();
+        let mut resolved: PtrResolution = HashMap::new();
+        resolved.insert(
+            ssa_key("main", "walk"),
+            (Base::Slot("base".to_string(), false), 0, Vec::new()),
+        );
+        let mut tmp = 0u32;
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
+        g.slot_mixed.insert(ssa_key("main", "base"));
+        let _ = g.mixed_tag("main", "walk");
     }
 
     #[test]
