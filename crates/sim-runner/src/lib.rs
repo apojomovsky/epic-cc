@@ -14,10 +14,33 @@ pub struct Args {
     pub breaks: Vec<u32>,
     pub pokes: Vec<(u32, u8)>,
     pub stimulus: Option<String>,
+    pub trace_sfr: Vec<String>,
+    pub dump: Option<DumpKind>,
+}
+
+/// What `--dump` prints before the final line (design 51 section 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DumpKind {
+    Regs,
+    Ram,
+    All,
+}
+
+impl DumpKind {
+    fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "regs" => Ok(DumpKind::Regs),
+            "ram" => Ok(DumpKind::Ram),
+            "all" => Ok(DumpKind::All),
+            _ => Err(format!(
+                "bad --dump value {text} (expected regs, ram, or all)"
+            )),
+        }
+    }
 }
 
 /// The usage contract `--help` prints and failures append.
-pub const USAGE: &str = "usage: epic-cc-sim <hex> [--device <name>] [--cycles <n>] [--break <addr>]... [--poke <addr>=<byte>]... [--stimulus <file>]";
+pub const USAGE: &str = "usage: epic-cc-sim <hex> [--device <name>] [--cycles <n>] [--break <addr>]... [--poke <addr>=<byte>]... [--stimulus <file>] [--trace-sfr <name|addr>[,...]] [--dump regs|ram|all]";
 
 /// Default cycle cap from the design 51 CLI contract.
 pub const DEFAULT_CYCLES: u64 = 1_000_000;
@@ -31,6 +54,8 @@ const KNOWN_FLAGS: &[&str] = &[
     "--break",
     "--poke",
     "--stimulus",
+    "--trace-sfr",
+    "--dump",
     "--help",
     "--version",
 ];
@@ -99,6 +124,8 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut breaks: Vec<u32> = Vec::new();
     let mut pokes: Vec<(u32, u8)> = Vec::new();
     let mut stimulus: Option<String> = None;
+    let mut trace_sfr: Vec<String> = Vec::new();
+    let mut dump: Option<DumpKind> = None;
     let mut i = 0;
     while i < argv.len() {
         let a = &argv[i];
@@ -108,7 +135,8 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
             _ => (a.as_str(), None),
         };
         match flag {
-            "--device" | "--cycles" | "--break" | "--poke" | "--stimulus" => {
+            "--device" | "--cycles" | "--break" | "--poke" | "--stimulus" | "--trace-sfr"
+            | "--dump" => {
                 let value = match inline {
                     Some(v) => v,
                     None => {
@@ -138,7 +166,21 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
                             parse_poke(&value).map_err(|e| usage_err(format!("--poke: {e}")))?,
                         );
                     }
-                    _ => stimulus = Some(value),
+                    "--stimulus" => stimulus = Some(value),
+                    "--trace-sfr" => {
+                        for item in value.split(',') {
+                            let item = item.trim();
+                            if item.is_empty() {
+                                return Err(usage_err(
+                                    "epic-cc-sim: empty entry in --trace-sfr".to_string(),
+                                ));
+                            }
+                            trace_sfr.push(item.to_string());
+                        }
+                    }
+                    _ => {
+                        dump = Some(DumpKind::parse(&value).map_err(usage_err)?);
+                    }
                 }
             }
             _ if flag.starts_with("--") => {
@@ -165,6 +207,8 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
         breaks,
         pokes,
         stimulus,
+        trace_sfr,
+        dump,
     })
 }
 
@@ -500,7 +544,228 @@ impl Sim {
     }
 }
 
-/// Why the run loop stopped (design 51 section 3 exit codes).
+/// How a traced register's value is snapshotted (design 51 D-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceKind {
+    /// The `width` bytes at `addr` in `ram()`, little-endian.
+    Ram,
+    /// `PCL`: snapshots `pc() & 0xFF`, not the dead `ram()` cell.
+    Pcl,
+    /// `WREG`: snapshots `w()`, not the dead `ram()` cell.
+    Wreg,
+}
+
+/// One resolved `--trace-sfr` entry, deduplicated on `(addr, width)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Traced {
+    pub display: String,
+    pub addr: u16,
+    pub width: u8,
+    pub kind: TraceKind,
+}
+
+impl Traced {
+    fn snapshot(&self, sim: &Sim) -> u64 {
+        match self.kind {
+            TraceKind::Pcl => (sim.pc() & 0xFF) as u64,
+            TraceKind::Wreg => sim.w() as u64,
+            TraceKind::Ram => {
+                let start = self.addr as usize;
+                let mut value: u64 = 0;
+                for (i, &b) in sim.ram()[start..start + self.width as usize]
+                    .iter()
+                    .enumerate()
+                {
+                    value |= (b as u64) << (8 * i);
+                }
+                value
+            }
+        }
+    }
+
+    fn line(&self, cycles: u64, pre_pc: u32, pc_width: usize, value: u64) -> String {
+        format!(
+            "cycle={cycles} pc=0x{:0pw$x} write {}=0x{:0vw$x}",
+            pre_pc,
+            self.display,
+            value,
+            pw = pc_width,
+            vw = 2 * self.width as usize
+        )
+    }
+}
+
+// The SFR table names each core's indirect registers (Pic14e has both
+// INDF0 and INDF1, Pic18 has three), so derive the set from it and add
+// the core's architectural addresses for devices with no SFR table.
+fn indf_addrs(device: &device::Device) -> Vec<u16> {
+    let mut addrs: Vec<u16> = device
+        .sfrs
+        .iter()
+        .filter(|s| is_indf_name(s.name) || s.aliases.iter().any(|a| is_indf_name(a)))
+        .map(|s| s.addr)
+        .collect();
+    addrs.extend(match device.core {
+        Core::Pic18 => &[0xFEF, 0xFE7, 0xFDF][..],
+        Core::Pic14e => &[0x00, 0x01][..],
+        _ => &[0x00][..],
+    });
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
+
+fn pseudo_kind(device: &device::Device, addr: u16) -> TraceKind {
+    for sfr in device.sfrs.iter().filter(|s| s.addr == addr) {
+        let named = |want: &str| {
+            sfr.name.eq_ignore_ascii_case(want)
+                || sfr.aliases.iter().any(|a| a.eq_ignore_ascii_case(want))
+        };
+        if named("PCL") {
+            return TraceKind::Pcl;
+        }
+        if named("WREG") {
+            return TraceKind::Wreg;
+        }
+    }
+    match device.core {
+        Core::Pic14e if addr == 0x09 => TraceKind::Wreg,
+        Core::Pic18 if addr == 0xFE8 => TraceKind::Wreg,
+        _ if addr == 0x02 && device.core != Core::Pic18 => TraceKind::Pcl,
+        Core::Pic18 if addr == 0xFF9 => TraceKind::Pcl,
+        _ => TraceKind::Ram,
+    }
+}
+
+fn parse_address(text: &str) -> Option<u64> {
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return u64::from_str_radix(hex, 16).ok();
+        }
+        return None;
+    }
+    if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+        return text.parse::<u64>().ok();
+    }
+    None
+}
+
+fn is_indf_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("INDF") || name.to_ascii_uppercase().starts_with("INDF")
+}
+
+/// Resolve `--trace-sfr` items over `device.sfrs` (design 51 D-4 and
+/// section 3): canonical display, first match by address, deduplication
+/// on `(addr, width)`, and the pseudo-register and `INDF` rules. Every
+/// failure is a usage error carrying the usage text (exit 2).
+pub fn resolve_traces(
+    device: &device::Device,
+    ram_len: usize,
+    items: &[String],
+) -> Result<Vec<Traced>, String> {
+    let core = device.core;
+    let indf = indf_addrs(device);
+    let mut traced: Vec<Traced> = Vec::new();
+    let push = |t: Traced, traced: &mut Vec<Traced>| {
+        if !traced
+            .iter()
+            .any(|e| e.addr == t.addr && e.width == t.width)
+        {
+            traced.push(t);
+        }
+    };
+    for item in items {
+        let resolved: Traced = if let Some(addr) = parse_address(item) {
+            if addr > u16::MAX as u64 {
+                return Err(usage_err(format!(
+                    "epic-cc-sim: --trace-sfr address {item} out of range"
+                )));
+            }
+            let addr = addr as u16;
+            if indf.contains(&addr) {
+                return Err(usage_err(
+                    "epic-cc-sim: INDF is not traceable; trace the target register instead"
+                        .to_string(),
+                ));
+            }
+            if addr as usize >= ram_len {
+                return Err(usage_err(format!(
+                    "epic-cc-sim: --trace-sfr address {item} out of range"
+                )));
+            }
+            let display = match device.sfrs.iter().find(|s| s.addr == addr) {
+                Some(s) => s.name.to_string(),
+                None => {
+                    let digits = if core == Core::PicBaseline { 2 } else { 3 };
+                    format!("0x{addr:0digits$x}")
+                }
+            };
+            Traced {
+                display,
+                addr,
+                width: 1,
+                kind: pseudo_kind(device, addr),
+            }
+        } else {
+            let Some(sfr) = device.sfrs.iter().find(|s| {
+                s.name.eq_ignore_ascii_case(item)
+                    || s.aliases.iter().any(|a| a.eq_ignore_ascii_case(item))
+            }) else {
+                return Err(usage_err(format!(
+                    "epic-cc-sim: unknown SFR name {item} in --trace-sfr"
+                )));
+            };
+            if is_indf_name(sfr.name) || indf.contains(&sfr.addr) {
+                return Err(usage_err(
+                    "epic-cc-sim: INDF is not traceable; trace the target register instead"
+                        .to_string(),
+                ));
+            }
+            if sfr.addr as usize + sfr.width as usize > ram_len {
+                return Err(usage_err(format!(
+                    "epic-cc-sim: --trace-sfr {} out of range",
+                    sfr.name
+                )));
+            }
+            Traced {
+                display: sfr.name.to_string(),
+                addr: sfr.addr,
+                width: sfr.width,
+                kind: pseudo_kind(device, sfr.addr),
+            }
+        };
+        push(resolved, &mut traced);
+    }
+    Ok(traced)
+}
+
+/// Dump lines in the design 51 byte-stable order, before the final line.
+pub fn dump_lines(sim: &Sim, kind: DumpKind) -> Vec<String> {
+    let mut lines = vec![
+        format!("w=0x{:02x}", sim.w()),
+        format!("status=0x{:02x}", sim.status()),
+        format!("pc=0x{:0width$x}", sim.pc(), width = sim.pc_width()),
+    ];
+    if kind != DumpKind::Regs {
+        for (base, block) in sim.ram().chunks(16).enumerate() {
+            if kind == DumpKind::All || block.iter().any(|&b| b != 0) {
+                let bytes: Vec<String> = block.iter().map(|b| format!("{b:02x}")).collect();
+                lines.push(format!("ram 0x{:04x}: {}", base * 16, bytes.join(" ")));
+            }
+        }
+    }
+    if kind == DumpKind::All {
+        if let Some(eeprom) = sim.eeprom() {
+            for (base, block) in eeprom.chunks(16).enumerate() {
+                let bytes: Vec<String> = block.iter().map(|b| format!("{b:02x}")).collect();
+                lines.push(format!("eeprom 0x{:04x}: {}", base * 16, bytes.join(" ")));
+            }
+        }
+    }
+    lines
+}
+
+/// Why the run loop stopped; exit codes 0 and 3 in T1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
     Halted,
@@ -551,9 +816,27 @@ impl Outcome {
 }
 
 /// Step one instruction at a time (design 51 D-5 run-loop order): apply
-/// due stimulus, check breakpoints on the pre-step pc, step, then check
+/// due stimulus, check breakpoints on the pre-step pc, snapshot traced
+/// registers, step, emit trace lines for changed registers, then check
 /// halt and the cycle cap.
 pub fn run(sim: &mut Sim, cap: u64, breaks: &[u32], stimulus: &[StimulusEntry]) -> Outcome {
+    run_loop(sim, cap, breaks, stimulus, &[]).0
+}
+
+/// The run loop with the T3 step hook: after each step, emit one trace
+/// line per traced register whose snapshot changed (change-only, D-4).
+pub fn run_traced(sim: &mut Sim, cap: u64, traced: &[Traced]) -> (Outcome, Vec<String>) {
+    run_loop(sim, cap, &[], &[], traced)
+}
+
+fn run_loop(
+    sim: &mut Sim,
+    cap: u64,
+    breaks: &[u32],
+    stimulus: &[StimulusEntry],
+    traced: &[Traced],
+) -> (Outcome, Vec<String>) {
+    let mut lines = Vec::new();
     let mut pending: Vec<StimulusEntry> = stimulus.to_vec();
     let stop = loop {
         let now = sim.cycles();
@@ -578,7 +861,15 @@ pub fn run(sim: &mut Sim, cap: u64, breaks: &[u32], stimulus: &[StimulusEntry]) 
         if sim.cycles() >= cap {
             break Stop::Capped;
         }
+        let pre_pc = sim.pc();
+        let before: Vec<u64> = traced.iter().map(|t| t.snapshot(sim)).collect();
         sim.step();
+        for (t, &b) in traced.iter().zip(&before) {
+            let after = t.snapshot(sim);
+            if after != b {
+                lines.push(t.line(sim.cycles(), pre_pc, sim.pc_width(), after));
+            }
+        }
         if sim.halted() {
             break Stop::Halted;
         }
@@ -586,14 +877,15 @@ pub fn run(sim: &mut Sim, cap: u64, breaks: &[u32], stimulus: &[StimulusEntry]) 
             break Stop::Capped;
         }
     };
-    Outcome {
+    let outcome = Outcome {
         stop,
         cycles: sim.cycles(),
         pc: sim.pc(),
         pc_width: sim.pc_width(),
         w: sim.w(),
         status: sim.status(),
-    }
+    };
+    (outcome, lines)
 }
 
 /// Run the whole invocation after `--help`/`--version` handling, returning
@@ -630,10 +922,25 @@ pub fn run_main(args: &Args) -> i32 {
         }
     };
     let mut sim = Sim::new(device, prog);
+    let traced = match resolve_traces(device, sim.ram().len(), &args.trace_sfr) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
     for &(addr, byte) in &args.pokes {
         sim.poke(addr, byte);
     }
-    let outcome = run(&mut sim, args.cycles, &args.breaks, &stimulus);
+    let (outcome, trace_lines) = run_loop(&mut sim, args.cycles, &args.breaks, &stimulus, &traced);
+    for line in &trace_lines {
+        println!("{line}");
+    }
+    if let Some(kind) = args.dump {
+        for line in dump_lines(&sim, kind) {
+            println!("{line}");
+        }
+    }
     println!("{}", outcome.final_line());
     outcome.stop.exit_code()
 }
@@ -732,5 +1039,143 @@ mod tests {
         assert_eq!(validate_hex(":0001FF\n"), Err(1));
         assert_eq!(validate_hex(":020000020000FA\n"), Err(1));
         assert_eq!(validate_hex(":0100000000FF\n"), Err(1));
+    }
+
+    #[test]
+    fn trace_resolution_canonical_alias_and_first_match() {
+        let dev = resolve_device(None).unwrap();
+        let traced =
+            resolve_traces(dev, 512, &["PORTB".into(), "0x06".into(), "portb".into()]).unwrap();
+        assert_eq!(traced.len(), 1);
+        assert_eq!(traced[0].display, "PORTB");
+        assert_eq!((traced[0].addr, traced[0].width), (0x06, 1));
+        // First entry at 0x0E is the joined TMR1 (width 2); a numeric
+        // address still traces width 1 under that canonical name.
+        let traced = resolve_traces(dev, 512, &["0x0e".into()]).unwrap();
+        assert_eq!(traced[0].display, "TMR1");
+        assert_eq!(traced[0].width, 1);
+        let traced = resolve_traces(dev, 512, &["TMR1".into()]).unwrap();
+        assert_eq!(traced[0].width, 2);
+        // An address with no SFR entry displays as the padded address.
+        let traced = resolve_traces(dev, 512, &["0x20".into()]).unwrap();
+        assert_eq!(traced[0].display, "0x020");
+    }
+
+    #[test]
+    fn trace_resolution_alias_uses_canonical_name() {
+        let dev = resolve_device(Some("p18f4550")).unwrap();
+        let traced = resolve_traces(dev, 4096, &["DDRA".into()]).unwrap();
+        assert_eq!(traced[0].display, "TRISA");
+        let traced = resolve_traces(dev, 4096, &["WREG".into()]).unwrap();
+        assert_eq!(traced[0].kind, TraceKind::Wreg);
+    }
+
+    #[test]
+    fn trace_resolution_rejects_unknown_indf_and_out_of_range() {
+        let dev = resolve_device(None).unwrap();
+        for items in [
+            vec!["NOSUCHREG".to_string()],
+            vec!["INDF".to_string()],
+            vec!["0x00".to_string()],
+            vec!["0x200".to_string()],
+        ] {
+            let e = resolve_traces(dev, 512, &items).unwrap_err();
+            assert!(e.contains(USAGE), "{e}");
+        }
+        let e = resolve_traces(dev, 512, &["INDF".into()]).unwrap_err();
+        assert!(e.contains("INDF is not traceable"), "{e}");
+        // PCL is a pseudo-register traced through pc(), not ram().
+        let traced = resolve_traces(dev, 512, &["PCL".into()]).unwrap();
+        assert_eq!(traced[0].kind, TraceKind::Pcl);
+    }
+
+    #[test]
+    fn indf_rejected_by_name_and_address_on_every_core() {
+        // (device, ram length, INDF names in its table, INDF addresses)
+        let cases: &[(&str, usize, &[&str], &[&str])] = &[
+            ("p16f877a", 512, &["INDF"], &["0x00"]),
+            ("p16f84a", 512, &[], &["0x00"]),
+            ("p16f1937", 4096, &["INDF0", "INDF1"], &["0x00", "0x01"]),
+            ("p16f1933", 4096, &[], &["0x00", "0x01"]),
+            (
+                "p18f4550",
+                4096,
+                &["INDF0", "INDF1", "INDF2"],
+                &["0xFEF", "0xFE7", "0xFDF"],
+            ),
+            ("p18f4520", 4096, &[], &["0xFEF", "0xFE7", "0xFDF"]),
+            ("p12f509", 256, &[], &["0x00"]),
+        ];
+        for &(name, ram_len, names, addrs) in cases {
+            let dev = resolve_device(Some(name)).unwrap();
+            for item in names.iter().chain(addrs) {
+                let e = resolve_traces(dev, ram_len, &[item.to_string()]).unwrap_err();
+                assert!(e.contains("INDF is not traceable"), "{name} {item}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn pseudo_registers_resolve_on_every_core() {
+        let dev = resolve_device(None).unwrap();
+        let traced = resolve_traces(dev, 512, &["0x02".into()]).unwrap();
+        assert_eq!(traced[0].kind, TraceKind::Pcl);
+
+        let dev = resolve_device(Some("p16f1937")).unwrap();
+        for (item, kind) in [
+            ("PCL", TraceKind::Pcl),
+            ("WREG", TraceKind::Wreg),
+            ("0x02", TraceKind::Pcl),
+            ("0x09", TraceKind::Wreg),
+        ] {
+            let traced = resolve_traces(dev, 4096, &[item.into()]).unwrap();
+            assert_eq!(traced[0].kind, kind, "p16f1937 {item}");
+        }
+
+        let dev = resolve_device(Some("p18f4550")).unwrap();
+        for (item, kind) in [
+            ("PCL", TraceKind::Pcl),
+            ("WREG", TraceKind::Wreg),
+            ("0xFF9", TraceKind::Pcl),
+            ("0xFE8", TraceKind::Wreg),
+        ] {
+            let traced = resolve_traces(dev, 4096, &[item.into()]).unwrap();
+            assert_eq!(traced[0].kind, kind, "p18f4550 {item}");
+        }
+
+        // Baseline has no SFR table: PCL still resolves by address, and
+        // an unnamed address displays with two digits, not three.
+        let dev = resolve_device(Some("p12f509")).unwrap();
+        let traced = resolve_traces(dev, 256, &["0x02".into()]).unwrap();
+        assert_eq!(traced[0].kind, TraceKind::Pcl);
+        let traced = resolve_traces(dev, 256, &["0x20".into()]).unwrap();
+        assert_eq!(traced[0].display, "0x20");
+    }
+
+    #[test]
+    fn wreg_and_pcl_traces_snapshot_the_accessors() {
+        let dev = resolve_device(Some("p16f1937")).unwrap();
+        // movlw 0x05; sleep
+        let mut sim = Sim::new(dev, vec![0x3005, 0x0063]);
+        let traced = resolve_traces(dev, sim.ram().len(), &["WREG".into(), "PCL".into()]).unwrap();
+        let (outcome, lines) = run_traced(&mut sim, 100, &traced);
+        assert_eq!(outcome.stop, Stop::Halted, "lines: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains(" write WREG=0x05")),
+            "lines: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains(" write PCL=")),
+            "lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn trace_and_dump_args_parse() {
+        let a = parse_args(&argv(&["a.hex", "--trace-sfr", "PORTB,0x06", "--dump=ram"])).unwrap();
+        assert_eq!(a.trace_sfr, ["PORTB", "0x06"]);
+        assert_eq!(a.dump, Some(DumpKind::Ram));
+        let e = parse_args(&argv(&["a.hex", "--dump", "everything"])).unwrap_err();
+        assert!(e.contains(USAGE), "{e}");
     }
 }

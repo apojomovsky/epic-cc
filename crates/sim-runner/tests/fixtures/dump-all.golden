@@ -1,0 +1,52 @@
+w=0xab
+status=0x10
+pc=0x0002
+ram 0x0000: 00 00 00 10 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0010: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0020: ab 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0030: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0040: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0050: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0060: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0070: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0080: 00 ff 00 00 00 3f ff ff ff 07 00 00 00 00 00 00
+ram 0x0090: 00 00 ff 00 00 00 00 00 02 00 00 00 07 00 00 00
+ram 0x00a0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x00b0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x00c0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x00d0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x00e0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x00f0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0100: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0110: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0120: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0130: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0140: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0150: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0160: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0170: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0180: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x0190: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x01a0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x01b0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x01c0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x01d0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x01e0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ram 0x01f0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+eeprom 0x0000: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x0010: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x0020: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x0030: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x0040: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x0050: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x0060: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x0070: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x0080: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x0090: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x00a0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x00b0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x00c0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x00d0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x00e0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+eeprom 0x00f0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+halted after 4 cycles pc=0x0002 w=0xab status=0x10
