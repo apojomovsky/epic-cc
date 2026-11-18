@@ -5,16 +5,19 @@
 use device::Core;
 use pic14_sim::{Pic14, Pic14e, Pic18, PicBaseline};
 
-/// Parsed `epic-cc-sim <hex> [--device <name>] [--cycles <n>]` arguments.
+/// Parsed `epic-cc-sim` arguments (design 51 section 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
     pub hex_path: String,
     pub device: Option<String>,
     pub cycles: u64,
+    pub breaks: Vec<u32>,
+    pub pokes: Vec<(u32, u8)>,
+    pub stimulus: Option<String>,
 }
 
 /// The usage contract `--help` prints and failures append.
-pub const USAGE: &str = "usage: epic-cc-sim <hex> [--device <name>] [--cycles <n>]";
+pub const USAGE: &str = "usage: epic-cc-sim <hex> [--device <name>] [--cycles <n>] [--break <addr>]... [--poke <addr>=<byte>]... [--stimulus <file>]";
 
 /// Default cycle cap from the design 51 CLI contract.
 pub const DEFAULT_CYCLES: u64 = 1_000_000;
@@ -22,7 +25,15 @@ pub const DEFAULT_CYCLES: u64 = 1_000_000;
 /// Default device from the design 51 CLI contract.
 pub const DEFAULT_DEVICE: &str = "p16f877a";
 
-const KNOWN_FLAGS: &[&str] = &["--device", "--cycles", "--help", "--version"];
+const KNOWN_FLAGS: &[&str] = &[
+    "--device",
+    "--cycles",
+    "--break",
+    "--poke",
+    "--stimulus",
+    "--help",
+    "--version",
+];
 const SUGGEST_MAX_DISTANCE: usize = 3;
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -63,12 +74,31 @@ pub fn parse_count(text: &str) -> Result<u64, String> {
     parsed.map_err(|_| format!("bad number {text}"))
 }
 
+fn parse_byte(text: &str) -> Result<u8, String> {
+    let v = parse_count(text)?;
+    u8::try_from(v).map_err(|_| format!("bad byte {text}"))
+}
+
+fn parse_poke(text: &str) -> Result<(u32, u8), String> {
+    let (addr, byte) = text
+        .split_once('=')
+        .ok_or_else(|| format!("bad poke {text}"))?;
+    let addr = u32::try_from(parse_count(addr)?).map_err(|_| format!("bad poke {text}"))?;
+    Ok((
+        addr,
+        parse_byte(byte).map_err(|_| format!("bad poke {text}"))?,
+    ))
+}
+
 /// Parse the runner command line. Errors are plain strings carrying the
 /// usage contract, so `main` can print them and exit 2 unchanged.
 pub fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut hex_path: Option<String> = None;
     let mut device: Option<String> = None;
     let mut cycles = DEFAULT_CYCLES;
+    let mut breaks: Vec<u32> = Vec::new();
+    let mut pokes: Vec<(u32, u8)> = Vec::new();
+    let mut stimulus: Option<String> = None;
     let mut i = 0;
     while i < argv.len() {
         let a = &argv[i];
@@ -78,7 +108,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
             _ => (a.as_str(), None),
         };
         match flag {
-            "--device" | "--cycles" => {
+            "--device" | "--cycles" | "--break" | "--poke" | "--stimulus" => {
                 let value = match inline {
                     Some(v) => v,
                     None => {
@@ -89,11 +119,26 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
                         v.clone()
                     }
                 };
-                if flag == "--device" {
-                    device = Some(value);
-                } else {
-                    cycles =
-                        parse_count(&value).map_err(|e| usage_err(format!("--cycles: {e}")))?;
+                match flag {
+                    "--device" => device = Some(value),
+                    "--cycles" => {
+                        cycles =
+                            parse_count(&value).map_err(|e| usage_err(format!("--cycles: {e}")))?;
+                    }
+                    "--break" => {
+                        let addr =
+                            parse_count(&value).map_err(|e| usage_err(format!("--break: {e}")))?;
+                        breaks.push(
+                            u32::try_from(addr)
+                                .map_err(|_| usage_err(format!("--break: bad address {value}")))?,
+                        );
+                    }
+                    "--poke" => {
+                        pokes.push(
+                            parse_poke(&value).map_err(|e| usage_err(format!("--poke: {e}")))?,
+                        );
+                    }
+                    _ => stimulus = Some(value),
                 }
             }
             _ if flag.starts_with("--") => {
@@ -117,7 +162,138 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
         hex_path,
         device,
         cycles,
+        breaks,
+        pokes,
+        stimulus,
     })
+}
+
+/// Physical `ram()` size in bytes for `core` (design 51 D-5).
+pub fn ram_size(core: Core) -> u32 {
+    match core {
+        Core::PicBaseline => 256,
+        Core::Pic14 => 512,
+        Core::Pic14e | Core::Pic18 => 4096,
+    }
+}
+
+/// Addresses a poke must not target: the `INDF` indirect cell and the
+/// pseudo-registers whose live value is not the `ram()` cell (design 51 D-5).
+pub fn is_poke_forbidden(core: Core, addr: u32) -> bool {
+    match core {
+        Core::Pic14 | Core::PicBaseline => matches!(addr, 0x00 | 0x02),
+        Core::Pic14e => matches!(addr, 0x00 | 0x01 | 0x02 | 0x09),
+        Core::Pic18 => matches!(addr, 0xFEF | 0xFE7 | 0xFDF | 0xFE8 | 0xFF9),
+    }
+}
+
+fn poke_addr_problem(core: Core, addr: u32) -> Option<String> {
+    if addr >= ram_size(core) {
+        Some(format!(
+            "poke address 0x{addr:x} out of range (ram size 0x{:x})",
+            ram_size(core)
+        ))
+    } else if is_poke_forbidden(core, addr) {
+        Some(format!(
+            "poke address 0x{addr:x} is a pseudo-register or INDF address"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Validate a flag `--poke` address for `core`; failure is a usage error.
+pub fn validate_flag_poke(core: Core, addr: u32) -> Result<(), String> {
+    poke_addr_problem(core, addr)
+        .map(|p| usage_err(format!("epic-cc-sim: --poke: {p}")))
+        .map_or(Ok(()), Err)
+}
+
+/// One timed stimulus action (design 51 D-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StimulusAction {
+    Poke(u32, u8),
+    Interrupt,
+}
+
+/// A validated stimulus entry, applied when the cycle count reaches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StimulusEntry {
+    pub cycle: u64,
+    pub action: StimulusAction,
+}
+
+/// A stimulus failure: message already names file and line, plus exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StimulusError {
+    pub message: String,
+    pub exit_code: i32,
+}
+
+/// Parse and validate a whole stimulus file up front (design 51 D-5).
+/// Syntax and poke problems exit 1; `interrupt` on a baseline device exits 2.
+pub fn parse_stimulus(path: &str, core: Core) -> Result<Vec<StimulusEntry>, StimulusError> {
+    let text = std::fs::read_to_string(path).map_err(|e| StimulusError {
+        message: format!("epic-cc-sim: read {path}: {e}"),
+        exit_code: 1,
+    })?;
+    let mut entries = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let err1 = |msg: String| StimulusError {
+            message: format!("epic-cc-sim: {path}:{line_no}: {msg}"),
+            exit_code: 1,
+        };
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 || parts[0] != "at" {
+            return Err(err1(format!("malformed stimulus line: {line}")));
+        }
+        let cycle =
+            parse_count(parts[1]).map_err(|_| err1(format!("malformed stimulus line: {line}")))?;
+        match parts[2] {
+            "poke" => {
+                if parts.len() != 5 {
+                    return Err(err1(format!("malformed stimulus line: {line}")));
+                }
+                let addr = parse_count(parts[3])
+                    .ok()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| err1(format!("malformed stimulus line: {line}")))?;
+                let byte = parse_byte(parts[4])
+                    .map_err(|_| err1(format!("malformed stimulus line: {line}")))?;
+                if let Some(p) = poke_addr_problem(core, addr) {
+                    return Err(err1(p));
+                }
+                entries.push(StimulusEntry {
+                    cycle,
+                    action: StimulusAction::Poke(addr, byte),
+                });
+            }
+            "interrupt" => {
+                if parts.len() != 3 {
+                    return Err(err1(format!("malformed stimulus line: {line}")));
+                }
+                if core == Core::PicBaseline {
+                    return Err(StimulusError {
+                        message: usage_err(format!(
+                            "epic-cc-sim: {path}:{line_no}: interrupt is not available on a baseline device"
+                        )),
+                        exit_code: 2,
+                    });
+                }
+                entries.push(StimulusEntry {
+                    cycle,
+                    action: StimulusAction::Interrupt,
+                });
+            }
+            _ => return Err(err1(format!("malformed stimulus line: {line}"))),
+        }
+    }
+    Ok(entries)
 }
 
 /// Resolve the `--device` spelling (or the default) to its registry entry.
@@ -295,6 +471,26 @@ impl Sim {
         }
     }
 
+    /// Write one validated physical cell directly (design 51 D-5).
+    pub fn poke(&mut self, addr: u32, byte: u8) {
+        match self {
+            Sim::Pic14(s) => s.ram_mut()[addr as usize] = byte,
+            Sim::Pic14e(s) => s.ram_mut()[addr as usize] = byte,
+            Sim::PicBaseline(s) => s.ram_mut()[addr as usize] = byte,
+            Sim::Pic18(s) => s.ram_mut()[addr as usize] = byte,
+        }
+    }
+
+    /// Request an interrupt through the gated hook; baseline has none.
+    pub fn request_interrupt(&mut self) {
+        match self {
+            Sim::Pic14(s) => s.request_interrupt(),
+            Sim::Pic14e(s) => s.request_interrupt(),
+            Sim::PicBaseline(_) => {}
+            Sim::Pic18(s) => s.request_interrupt(),
+        }
+    }
+
     /// Hex digits in a formatted `pc=`: 6 on Pic18, 4 on the other cores.
     pub fn pc_width(&self) -> usize {
         match self {
@@ -304,11 +500,12 @@ impl Sim {
     }
 }
 
-/// Why the run loop stopped; exit codes 0 and 3 in T1.
+/// Why the run loop stopped (design 51 section 3 exit codes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
     Halted,
     Capped,
+    Breakpoint,
 }
 
 impl Stop {
@@ -316,12 +513,14 @@ impl Stop {
         match self {
             Stop::Halted => "halted",
             Stop::Capped => "capped",
+            Stop::Breakpoint => "breakpoint",
         }
     }
     pub fn exit_code(&self) -> i32 {
         match self {
             Stop::Halted => 0,
             Stop::Capped => 3,
+            Stop::Breakpoint => 4,
         }
     }
 }
@@ -351,16 +550,41 @@ impl Outcome {
     }
 }
 
-/// Step one instruction at a time to a halt or the cycle cap (design 51
-/// D-5: the loop never calls the bulk `run`/`run_until` primitives).
-pub fn run(sim: &mut Sim, cap: u64) -> Outcome {
-    while !sim.halted() && sim.cycles() < cap {
+/// Step one instruction at a time (design 51 D-5 run-loop order): apply
+/// due stimulus, check breakpoints on the pre-step pc, step, then check
+/// halt and the cycle cap.
+pub fn run(sim: &mut Sim, cap: u64, breaks: &[u32], stimulus: &[StimulusEntry]) -> Outcome {
+    let mut pending: Vec<StimulusEntry> = stimulus.to_vec();
+    let stop = loop {
+        let now = sim.cycles();
+        let mut rest = Vec::new();
+        for e in pending {
+            if e.cycle <= now {
+                match e.action {
+                    StimulusAction::Poke(a, b) => sim.poke(a, b),
+                    StimulusAction::Interrupt => sim.request_interrupt(),
+                }
+            } else {
+                rest.push(e);
+            }
+        }
+        pending = rest;
+        if breaks.contains(&sim.pc()) {
+            break Stop::Breakpoint;
+        }
+        if sim.halted() {
+            break Stop::Halted;
+        }
+        if sim.cycles() >= cap {
+            break Stop::Capped;
+        }
         sim.step();
-    }
-    let stop = if sim.halted() {
-        Stop::Halted
-    } else {
-        Stop::Capped
+        if sim.halted() {
+            break Stop::Halted;
+        }
+        if sim.cycles() >= cap {
+            break Stop::Capped;
+        }
     };
     Outcome {
         stop,
@@ -382,6 +606,22 @@ pub fn run_main(args: &Args) -> i32 {
             return 2;
         }
     };
+    for &(addr, _) in &args.pokes {
+        if let Err(e) = validate_flag_poke(device.core, addr) {
+            eprintln!("{e}");
+            return 2;
+        }
+    }
+    let stimulus = match &args.stimulus {
+        Some(path) => match parse_stimulus(path, device.core) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{}", e.message);
+                return e.exit_code;
+            }
+        },
+        None => Vec::new(),
+    };
     let prog = match load_program(&args.hex_path, device.core) {
         Ok(p) => p,
         Err(e) => {
@@ -390,7 +630,10 @@ pub fn run_main(args: &Args) -> i32 {
         }
     };
     let mut sim = Sim::new(device, prog);
-    let outcome = run(&mut sim, args.cycles);
+    for &(addr, byte) in &args.pokes {
+        sim.poke(addr, byte);
+    }
+    let outcome = run(&mut sim, args.cycles, &args.breaks, &stimulus);
     println!("{}", outcome.final_line());
     outcome.stop.exit_code()
 }
