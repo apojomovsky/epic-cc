@@ -490,3 +490,69 @@ fn freeze_of_mixed_select_is_maybe_flash() {
     assert!(!flash.contains("main::f"), "frozen join must not be flash");
     assert!(mixed.contains("main::f"), "frozen join must be maybe-flash");
 }
+
+// epic-cc#1419: a definite inttoptr is a flash writer in the slot
+// proof, so a select joining it with a RAM arm is maybe-flash (the
+// 3-byte tagged form alloc sizes), not RAM-only.
+#[test]
+fn inttoptr_flash_joined_with_ram_is_maybe_flash() {
+    let m = parse(
+        "const c i8\n\
+         global g i16\n\
+         global buf i16\n\
+         global flag i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store ptr @c @g\n\
+             %x = load i16 @g\n\
+             %p = inttoptr i16 %x to ptr\n\
+             %f = load i8 @flag\n\
+             %m = select i1 %f, ptr @buf, ptr %p\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let mut prov = iselcore::flash_provenance(&m);
+    iselcore::add_int_flash_definite(&mut prov, &m, &r, |n| n == "c");
+    let (flash, mixed, _) = iselcore::flash_slot_spaces_ex(&m, &r, &prov, |n| n == "c");
+    assert!(
+        flash.contains("main::p"),
+        "inttoptr dst must be flash: {flash:?}"
+    );
+    assert!(
+        !flash.contains("main::m"),
+        "join must not be flash: {flash:?}"
+    );
+    assert!(
+        mixed.contains("main::m"),
+        "join must be maybe-flash: {mixed:?}"
+    );
+}
+
+// A non-definite inttoptr stays a RAM writer: no tag claim survives.
+#[test]
+fn inttoptr_ram_joined_with_ram_is_not_maybe_flash() {
+    let m = parse(
+        "global g i16\n\
+         global buf i16\n\
+         global flag i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = load i16 @g\n\
+             %p = inttoptr i16 %x to ptr\n\
+             %f = load i8 @flag\n\
+             %m = select i1 %f, ptr @buf, ptr %p\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let mut prov = iselcore::flash_provenance(&m);
+    iselcore::add_int_flash_definite(&mut prov, &m, &r, |_| false);
+    let (flash, mixed, _) = iselcore::flash_slot_spaces_ex(&m, &r, &prov, |_| false);
+    assert!(
+        !flash.contains("main::p"),
+        "RAM inttoptr must not be flash: {flash:?}"
+    );
+    assert!(
+        !mixed.contains("main::m"),
+        "RAM join must not be maybe-flash: {mixed:?}"
+    );
+}

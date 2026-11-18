@@ -2368,9 +2368,9 @@ pub fn flash_slot_spaces_ex(
     let is_func = |n: &str| m.funcs.iter().any(|f| f.name == n);
     // Candidate slots: plain ptr params plus every reg that can hold an
     // address (ptr phis/selects, geps, ptr loads, freezes, call results
-    // used in pointer position). byval/sret params hold caller copies,
-    // integer-only call results and inttoptr/va_arg/alloca slots hold
-    // RAM or runtime integers, so none of those are candidates.
+    // used in pointer position, inttoptr dsts). byval/sret params hold
+    // caller copies, and integer-only call results and va_arg/alloca
+    // slots hold RAM or runtime integers, so none of those are candidates.
     let mut cands: HashSet<String> = HashSet::new();
     for f in &m.funcs {
         for p in &f.params {
@@ -2395,6 +2395,9 @@ pub fn flash_slot_spaces_ex(
                     }
                     Inst::Freeze(fr) => {
                         cands.insert(ssa_key(&f.name, &fr.dst));
+                    }
+                    Inst::IntToPtr(p) => {
+                        cands.insert(ssa_key(&f.name, &p.dst));
                     }
                     _ => {}
                 }
@@ -2552,9 +2555,7 @@ pub fn flash_slot_spaces_ex(
     };
     // A value crossing a call boundary: a definite inttoptr pointer
     // (epic-cc#1346) is a flash writer of the param or call-dst slot it
-    // lands in, exactly like a proven flash pointer. Inside a function
-    // the same value only grounds its own slot, so a join with a RAM
-    // arm stays maybe-flash there and keeps its refusal.
+    // lands in, exactly like a proven flash pointer.
     let arg_writer = |v: &ir::Val, func: &str| -> SlotWriter {
         if let ir::Val::Reg(r) = v {
             if prov.int_flash_ptr.contains(&ssa_key(func, r)) {
@@ -2640,6 +2641,17 @@ pub fn flash_slot_spaces_ex(
                     Inst::Freeze(fr) => {
                         // A freeze copies its operand whole, tag included.
                         push(ssa_key(&f.name, &fr.dst), val_writer(&fr.val, &f.name));
+                    }
+                    Inst::IntToPtr(p) => {
+                        // A definite inttoptr writes a flash address, so
+                        // a join over it can carry the tag (epic-cc#1419);
+                        // any other inttoptr is a RAM writer.
+                        let key = ssa_key(&f.name, &p.dst);
+                        if prov.int_flash_ptr.contains(&key) {
+                            push(key, SlotWriter::Src);
+                        } else {
+                            push(key, SlotWriter::Bad);
+                        }
                     }
                     Inst::Load(l) if l.ptr_ty => {
                         let key = ssa_key(&f.name, &l.dst);
@@ -4688,8 +4700,9 @@ pub fn add_int_flash_definite(
             }
         }
     }
-    // The maybe-flash joins are mixed pointers: the backend refuses a
-    // dereference through one, because no tag survives the join.
+    // The maybe-flash joins are mixed pointers: the slot proof marks
+    // the same joins maybe-flash (epic-cc#1419), so the backend
+    // dispatches on the tag the select writes instead of refusing.
     for key in &mixed_joins {
         prov.mixed.insert(key.clone());
     }

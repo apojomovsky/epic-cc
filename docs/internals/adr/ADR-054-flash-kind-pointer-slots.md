@@ -164,19 +164,17 @@ such a redefinition, so a use before that write keeps the incoming
 value.
 
 A pointer that joins a definite flash pointer with a value that is
-not a flash address is maybe-flash, and no tag survives the join, so
-the proof withdraws the flash claim from the join's result and marks
-it mixed. The join's own dereference then keeps the maybe-flash
-refusal; the flash arm it joined keeps its claim, so a direct
-dereference through the arm still reads flash. The withdrawal is what
-keeps the maybe case safe without the 3-byte tagged form: a
-maybe-flash slot is sized by `alloc` from its own slot proof, so
-marking the `inttoptr` dst a flash writer there would widen the slot
-on the backend side only.
+not a flash address is maybe-flash, so the proof withdraws the flash
+claim from the join's result and marks it mixed. The flash arm it
+joined keeps its claim, so a direct dereference through the arm still
+reads flash.
 
-Inside a function the `inttoptr` dsts stay out of the slot proof's
-writer set, so a join with a RAM arm stays maybe-flash and keeps its
-refusal. At a call boundary a definite `inttoptr` value is a flash
+Since epic-cc#1419 the `inttoptr` dst is a flash writer in the slot
+proof too, in both the backend and `alloc` (which runs the same
+definite proof before its slot proof), so a join with a RAM arm is
+maybe-flash in both: `alloc` sizes the join's slot 3 bytes, the
+select writes the picked arm's tag, and the dereference dispatches
+on it. At a call boundary a definite `inttoptr` value is a flash
 writer of the param or call-dst slot it lands in, exactly like a
 proven flash pointer, so the callee's dereference through that param
 reads flash. `alloc` runs the same definite proof before its slot
