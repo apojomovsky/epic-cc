@@ -7239,6 +7239,19 @@ impl<'m> Gen<'m> {
         self.slot_mixed.contains(&format!("@{name}"))
     }
 
+    /// Whether global `name` is a maybe-flash pointer slot whose tag a
+    /// memcpy would have to thread: only a 2-byte slot holds a pointer
+    /// value at all, so a wider global in the mixed set is a content
+    /// buffer, not a tagged slot (epic-cc#1435).
+    fn global_slot_is_mixed_ptr(&self, name: &str) -> bool {
+        self.global_slot_is_mixed(name)
+            && self
+                .m
+                .globals
+                .iter()
+                .any(|x| x.name == name && !x.is_const && x.size == 2)
+    }
+
     /// Whether slot `slot` of `func` is maybe-flash.
     fn slot_is_mixed(&self, func: &str, slot: &str) -> bool {
         self.slot_mixed.contains(&ssa_key(func, slot))
@@ -8915,7 +8928,7 @@ impl<'m> Gen<'m> {
             // A GEP register names its base slot, not itself: resolve
             // it, or a maybe-flash global escapes this refusal.
             let base_is_mixed = match self.resolved.get(&key) {
-                Some((Base::Global(g), _, _)) => self.global_slot_is_mixed(g),
+                Some((Base::Global(g), _, _)) => self.global_slot_is_mixed_ptr(g),
                 Some((Base::Slot(sname, _), _, _)) => self.slot_is_mixed(self.cur_func, sname),
                 _ => false,
             };
@@ -8931,7 +8944,7 @@ impl<'m> Gen<'m> {
             }
         }
         if let Val::Global(g) = dst {
-            if self.global_slot_is_mixed(g) {
+            if self.global_slot_is_mixed_ptr(g) {
                 panic!(
                     "isel-pic18: memcpy into a maybe-flash destination @{g} is not supported (epic-cc#1306)"
                 );
@@ -8954,7 +8967,7 @@ impl<'m> Gen<'m> {
                 // that base, or the call falls through to the trap loop.
                 let base_may_be_flash = match self.resolved.get(&key) {
                     Some((Base::Global(g), _, _)) => {
-                        self.global_slot_is_mixed(g) || self.global_is_const(g)
+                        self.global_slot_is_mixed_ptr(g) || self.global_is_const(g)
                     }
                     Some((Base::Slot(sname, _), _, _)) => {
                         let sk = ssa_key(self.cur_func, sname);
@@ -8972,7 +8985,7 @@ impl<'m> Gen<'m> {
                     || self.maybe_flash_slot_under_index(&key).is_some()
                     || base_may_be_flash
             }
-            Val::Global(g) => self.global_slot_is_mixed(g),
+            Val::Global(g) => self.global_slot_is_mixed_ptr(g),
             _ => false,
         };
         self.const_base_of(&dst.val).is_some() || may_be_flash(&dst.val) || may_be_flash(&src.val)
