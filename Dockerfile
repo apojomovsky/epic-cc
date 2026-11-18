@@ -240,16 +240,18 @@ ARG EPIC_CC_VERSION=dev
 COPY . /workspace
 WORKDIR /workspace
 
-# Build the release binary and assemble the bundle. The smoke test runs the
-# shipped binary twice — once via env vars, once via bundled discovery — and
-# requires byte-identical HEX, proving the bundle's clang loads and the
-# driver finds it.
-RUN cargo build --release -p driver -p epic-cc-gdbserver \
+# Build the release binaries and assemble the bundle. The smoke test runs
+# the shipped compiler twice, once via env vars and once via bundled
+# discovery, and requires byte-identical HEX, proving the bundle's clang
+# loads and the driver finds it. It then runs that HEX under the shipped
+# epic-cc-sim and requires the halted final line.
+RUN cargo build --release -p driver -p epic-cc-gdbserver -p epic-cc-sim \
     && mkdir -p "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin" \
     && python3 scripts/gen_devices_manifest.py \
         "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/devices.json" \
     && cp target/release/epic-cc "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/" \
     && cp target/release/epic-cc-gdbserver "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/" \
+    && cp target/release/epic-cc-sim "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/" \
     && ./target/release/epic-cc --dump-include-dir "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/include" \
     && cp /opt/clang/bin/clang "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \
     && cp /opt/clang/bin/llvm-link "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \
@@ -264,4 +266,6 @@ RUN cargo build --release -p driver -p epic-cc-gdbserver \
     && env -u PIC8_CLANG_UNWRAPPED -u PIC8_CLANG_RESOURCE_DIR \
        ./epic-cc /workspace/crates/driver/tests/fixtures/add.c -o /tmp/bundled.hex \
     && cmp /tmp/env.hex /tmp/bundled.hex \
-    && test "$(./epic-cc --print-include-dir)" = "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/include"
+    && test "$(./epic-cc --print-include-dir)" = "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/include" \
+    && ./epic-cc-sim /tmp/bundled.hex > /tmp/sim-smoke.txt \
+    && grep -q '^halted after [0-9]* cycles pc=0x[0-9a-f]* w=0x[0-9a-f][0-9a-f] status=0x[0-9a-f][0-9a-f]$' /tmp/sim-smoke.txt

@@ -55,7 +55,7 @@ Download the release bundle for Linux with the [GitHub CLI](https://cli.github.c
 --8<-- "docs/snippets/install.sh"
 ```
 
-The folder you end up in holds the `epic-cc` program, its clang, and the definitions of the supported parts.
+The folder you end up in holds the `epic-cc` program, its clang, and the definitions of the supported parts. It also holds `epic-cc-sim`, which runs a compiled `.hex` file in the simulator: `./epic-cc-sim add.hex`.
 
 Check that it runs:
 

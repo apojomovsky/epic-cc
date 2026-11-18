@@ -150,14 +150,14 @@ New `release.yml`, tag-triggered:
 
 - **Linux job:** `scripts/warm-toolchain-cache.sh --target release --load` → bundle zip. The clang layer comes
   from the registry cache (see above).
-- **Windows job:** `windows-latest`, build `epic-cc` and `epic-cc-gdbserver` natively; download the official
+- **Windows job:** `windows-latest`, build `epic-cc`, `epic-cc-gdbserver` and `epic-cc-sim` natively; download the official
   LLVM 20.1.8 MSVC bundle, slice `clang.exe` + DLLs + `lib/clang/20/`, assemble the zip.
 - **Per-platform smoke:** run the *actual shipped binary* from the zip against a fixture
   (e.g. `add.c`) and byte-diff its HEX against the dev-shell build of the same fixture.
   The compiler is deterministic, so this proves the bundle's clang loads and the driver
   finds it — end to end.
 - **Bundle check:** the release job runs `scripts/check_release_bundle.py` over every
-  downloaded zip and fails unless each carries `epic-cc` and `epic-cc-gdbserver` (`.exe` on
+  downloaded zip and fails unless each carries `epic-cc`, `epic-cc-gdbserver` and `epic-cc-sim` (`.exe` on
   Windows), then lists the zip contents. `pio debug` needs the adapter on every platform.
 - Attach both zips + sha256 sums + LLVM license to the GitHub release.
 

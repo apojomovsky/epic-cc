@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Fail unless every release zip ships both epic-cc and epic-cc-gdbserver.
+"""Fail unless every release zip ships epic-cc, epic-cc-gdbserver and epic-cc-sim.
 
 A bundle without the debugger adapter breaks `pio debug` on that platform
-(epic-cc#1336), so release.yml runs this on every downloaded zip before it
-publishes. Windows zips (`*-windows.zip`) must carry `.exe` binaries.
+(epic-cc#1336), and one without the simulator runner breaks the tutorial
+flow (epic-cc#1530), so release.yml runs this on every downloaded zip
+before it publishes. Windows zips (`*-windows.zip`) must carry `.exe`
+binaries.
 
 usage: check_release_bundle.py <zip>...
 """
@@ -12,7 +14,7 @@ import pathlib
 import sys
 import zipfile
 
-BINARIES = ("epic-cc", "epic-cc-gdbserver")
+BINARIES = ("epic-cc", "epic-cc-gdbserver", "epic-cc-sim")
 
 
 def expected_members(zip_path):
