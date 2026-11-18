@@ -7489,14 +7489,13 @@ impl<'m> Gen<'m> {
             "isel-pic18: fat join of a non-pointer-width value"
         );
         let tag = self.tag_src(self.cur_func, val);
-        // A directly proven flash value never reaches a join: every
-        // caller keeps its refusal (epic-cc#1101). Reaching this arm
-        // is a caller bug, not a lowering gap.
-        assert!(
-            !matches!(tag, TagSrc::Flash),
-            "isel-pic18: fat join of a directly proven flash address"
-        );
-        self.emit_move_val_to_slot(val, ty, dst);
+        // A directly proven flash value joins with tag 1: its address
+        // bytes take the flash form (epic-cc#1351).
+        if matches!(tag, TagSrc::Flash) {
+            self.emit_flash_addr_store(val, ty, dst);
+        } else {
+            self.emit_move_val_to_slot(val, ty, dst);
+        }
         self.emit_tag_store(tag, dst + 2);
     }
     /// The plain store tail: W-threaded and const-phis, TABLAT forwards,
@@ -10270,14 +10269,11 @@ impl<'m> Gen<'m> {
                             if big {
                                 missing_global_addr(self.m, self.cur_func, g);
                             }
-                            if param_mixed {
+                            if !param_mixed {
                                 panic!(
-                                    "isel-pic18: cannot pass flash address @{g} to a maybe-flash pointer param (a directly proven ROM address keeps its refusal; epic-cc#1101, epic-cc#1306)"
+                                    "isel-pic18: cannot pass flash address @{g} to a RAM pointer param (epic-cc#1119)"
                                 );
                             }
-                            panic!(
-                                "isel-pic18: cannot pass flash address @{g} to a RAM pointer param (epic-cc#1119)"
-                            );
                         }
                         let (a0, f0) = self.operand(pa);
                         self.emit(format!("    MOVLW LOW({g})"));
@@ -10291,6 +10287,9 @@ impl<'m> Gen<'m> {
                             "    MOVWF 0x{f1:03X},{}",
                             if a1 == 0 { "A" } else { "B" }
                         ));
+                        if param_mixed {
+                            self.emit_tag_store(TagSrc::Flash, pa + 2);
+                        }
                     } else {
                         let addr = self.global_addr(g);
                         let (a0, f0) = self.operand(pa);
@@ -10323,7 +10322,8 @@ impl<'m> Gen<'m> {
                         self.prov.mixed.contains(&key) || self.slot_mixed.contains(&key)
                     };
                     let param_flash = self.slot_is_flash(func, &callee.params[i].name);
-                    if vflash && !param_flash {
+                    let int_ptr = self.prov.int_flash_ptr.contains(&ssa_key(self.cur_func, r));
+                    if vflash && !param_flash && !(param_mixed && !int_ptr) {
                         panic!(
                             "isel-pic18: cannot pass flash address %{r} to a RAM pointer param (epic-cc#1119)"
                         );
@@ -11123,11 +11123,8 @@ impl<'m> Gen<'m> {
                 // A ROM address has no RAM form: a later load through the stored
                 // slot reads RAM at that address, silently wrong. A flash-kind
                 // slot takes it whole (epic-cc#1119); a maybe-flash slot
-                // takes a joined or RAM value whole plus the tag
-                // (epic-cc#1306). A directly proven flash address keeps
-                // today's refusal even into a mixed slot (epic-cc#1101):
-                // the fallback serves join values and initializers, not a
-                // statically known ROM store.
+                // takes a joined, RAM, or directly proven flash value
+                // whole plus the tag (epic-cc#1306, epic-cc#1351).
                 let stores_rom = match &s.val {
                     Val::Global(g) => self.global_is_const(g),
                     Val::Reg(_) => self.flash_val(self.cur_func, &s.val),
@@ -11141,21 +11138,19 @@ impl<'m> Gen<'m> {
                     _ => false,
                 };
                 if let Some(dst) = dst_mixed {
-                    if !stores_rom {
-                        if self.mixed_no_slot(self.cur_func, &s.val) {
-                            panic!(
-                                "isel-pic18: store of a maybe-flash address {:?} is not supported (a pointer joins flash and RAM; epic-cc#1099, epic-cc#1119)",
-                                s.val
-                            );
-                        }
-                        if s.ty.bytes() != 2 {
-                            panic!(
-                                "isel-pic18: store of a non-pointer-width value into a maybe-flash slot is not supported"
-                            );
-                        }
-                        self.emit_ptr_join_store(&s.val, s.ty, dst);
-                        return;
+                    if self.mixed_no_slot(self.cur_func, &s.val) {
+                        panic!(
+                            "isel-pic18: store of a maybe-flash address {:?} is not supported (a pointer joins flash and RAM; epic-cc#1099, epic-cc#1119)",
+                            s.val
+                        );
                     }
+                    if s.ty.bytes() != 2 {
+                        panic!(
+                            "isel-pic18: store of a non-pointer-width value into a maybe-flash slot is not supported"
+                        );
+                    }
+                    self.emit_ptr_join_store(&s.val, s.ty, dst);
+                    return;
                 }
                 // A const destination is a ROM write: leave it to the const-base refusal below.
                 let dst_is_const = s
@@ -11997,11 +11992,6 @@ impl<'m> Gen<'m> {
                 // width, mirroring `isel`'s own Freeze arm). A maybe-flash
                 // dst takes the value whole plus the tag.
                 if self.slot_is_mixed(self.cur_func, &f.dst) {
-                    if self.flash_val(self.cur_func, &f.val) {
-                        panic!(
-                            "isel-pic18: freeze of a flash address into a maybe-flash slot is not supported (a directly proven ROM address keeps its refusal; epic-cc#1101, epic-cc#1306)"
-                        );
-                    }
                     if self.mixed_no_slot(self.cur_func, &f.val) {
                         panic!(
                             "isel-pic18: freeze of a maybe-flash address is not supported (a pointer joins flash and RAM; epic-cc#1099)"
@@ -19652,7 +19642,15 @@ pub fn select_with_opts(
                         })
                         && !g.m.funcs.iter().flat_map(|h| &h.blocks).flat_map(|b| &b.insts)
                             .any(|i| matches!(i, Inst::Call(c) if c.callees.iter().any(|t| t == &f.name)));
-                    if !definite_return && !matches!(v, Val::Const(_)) && g.flash_val(&f.name, v) {
+                    let int_ptr = matches!(v, Val::Reg(r) if g
+                        .prov
+                        .int_flash_ptr
+                        .contains(&ssa_key(&f.name, r)));
+                    if !definite_return
+                        && !(g.ret_fat.contains(&f.name) && !int_ptr)
+                        && !matches!(v, Val::Const(_))
+                        && g.flash_val(&f.name, v)
+                    {
                         panic!(
                             "isel-pic18: cannot return flash address {v:?} to a RAM caller (epic-cc#1119)"
                         );
@@ -19671,13 +19669,17 @@ pub fn select_with_opts(
                             2,
                             "isel-pic18: fat return of a non-pointer-width value"
                         );
-                        for i in 0..2 {
-                            g.emit_load_w(v, i, false);
-                            let (a, f2) = g.operand(g.retval_lo + u16::from(i));
-                            let bank = if a == 0 { "A" } else { "B" };
-                            g.emit(format!("    MOVWF 0x{f2:03X},{bank}"));
-                        }
                         let tag = g.tag_src(&f.name, v);
+                        if matches!(tag, TagSrc::Flash) {
+                            g.emit_flash_addr_store(v, *ty, g.retval_lo);
+                        } else {
+                            for i in 0..2 {
+                                g.emit_load_w(v, i, false);
+                                let (a, f2) = g.operand(g.retval_lo + u16::from(i));
+                                let bank = if a == 0 { "A" } else { "B" };
+                                g.emit(format!("    MOVWF 0x{f2:03X},{bank}"));
+                            }
+                        }
                         g.emit_tag_store(tag, g.retval_lo + 2);
                         g.emit("    RETURN".to_string());
                     } else {

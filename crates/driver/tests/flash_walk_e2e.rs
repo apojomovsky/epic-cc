@@ -290,6 +290,33 @@ fn flash_walk_mixed_runtime_index_store_writes_ram_copy_on_p18() {
     assert!(halted);
 }
 
+/// A definite flash address stored directly into a maybe-flash global
+/// slot writes the tagged form: the flash path reads back through
+/// TBLRD and the RAM path through RAM (epic-cc#1351).
+#[test]
+fn flash_direct_store_into_mixed_slot_reads_back_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_direct_mixed_store.c");
+    assert_eq!(ram[map_addr(&map, "out")], b'P', "flash path reads gp[1]");
+    assert!(halted);
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_direct_mixed_store_ram.c");
+    assert_eq!(ram[map_addr(&map, "out")], b'b', "RAM path reads gp[1]");
+    assert!(halted);
+}
+
+/// A definite flash address passed directly to a maybe-flash pointer
+/// param writes the tagged form (epic-cc#1351).
+#[test]
+fn flash_direct_call_into_mixed_param_reads_back_on_p18() {
+    let (ram, map, halted) = run_p18("tests/fixtures/flash_direct_mixed_call.c");
+    assert_eq!(
+        ram[map_addr(&map, "out_flash")],
+        b'P',
+        "flash arg reads p[1]"
+    );
+    assert_eq!(ram[map_addr(&map, "out_ram")], b'b', "RAM arg reads p[1]");
+    assert!(halted);
+}
+
 /// A constant-length `memcpy` from a flash walk must copy program memory
 /// (epic-cc#1100). `sum` adds the first copied byte on every step, so it pins
 /// each walk position, not only the last one.

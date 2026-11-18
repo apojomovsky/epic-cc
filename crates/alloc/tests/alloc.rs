@@ -687,9 +687,10 @@ fn const_direct_ptr_call_arg_stays_in_flash_on_pic18() {
 }
 
 #[test]
-fn const_direct_ptr_call_arg_is_copied_to_ram_when_mixed() {
+fn const_direct_ptr_call_arg_stays_in_flash_when_mixed() {
     // The same call also passing a RAM global joins the param's spaces:
-    // the const keeps its RAM copy so the callee reads RAM either way.
+    // the const stays flash-resident and the callee dispatches on the
+    // tag the call writes (epic-cc#1351).
     let mut m = parse(
         "const c i8\n\
          global buf i8\n\
@@ -705,12 +706,12 @@ fn const_direct_ptr_call_arg_is_copied_to_ram_when_mixed() {
     m.globals[0].size = 2; // c: [2 x i8], like menu-demo .str
     let out = allocate(&PIC18F4550, &m, "edge main f\n");
     assert!(
-        out.globals.contains_key("c"),
-        "mixed call arg @c must be copied to RAM"
+        !out.globals.contains_key("c"),
+        "mixed call arg @c must keep no RAM copy"
     );
     assert!(
-        !out.const_globals.contains("c"),
-        "copied const @c must leave the flash set"
+        out.const_globals.contains("c"),
+        "mixed call arg @c must stay in the flash set"
     );
 }
 

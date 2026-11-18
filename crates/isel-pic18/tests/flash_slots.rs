@@ -213,10 +213,10 @@ fn flash_phi_forwarded_to_callee_reads_flash() {
 }
 
 #[test]
-#[should_panic(expected = "store of a ROM address into RAM")]
-fn mixed_global_slot_store_is_refused() {
-    // A global also written with a RAM address is no flash-kind slot:
-    // storing a ROM address into it stays refused (epic-cc#1101).
+fn mixed_global_slot_store_compiles() {
+    // A global also written with a RAM address is a maybe-flash slot:
+    // storing a ROM address into it writes the tagged form
+    // (epic-cc#1351).
     let m = with_bytes(
         parse(
             "const c i8\nglobal g i16\nglobal buf i8\n\
@@ -225,11 +225,15 @@ fn mixed_global_slot_store_is_refused() {
         "c",
         b"P",
     );
-    let _ = select(
+    let asm = select(
         &PIC18F4550,
         &m,
-        &addrs(&[("g", 0x10), ("buf", 0x12), ("main::q", 0x13)]),
+        &addrs(&[("g", 0x10), ("buf", 0x13), ("main::q", 0x14)]),
         None,
+    );
+    assert!(
+        asm.contains("MOVLW LOW(c)"),
+        "flash store must materialize the table address:\n{asm}"
     );
 }
 
@@ -273,10 +277,9 @@ fn mixed_phi_load_reads_both_spaces() {
 }
 
 #[test]
-#[should_panic(expected = "cannot pass flash address")]
-fn flash_arg_to_ram_param_is_refused() {
-    // A flash address bound for a RAM-kind param (mixed call sites here)
-    // would read back through FSR: refuse (epic-cc#1119).
+fn flash_arg_to_mixed_param_compiles() {
+    // A flash address bound for a param that also takes RAM at another
+    // call site writes the tagged form (epic-cc#1351).
     let m = with_bytes(
         parse(
             "const c i8\nglobal buf i8\nglobal out i8\n\
@@ -286,16 +289,20 @@ fn flash_arg_to_ram_param_is_refused() {
         "c",
         b"P",
     );
-    let _ = select(
+    let asm = select(
         &PIC18F4550,
         &m,
         &addrs(&[
             ("buf", 0x10),
             ("out", 0x11),
             ("use::p", 0x12),
-            ("use::v", 0x14),
+            ("use::v", 0x15),
         ]),
         None,
+    );
+    assert!(
+        asm.contains("TBLRD*"),
+        "callee must dispatch to flash:\n{asm}"
     );
 }
 
@@ -322,10 +329,9 @@ fn flash_address_return_is_refused() {
 }
 
 #[test]
-#[should_panic(expected = "store of a ROM address into RAM")]
-fn flash_walk_reg_store_into_ram_is_refused() {
-    // A walk-phi value stored into a RAM-kind global would read back
-    // through RAM at a flash address: refuse (epic-cc#1119).
+fn flash_walk_reg_store_into_mixed_compiles() {
+    // A walk-phi value stored into a global also written with a RAM
+    // address writes the tagged form (epic-cc#1351).
     let m = with_bytes(
         parse(
             "const t i8\nglobal pv i16\nglobal buf i8\n\
@@ -339,10 +345,10 @@ fn flash_walk_reg_store_into_ram_is_refused() {
         &m,
         &addrs(&[
             ("pv", 0x10),
-            ("buf", 0x12),
-            ("main::p", 0x13),
-            ("main::q", 0x15),
-            ("main::n", 0x17),
+            ("buf", 0x13),
+            ("main::p", 0x14),
+            ("main::q", 0x16),
+            ("main::n", 0x18),
         ]),
         None,
     );
@@ -470,6 +476,125 @@ fn mixed_select_returned_reads_both_spaces() {
         assert!(p.halted(), "program must halt");
         assert_eq!(p.ram()[0x12], want, "arm f={f} must read its space");
     }
+}
+
+#[test]
+fn direct_flash_store_into_mixed_global_reads_both_spaces() {
+    // A definite flash address stored directly into a maybe-flash
+    // slot writes the tagged form (epic-cc#1351).
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal g i16\nglobal buf i8\nglobal flag i8\nglobal out i8\n\
+             fn main(void) ()\n  block entry:\n    %f = load i8 @flag\n    br i1 %f ram flash\n  block ram:\n    %b = gep @buf +0\n    store ptr %b @g\n    br join\n  block flash:\n    store ptr @c @g\n    br join\n  block join:\n    %q = load ptr @g\n    %v = load i8 %q\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"PQ",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("g", 0x10),
+            ("buf", 0x13),
+            ("flag", 0x14),
+            ("out", 0x15),
+            ("main::f", 0x16),
+            ("main::b", 0x17),
+            ("main::q", 0x19),
+            ("main::v", 0x1C),
+        ]),
+        None,
+    );
+    assert!(asm.contains("TBLRD*"), "flash arm must read flash:\n{asm}");
+    for (f, want) in [(0u8, b'P'), (1u8, b'B')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x14] = f;
+        p.ram_mut()[0x13] = b'B';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x15], want, "arm f={f} must read its space");
+    }
+}
+
+#[test]
+fn direct_flash_return_beside_ram_reads_both_spaces() {
+    // A definite flash return beside a RAM return travels fat
+    // (epic-cc#1351).
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal buf i8\nglobal flag i8\nglobal out i8\n\
+             fn get(ptr) ()\n  block entry:\n    %f = load i8 @flag\n    br i1 %f ram flash\n  block ram:\n    %b = gep @buf +0\n    ret ptr %b\n  block flash:\n    ret ptr @c\n\
+             fn main(void) ()\n  block entry:\n    %r = call ptr @get()\n    %v = load i8 %r\n    store i8 %v @out\n    ret void\n",
+        ),
+        "c",
+        b"PQ",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("buf", 0x10),
+            ("flag", 0x11),
+            ("out", 0x12),
+            ("get::f", 0x13),
+            ("get::b", 0x14),
+            ("main::r", 0x16),
+            ("main::v", 0x19),
+        ]),
+        None,
+    );
+    assert!(asm.contains("TBLRD*"), "flash arm must read flash:\n{asm}");
+    for (f, want) in [(0u8, b'P'), (1u8, b'B')] {
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x11] = f;
+        p.ram_mut()[0x10] = b'B';
+        p.run(500);
+        assert!(p.halted(), "program must halt");
+        assert_eq!(p.ram()[0x12], want, "arm f={f} must read its space");
+    }
+}
+
+#[test]
+fn direct_flash_arg_to_mixed_param_reads_both_spaces() {
+    // A definite flash argument to a maybe-flash param writes the
+    // tagged form (epic-cc#1351).
+    let m = with_bytes(
+        parse(
+            "const c i8\nglobal buf i8\nglobal outf i8\nglobal outr i8\n\
+             fn use(i8) (p=ptr)\n  block entry:\n    %v = load i8 %p\n    ret i8 %v\n\
+             fn main(void) ()\n  block entry:\n    %a = call i8 @use(ptr @c)\n    store i8 %a @outf\n    %b = gep @buf +0\n    %d = call i8 @use(ptr %b)\n    store i8 %d @outr\n    ret void\n",
+        ),
+        "c",
+        b"PQ",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("buf", 0x10),
+            ("outf", 0x11),
+            ("outr", 0x12),
+            ("use::p", 0x13),
+            ("use::v", 0x16),
+            ("main::a", 0x17),
+            ("main::b", 0x18),
+            ("main::d", 0x1A),
+        ]),
+        None,
+    );
+    assert!(asm.contains("TBLRD*"), "flash arm must read flash:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x10] = b'B';
+    p.run(500);
+    assert!(p.halted(), "program must halt");
+    assert_eq!(p.ram()[0x11], b'P', "flash arg must read the table");
+    assert_eq!(p.ram()[0x12], b'B', "RAM arg must read RAM");
 }
 
 #[test]
